@@ -76,8 +76,11 @@ duplex stream object; per-transport factories differ only in connect/accept.
     `IBuffer.Length` and fires the Completed handler.
   - `WriteAsync(buf: IBuffer)` → overlapped `WriteFile`/`WSASend` →
     `IAsyncOperationWithProgress<u32,u32>`.
-  - `Close` (`IClosable`) cancels in-flight ops (`CancelIoEx`) and closes the
-    handle/TP_IO.
+  - `Close` (`IClosable`) releases this stream's own reference; it does not
+    force-cancel in-flight ops (each op holds its own handle/TP_IO reference
+    via `Arc<IoReg>`, so it keeps running until it completes on its own). To
+    cancel a specific pending read/write, call `IAsyncInfo::Cancel` on the
+    async operation `ReadAsync`/`WriteAsync` returned for it.
   - Being real WinRT streams, they work with `DataReader`/`DataWriter` and any
     WinRT consumer.
 - **Factories** (analogous to WinRT types):
@@ -149,9 +152,11 @@ dq task: stream.ReadAsync(buf,n,opts)?.await
   completion (pool) thread and the DQ thread; they carry no thread-affine state
   beyond what is mutex/refcount protected.
 - **Cancellation:** `LocalJoinHandle::abort` drops the task future; a comio
-  async-op's `IAsyncInfo::Cancel` (and stream `Close`) issue `CancelIoEx`.
-  WinRT-backed ops (TCP/file) are cooperatively dropped (windows-future does not
-  auto-cancel — documented).
+  async-op's `IAsyncInfo::Cancel` issues `CancelIoEx`. Stream `Close` does
+  NOT issue `CancelIoEx` — it only releases this stream's own reference;
+  cancelling a specific in-flight read/write is done via that op's own
+  `IAsyncInfo::Cancel`. WinRT-backed ops (TCP/file) are cooperatively dropped
+  (windows-future does not auto-cancel — documented).
 - **Panics:** dq task polls use `catch_unwind` → `JoinError::Panicked`. No panic
   may cross a COM/FFI callback boundary.
 - **AF_UNIX/ConnectEx** requires a bound socket first (`bind` to an autobind /

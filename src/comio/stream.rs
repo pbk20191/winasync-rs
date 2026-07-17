@@ -49,6 +49,15 @@ pub(crate) fn from_reg(reg: Arc<IoReg>) -> windows_core::IInspectable {
 }
 
 impl IClosable_Impl for OverlappedDuplexStream_Impl {
+    /// Releases this stream's own reference to the underlying registration;
+    /// it does NOT force-cancel in-flight reads/writes. Each in-flight op
+    /// (`IoAsyncOp`, via `tpio::submit`) holds its own `Arc<IoReg>`, so the
+    /// handle/socket stays open — and any op already issued keeps running —
+    /// until every such op completes or is individually cancelled, even
+    /// after `Close` returns and even if this was the caller's last
+    /// reference to the stream object itself. To cancel a specific pending
+    /// read/write, call `IAsyncInfo::Cancel` on the `IAsyncOperationWithProgress`
+    /// that `ReadAsync`/`WriteAsync` returned for it.
     fn Close(&self) -> Result<()> {
         // Dropping the last `Arc<IoReg>` (when this COM object itself is
         // released) closes the underlying handle/socket; nothing else to do.
@@ -70,16 +79,29 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
         let is_socket = reg.is_socket();
         let handle = reg.handle;
         let sock = SOCKET(handle.0 as usize);
-        Ok(IoAsyncOp::start_read(&reg, ib, move |ovl| unsafe {
-            if is_socket {
-                let mut flags = 0u32;
+        if is_socket {
+            // `WSARecv`'s `lpFlags` out-param is written by the provider at
+            // completion time for a pending overlapped recv — which may be
+            // well after this synchronous `issue` closure (and this whole
+            // function) has returned. A plain stack local here would be
+            // freed long before that deferred write, a write-after-free.
+            // Box it and hand it to `start_read` as the `keep_alive` value,
+            // which retains it in the same completion-gated `on_complete`
+            // closure that already retains the destination buffer via
+            // `out_agile` (see `IoAsyncOp::start_read`), so it lives until
+            // the op's real completion regardless of cancellation.
+            let mut flags = Box::new(0u32);
+            let flags_ptr: *mut u32 = &mut *flags;
+            Ok(IoAsyncOp::start_read(&reg, ib, flags, move |ovl| unsafe {
                 let wsabuf = WSABUF {
                     len: n,
                     buf: windows_core::PSTR(ptr),
                 };
-                let r = WSARecv(sock, &[wsabuf], None, &mut flags, Some(ovl), None);
+                let r = WSARecv(sock, &[wsabuf], None, flags_ptr, Some(ovl), None);
                 classify_wsa(r)
-            } else {
+            }))
+        } else {
+            Ok(IoAsyncOp::start_read(&reg, ib, (), move |ovl| unsafe {
                 match ReadFile(
                     handle,
                     Some(std::slice::from_raw_parts_mut(ptr, n as usize)),
@@ -90,8 +112,8 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
-            }
-        }))
+            }))
+        }
     }
 }
 

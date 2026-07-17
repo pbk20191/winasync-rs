@@ -171,6 +171,17 @@ impl IoAsyncOp<IBuffer> {
     pub(crate) fn start_read(
         reg: &Arc<IoReg>,
         out: IBuffer,
+        // Retained (moved, unused) inside the completion-gated `on_complete`
+        // closure below purely to extend its lifetime to the operation's
+        // real completion — exactly like `out_agile`. This exists for
+        // callers whose `issue` closure hands the kernel a pointer into some
+        // *other* piece of memory that the provider may write back through
+        // only at completion time (e.g. `WSARecv`'s `lpFlags` out-param):
+        // without this, that memory would have to be a plain local that gets
+        // freed the instant `issue` returns, well before the deferred write
+        // — a write-after-free. Pass `()` (or any trivial value) when `issue`
+        // needs no such keep-alive (e.g. the `ReadFile` path).
+        keep_alive: impl Send + 'static,
         // `issue` is run synchronously inside `submit` on the calling thread,
         // so — unlike the completion callback — it need not be `Send`/`'static`.
         issue: impl FnOnce(*mut OVERLAPPED) -> Issue,
@@ -186,6 +197,11 @@ impl IoAsyncOp<IBuffer> {
             submit(
                 reg,
                 Box::new(move |ioresult: u32, bytes: usize| {
+                    // Force the closure to capture (and thus keep alive until
+                    // the real completion fires, whether natural or
+                    // cancelled) whatever `keep_alive` value the caller's
+                    // `issue` closure wrote a kernel-visible pointer into.
+                    let _ = &keep_alive;
                     let out = out_agile.resolve().expect("resolve agile IBuffer");
                     let res = if ioresult == 0 {
                         let _ = out.SetLength(bytes as u32);
@@ -325,7 +341,7 @@ mod tests {
         let rib: IBuffer = rbuf.clone().into();
         let rp = buffer_ptr(&rib).unwrap();
         let ch = creg.handle;
-        let read_op = IoAsyncOp::start_read(&creg, rib.clone(), move |ovl| {
+        let read_op = IoAsyncOp::start_read(&creg, rib.clone(), (), move |ovl| {
             match unsafe { ReadFile(ch, Some(std::slice::from_raw_parts_mut(rp, 2)), None, Some(ovl)) } {
                 Ok(()) => Issue::Pending,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,

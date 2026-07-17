@@ -218,8 +218,11 @@ impl UnixStreamListener {
         // value never moves its heap allocation. Smuggled through as a
         // `usize` because raw pointers aren't `Send` (required by
         // `await_io_owning`'s `issue` bound).
-        let addr_buf: Box<[u8; 2 * ADDR_SLOT]> = Box::new([0u8; 2 * ADDR_SLOT]);
-        let addr_ptr = addr_buf.as_ptr() as usize;
+        let mut addr_buf: Box<[u8; 2 * ADDR_SLOT]> = Box::new([0u8; 2 * ADDR_SLOT]);
+        // `as_mut_ptr` (not `as_ptr`), matching the kernel writing into this
+        // buffer: the `Box` is uniquely owned, so a mutable-provenance
+        // pointer is both correct and required for `AcceptEx`'s write.
+        let addr_ptr = addr_buf.as_mut_ptr() as usize;
 
         let result = await_io_owning(&self.reg, addr_buf, move |ovl| unsafe {
             let mut bytes = 0u32;
@@ -424,6 +427,119 @@ mod tests {
                 b"ping"
             );
         }
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Exercises the `WSARecv` path (`stream::ReadAsync`'s socket branch)
+    /// with a non-trivial, multi-chunk payload, rather than `af_unix_echo`'s
+    /// single 4-byte round trip. This is realistic coverage for the
+    /// `WSARecv`-`lpFlags` write-after-free fix in `IoAsyncOp::start_read`
+    /// (`flags` is now a kernel-gated `Box<u32>` keep-alive instead of a
+    /// stack local): every chunk here drives a real overlapped `WSARecv`
+    /// whose provider writes back through that pointer at completion.
+    #[test]
+    fn af_unix_echo_large_payload() {
+        const TOTAL: usize = 5000;
+        const CHUNK: usize = 1024;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("comio_unix_large_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().into_owned();
+        let sp = p.clone();
+
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 256) as u8).collect();
+        let payload_for_server = payload.clone();
+
+        let server = std::thread::spawn(move || {
+            let l = UnixStreamListener::bind(&sp).unwrap();
+            let s = block_on(l.accept()).unwrap();
+            let input: IInputStream = s.cast().unwrap();
+            let output: IOutputStream = s.cast().unwrap();
+
+            // Read exactly TOTAL bytes. A single overlapped recv is not
+            // guaranteed to fill a several-KB request in one completion, so
+            // loop `ReadAsync` (each iteration a fresh `WSARecv`) until the
+            // whole payload has arrived.
+            let mut received = Vec::with_capacity(TOTAL);
+            while received.len() < TOTAL {
+                let want = (TOTAL - received.len()).min(CHUNK) as u32;
+                let rbuf = new_buffer(want).unwrap();
+                let got: IBuffer = block_on(
+                    input
+                        .ReadAsync(&rbuf.cast::<IBuffer>().unwrap(), want, InputStreamOptions(0))
+                        .unwrap()
+                        .into_future(),
+                )
+                .unwrap();
+                let len = got.Length().unwrap() as usize;
+                assert!(len > 0, "peer closed early");
+                unsafe {
+                    let ptr = buffer_ptr(&got).unwrap();
+                    received.extend_from_slice(std::slice::from_raw_parts(ptr, len));
+                }
+            }
+            assert_eq!(received, payload_for_server);
+
+            // Echo it back, also in chunks, exercising the `WSASend` side
+            // with the same multi-chunk shape.
+            let mut sent = 0usize;
+            while sent < TOTAL {
+                let chunk_len = (TOTAL - sent).min(CHUNK);
+                let wbuf = new_buffer(chunk_len as u32).unwrap();
+                let wib: IBuffer = wbuf.clone().into();
+                unsafe {
+                    buffer_ptr(&wib).unwrap().copy_from_nonoverlapping(
+                        received[sent..sent + chunk_len].as_ptr(),
+                        chunk_len,
+                    );
+                }
+                wbuf.SetLength(chunk_len as u32).unwrap();
+                let wrote = block_on(output.WriteAsync(&wib).unwrap().into_future()).unwrap();
+                sent += wrote as usize;
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let c = block_on(UnixStreamSocket::connect(&p)).unwrap();
+        let c_out: IOutputStream = c.cast().unwrap();
+        let c_in: IInputStream = c.cast().unwrap();
+
+        let mut sent = 0usize;
+        while sent < TOTAL {
+            let chunk_len = (TOTAL - sent).min(CHUNK);
+            let wbuf = new_buffer(chunk_len as u32).unwrap();
+            let wib: IBuffer = wbuf.clone().into();
+            unsafe {
+                buffer_ptr(&wib)
+                    .unwrap()
+                    .copy_from_nonoverlapping(payload[sent..sent + chunk_len].as_ptr(), chunk_len);
+            }
+            wbuf.SetLength(chunk_len as u32).unwrap();
+            let wrote = block_on(c_out.WriteAsync(&wib).unwrap().into_future()).unwrap();
+            sent += wrote as usize;
+        }
+
+        let mut echoed = Vec::with_capacity(TOTAL);
+        while echoed.len() < TOTAL {
+            let want = (TOTAL - echoed.len()).min(CHUNK) as u32;
+            let rbuf = new_buffer(want).unwrap();
+            let got: IBuffer = block_on(
+                c_in.ReadAsync(&rbuf.cast::<IBuffer>().unwrap(), want, InputStreamOptions(0))
+                    .unwrap()
+                    .into_future(),
+            )
+            .unwrap();
+            let len = got.Length().unwrap() as usize;
+            assert!(len > 0, "server closed early");
+            unsafe {
+                let ptr = buffer_ptr(&got).unwrap();
+                echoed.extend_from_slice(std::slice::from_raw_parts(ptr, len));
+            }
+        }
+        assert_eq!(echoed, payload);
+
         server.join().unwrap();
         let _ = std::fs::remove_file(&path);
     }
