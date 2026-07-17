@@ -1,4 +1,5 @@
 mod tp;
+mod comio;
 
 use windows::System::Threading::{ThreadPool, WorkItemHandler};
 use windows::Win32::System::WinRT::ICoreWindowInterop;
