@@ -6,6 +6,7 @@
 
 pub mod asyncop;
 pub mod buffer;
+pub mod stream;
 pub mod tpio;
 
 /// Thread pool / overlapped calls only fail on resource exhaustion; map those

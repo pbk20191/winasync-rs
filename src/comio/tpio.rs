@@ -53,6 +53,12 @@ impl IoReg {
     fn socket(&self) -> SOCKET {
         SOCKET(self.handle.0 as usize)
     }
+
+    /// Whether this registration wraps a `SOCKET` (branches `ReadAsync`/
+    /// `WriteAsync` between `WSARecv`/`WSASend` and `ReadFile`/`WriteFile`).
+    pub(crate) fn is_socket(&self) -> bool {
+        self.is_socket
+    }
 }
 
 impl Drop for IoReg {
