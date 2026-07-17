@@ -4,6 +4,7 @@
 //! IO on the default thread-pool callback environment (`pcbe = NULL`).
 #![allow(dead_code)]
 
+pub mod asyncop;
 pub mod buffer;
 pub mod tpio;
 
