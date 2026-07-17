@@ -53,6 +53,12 @@ impl std::fmt::Debug for JoinError {
 pub(crate) struct JoinShared<T> {
     slot: Option<Result<T, JoinError>>,
     waker: Option<Waker>,
+    /// One-way terminal flag: set to `true` exactly when `set()` stores a
+    /// result, and never reset. `slot` itself is emptied by `take()` once
+    /// the `LocalJoinHandle` consumes the value, so `is_finished()` must
+    /// read this instead of `slot.is_some()` — otherwise a handle that has
+    /// already been awaited to completion would wrongly report `false`.
+    finished: bool,
 }
 
 impl<T> JoinShared<T> {
@@ -60,12 +66,14 @@ impl<T> JoinShared<T> {
         Self {
             slot: None,
             waker: None,
+            finished: false,
         }
     }
 
     /// Stores the final result and wakes anyone polling the join handle.
     pub(crate) fn set(&mut self, result: Result<T, JoinError>) {
         self.slot = Some(result);
+        self.finished = true;
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
@@ -77,8 +85,10 @@ impl<T> JoinShared<T> {
         self.slot.take()
     }
 
+    /// Sticky once true: reflects whether `set()` has ever been called,
+    /// regardless of whether `take()` has since emptied `slot`.
     pub(crate) fn is_finished(&self) -> bool {
-        self.slot.is_some()
+        self.finished
     }
 
     /// Registers the waker to be notified when `set` is next called.
@@ -114,12 +124,25 @@ where
 {
     fn poll_task(&self, waker: &Waker) -> bool {
         if self.abort_requested.get() {
-            let mut stage = self.stage.borrow_mut();
-            if matches!(&*stage, Stage::Running(_)) {
-                *stage = Stage::Aborted;
-            }
-            drop(stage);
-            self.shared.borrow_mut().set(Err(JoinError::Aborted));
+            // Overwriting `Stage::Running(fut)` here drops the user's
+            // future, which can panic; and `shared.set(...)` below can run
+            // an arbitrary registered join `Waker::wake()`, which can also
+            // panic. Neither may unwind across the DQ FFI boundary (this is
+            // ultimately invoked from an `unsafe extern "system"`
+            // `DispatcherQueueHandler::Invoke` with no panic protection of
+            // its own), so both are caught and swallowed — the task is
+            // already terminating, so there is nothing left to report the
+            // panic to. Mirrors `tp::task::TaskCore::finish`.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let mut stage = self.stage.borrow_mut();
+                if matches!(&*stage, Stage::Running(_)) {
+                    *stage = Stage::Aborted;
+                }
+                drop(stage);
+            }));
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                self.shared.borrow_mut().set(Err(JoinError::Aborted));
+            }));
             return true;
         }
 
@@ -147,13 +170,30 @@ where
             None => true,
             Some(Ok(Poll::Pending)) => false,
             Some(Ok(Poll::Ready(value))) => {
-                *self.stage.borrow_mut() = Stage::Finished;
-                self.shared.borrow_mut().set(Ok(value));
+                // Same rationale as the abort branch above: overwriting
+                // `Stage::Running(fut)` drops the (already-completed)
+                // future, and `shared.set(...)` can run an arbitrary join
+                // waker — neither may unwind across the FFI boundary. The
+                // future's own poll panic (captured above by the outer
+                // `catch_unwind`) is unaffected and still delivered as
+                // `JoinError::Panicked` via `shared.set` in the branch below.
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    *self.stage.borrow_mut() = Stage::Finished;
+                }));
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    self.shared.borrow_mut().set(Ok(value));
+                }));
                 true
             }
             Some(Err(payload)) => {
-                *self.stage.borrow_mut() = Stage::Finished;
-                self.shared.borrow_mut().set(Err(JoinError::Panicked(payload)));
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    *self.stage.borrow_mut() = Stage::Finished;
+                }));
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    self.shared
+                        .borrow_mut()
+                        .set(Err(JoinError::Panicked(payload)));
+                }));
                 true
             }
         }
@@ -244,5 +284,31 @@ mod tests {
         let shared = std::rc::Rc::new(std::cell::RefCell::new(JoinShared::<i32>::new()));
         shared.borrow_mut().set(Ok(5));
         assert!(matches!(shared.borrow_mut().take(), Some(Ok(5))));
+    }
+
+    /// `is_finished()` must stay `true` after `take()` empties `slot` — it
+    /// is a one-way terminal flag, not a proxy for "has an unread result".
+    /// Regression test for the bug where `is_finished()` read
+    /// `slot.is_some()` directly and went stale (back to `false`) the
+    /// moment a `LocalJoinHandle` consumed its result via `take()`.
+    #[test]
+    fn join_shared_is_finished_stays_true_after_take() {
+        let shared = JoinShared::<i32>::new();
+        let shared = std::cell::RefCell::new(shared);
+
+        assert!(!shared.borrow().is_finished());
+
+        shared.borrow_mut().set(Ok(7));
+        assert!(shared.borrow().is_finished());
+
+        // Consuming the result (as `LocalJoinHandle::poll` does on its
+        // `Ready` poll) must not un-finish the task.
+        assert!(matches!(shared.borrow_mut().take(), Some(Ok(7))));
+        assert!(shared.borrow().is_finished());
+
+        // A second `take()` correctly finds nothing left, but `is_finished`
+        // still reports the sticky terminal state.
+        assert!(shared.borrow_mut().take().is_none());
+        assert!(shared.borrow().is_finished());
     }
 }

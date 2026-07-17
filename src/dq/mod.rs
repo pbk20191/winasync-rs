@@ -10,6 +10,7 @@ pub mod waker;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 
@@ -57,8 +58,25 @@ pub(crate) fn with_current<R>(f: impl FnOnce(&Rc<RuntimeInner>) -> R) -> R {
 
 /// Entry point enqueued by `WakerData::schedule`: runs on the DQ thread and
 /// drains whatever task ids are ready.
+///
+/// This is invoked (indirectly, via the `DispatcherQueueHandler` closure) from
+/// an `unsafe extern "system" fn` `Invoke` on the WinRT side, which has no
+/// panic protection of its own — a panic that unwinds out of this function
+/// would unwind across that FFI boundary and abort the process. `LocalTask`'s
+/// `poll_task` already guards its own internal panic points (the future's
+/// poll, dropping the old `Stage`, and waking the join waker), but this
+/// top-level `catch_unwind` is the last line of defense: it also covers
+/// `with_current`'s `.expect(...)` calls (which panic if `set_current` was
+/// never called, or if the runtime has been dropped) and any future path
+/// that might otherwise slip through unguarded. A caught panic here is
+/// swallowed — there is no reasonable way to propagate it further outward
+/// through the WinRT dispatcher, and by construction the runtime itself
+/// still owns all task state, so any tasks other than the one that panicked
+/// remain pollable on the next drain.
 pub(crate) fn drain_ready() {
-    with_current(|rt| rt.drain());
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        with_current(|rt| rt.drain());
+    }));
 }
 
 /// Owns the DQ-thread task map and the cross-thread ready queue. `!Send`:
@@ -128,6 +146,15 @@ impl RuntimeInner {
         self.tasks.borrow_mut().insert(id, task as Rc<dyn TaskObj>);
 
         self.ready.push(id);
+        // `TryEnqueue` can fail (e.g. the queue is shutting down), in which
+        // case this task's id sits on `ready` with nothing left to drain it
+        // — it never gets its first poll and its `LocalJoinHandle` would
+        // hang forever rather than resolve. We don't currently surface this:
+        // a failed enqueue means the DispatcherQueue itself is going away
+        // (or already gone), at which point the whole executor is moot and
+        // no further drains would run regardless. Revisit if a caller ever
+        // needs a hard signal here (e.g. resolve the handle to a dedicated
+        // `JoinError` variant) rather than a silent stall.
         let _ = self.queue.TryEnqueue(&DispatcherQueueHandler::new(|| {
             drain_ready();
             Ok(())
