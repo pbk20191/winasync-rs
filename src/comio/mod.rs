@@ -9,6 +9,7 @@ pub mod buffer;
 pub mod pipe;
 pub mod stream;
 pub mod tpio;
+pub mod unix;
 pub mod waitop;
 
 /// Thread pool / overlapped calls only fail on resource exhaustion; map those
