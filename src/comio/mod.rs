@@ -6,8 +6,10 @@
 
 pub mod asyncop;
 pub mod buffer;
+pub mod pipe;
 pub mod stream;
 pub mod tpio;
+pub mod waitop;
 
 /// Thread pool / overlapped calls only fail on resource exhaustion; map those
 /// to a panic, matching `tp`'s policy.
