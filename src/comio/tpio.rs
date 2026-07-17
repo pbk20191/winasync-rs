@@ -217,7 +217,12 @@ pub(crate) unsafe fn submit(
                 } else {
                     31
                 };
-                cb(win32, 0);
+                // Mirror io_complete: a panic in `cb` must not skip
+                // release_ref below, or the Op block (and its Arc<IoReg>)
+                // leaks permanently.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    cb(win32, 0)
+                }));
             }
             release_ref(op as *mut c_void);
         }
@@ -287,5 +292,68 @@ mod tests {
 
         drop(sreg); drop(creg);
         let _ = server; let _ = client; // handles closed by IoReg::Drop
+    }
+
+    // Regression test: cancelling an in-flight op and dropping its OpHandle
+    // must still deliver a completion (releasing the kernel-side ref) so the
+    // Op block and its Arc<IoReg> don't leak. Loops a modest number of times
+    // so a leak would show up as a nonzero LIVE_OPS count.
+    #[test]
+    fn cancel_in_flight_read_does_not_leak() {
+        for i in 0..100 {
+            let name = format!(r"\\.\pipe\comio_tpio_cancel_{}_{}", std::process::id(), i);
+            let wname = windows_core::HSTRING::from(&name);
+            let server = unsafe {
+                CreateNamedPipeW(&wname, windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0), PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, None)
+            };
+            assert!(!server.is_invalid(), "CreateNamedPipeW failed: {:?}", unsafe { windows::Win32::Foundation::GetLastError() });
+            let client = unsafe {
+                CreateFileW(&wname, FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
+            }.unwrap();
+
+            let sreg = IoReg::register(server, false).unwrap();
+            let creg = IoReg::register(client, false).unwrap();
+
+            // Start a read on the client with NO corresponding write, so it
+            // stays pending; cancel it in flight and drop the handle right
+            // away, without waiting for the completion ourselves.
+            let rbuf = Box::new([0u8; 1]);
+            let rptr = rbuf.as_ptr() as *mut u8;
+            let rop = unsafe {
+                submit(&creg, Box::new(move |_ioresult, _bytes| { let _ = &rbuf; }), |ovl| {
+                    match ReadFile(creg.handle, Some(std::slice::from_raw_parts_mut(rptr, 1)), None, Some(ovl)) {
+                        Ok(()) => Issue::Pending,
+                        Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                        Err(e) => Issue::Failed(e.code()),
+                    }
+                })
+            };
+            rop.cancel();
+            drop(rop);
+
+            drop(sreg); drop(creg);
+            let _ = server; let _ = client; // handles closed by IoReg::Drop
+        }
+
+        // The kernel delivers ERROR_OPERATION_ABORTED completions
+        // asynchronously; give the threadpool a brief, bounded window to
+        // drain them. LIVE_OPS is process-global (shared with other tests
+        // running concurrently), so poll for it to settle rather than
+        // asserting immediately — mirrors
+        // `src/tp/io/file.rs`'s `dropped_read_future_does_not_leak`.
+        #[cfg(debug_assertions)]
+        {
+            for _ in 0..500 {
+                if LIVE_OPS.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                LIVE_OPS.load(Ordering::Relaxed),
+                0,
+                "op blocks leaked after cancel"
+            );
+        }
     }
 }
