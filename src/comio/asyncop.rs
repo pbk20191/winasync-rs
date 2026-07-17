@@ -207,20 +207,36 @@ impl IoAsyncOp<IBuffer> {
 }
 
 impl IoAsyncOp<u32> {
-    /// Starts an overlapped write whose result is the number of bytes written.
+    /// Starts an overlapped write whose result is the number of bytes
+    /// written. `out` is the source `IBuffer` whose backing memory the
+    /// overlapped write reads from directly (via a raw pointer captured by
+    /// `issue`); it is retained (via an agile reference, exactly as
+    /// `start_read` retains its destination buffer) for the lifetime of the
+    /// operation so the kernel never writes through a dangling pointer into
+    /// freed WinRT buffer memory, even though the completion callback itself
+    /// has no need to read from it.
     pub(crate) fn start_write(
         reg: &Arc<IoReg>,
+        out: IBuffer,
         _count_hint: u32,
         // See `start_read`: `issue` runs synchronously and need not be `Send`.
         issue: impl FnOnce(*mut OVERLAPPED) -> Issue,
     ) -> IAsyncOperationWithProgress<u32, u32> {
         let object = new_object::<u32>();
         let iface: IAsyncOperationWithProgress<u32, u32> = object.to_interface();
+        // The completion callback runs on a thread-pool thread, so it may not
+        // capture the non-agile `IBuffer` directly; hold an agile reference
+        // purely to keep the buffer's backing memory alive until the
+        // overlapped write completes.
+        let out_agile = check(AgileReference::new(&out));
         let cb_object = object.clone();
         let handle = unsafe {
             submit(
                 reg,
                 Box::new(move |ioresult: u32, bytes: usize| {
+                    // Force the closure to capture (and thus keep alive until
+                    // this point) the agile reference to the source buffer.
+                    let _ = &out_agile;
                     let res = if ioresult == 0 {
                         Ok(bytes as u32)
                     } else {
@@ -296,7 +312,7 @@ mod tests {
         wbuf.SetLength(2).unwrap();
         let wp = buffer_ptr(&wib).unwrap();
         let sh = sreg.handle;
-        let write_op = IoAsyncOp::<u32>::start_write(&sreg, 2, move |ovl| {
+        let write_op = IoAsyncOp::<u32>::start_write(&sreg, wib.clone(), 2, move |ovl| {
             match unsafe { WriteFile(sh, Some(std::slice::from_raw_parts(wp, 2)), None, Some(ovl)) } {
                 Ok(()) => Issue::Pending,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,

@@ -25,11 +25,12 @@ use windows_future::{IAsyncOperation, IAsyncOperationWithProgress};
 /// does: `r == 0` or `WSA_IO_PENDING` both mean "a completion is coming".
 fn classify_wsa(r: i32) -> Issue {
     if r == 0 {
-        Issue::Pending
-    } else if unsafe { WSAGetLastError() } == WSA_IO_PENDING {
+        return Issue::Pending;
+    }
+    let err = unsafe { WSAGetLastError() };
+    if err == WSA_IO_PENDING {
         Issue::Pending
     } else {
-        let err = unsafe { WSAGetLastError() };
         Issue::Failed(windows::Win32::Foundation::WIN32_ERROR(err.0 as u32).to_hresult())
     }
 }
@@ -103,7 +104,7 @@ impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
         let is_socket = reg.is_socket();
         let handle = reg.handle;
         let sock = SOCKET(handle.0 as usize);
-        Ok(IoAsyncOp::start_write(&reg, len, move |ovl| unsafe {
+        Ok(IoAsyncOp::start_write(&reg, ib, len, move |ovl| unsafe {
             if is_socket {
                 let wsabuf = WSABUF {
                     len,
@@ -183,19 +184,24 @@ mod tests {
         let c_in: IInputStream = c.cast().unwrap();
 
         let wbuf = new_buffer(3).unwrap();
+        let wib: IBuffer = wbuf.clone().into();
         unsafe {
-            buffer_ptr(&wbuf.clone().into())
+            buffer_ptr(&wib)
                 .unwrap()
                 .copy_from_nonoverlapping(b"abc".as_ptr(), 3);
         }
         wbuf.SetLength(3).unwrap();
-        let wrote = block_on(
-            s_out
-                .WriteAsync(&wbuf.cast::<IBuffer>().unwrap())
-                .unwrap()
-                .into_future(),
-        )
-        .unwrap();
+        // `WriteAsync` clones `wib` internally and (per the fix under test)
+        // `IoAsyncOp::<u32>::start_write` retains that clone via an
+        // `AgileReference` for the life of the op. Get the future, then drop
+        // *both* of the caller's own bindings to the write buffer before
+        // awaiting, so the only thing keeping its backing memory alive
+        // during the still-pending overlapped write is the op itself — not
+        // incidental caller keep-alive.
+        let write_future = s_out.WriteAsync(&wib).unwrap().into_future();
+        drop(wib);
+        drop(wbuf);
+        let wrote = block_on(write_future).unwrap();
         assert_eq!(wrote, 3);
 
         let rbuf = new_buffer(3).unwrap();
