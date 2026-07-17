@@ -121,16 +121,26 @@ fn unregister_timer(id: u64) {
 /// own — `waker.wake()` can run arbitrary combinator code, so it's wrapped in
 /// `catch_unwind` rather than allowed to unwind across that FFI boundary.
 fn on_tick(id: u64) {
-    let waker = TIMERS.with(|t| {
-        t.borrow().get(&id).map(|state| {
-            let mut state = state.borrow_mut();
-            state.ticks += 1;
-            state.waker.take()
-        })
-    });
-    if let Some(Some(waker)) = waker {
-        let _ = catch_unwind(AssertUnwindSafe(|| waker.wake()));
-    }
+    // The whole body — thread-local lookup, `ticks` increment, and the wake
+    // itself — runs inside a single `catch_unwind`. Previously only
+    // `waker.wake()` was guarded; the lookup/increment ran outside it, so a
+    // panic there (e.g. a poisoned/misbehaving `Waker` impl, or a future
+    // change to this body) would unwind straight out of `on_tick` and across
+    // the WinRT `Tick` delegate's `unsafe extern "system"` FFI boundary,
+    // aborting the process. Widening the guard to cover the full body closes
+    // that gap symmetrically with `drain_ready` and `LocalTask::poll_task`.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let waker = TIMERS.with(|t| {
+            t.borrow().get(&id).map(|state| {
+                let mut state = state.borrow_mut();
+                state.ticks += 1;
+                state.waker.take()
+            })
+        });
+        if let Some(Some(waker)) = waker {
+            waker.wake();
+        }
+    }));
 }
 
 /// Creates a `DispatcherQueueTimer` on the current dq runtime's queue and
@@ -261,6 +271,7 @@ mod tests {
     #[test]
     fn sleep_waits() {
         crate::dq::ensure_sdk();
+        let _g = crate::dq::dq_test_guard();
         let elapsed = DispatcherRuntime::run(async {
             let start = Instant::now();
             sleep(Duration::from_millis(50)).await;
@@ -273,6 +284,7 @@ mod tests {
     #[test]
     fn interval_ticks() {
         crate::dq::ensure_sdk();
+        let _g = crate::dq::dq_test_guard();
         let elapsed = DispatcherRuntime::run(async {
             let start = Instant::now();
             let mut iv = interval(Duration::from_millis(20));
@@ -291,6 +303,7 @@ mod tests {
     #[test]
     fn drop_before_fire() {
         crate::dq::ensure_sdk();
+        let _g = crate::dq::dq_test_guard();
         DispatcherRuntime::run(async {
             for _ in 0..100 {
                 drop(sleep(Duration::from_secs(10)));

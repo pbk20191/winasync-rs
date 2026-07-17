@@ -48,6 +48,26 @@ thread_local! {
     static CURRENT: RefCell<Option<Weak<RuntimeInner>>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// Strong-owner slot for the runtime backing `DispatcherRuntime::run_dedicated`.
+    ///
+    /// `run_dedicated`'s bootstrap closure runs *once*, on the dedicated DQ
+    /// thread, to build the `RuntimeInner`, `set_current` it (a `Weak`, per
+    /// above), and `spawn` the root task — then returns. Unlike `run` (where
+    /// the caller's own stack frame holds a strong `Rc<RuntimeInner>` alive
+    /// across the blocking `RunEventLoop` call), nothing on that dedicated
+    /// thread's stack survives past the bootstrap closure returning:
+    /// `CURRENT` only holds a `Weak`, and `LocalJoinHandle`/`LocalTask` hold
+    /// no strong ref to the runtime either. Without a separate strong owner,
+    /// the bootstrap closure returning would drop the runtime's only `Rc` —
+    /// tearing down the task map (and the just-spawned root task with it)
+    /// before the initial drain it enqueued ever runs. This thread-local is
+    /// that owner: the bootstrap closure stores a strong clone here so the
+    /// runtime survives until the root task itself clears it on completion
+    /// (see `DedicatedRootTask::poll`).
+    static DEDICATED_ANCHOR: RefCell<Option<Rc<RuntimeInner>>> = const { RefCell::new(None) };
+}
+
 /// Installs `rt` as the runtime reachable from `with_current`/`drain_ready`
 /// on the calling (DQ) thread. Used by the `run` loop bootstrap (Task 4).
 pub(crate) fn set_current(rt: &Rc<RuntimeInner>) {
@@ -250,6 +270,7 @@ impl<T> Future for DedicatedRootTask<T> {
                 if let Some(tx) = self.tx.take() {
                     let _ = tx.send(Ok(value));
                 }
+                clear_dedicated_thread_state();
                 Poll::Ready(())
             }
             Err(payload) => {
@@ -257,10 +278,25 @@ impl<T> Future for DedicatedRootTask<T> {
                 if let Some(tx) = self.tx.take() {
                     let _ = tx.send(Err(payload));
                 }
+                clear_dedicated_thread_state();
                 Poll::Ready(())
             }
         }
     }
+}
+
+/// Uninstalls the dedicated-thread runtime once its root task has reached a
+/// terminal state (completed or panicked): clears `CURRENT` (a `Weak`, so
+/// this is mostly for consistency with `run`'s teardown — see its comment)
+/// and releases `DEDICATED_ANCHOR`'s strong clone, which drops `RuntimeInner`
+/// unless something else is still holding it alive. This runs on the DQ
+/// thread itself, from inside `RuntimeInner::drain` (via `LocalTask::poll_task`
+/// polling this future), which is still holding its own strong `Rc` for the
+/// duration of that call — so releasing the anchor here is safe even though
+/// it happens mid-`drain`.
+fn clear_dedicated_thread_state() {
+    CURRENT.with(|c| *c.borrow_mut() = None);
+    DEDICATED_ANCHOR.with(|a| *a.borrow_mut() = None);
 }
 
 impl DispatcherRuntime {
@@ -373,6 +409,15 @@ impl DispatcherRuntime {
             if let Some((make, tx)) = make_and_tx.take() {
                 let rt = RuntimeInner::new(inner_queue.clone());
                 set_current(&rt);
+                // `set_current` only stores a `Weak`; without a strong owner
+                // surviving past this closure's return, `rt` would be the
+                // *only* strong `Rc<RuntimeInner>` and would be dropped right
+                // here — tearing down the task map (and the root task about
+                // to be spawned into it) before the initial drain enqueued by
+                // `spawn` below ever runs. Stash a strong clone here so the
+                // runtime survives until `DedicatedRootTask::poll` clears it
+                // on completion.
+                DEDICATED_ANCHOR.with(|a| *a.borrow_mut() = Some(rt.clone()));
                 let fut = make();
                 let root_task = DedicatedRootTask {
                     root: Box::pin(fut),
@@ -450,6 +495,31 @@ pub(crate) fn ensure_sdk() {
     });
 }
 
+/// Process-wide serialization lock for dq tests that create a `DispatcherQueue`
+/// (directly, or via `DispatcherRuntime::run`/`run_dedicated`).
+///
+/// Those tests are only sound run single-threaded — see `SdkGuard`'s doc
+/// comment above and the `run_tests`/`integration` module docs below — and
+/// the repo's convention is `cargo test -- --test-threads=1`. But nothing
+/// stops a plain `cargo test` (parallel by default) from running them
+/// concurrently anyway, which would be a silent soundness violation rather
+/// than a loud failure. This lock is a belt-and-suspenders backstop for that:
+/// every such test acquires it (via `dq_test_guard()`) as its first line
+/// after `ensure_sdk()`, so even a parallel harness serializes them. It does
+/// *not* replace `--test-threads=1` as the documented/preferred way to run
+/// these tests; it just makes forgetting the flag a slowdown instead of a
+/// hang/flake.
+#[cfg(test)]
+pub(crate) static DQ_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquires `DQ_TEST_LOCK` for the duration of the returned guard, tolerating
+/// a poisoned lock (a prior test panicking while holding it must not
+/// poison-fail every subsequent dq test).
+#[cfg(test)]
+pub(crate) fn dq_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    DQ_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +546,7 @@ mod run_tests {
     #[test]
     fn run_returns_value() {
         ensure_sdk();
+        let _g = dq_test_guard();
         let v = DispatcherRuntime::run(async { 21 * 2 });
         assert_eq!(v, 42);
     }
@@ -483,6 +554,7 @@ mod run_tests {
     #[test]
     fn spawn_local_join() {
         ensure_sdk();
+        let _g = dq_test_guard();
         let v = DispatcherRuntime::run(async {
             let h = spawn_local(async { 7 });
             h.await.unwrap()
@@ -490,9 +562,38 @@ mod run_tests {
         assert_eq!(v, 7);
     }
 
+    /// Regression coverage for the run_dedicated bootstrap bug: without a
+    /// strong owner surviving past the bootstrap closure's return, the
+    /// runtime (and the just-spawned root task) was dropped before its first
+    /// poll, so `run_dedicated` panicked on *every* call (`rx.recv()` saw a
+    /// disconnected channel). See `DEDICATED_ANCHOR`.
+    #[test]
+    fn run_dedicated_returns_value() {
+        ensure_sdk();
+        let _g = dq_test_guard();
+        assert_eq!(DispatcherRuntime::run_dedicated(|| async { 40 + 2 }), 42);
+    }
+
+    /// Same regression coverage as `run_dedicated_returns_value`, but also
+    /// exercises `spawn_local`/`LocalJoinHandle` on the dedicated thread: the
+    /// root spawns a child task and awaits it, which only works if the
+    /// runtime (and its task map) is still alive and getting drained after
+    /// the bootstrap closure returns.
+    #[test]
+    fn run_dedicated_spawn_local_join() {
+        ensure_sdk();
+        let _g = dq_test_guard();
+        let v = DispatcherRuntime::run_dedicated(|| async {
+            let h = spawn_local(async { 19 + 23 });
+            h.await.unwrap()
+        });
+        assert_eq!(v, 42);
+    }
+
     #[test]
     fn cross_thread_wake_resumes_on_dq_thread() {
         ensure_sdk();
+        let _g = dq_test_guard();
         // Await a comio-style op whose completion wakes from a pool thread; the
         // continuation must run on the DQ thread. `IAsyncOperation::spawn`
         // runs the closure on the Windows thread pool and completes there,
@@ -525,6 +626,7 @@ mod run_tests {
     #[test]
     fn aborted_task_panic_on_drop_is_contained() {
         ensure_sdk();
+        let _g = dq_test_guard();
         let result = DispatcherRuntime::run(async {
             let h = spawn_local(async {
                 let _guard = PanicOnDrop;
@@ -550,6 +652,7 @@ mod run_tests {
     #[test]
     fn spawned_task_panic_in_poll_is_contained() {
         ensure_sdk();
+        let _g = dq_test_guard();
         let result = DispatcherRuntime::run(async {
             let h = spawn_local(async {
                 panic!("boom");
@@ -592,6 +695,7 @@ mod integration {
     #[test]
     fn dq_named_pipe_echo() {
         crate::dq::ensure_sdk();
+        let _g = crate::dq::dq_test_guard();
         let name = format!(r"\\.\pipe\dq_comio_{}", std::process::id());
         let sname = name.clone();
         // Server on a plain thread using tp::block_on (comio is runtime-agnostic).
