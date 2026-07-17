@@ -564,3 +564,96 @@ mod run_tests {
         }
     }
 }
+
+/// Proves the two layers actually compose: a `comio` named-pipe echo driven
+/// from inside a `dq` `DispatcherRuntime::run` future. The server lives on a
+/// plain `std::thread` and drives its half with `tp::block_on` (`comio` is
+/// runtime-agnostic, per its own module docs); the client is the `run` root
+/// future itself and drives its half via plain `.await` on the WinRT async
+/// operations `NamedPipeClient`/`ReadAsync`/`WriteAsync` return — exercising
+/// the executor/waker bridge against a real overlapped-IO completion
+/// (delivered from a thread-pool callback) rather than the synthetic
+/// `IAsyncOperation::spawn` used by `cross_thread_wake_resumes_on_dq_thread`
+/// above.
+///
+/// Adapted from the task-6 brief's sketch: the brief passes
+/// `IAsyncOperationWithProgress` values straight to `tp::block_on`, but
+/// `block_on` requires `F: Future` and these WinRT operation types only
+/// implement `IntoFuture` (see `comio`'s own tests, e.g.
+/// `pipe::tests::named_pipe_echo`, which all call `.into_future()` before
+/// `block_on`) — `.await` performs that conversion implicitly, but a bare
+/// function call does not. The client-side `run` future uses plain `.await`
+/// throughout (as `run_tests::cross_thread_wake_resumes_on_dq_thread`
+/// already does), so no `.into_future()` is needed there.
+#[cfg(test)]
+mod integration {
+    use super::*;
+
+    #[test]
+    fn dq_named_pipe_echo() {
+        crate::dq::ensure_sdk();
+        let name = format!(r"\\.\pipe\dq_comio_{}", std::process::id());
+        let sname = name.clone();
+        // Server on a plain thread using tp::block_on (comio is runtime-agnostic).
+        let server = std::thread::spawn(move || {
+            use crate::comio::buffer::new_buffer;
+            use crate::comio::NamedPipeListener;
+            use crate::tp::block_on;
+            use std::future::IntoFuture;
+            use windows::Storage::Streams::{
+                IBuffer, IInputStream, IOutputStream, InputStreamOptions,
+            };
+            use windows_core::Interface;
+
+            let l = NamedPipeListener::create(&sname);
+            let s = block_on(l.accept()).unwrap();
+            let i: IInputStream = s.cast().unwrap();
+            let o: IOutputStream = s.cast().unwrap();
+            let rb = new_buffer(16).unwrap();
+            let got: IBuffer = block_on(
+                i.ReadAsync(&rb.cast::<IBuffer>().unwrap(), 16, InputStreamOptions(0))
+                    .unwrap()
+                    .into_future(),
+            )
+            .unwrap();
+            block_on(o.WriteAsync(&got).unwrap().into_future()).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let echoed = DispatcherRuntime::run(async move {
+            use crate::comio::buffer::{buffer_ptr, new_buffer};
+            use crate::comio::NamedPipeClient;
+            use windows::Storage::Streams::{
+                IBuffer, IInputStream, IOutputStream, InputStreamOptions,
+            };
+            use windows_core::Interface;
+
+            let c = NamedPipeClient::connect(&name).await.unwrap();
+            let o: IOutputStream = c.cast().unwrap();
+            let i: IInputStream = c.cast().unwrap();
+
+            let wb = new_buffer(4).unwrap();
+            unsafe {
+                buffer_ptr(&wb.clone().into())
+                    .unwrap()
+                    .copy_from_nonoverlapping(b"echo".as_ptr(), 4);
+            }
+            wb.SetLength(4).unwrap();
+            o.WriteAsync(&wb.cast::<IBuffer>().unwrap())
+                .unwrap()
+                .await
+                .unwrap();
+
+            let rb = new_buffer(4).unwrap();
+            let got: IBuffer = i
+                .ReadAsync(&rb.cast::<IBuffer>().unwrap(), 4, InputStreamOptions(0))
+                .unwrap()
+                .await
+                .unwrap();
+            unsafe { std::slice::from_raw_parts(buffer_ptr(&got).unwrap(), 4).to_vec() }
+        });
+
+        assert_eq!(&echoed, b"echo");
+        server.join().unwrap();
+    }
+}
