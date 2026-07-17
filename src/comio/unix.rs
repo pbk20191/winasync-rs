@@ -4,12 +4,17 @@
 //! sockets (`is_socket = true`), so `ReadAsync`/`WriteAsync` drive
 //! `WSARecv`/`WSASend`. Mirrors `src/tp/io/net.rs`'s AF_INET
 //! `TcpListener`/`TcpStream`, but with `AF_UNIX`/`SOCKADDR_UN` addressing and
-//! completion driven through `comio::waitop::await_io` instead of `tp::io`'s
-//! own future machinery.
+//! completion driven through `comio::waitop::await_io_owning` instead of
+//! `tp::io`'s own future machinery. `await_io_owning` (rather than the
+//! simpler `await_io`) is required here because both `AcceptEx`'s output
+//! address buffer and `ConnectEx`'s input `SOCKADDR_UN` are memory the
+//! kernel touches for the lifetime of the op; `await_io_owning` keeps that
+//! memory alive until the op's real completion, not merely until the
+//! `accept()`/`connect()` future is dropped — see its doc comment.
 
 use super::stream;
 use super::tpio::{IoReg, Issue};
-use super::waitop::await_io;
+use super::waitop::await_io_owning;
 use core::ffi::c_void;
 use std::mem;
 use std::sync::{Arc, Once, OnceLock};
@@ -149,27 +154,24 @@ fn get_connectex(sock: SOCKET) -> Result<ConnectExFn> {
 /// AcceptEx address slot: sockaddr size + 16 bytes, per the API contract.
 const ADDR_SLOT: usize = size_of::<SOCKADDR_UN>() + 16;
 
-/// Owns the pre-created accept socket and address buffer while `AcceptEx` is
-/// in flight, so both stay alive across the `.await` regardless of how the
-/// enclosing `accept()` future is polled. If `accept()`'s own future is
-/// dropped before `await_io` resolves, this `Drop` closes the still-owned
-/// accept socket (mirrors `tp/io/net.rs`'s `AcceptPayload`); the address
-/// buffer is simply freed at that point, same as any other local.
-struct AcceptGuard {
-    sock: SOCKET,
-    _addr_buf: Box<[u8; 2 * ADDR_SLOT]>,
-}
+/// Owns the pre-created accept socket while `AcceptEx` is in flight, closing
+/// it if `accept()`'s own future is dropped before the op resolves. This is
+/// safe as a plain frame-local guard (unlike the address buffer, below):
+/// closing a socket with a pending overlapped op on it just aborts the op
+/// and releases the handle — there is no kernel-owned *memory* backing the
+/// socket value itself that a delayed completion could still write into.
+struct AcceptSockGuard(SOCKET);
 
-impl Drop for AcceptGuard {
+impl Drop for AcceptSockGuard {
     fn drop(&mut self) {
-        if self.sock != INVALID_SOCKET {
-            unsafe { closesocket(self.sock) };
+        if self.0 != INVALID_SOCKET {
+            unsafe { closesocket(self.0) };
         }
     }
 }
 
 // SOCKET is a plain kernel handle value.
-unsafe impl Send for AcceptGuard {}
+unsafe impl Send for AcceptSockGuard {}
 
 /// A listening AF_UNIX socket, registered with the thread pool's TP_IO so
 /// `AcceptEx` can be driven through [`await_io`].
@@ -203,13 +205,23 @@ impl UnixStreamListener {
     pub async fn accept(&self) -> Result<IInspectable> {
         let accept_sock = new_socket()?;
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
-        let mut guard = AcceptGuard {
-            sock: accept_sock,
-            _addr_buf: Box::new([0u8; 2 * ADDR_SLOT]),
-        };
-        let addr_ptr = guard._addr_buf.as_mut_ptr();
+        let mut guard = AcceptSockGuard(accept_sock);
 
-        let result = await_io(&self.reg, |ovl| unsafe {
+        // The address buffer, in contrast to the socket above, IS kernel-
+        // owned memory for the duration of the op: `AcceptEx` writes the
+        // local/remote addresses into it, possibly as late as when the
+        // (cancelled) op's real completion is processed. It must therefore
+        // outlive not just this `.await` but the op's actual completion —
+        // hence `await_io_owning` rather than a plain frame local. The
+        // pointer is read out of the `Box` *before* the box is moved into
+        // `await_io_owning`'s payload; that's sound because moving a `Box`
+        // value never moves its heap allocation. Smuggled through as a
+        // `usize` because raw pointers aren't `Send` (required by
+        // `await_io_owning`'s `issue` bound).
+        let addr_buf: Box<[u8; 2 * ADDR_SLOT]> = Box::new([0u8; 2 * ADDR_SLOT]);
+        let addr_ptr = addr_buf.as_ptr() as usize;
+
+        let result = await_io_owning(&self.reg, addr_buf, move |ovl| unsafe {
             let mut bytes = 0u32;
             let ok = AcceptEx(
                 listen_sock,
@@ -228,7 +240,7 @@ impl UnixStreamListener {
 
         // Success: take the socket out of the guard so its `Drop` no longer
         // closes it (`IoReg::register` owns it from here).
-        let sock = mem::replace(&mut guard.sock, INVALID_SOCKET);
+        let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
         let finish = || -> Result<IInspectable> {
             // Until `SO_UPDATE_ACCEPT_CONTEXT` (value = the listen socket)
             // the accepted socket is half-configured.
@@ -277,11 +289,20 @@ impl UnixStreamSocket {
             Ok(v) => v,
             Err(e) => return Err(e), // `reg`'s Drop closes `sock`.
         };
-        let result = await_io(&reg, |ovl| unsafe {
+        // `remote` is memory `ConnectEx` reads from for the duration of the
+        // op (the provider may defer reading it until the completion is
+        // actually processed). Box it and gate it through
+        // `await_io_owning` the same way `accept`'s address buffer is
+        // gated, rather than leaving it as a plain async-fn-frame local
+        // that would be freed as soon as this future is dropped (e.g. under
+        // a timeout), regardless of whether the op is still in flight.
+        let remote_box = Box::new(remote);
+        let remote_ptr = remote_box.as_ref() as *const SOCKADDR_UN as usize;
+        let result = await_io_owning(&reg, remote_box, move |ovl| unsafe {
             let mut sent = 0u32;
             let ok = connect_ex(
                 sock,
-                &remote as *const _ as *const SOCKADDR,
+                remote_ptr as *const SOCKADDR,
                 remote_len,
                 core::ptr::null(),
                 0,
@@ -302,9 +323,53 @@ mod tests {
     use super::*;
     use crate::comio::buffer::{buffer_ptr, new_buffer};
     use crate::tp::block_on;
-    use std::future::IntoFuture;
+    use std::future::{Future, IntoFuture};
+    use std::task::{Context, RawWaker, RawWakerVTable, Waker};
     use windows::Storage::Streams::{IBuffer, IInputStream, IOutputStream, InputStreamOptions};
     use windows_core::Interface;
+
+    /// A `Waker` that does nothing when woken — sufficient for tests that
+    /// only need one `poll()` to run an async fn's body up to its first
+    /// `.await` (an async fn's body runs none of its code until first
+    /// polled) and don't care about being woken again afterward.
+    fn noop_waker() -> Waker {
+        fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        fn no_op(_: *const ()) {}
+        fn raw() -> RawWaker {
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe { Waker::from_raw(raw()) }
+    }
+
+    /// Polls `fut` exactly once (enough to issue the overlapped op the async
+    /// fn starts with, since it runs no code until first polled) and then
+    /// drops it immediately, mid-flight.
+    fn issue_then_drop<F: Future>(fut: F) {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        let _ = fut.as_mut().poll(&mut cx);
+        drop(fut);
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_no_live_ops(msg: &str) {
+        use std::sync::atomic::Ordering;
+        for _ in 0..500 {
+            if crate::comio::tpio::LIVE_OPS.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            crate::comio::tpio::LIVE_OPS.load(Ordering::Relaxed),
+            0,
+            "{msg}"
+        );
+    }
 
     #[test]
     fn af_unix_echo() {
@@ -360,6 +425,70 @@ mod tests {
             );
         }
         server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression test for the write-after-free this change fixes:
+    /// `AcceptEx`'s output address buffer used to be a plain local in
+    /// `accept()`'s async fn frame, freed as soon as the future dropped —
+    /// but `await_io`'s (now `await_io_owning`'s) `Drop` only issues
+    /// `CancelIoEx` and returns immediately, without waiting for the real
+    /// `ERROR_OPERATION_ABORTED` completion, so the kernel could still write
+    /// into that freed memory afterward. Repeatedly starts `accept()` with
+    /// no client ever connecting, polls it exactly once (to actually issue
+    /// the `AcceptEx`), and drops it mid-flight — the same shape as a
+    /// `select!`/timeout abandoning the future. With the fix, the address
+    /// buffer now lives on the kernel-completion-gated `Op` block (via
+    /// `await_io_owning`) instead of the async-fn frame, so it survives
+    /// until the real completion regardless of the future's `Drop`. This
+    /// asserts the ops don't leak (`LIVE_OPS` settles back to 0), which
+    /// mirrors `tp/io/net.rs::cancel_storm_accept_and_read` and
+    /// `tpio.rs::cancel_in_flight_read_does_not_leak`'s leak-detection
+    /// pattern; it does not (and cannot, without a race detector) directly
+    /// observe the UAF itself, so the actual safety guarantee rests on the
+    /// `await_io_owning` contract (payload moved into the kernel-gated
+    /// `on_complete` closure) being upheld here, not on this test alone.
+    #[test]
+    fn accept_cancel_storm_does_not_leak() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("comio_unix_accept_cancel_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().into_owned();
+        let listener = UnixStreamListener::bind(&p).unwrap();
+
+        for _ in 0..500 {
+            issue_then_drop(listener.accept());
+        }
+        drop(listener);
+
+        #[cfg(debug_assertions)]
+        assert_no_live_ops("op blocks leaked after accept() cancel storm");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// As `accept_cancel_storm_does_not_leak`, for `connect()`'s
+    /// `ConnectEx` input `SOCKADDR_UN` (lower certainty than the accept
+    /// buffer per the task brief — it's a provider *input*, so may be read
+    /// synchronously rather than deferred — but gated identically for
+    /// consistency with the module's invariant, so exercised identically
+    /// here). No `accept()` is ever called on `listener`, so connections
+    /// simply queue in the listen backlog rather than completing, giving
+    /// `connect()`'s op a real window to be cancelled mid-flight.
+    #[test]
+    fn connect_cancel_storm_does_not_leak() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("comio_unix_connect_cancel_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().into_owned();
+        let listener = UnixStreamListener::bind(&p).unwrap();
+
+        for _ in 0..200 {
+            issue_then_drop(UnixStreamSocket::connect(&p));
+        }
+        drop(listener);
+
+        #[cfg(debug_assertions)]
+        assert_no_live_ops("op blocks leaked after connect() cancel storm");
         let _ = std::fs::remove_file(&path);
     }
 }
