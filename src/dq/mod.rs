@@ -7,6 +7,8 @@ pub mod task;
 pub mod timer;
 pub mod waker;
 
+pub use timer::{interval, sleep, Interval, Sleep, Tick};
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
