@@ -136,6 +136,21 @@ no-op Close (and supersedes the "Close is advisory" note in the earlier spec).
 
 ## Key invariants & edge cases
 
+- **COM identity is framework-generated — never hand-rolled.** `#[implement]`
+  auto-generates the full `IUnknown` (`QueryInterface`/`AddRef`/`Release`) and
+  `IInspectable`, backed by a thread-safe internal refcount (`ComObject`/
+  `RefCount`); `#[interface]` supplies the custom vtable slots on top of that
+  IUnknown base. We implement ONLY the custom methods (`Stream`, `ConnectionReceived`,
+  …) — implementing `AddRef`/`Release`/`QueryInterface` ourselves is wrong and
+  would conflict. (All existing comio COM objects already rely on this.)
+- **Agility (free-threaded marshaling).** `#[implement]` implements
+  `IAgileObject`/`IMarshal` by default (`windows-implement` `agile = true`), so
+  `ConnectionReceivedArgs`/`ConnectionListener`/the stream can be safely marshaled
+  by a handler onto another thread (e.g. a consumer forwarding the connection to
+  the UI thread via `DispatcherQueue`). This holds only while every field is
+  `Send + Sync`; keep these objects' state to `Arc`-wrapped, thread-safe handles
+  (as the existing objects do) — do NOT introduce `Rc`/`!Send` fields, and do not
+  pass `Agile(false)`.
 - **`RO_E_CLOSED` everywhere post-Close:** every public member of the listener
   and (for reads/writes) the stream checks the `closed` flag before acting;
   return `Err(windows_core::Error::from_hresult(HRESULT(0x80000013u32 as i32)))`
