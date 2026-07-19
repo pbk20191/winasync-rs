@@ -39,13 +39,18 @@ fn classify_wsa(r: i32) -> Issue {
 #[implement(IInputStream, IOutputStream, windows::Foundation::IClosable)]
 pub struct OverlappedDuplexStream {
     reg: Arc<IoReg>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 /// Wraps an already-registered handle/socket as a WinRT stream object.
 /// Callers `.cast()` the returned `IInspectable` to `IInputStream` and/or
 /// `IOutputStream` as needed.
 pub(crate) fn from_reg(reg: Arc<IoReg>) -> windows_core::IInspectable {
-    ComObject::new(OverlappedDuplexStream { reg }).to_interface()
+    ComObject::new(OverlappedDuplexStream {
+        reg,
+        closed: std::sync::atomic::AtomicBool::new(false),
+    })
+    .to_interface()
 }
 
 impl IClosable_Impl for OverlappedDuplexStream_Impl {
@@ -60,7 +65,10 @@ impl IClosable_Impl for OverlappedDuplexStream_Impl {
     /// that `ReadAsync`/`WriteAsync` returned for it.
     fn Close(&self) -> Result<()> {
         // Dropping the last `Arc<IoReg>` (when this COM object itself is
-        // released) closes the underlying handle/socket; nothing else to do.
+        // released) closes the underlying handle/socket; nothing else to do
+        // beyond refusing new ops (see the field docs / module docs above).
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -72,6 +80,11 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
         count: u32,
         _options: InputStreamOptions,
     ) -> Result<IAsyncOperationWithProgress<IBuffer, u32>> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(windows_core::Error::from_hresult(
+                crate::comio::listener::RO_E_CLOSED,
+            ));
+        }
         let ib = buffer.ok()?.clone();
         let ptr = buffer_ptr(&ib)?;
         let n = count.min(ib.Capacity()?);
@@ -119,6 +132,11 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
 
 impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
     fn WriteAsync(&self, buffer: Ref<IBuffer>) -> Result<IAsyncOperationWithProgress<u32, u32>> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(windows_core::Error::from_hresult(
+                crate::comio::listener::RO_E_CLOSED,
+            ));
+        }
         let ib = buffer.ok()?.clone();
         let ptr = buffer_ptr(&ib)?;
         let len = ib.Length()?;
@@ -237,5 +255,69 @@ mod tests {
         unsafe {
             assert_eq!(std::slice::from_raw_parts(buffer_ptr(&got).unwrap(), 3), b"abc");
         }
+    }
+
+    /// Creates a connected overlapped named-pipe pair and wraps each end as
+    /// a WinRT stream `IInspectable`, mirroring the setup in
+    /// `stream_read_write_roundtrip`. Returns `(server, client)`.
+    pub(crate) fn pipe_pair() -> (windows_core::IInspectable, windows_core::IInspectable) {
+        let name = format!(
+            r"\\.\pipe\comio_stream_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let wname = windows_core::HSTRING::from(&name);
+        let server = unsafe {
+            CreateNamedPipeW(
+                &wname,
+                FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0),
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                None,
+            )
+        };
+        assert!(!server.is_invalid(), "CreateNamedPipeW failed: {:?}", unsafe {
+            windows::Win32::Foundation::GetLastError()
+        });
+        let client = unsafe {
+            CreateFileW(
+                &wname,
+                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                None,
+            )
+        }
+        .unwrap();
+        let s = from_reg(IoReg::register(server, false).unwrap());
+        let c = from_reg(IoReg::register(client, false).unwrap());
+        (s, c)
+    }
+
+    #[test]
+    fn read_write_after_close_returns_ro_e_closed() {
+        use crate::comio::listener::RO_E_CLOSED;
+        use windows::Foundation::IClosable;
+
+        let (a, _b) = pipe_pair(); // a: IInspectable stream over the server end
+        let closable: IClosable = a.cast().unwrap();
+        closable.Close().unwrap();
+        let inp: IInputStream = a.cast().unwrap();
+        let outp: IOutputStream = a.cast().unwrap();
+        let rb = new_buffer(4).unwrap();
+        let rerr = inp
+            .ReadAsync(&rb.cast::<IBuffer>().unwrap(), 4, InputStreamOptions(0))
+            .unwrap_err();
+        assert_eq!(rerr.code(), RO_E_CLOSED);
+        let werr = outp.WriteAsync(&rb.cast::<IBuffer>().unwrap()).unwrap_err();
+        assert_eq!(werr.code(), RO_E_CLOSED);
     }
 }
