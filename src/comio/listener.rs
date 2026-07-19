@@ -89,6 +89,28 @@ pub struct ConnectionListener {
     transport: Transport,
 }
 
+impl Drop for ConnectionListener {
+    /// Breaks the `Arc<ListenerState>` <-> accept-loop reference cycle: the
+    /// accept loop future (driven by `state.task`'s `JoinHandle`) captures a
+    /// clone of `state`, so without this the last COM reference going away
+    /// would leak the state, the pending overlapped op, and run the accept
+    /// loop forever. This is not part of the COM refcount cycle — the loop
+    /// captures `Arc<ListenerState>`, never the `ComObject`/COM pointer
+    /// itself — so this inner `Drop` is guaranteed to run once the COM
+    /// object's refcount reaches zero, even if `Close` was never called.
+    /// Performs the same teardown as `IClosable_Impl::Close`; safe to run
+    /// again after an explicit `Close` since both `closed.store` and
+    /// `event.clear` are idempotent and `task.lock().unwrap().take()` is
+    /// already `None` the second time.
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+        if let Some(h) = self.state.task.lock().unwrap().take() {
+            h.abort();
+        }
+        self.state.event.clear();
+    }
+}
+
 impl ConnectionListener {
     /// Constructs a listener bound to the named-pipe transport. Nothing is
     /// created on disk/in the kernel until `BindAsync` is called.
@@ -153,7 +175,13 @@ impl ConnectionListener {
                 let name = endpoint.to_string();
                 let state = self.state.clone();
                 let handle = super::shared_runtime().spawn(run_named_pipe_accept_loop(state, name));
-                *self.state.task.lock().unwrap() = Some(handle);
+                // Abort any existing accept loop before overwriting its
+                // handle, so a second `BindAsync` can't orphan an
+                // uncancellable loop (its `JoinHandle` would otherwise be
+                // dropped here, detaching rather than stopping it).
+                if let Some(old) = self.state.task.lock().unwrap().replace(handle) {
+                    old.abort();
+                }
             }
             Transport::Unix => {
                 let path = endpoint.to_string();
@@ -161,7 +189,9 @@ impl ConnectionListener {
                 *self.state.endpoint.lock().unwrap() = Some(endpoint.clone());
                 let state = self.state.clone();
                 let handle = super::shared_runtime().spawn(run_unix_accept_loop(state, path, l));
-                *self.state.task.lock().unwrap() = Some(handle);
+                if let Some(old) = self.state.task.lock().unwrap().replace(handle) {
+                    old.abort();
+                }
             }
         }
 
@@ -174,6 +204,12 @@ impl ConnectionListener {
     /// a full info object is unneeded (YAGNI) — callers that already have the
     /// endpoint string (they passed it to `BindAsync`) rarely need this, but
     /// it's here for API parity with `StreamSocketListener::Information()`.
+    ///
+    /// Note: unlike `StreamSocketListener`, there is intentionally no
+    /// `Control`/`ListenerControl`-style object here (e.g. for tuning
+    /// backlog or pipe-instance count) — the spec's richer shape is scoped
+    /// down to what's actually used (YAGNI); add one if/when a caller needs
+    /// to configure that.
     #[allow(non_snake_case)]
     pub fn Information(&self) -> Result<HSTRING> {
         if self.state.closed.load(Ordering::Acquire) {
@@ -233,28 +269,42 @@ async fn run_named_pipe_accept_loop(state: Arc<ListenerState>, name: String) {
             break;
         }
         let listener = super::pipe::NamedPipeListener::create(&name);
-        match AssertSend(listener.accept()).await {
-            Ok(stream) => {
-                if state.closed.load(Ordering::Acquire) {
-                    break;
+        // The accepted `Result` (and its match) live inside this nested
+        // block so its storage is lexically dead before the backoff
+        // `.await` below: otherwise this generator would capture the
+        // non-`Send` `Result<IInspectable, Error>` across that await too,
+        // since the compiler's live-locals analysis is scope-based, not
+        // move-based, for a plain `let` binding used earlier in the same
+        // block.
+        let failed = {
+            match AssertSend(listener.accept()).await {
+                Ok(stream) => {
+                    if state.closed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let args: IInspectable = new_args(stream, HSTRING::from(&name)).cast().unwrap();
+                    // Fire on this pool thread with a null sender — the
+                    // connection is carried by `args`, not the (nonexistent)
+                    // sender object. Guard against a panicking consumer
+                    // handler unwinding across this FFI-adjacent boundary.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.event.call(|h| h.Invoke(None, &args));
+                    }));
+                    false
                 }
-                let args: IInspectable = new_args(stream, HSTRING::from(&name)).cast().unwrap();
-                // Fire on this pool thread with a null sender — the
-                // connection is carried by `args`, not the (nonexistent)
-                // sender object. Guard against a panicking consumer handler
-                // unwinding across this FFI-adjacent boundary.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    state.event.call(|h| h.Invoke(None, &args));
-                }));
+                Err(_) => true,
             }
-            Err(_) => {
-                // Transient accept failure (or a cancellation from Close
-                // racing the in-flight accept); keep looping unless we've
-                // been asked to stop.
-                if state.closed.load(Ordering::Acquire) {
-                    break;
-                }
+        };
+        if failed {
+            // Transient accept failure (or a cancellation from Close racing
+            // the in-flight accept); keep looping unless we've been asked to
+            // stop. A short async backoff prevents a persistent failure
+            // (e.g. a malformed pipe name) from hot-spinning this pool
+            // thread at 100% CPU forever.
+            if state.closed.load(Ordering::Acquire) {
+                break;
             }
+            crate::tp::sleep(crate::comio::shared_runtime(), std::time::Duration::from_millis(100)).await;
         }
     }
 }
@@ -274,28 +324,37 @@ async fn run_unix_accept_loop(state: Arc<ListenerState>, path: String, l: super:
         if state.closed.load(Ordering::Acquire) {
             break;
         }
-        match AssertSend(l.accept()).await {
-            Ok(stream) => {
-                if state.closed.load(Ordering::Acquire) {
-                    break;
+        // See the comment in `run_named_pipe_accept_loop` on why the match on
+        // the awaited `Result` is scoped to its own nested block.
+        let failed = {
+            match AssertSend(l.accept()).await {
+                Ok(stream) => {
+                    if state.closed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let args: IInspectable = new_args(stream, HSTRING::from(&path)).cast().unwrap();
+                    // Fire on this pool thread with a null sender — the
+                    // connection is carried by `args`, not the (nonexistent)
+                    // sender object. Guard against a panicking consumer
+                    // handler unwinding across this FFI-adjacent boundary.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.event.call(|h| h.Invoke(None, &args));
+                    }));
+                    false
                 }
-                let args: IInspectable = new_args(stream, HSTRING::from(&path)).cast().unwrap();
-                // Fire on this pool thread with a null sender — the
-                // connection is carried by `args`, not the (nonexistent)
-                // sender object. Guard against a panicking consumer handler
-                // unwinding across this FFI-adjacent boundary.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    state.event.call(|h| h.Invoke(None, &args));
-                }));
+                Err(_) => true,
             }
-            Err(_) => {
-                // Transient accept failure (or a cancellation from Close
-                // racing the in-flight accept); keep looping unless we've
-                // been asked to stop.
-                if state.closed.load(Ordering::Acquire) {
-                    break;
-                }
+        };
+        if failed {
+            // Transient accept failure (or a cancellation from Close racing
+            // the in-flight accept); keep looping unless we've been asked to
+            // stop. Same backoff as the named-pipe loop, for symmetry — a
+            // persistent failure here would be similarly unexpected, but
+            // hot-spinning is still undesirable if one ever occurs.
+            if state.closed.load(Ordering::Acquire) {
+                break;
             }
+            crate::tp::sleep(crate::comio::shared_runtime(), std::time::Duration::from_millis(100)).await;
         }
     }
 }
@@ -539,6 +598,36 @@ mod listener_tests {
                 0,
                 "listener accept leaked an op"
             );
+        }
+    }
+
+    #[test]
+    fn drop_without_close_no_leak() {
+        use crate::tp::block_on;
+        let name = format!(r"\\.\pipe\comio_listener_dropleak_{}", std::process::id());
+        let listener = ConnectionListener::named_pipe();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
+        listener.ConnectionReceived(&handler).unwrap();
+        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        // No client connects; the loop is parked in an in-flight ConnectNamedPipe.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Drop the sole COM reference WITHOUT calling Close(). This proves
+        // `impl Drop for ConnectionListener` (not `IClosable::Close`) is what
+        // breaks the `Arc<ListenerState>` <-> accept-loop reference cycle:
+        // without it, this drop would leak the state, the in-flight
+        // overlapped op, and leave the accept loop spinning forever.
+        drop(listener);
+        #[cfg(debug_assertions)]
+        {
+            let mut live = crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..500 {
+                if live == 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                live = crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed);
+            }
+            assert_eq!(live, 0, "dropping listener without Close leaked an op");
         }
     }
 
