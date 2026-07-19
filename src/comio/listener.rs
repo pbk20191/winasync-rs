@@ -17,7 +17,7 @@ pub(crate) const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
 /// Custom fixed-IID interface exposing the stream/endpoint pair delivered by
 /// a `ConnectionReceived` event. GUID frozen here — do not change or reuse.
 #[interface("9d359f23-57af-4770-b11a-e223be76adc3")]
-pub(crate) unsafe trait IConnectionReceivedArgs: IUnknown {
+pub unsafe trait IConnectionReceivedArgs: IUnknown {
     fn Stream(&self, result: *mut *mut c_void) -> HRESULT;
     fn RemoteEndpoint(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT;
 }
@@ -167,6 +167,20 @@ impl ConnectionListener {
 
         Ok(IAsyncAction::spawn(|| Ok(())))
     }
+
+    /// Returns the endpoint this listener is bound to (the pipe name / socket
+    /// path passed to `BindAsync`), or `RO_E_CLOSED` once the listener has
+    /// been closed. A minimal stand-in for `StreamSocketListenerInformation`:
+    /// a full info object is unneeded (YAGNI) — callers that already have the
+    /// endpoint string (they passed it to `BindAsync`) rarely need this, but
+    /// it's here for API parity with `StreamSocketListener::Information()`.
+    #[allow(non_snake_case)]
+    pub fn Information(&self) -> Result<HSTRING> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        Ok(self.state.endpoint.lock().unwrap().clone().unwrap_or_default())
+    }
 }
 
 /// `NamedPipeListener::accept()`'s returned future is not `Send`: its own
@@ -179,6 +193,27 @@ impl ConnectionListener {
 /// loop's `Send` boundary (required by `tp::Runtime::spawn`), without having
 /// to modify `pipe.rs` itself.
 struct AssertSend<F>(F);
+// # Safety
+//
+// This blanket `unsafe impl` is sound only because every future this wrapper
+// is actually applied to — `NamedPipeListener::accept()` and
+// `UnixStreamListener::accept()`'s returned futures, per the two call sites
+// in this file — upholds the following invariant: across every `.await`
+// point, the future's state holds nothing thread-affine. Concretely, what it
+// may hold across an await is limited to:
+//   - raw kernel handles/identifiers (Win32 `HANDLE`, `SOCKET`) and comio's
+//     own overlapped-op bookkeeping around them (`tpio::IoReg`/`OpHandle`),
+//     which are safe to move/poll from any thread — the kernel object itself
+//     has no thread affinity, only windows-rs's `HANDLE` wrapper type is
+//     conservatively `!Send` by default;
+//   - other wrappers that are already `Send` in their own right;
+//   - agile COM objects (e.g. the accepted stream's `IInspectable`)
+//     constructed *after* the last await, never carried across one.
+// It must NOT be used to wrap a future that parks an STA-affine COM pointer,
+// a thread-local, or any other genuinely thread-bound value across an await.
+// Callers introducing a new use of `AssertSend` must re-verify this
+// invariant for the specific future being wrapped — it is not enforced by
+// the type system.
 unsafe impl<F> Send for AssertSend<F> {}
 impl<F: Future> Future for AssertSend<F> {
     type Output = F::Output;
@@ -473,6 +508,38 @@ mod listener_tests {
         let closable: IClosable = listener.cast().unwrap();
         closable.Close().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn close_cancels_inflight_accept_no_leak() {
+        use crate::tp::block_on;
+        use windows::Foundation::IClosable;
+        let name = format!(r"\\.\pipe\comio_listener_leak_{}", std::process::id());
+        let listener = ConnectionListener::named_pipe();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
+        listener.ConnectionReceived(&handler).unwrap();
+        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        // No client connects; the loop is parked in an in-flight ConnectNamedPipe.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Information returns the endpoint; then close.
+        assert_eq!(listener.Information().unwrap().to_string(), name);
+        let closable: IClosable = listener.cast().unwrap();
+        closable.Close().unwrap();
+        assert_eq!(listener.Information().unwrap_err().code(), RO_E_CLOSED);
+        #[cfg(debug_assertions)]
+        {
+            for _ in 0..500 {
+                if crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "listener accept leaked an op"
+            );
+        }
     }
 
     #[test]

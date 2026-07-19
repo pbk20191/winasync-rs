@@ -19,6 +19,11 @@ pub mod waitop;
 // `#![allow(dead_code)]` — both are re-export/API-shape warnings, not bugs.
 #[allow(unused_imports)]
 pub use pipe::{NamedPipeClient, NamedPipeListener};
+// `ConnectionListener`/`IConnectionReceivedArgs` are the WinRT-native,
+// `StreamSocketListener`-shaped surface over both transports (`listener.rs`);
+// re-exported here for the same reason as the transport types above.
+#[allow(unused_imports)]
+pub use listener::{ConnectionListener, IConnectionReceivedArgs};
 // `stream::from_reg` takes/returns crate-private types (`Arc<tpio::IoReg>`),
 // so it stays `pub(crate)` here rather than `pub` (the latter would be a hard
 // "private type in public interface" error, E0446) — this re-export just
