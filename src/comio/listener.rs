@@ -51,9 +51,9 @@ pub(crate) fn new_args(stream: IInspectable, endpoint: HSTRING) -> IConnectionRe
 }
 
 /// Which comio transport a [`ConnectionListener`] accepts connections over.
-/// AF_UNIX is added in a later task.
 enum Transport {
     NamedPipe,
+    Unix,
 }
 
 /// Shared, `Send + Sync` state behind a [`ConnectionListener`]: held both by
@@ -99,6 +99,15 @@ impl ConnectionListener {
         })
     }
 
+    /// Constructs a listener bound to the AF_UNIX transport. Nothing is
+    /// created on disk/in the kernel until `BindAsync` is called.
+    pub fn unix() -> ComObject<ConnectionListener> {
+        ComObject::new(ConnectionListener {
+            state: Arc::new(ListenerState::new()),
+            transport: Transport::Unix,
+        })
+    }
+
     /// Registers `handler` to be invoked (on a thread-pool thread) for each
     /// accepted connection. Returns a token for `RemoveConnectionReceived`.
     #[allow(non_snake_case)]
@@ -122,22 +131,39 @@ impl ConnectionListener {
         Ok(())
     }
 
-    /// Records `endpoint` (the pipe name for the named-pipe transport) and
-    /// starts the self-driving accept loop on `shared_runtime()`. Binding
-    /// itself is synchronous — the returned `IAsyncAction` is already
-    /// completed — the loop is what actually creates pipe instances and
-    /// waits for clients.
+    /// Records `endpoint` (the pipe name / socket path, depending on
+    /// transport) and starts the self-driving accept loop on
+    /// `shared_runtime()`. For the named-pipe transport, binding is
+    /// synchronous and the loop itself creates pipe instances and waits for
+    /// clients. For the AF_UNIX transport, the persistent listen socket is
+    /// created here (so a bind error — e.g. a stale socket file — surfaces
+    /// synchronously from this call rather than from the completed action)
+    /// and then moved into the loop, which repeatedly `accept()`s on that
+    /// same socket. Either way the returned `IAsyncAction` is already
+    /// completed once this call returns `Ok`.
     #[allow(non_snake_case)]
     pub fn BindAsync(&self, endpoint: &HSTRING) -> Result<IAsyncAction> {
         if self.state.closed.load(Ordering::Acquire) {
             return Err(Error::from_hresult(RO_E_CLOSED));
         }
-        *self.state.endpoint.lock().unwrap() = Some(endpoint.clone());
 
-        let name = endpoint.to_string();
-        let state = self.state.clone();
-        let handle = super::shared_runtime().spawn(run_named_pipe_accept_loop(state, name));
-        *self.state.task.lock().unwrap() = Some(handle);
+        match self.transport {
+            Transport::NamedPipe => {
+                *self.state.endpoint.lock().unwrap() = Some(endpoint.clone());
+                let name = endpoint.to_string();
+                let state = self.state.clone();
+                let handle = super::shared_runtime().spawn(run_named_pipe_accept_loop(state, name));
+                *self.state.task.lock().unwrap() = Some(handle);
+            }
+            Transport::Unix => {
+                let path = endpoint.to_string();
+                let l = super::UnixStreamListener::bind(&path)?;
+                *self.state.endpoint.lock().unwrap() = Some(endpoint.clone());
+                let state = self.state.clone();
+                let handle = super::shared_runtime().spawn(run_unix_accept_loop(state, path, l));
+                *self.state.task.lock().unwrap() = Some(handle);
+            }
+        }
 
         Ok(IAsyncAction::spawn(|| Ok(())))
     }
@@ -178,6 +204,47 @@ async fn run_named_pipe_accept_loop(state: Arc<ListenerState>, name: String) {
                     break;
                 }
                 let args: IInspectable = new_args(stream, HSTRING::from(&name)).cast().unwrap();
+                // Fire on this pool thread with a null sender — the
+                // connection is carried by `args`, not the (nonexistent)
+                // sender object. Guard against a panicking consumer handler
+                // unwinding across this FFI-adjacent boundary.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.event.call(|h| h.Invoke(None, &args));
+                }));
+            }
+            Err(_) => {
+                // Transient accept failure (or a cancellation from Close
+                // racing the in-flight accept); keep looping unless we've
+                // been asked to stop.
+                if state.closed.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The AF_UNIX accept loop: owns the single persistent listen socket `l`
+/// (created once by `BindAsync`) and repeatedly `accept()`s on it, raising
+/// `ConnectionReceived` with each accepted stream. Runs until `Close` flips
+/// `state.closed` (observed either before starting the next accept or right
+/// after one completes) or `abort()`s the task outright. `l.accept()`'s
+/// returned future is `!Send` for the same reason the named-pipe accept
+/// future is (raw kernel `SOCKET`/overlapped state held across an internal
+/// `.await`), so it's wrapped in the same `AssertSend` — sound for the same
+/// reason: only kernel socket/overlapped state and agile COM objects are
+/// held past the await, no thread-affine state.
+async fn run_unix_accept_loop(state: Arc<ListenerState>, path: String, l: super::UnixStreamListener) {
+    loop {
+        if state.closed.load(Ordering::Acquire) {
+            break;
+        }
+        match AssertSend(l.accept()).await {
+            Ok(stream) => {
+                if state.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                let args: IInspectable = new_args(stream, HSTRING::from(&path)).cast().unwrap();
                 // Fire on this pool thread with a null sender — the
                 // connection is carried by `args`, not the (nonexistent)
                 // sender object. Guard against a panicking consumer handler
@@ -341,6 +408,71 @@ mod listener_tests {
         // type by value, not by reference.
         let closable: IClosable = listener.cast().unwrap();
         closable.Close().unwrap();
+    }
+
+    #[test]
+    fn unix_connection_received_echo() {
+        let path = std::env::temp_dir().join(format!(
+            "comio_listener_unix_{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().into_owned();
+
+        let listener = ConnectionListener::unix();
+        let (tx, rx) = mpsc::channel::<usize>();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
+            let a = args.as_ref().unwrap();
+            let cra: IConnectionReceivedArgs = a.cast().unwrap();
+            let raw = unsafe {
+                let mut raw = core::ptr::null_mut();
+                cra.Stream(&mut raw).ok()?;
+                raw as usize
+            };
+            let _ = tx.send(raw);
+            Ok(())
+        });
+        listener.ConnectionReceived(&handler).unwrap();
+        block_on(listener.BindAsync(&HSTRING::from(&p)).unwrap().into_future()).unwrap();
+
+        let client = block_on(crate::comio::UnixStreamSocket::connect(&p)).unwrap();
+        let server_raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("no ConnectionReceived");
+        let server = unsafe { IInspectable::from_raw(server_raw as *mut core::ffi::c_void) };
+
+        let c_out: IOutputStream = client.cast().unwrap();
+        let s_in: IInputStream = server.cast().unwrap();
+        let s_out: IOutputStream = server.cast().unwrap();
+        let c_in: IInputStream = client.cast().unwrap();
+        let wb = new_buffer(4).unwrap();
+        unsafe {
+            buffer_ptr(&wb.clone().into())
+                .unwrap()
+                .copy_from_nonoverlapping(b"unix".as_ptr(), 4);
+        }
+        wb.SetLength(4).unwrap();
+        block_on(c_out.WriteAsync(&wb.cast::<IBuffer>().unwrap()).unwrap().into_future()).unwrap();
+        let got: IBuffer = block_on(
+            s_in.ReadAsync(&new_buffer(4).unwrap().cast::<IBuffer>().unwrap(), 4, InputStreamOptions(0))
+                .unwrap()
+                .into_future(),
+        )
+        .unwrap();
+        block_on(s_out.WriteAsync(&got).unwrap().into_future()).unwrap();
+        let echoed: IBuffer = block_on(
+            c_in.ReadAsync(&new_buffer(4).unwrap().cast::<IBuffer>().unwrap(), 4, InputStreamOptions(0))
+                .unwrap()
+                .into_future(),
+        )
+        .unwrap();
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(buffer_ptr(&echoed).unwrap(), 4), b"unix");
+        }
+
+        let closable: IClosable = listener.cast().unwrap();
+        closable.Close().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
