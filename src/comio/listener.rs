@@ -2,9 +2,14 @@
 #![allow(dead_code)]
 
 use core::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use windows::Foundation::{IClosable_Impl, TypedEventHandler};
 use windows_core::{
-    HRESULT, HSTRING, IInspectable, IUnknown, IUnknown_Vtbl, Interface, implement, interface,
+    ComObject, Error, HRESULT, HSTRING, IInspectable, IUnknown, IUnknown_Vtbl, Interface, Result,
+    implement, interface,
 };
+use windows_future::IAsyncAction;
 
 /// RO_E_CLOSED — returned by members of a closed listener/stream.
 pub(crate) const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
@@ -45,6 +50,169 @@ pub(crate) fn new_args(stream: IInspectable, endpoint: HSTRING) -> IConnectionRe
     ConnectionReceivedArgs { stream, endpoint }.into()
 }
 
+/// Which comio transport a [`ConnectionListener`] accepts connections over.
+/// AF_UNIX is added in a later task.
+enum Transport {
+    NamedPipe,
+}
+
+/// Shared, `Send + Sync` state behind a [`ConnectionListener`]: held both by
+/// the COM object itself and by its self-driving accept loop (spawned on
+/// [`super::shared_runtime`]), so `Close` can flip `closed`/abort the loop
+/// out from under a still-running accept, and the loop can tell it has been
+/// asked to stop.
+struct ListenerState {
+    closed: AtomicBool,
+    event: windows_core::Event<TypedEventHandler<IInspectable, IInspectable>>,
+    endpoint: Mutex<Option<HSTRING>>,
+    task: Mutex<Option<crate::tp::JoinHandle<()>>>,
+}
+
+impl ListenerState {
+    fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            event: windows_core::Event::new(),
+            endpoint: Mutex::new(None),
+            task: Mutex::new(None),
+        }
+    }
+}
+
+/// A WinRT-native, `StreamSocketListener`-shaped connection listener: raises
+/// `ConnectionReceived` for each inbound connection accepted on its
+/// transport, self-driving the accept loop on the crate-shared
+/// [`super::shared_runtime`] thread pool once `BindAsync` is called.
+#[implement(windows::Foundation::IClosable)]
+pub struct ConnectionListener {
+    state: Arc<ListenerState>,
+    transport: Transport,
+}
+
+impl ConnectionListener {
+    /// Constructs a listener bound to the named-pipe transport. Nothing is
+    /// created on disk/in the kernel until `BindAsync` is called.
+    pub fn named_pipe() -> ComObject<ConnectionListener> {
+        ComObject::new(ConnectionListener {
+            state: Arc::new(ListenerState::new()),
+            transport: Transport::NamedPipe,
+        })
+    }
+
+    /// Registers `handler` to be invoked (on a thread-pool thread) for each
+    /// accepted connection. Returns a token for `RemoveConnectionReceived`.
+    #[allow(non_snake_case)]
+    pub fn ConnectionReceived(
+        &self,
+        handler: &TypedEventHandler<IInspectable, IInspectable>,
+    ) -> Result<i64> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        self.state.event.add(handler)
+    }
+
+    /// Revokes a previously registered `ConnectionReceived` handler.
+    #[allow(non_snake_case)]
+    pub fn RemoveConnectionReceived(&self, token: i64) -> Result<()> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        self.state.event.remove(token);
+        Ok(())
+    }
+
+    /// Records `endpoint` (the pipe name for the named-pipe transport) and
+    /// starts the self-driving accept loop on `shared_runtime()`. Binding
+    /// itself is synchronous — the returned `IAsyncAction` is already
+    /// completed — the loop is what actually creates pipe instances and
+    /// waits for clients.
+    #[allow(non_snake_case)]
+    pub fn BindAsync(&self, endpoint: &HSTRING) -> Result<IAsyncAction> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        *self.state.endpoint.lock().unwrap() = Some(endpoint.clone());
+
+        let name = endpoint.to_string();
+        let state = self.state.clone();
+        let handle = super::shared_runtime().spawn(run_named_pipe_accept_loop(state, name));
+        *self.state.task.lock().unwrap() = Some(handle);
+
+        Ok(IAsyncAction::spawn(|| Ok(())))
+    }
+}
+
+/// `NamedPipeListener::accept()`'s returned future is not `Send`: its own
+/// generator holds a raw Win32 `HANDLE` (from `CreateNamedPipeW`) across an
+/// internal `.await`, and windows-rs's `HANDLE` isn't `Send`/`Sync` by
+/// default. Moving a named-pipe handle between threads is safe in practice —
+/// `comio`'s own `IoReg`/`OpHandle` (in `tpio.rs`) make the identical
+/// unsafe-Send call around the same kind of handle — so this wrapper asserts
+/// it locally for the one nested future that needs to cross our own accept
+/// loop's `Send` boundary (required by `tp::Runtime::spawn`), without having
+/// to modify `pipe.rs` itself.
+struct AssertSend<F>(F);
+unsafe impl<F> Send for AssertSend<F> {}
+impl<F: Future> Future for AssertSend<F> {
+    type Output = F::Output;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll(cx)
+    }
+}
+
+/// The named-pipe accept loop: creates a fresh pipe instance per iteration
+/// (a listener instance is single-use once connected), waits for a client,
+/// and raises `ConnectionReceived` with the accepted stream. Runs until
+/// `Close` flips `state.closed` (observed either before starting the next
+/// accept or right after one completes) or `abort()`s the task outright.
+async fn run_named_pipe_accept_loop(state: Arc<ListenerState>, name: String) {
+    loop {
+        if state.closed.load(Ordering::Acquire) {
+            break;
+        }
+        let listener = super::pipe::NamedPipeListener::create(&name);
+        match AssertSend(listener.accept()).await {
+            Ok(stream) => {
+                if state.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                let args: IInspectable = new_args(stream, HSTRING::from(&name)).cast().unwrap();
+                // Fire on this pool thread with a null sender — the
+                // connection is carried by `args`, not the (nonexistent)
+                // sender object. Guard against a panicking consumer handler
+                // unwinding across this FFI-adjacent boundary.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.event.call(|h| h.Invoke(None, &args));
+                }));
+            }
+            Err(_) => {
+                // Transient accept failure (or a cancellation from Close
+                // racing the in-flight accept); keep looping unless we've
+                // been asked to stop.
+                if state.closed.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl IClosable_Impl for ConnectionListener_Impl {
+    /// Idempotent: flips `closed` (guarding every other member), aborts the
+    /// accept loop (dropping its in-flight `accept()` and thus cancelling
+    /// the pending overlapped `ConnectNamedPipe`), and clears all registered
+    /// `ConnectionReceived` handlers.
+    fn Close(&self) -> Result<()> {
+        self.state.closed.store(true, Ordering::Release);
+        if let Some(h) = self.state.task.lock().unwrap().take() {
+            h.abort();
+        }
+        self.state.event.clear();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +237,127 @@ mod tests {
             core::mem::ManuallyDrop::into_inner(s)
         };
         assert_eq!(ep.to_string(), "pipe://x");
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+    use crate::comio::buffer::{buffer_ptr, new_buffer};
+    use crate::tp::block_on;
+    use std::future::IntoFuture;
+    use std::sync::mpsc;
+    use windows::Foundation::IClosable;
+    use windows::Storage::Streams::{IBuffer, IInputStream, IOutputStream, InputStreamOptions};
+    use windows_core::{IInspectable, Interface, HSTRING};
+
+    #[test]
+    fn connection_received_fires_with_working_stream() {
+        let name = format!(r"\\.\pipe\comio_listener_{}", std::process::id());
+        let listener = ConnectionListener::named_pipe();
+
+        // `IInspectable` (and hence the accepted stream) isn't `Send` — same
+        // reasoning as `comio::tests::cancel_storm` — so `TypedEventHandler`'s
+        // `F: Send` bound rules out sending it directly through the channel
+        // from the pool thread the event fires on. Smuggle the identity as a
+        // `usize` (itself `Send`) and reconstitute it on this thread instead;
+        // the object underneath is genuinely thread-safe (a plain overlapped
+        // registration), only the `IInspectable` wrapper type is
+        // conservatively `!Send`.
+        let (tx, rx) = mpsc::channel::<usize>();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_sender, args| {
+            // args -> IConnectionReceivedArgs -> Stream()
+            let a = args.as_ref().unwrap();
+            let cra: IConnectionReceivedArgs = a.cast().unwrap();
+            let raw = unsafe {
+                let mut raw = core::ptr::null_mut();
+                cra.Stream(&mut raw).ok()?;
+                raw as usize
+            };
+            let _ = tx.send(raw);
+            Ok(())
+        });
+        listener.ConnectionReceived(&handler).unwrap();
+        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+
+        // Client connects (short retry to cover the inter-instance window
+        // between the loop's pipe instances).
+        let client = {
+            let mut last = None;
+            for _ in 0..50 {
+                match block_on(crate::comio::NamedPipeClient::connect(&name)) {
+                    Ok(c) => {
+                        last = Some(c);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            last.expect("client failed to connect")
+        };
+
+        // Server-side stream delivered via the event; echo a payload
+        // client->server->client to prove it's a working duplex stream, not
+        // just a non-null object.
+        let server_raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("no ConnectionReceived");
+        let server = unsafe { IInspectable::from_raw(server_raw as *mut core::ffi::c_void) };
+        let c_out: IOutputStream = client.cast().unwrap();
+        let c_in: IInputStream = client.cast().unwrap();
+        let s_in: IInputStream = server.cast().unwrap();
+        let s_out: IOutputStream = server.cast().unwrap();
+
+        let wb = new_buffer(4).unwrap();
+        unsafe {
+            buffer_ptr(&wb.clone().into())
+                .unwrap()
+                .copy_from_nonoverlapping(b"echo".as_ptr(), 4);
+        }
+        wb.SetLength(4).unwrap();
+        block_on(c_out.WriteAsync(&wb.cast::<IBuffer>().unwrap()).unwrap().into_future()).unwrap();
+        let got: IBuffer = block_on(
+            s_in.ReadAsync(&new_buffer(4).unwrap().cast::<IBuffer>().unwrap(), 4, InputStreamOptions(0))
+                .unwrap()
+                .into_future(),
+        )
+        .unwrap();
+        block_on(s_out.WriteAsync(&got).unwrap().into_future()).unwrap();
+        let echoed: IBuffer = block_on(
+            c_in.ReadAsync(&new_buffer(4).unwrap().cast::<IBuffer>().unwrap(), 4, InputStreamOptions(0))
+                .unwrap()
+                .into_future(),
+        )
+        .unwrap();
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(buffer_ptr(&echoed).unwrap(), 4), b"echo");
+        }
+
+        // `ConnectionListener::named_pipe()` returns a `ComObject<ConnectionListener>`:
+        // inherent methods (`ConnectionReceived`/`BindAsync` above) are reached
+        // through its `Deref` chain, and `IClosable::Close` is reached via
+        // `ComObject::cast` (a `QueryInterface`) rather than `IClosable::from`,
+        // since the `#[implement]`-generated `From` impls take the concrete
+        // type by value, not by reference.
+        let closable: IClosable = listener.cast().unwrap();
+        closable.Close().unwrap();
+    }
+
+    #[test]
+    fn members_after_close_return_ro_e_closed() {
+        let listener = ConnectionListener::named_pipe();
+        let closable: IClosable = listener.cast().unwrap();
+        closable.Close().unwrap();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
+        assert_eq!(
+            listener.ConnectionReceived(&handler).unwrap_err().code(),
+            RO_E_CLOSED
+        );
+        assert_eq!(
+            listener.BindAsync(&HSTRING::from("x")).unwrap_err().code(),
+            RO_E_CLOSED
+        );
+        // Second Close is a no-op.
+        closable.Close().unwrap();
     }
 }
