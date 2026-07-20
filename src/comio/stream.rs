@@ -21,11 +21,16 @@ use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_core::{implement, ComObject, Ref, Result};
 use windows_future::{IAsyncOperation, IAsyncOperationWithProgress};
 
-/// Classifies a WinSock overlapped call's return the way `src/tp/io/net.rs`
-/// does: `r == 0` or `WSA_IO_PENDING` both mean "a completion is coming".
-fn classify_wsa(r: i32) -> Issue {
+/// Classifies a WinSock overlapped call's return. Unlike `src/tp/io/net.rs`
+/// (which never sets `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, so `r == 0`
+/// there still means "a completion is coming"), every socket registered via
+/// `IoReg::register` in this module has that flag set, so `r == 0`
+/// (synchronous success) means no completion packet is coming — `bytes` is
+/// the synchronous byte count already reported by the WSARecv/WSASend call
+/// itself.
+fn classify_wsa(r: i32, bytes: u32) -> Issue {
     if r == 0 {
-        return Issue::Pending;
+        return Issue::Completed(0, bytes as usize);
     }
     let err = unsafe { WSAGetLastError() };
     if err == WSA_IO_PENDING {
@@ -110,18 +115,20 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
                     len: n,
                     buf: windows_core::PSTR(ptr),
                 };
-                let r = WSARecv(sock, &[wsabuf], None, flags_ptr, Some(ovl), None);
-                classify_wsa(r)
+                let mut recvd = 0u32;
+                let r = WSARecv(sock, &[wsabuf], Some(&mut recvd), flags_ptr, Some(ovl), None);
+                classify_wsa(r, recvd)
             }))
         } else {
             Ok(IoAsyncOp::start_read(&reg, ib, (), move |ovl| unsafe {
+                let mut read = 0u32;
                 match ReadFile(
                     handle,
                     Some(std::slice::from_raw_parts_mut(ptr, n as usize)),
-                    None,
+                    Some(&mut read),
                     Some(ovl),
                 ) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::Completed(0, read as usize),
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -150,16 +157,18 @@ impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
                     len,
                     buf: windows_core::PSTR(ptr),
                 };
-                let r = WSASend(sock, &[wsabuf], None, 0, Some(ovl), None);
-                classify_wsa(r)
+                let mut sent = 0u32;
+                let r = WSASend(sock, &[wsabuf], Some(&mut sent), 0, Some(ovl), None);
+                classify_wsa(r, sent)
             } else {
+                let mut written = 0u32;
                 match WriteFile(
                     handle,
                     Some(std::slice::from_raw_parts(ptr, len as usize)),
-                    None,
+                    Some(&mut written),
                     Some(ovl),
                 ) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::Completed(0, written as usize),
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }

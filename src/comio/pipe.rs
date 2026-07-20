@@ -67,27 +67,26 @@ impl NamedPipeListener {
         };
 
         await_io(&reg, move |ovl| unsafe {
-            // On an overlapped handle, `ConnectNamedPipe` returning `Ok(())`
-            // or `ERROR_IO_PENDING` both mean a completion packet is (or
-            // will be) queued to the thread pool's IOCP — same as
-            // `ReadFile`/`WriteFile` elsewhere in `comio`.
+            // With `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` set on every
+            // registered handle (`IoReg::register`), only `ERROR_IO_PENDING`
+            // means a completion packet is coming.
             //
-            // `ERROR_PIPE_CONNECTED` is the one documented exception: it
-            // means a client connected between `CreateNamedPipeW` and this
-            // call, so the "connect" is already done — but *no* completion
-            // packet is ever queued for it, unlike every other overlapped
-            // call on this handle. We still classify it as `Issue::Failed`
-            // so `tpio::submit` balances the `StartThreadpoolIo` it already
-            // armed (via `CancelThreadpoolIo`) and invokes the completion
-            // callback synchronously right here, instead of leaving the
-            // thread pool waiting for a callback that will never arrive.
-            // `await_io`'s completion mapping then treats
-            // `ERROR_PIPE_CONNECTED` as success rather than as an error, so
-            // callers of `accept` see a single, ordinary "connected" outcome
-            // regardless of which path produced it.
+            // `ERROR_PIPE_CONNECTED` is the documented case where a client
+            // connected between `CreateNamedPipeW` and this call, so the
+            // "connect" is already done — like any other synchronous
+            // success, no completion packet is ever queued for it. Classify
+            // it as `Issue::Completed(0, 0)` (plain success, zero bytes) so
+            // `tpio::submit` balances the `StartThreadpoolIo` it already
+            // armed (via `CancelThreadpoolIo`) and re-dispatches the
+            // completion to the pool with `ioresult == 0`, exactly like an
+            // ordinary connect — `await_io`'s completion mapping then needs
+            // no special case at all: `ioresult == 0` already means success.
             match ConnectNamedPipe(handle, Some(ovl)) {
-                Ok(()) => Issue::Pending,
+                Ok(()) => Issue::Completed(0, 0),
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
+                    Issue::Completed(0, 0)
+                }
                 Err(e) => Issue::Failed(e.code()),
             }
         })
@@ -104,14 +103,15 @@ impl NamedPipeListener {
 /// overlapped `ConnectNamedPipe` — the same flags/classification as
 /// `accept()` above, including the `ERROR_PIPE_CONNECTED` special case.
 ///
-/// `on_result` is invoked exactly once: normally on a thread-pool worker
-/// thread when the kernel completion arrives, but — per `tpio::submit`'s
-/// documented `Issue::Failed` behavior — it may instead run synchronously,
-/// on the calling thread, *before this function returns*, whenever
-/// `ConnectNamedPipe` reports `ERROR_PIPE_CONNECTED` (a client connected
-/// between `CreateNamedPipeW` and this call) or any other synchronous
-/// failure. Callers that re-arm from within `on_result` must account for
-/// that reentrancy.
+/// `on_result` is invoked exactly once, always later, on a thread-pool
+/// worker thread on a fresh call stack — never synchronously, on the calling
+/// thread, before this function returns. This holds even for the
+/// `ERROR_PIPE_CONNECTED` case (a client connected between `CreateNamedPipeW`
+/// and this call) or any other synchronous outcome: `tpio::submit`
+/// re-dispatches every synchronous `Issue::Completed`/`Issue::Failed` outcome
+/// to the default thread pool rather than invoking `on_complete` inline (see
+/// `tpio::submit`'s doc comment). Callers that re-arm from within `on_result`
+/// therefore have no reentrancy to guard against.
 ///
 /// A synchronous failure to create/register the pipe instance itself is
 /// returned as `Err` directly, without ever invoking `on_result` — mirroring
@@ -152,7 +152,13 @@ pub(crate) fn arm_accept(
         tpio::submit(
             &reg,
             Box::new(move |ioresult: u32, _bytes: usize| {
-                let res = if ioresult == 0 || ioresult == ERROR_PIPE_CONNECTED.0 {
+                // `Issue::Completed(0, 0)` (below) already reports plain
+                // success (`ioresult == 0`) for the `ERROR_PIPE_CONNECTED`
+                // case, so no special-case remap is needed here — unlike
+                // before this classifier existed, when that case arrived as
+                // `Issue::Failed(ERROR_PIPE_CONNECTED)` and had to be
+                // unmapped back to success right here.
+                let res = if ioresult == 0 {
                     Ok(stream::from_reg(reg_for_complete))
                 } else {
                     Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
@@ -160,8 +166,11 @@ pub(crate) fn arm_accept(
                 on_result(res);
             }),
             move |ovl| match ConnectNamedPipe(handle, Some(ovl)) {
-                Ok(()) => Issue::Pending,
+                Ok(()) => Issue::Completed(0, 0),
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
+                    Issue::Completed(0, 0)
+                }
                 Err(e) => Issue::Failed(e.code()),
             },
         )
@@ -319,8 +328,11 @@ mod tests {
         let reg = IoReg::register(handle, false).unwrap();
         let server_stream = block_on(await_io(&reg, |ovl| unsafe {
             match ConnectNamedPipe(handle, Some(ovl)) {
-                Ok(()) => Issue::Pending,
+                Ok(()) => Issue::Completed(0, 0),
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
+                    Issue::Completed(0, 0)
+                }
                 Err(e) => Issue::Failed(e.code()),
             }
         }))

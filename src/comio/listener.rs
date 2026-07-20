@@ -282,11 +282,13 @@ impl ConnectionListener {
 /// always invoked later, on a thread-pool worker thread, on its own fresh
 /// call stack — never synchronously, on this call's own stack, even for the
 /// named-pipe transport's `ERROR_PIPE_CONNECTED` case (a client connected
-/// between `CreateNamedPipeW` and `ConnectNamedPipe`). `tpio::submit`
-/// guarantees this: a synchronous issue failure (`Issue::Failed`, which
-/// covers `ERROR_PIPE_CONNECTED`) is re-dispatched to the default thread pool
-/// rather than invoking the completion inline (see `tpio::submit`'s doc
-/// comment). So `on_result`'s success branch can simply call `arm` again
+/// between `CreateNamedPipeW` and `ConnectNamedPipe`) or any other
+/// synchronous success (data already available, an immediate `AcceptEx`,
+/// ...). `tpio::submit` guarantees this: every synchronous issue outcome —
+/// `Issue::Failed` (hard failure) or `Issue::Completed` (synchronous
+/// success, which covers `ERROR_PIPE_CONNECTED`) — is re-dispatched to the
+/// default thread pool rather than invoking the completion inline (see
+/// `tpio::submit`'s doc comment). So `on_result`'s success branch can simply call `arm` again
 /// directly — each call to `arm` (whether the first, from `BindAsync`, or a
 /// re-arm, from `on_result`) issues exactly one accept and returns; the
 /// "chain" is just each completion, arriving on its own thread-pool callback,

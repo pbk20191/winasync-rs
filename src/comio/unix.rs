@@ -97,11 +97,15 @@ fn sockaddr_un_autobind() -> (SOCKADDR_UN, i32) {
     (sa, size_of::<ADDRESS_FAMILY>() as i32)
 }
 
-fn classify_wsa_overlapped(succeeded: bool) -> Issue {
+/// `bytes` is the synchronous byte count the provider (`AcceptEx`/`ConnectEx`)
+/// already wrote through its `lpdwbytesreceived`/`lpdwbytessent` out-param
+/// when `succeeded` is true — with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` set
+/// on every registered socket (`IoReg::register`), a synchronous success
+/// queues no completion packet, so it must be reported as `Issue::Completed`
+/// rather than `Issue::Pending` here.
+fn classify_wsa_overlapped(succeeded: bool, bytes: u32) -> Issue {
     if succeeded {
-        // Synchronous success still queues a completion (we never set
-        // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS).
-        Issue::Pending
+        Issue::Completed(0, bytes as usize)
     } else if unsafe { WSAGetLastError() } == WSA_IO_PENDING {
         Issue::Pending
     } else {
@@ -236,7 +240,7 @@ impl UnixStreamListener {
                 &mut bytes,
                 ovl,
             );
-            classify_wsa_overlapped(ok.as_bool())
+            classify_wsa_overlapped(ok.as_bool(), bytes)
         })
         .await;
         result?;
@@ -278,11 +282,14 @@ impl UnixStreamListener {
     /// whether that's a natural finish or an aborted cancellation) without
     /// going through a `Future` at all.
     ///
-    /// `on_result` normally runs on a thread-pool worker thread; a
-    /// synchronous `AcceptEx` failure (rare — success, even the "already
-    /// connected" case, always queues a completion per
-    /// `classify_wsa_overlapped`) invokes it synchronously instead, before
-    /// this function returns.
+    /// `on_result` always runs later, on a thread-pool worker thread on a
+    /// fresh call stack — never synchronously, on the calling thread, before
+    /// this function returns. This holds for a synchronous `AcceptEx`
+    /// success too (`classify_wsa_overlapped` reports it as
+    /// `Issue::Completed`, since `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` means
+    /// no completion packet is coming for it): `tpio::submit` re-dispatches
+    /// every synchronous outcome to the default thread pool rather than
+    /// invoking `on_complete` inline (see its doc comment).
     ///
     /// A synchronous failure to create the accept socket is returned as
     /// `Err` directly, without ever invoking `on_result`.
@@ -344,7 +351,7 @@ impl UnixStreamListener {
                         &mut bytes,
                         ovl,
                     );
-                    classify_wsa_overlapped(ok.as_bool())
+                    classify_wsa_overlapped(ok.as_bool(), bytes)
                 },
             )
         };
@@ -400,7 +407,7 @@ impl UnixStreamSocket {
                 &mut sent,
                 ovl,
             );
-            classify_wsa_overlapped(ok.as_bool())
+            classify_wsa_overlapped(ok.as_bool(), sent)
         })
         .await;
         result?;
