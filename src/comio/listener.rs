@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Foundation::{IClosable_Impl, TypedEventHandler};
 use windows_core::{
@@ -60,11 +60,12 @@ enum Transport {
 
 /// The concrete accept source `arm` re-arms against once `BindAsync` has
 /// bound it, shared (behind an `Arc`, cloned out of `ListenerState::source`)
-/// rather than referenced directly, because `arm`'s `on_result` callback can
-/// run *synchronously*, reentrantly calling `arm` again before the outer
-/// call returns (see `arm`'s doc comment) — holding `ListenerState::source`'s
-/// lock across the `AcceptSource::arm` call itself would self-deadlock on
-/// that path, so callers must clone the `Arc` and drop the lock first.
+/// rather than referenced directly, so that `arm` can drop
+/// `ListenerState::source`'s lock before calling `AcceptSource::arm` on it —
+/// `tpio::submit` guarantees `on_result` (built by `arm`, passed down into
+/// `AcceptSource::arm`) always runs later, on a thread-pool thread, never on
+/// this call's own stack, but cloning the `Arc` out first keeps the lock's
+/// scope minimal regardless.
 enum AcceptSource {
     NamedPipe(String),
     Unix(super::UnixStreamListener),
@@ -93,14 +94,12 @@ struct ListenerState {
     endpoint: Mutex<Option<HSTRING>>,
     /// Set once by `BindAsync`, read (cloned) by every `arm` call.
     source: Mutex<Option<Arc<AcceptSource>>>,
-    /// The in-flight accept's `OpHandle`, tagged with the `seq` of the
-    /// `arm` call that stored it — see `arm`'s doc comment for why the tag
-    /// is needed (a reentrant re-arm can otherwise be clobbered by its own
-    /// stale caller finishing "later").
-    current_op: Mutex<Option<(u64, OpHandle)>>,
-    /// Monotonic counter handing out a unique, increasing id to each `arm`
-    /// call, assigned before that call can possibly recurse.
-    seq: AtomicU64,
+    /// The in-flight accept's `OpHandle`. `tpio::submit` guarantees every
+    /// completion — synchronous or asynchronous — is delivered on a
+    /// thread-pool thread (see `tpio::submit`'s doc comment), so `arm` never
+    /// recurses/re-enters on the caller's own stack and a plain
+    /// `Option<OpHandle>` (no sequence tag) is sufficient here.
+    current_op: Mutex<Option<OpHandle>>,
 }
 
 impl ListenerState {
@@ -111,7 +110,6 @@ impl ListenerState {
             endpoint: Mutex::new(None),
             source: Mutex::new(None),
             current_op: Mutex::new(None),
-            seq: AtomicU64::new(0),
         }
     }
 }
@@ -148,7 +146,7 @@ impl Drop for ConnectionListener {
     /// time.
     fn drop(&mut self) {
         self.state.closed.store(true, Ordering::Release);
-        if let Some((_, op)) = self.state.current_op.lock().unwrap().take() {
+        if let Some(op) = self.state.current_op.lock().unwrap().take() {
             op.cancel();
         }
         self.state.event.clear();
@@ -219,8 +217,8 @@ impl ConnectionListener {
     /// chain, so nothing is orphaned. But calling `BindAsync` from one
     /// thread while a previously started accept chain is still actively
     /// running (not yet superseded) on another is not supported: the
-    /// `seq`/`current_op` handoff in `arm` assumes a single active chain at
-    /// a time, and a concurrent rebind racing it could store a new `source`/
+    /// `current_op` handoff in `arm` assumes a single active chain at a
+    /// time, and a concurrent rebind racing it could store a new `source`/
     /// cancel the wrong `current_op` out from under the other chain,
     /// orphaning an in-flight accept (untracked, so `Close`/`Drop` can no
     /// longer cancel it). Callers that need to rebind must serialize
@@ -234,7 +232,7 @@ impl ConnectionListener {
         // A second `BindAsync` replacing an in-flight chain must not orphan
         // an uncancellable accept: cancel whatever is currently armed before
         // installing the new source.
-        if let Some((_, op)) = self.state.current_op.lock().unwrap().take() {
+        if let Some(op) = self.state.current_op.lock().unwrap().take() {
             op.cancel();
         }
 
@@ -273,200 +271,105 @@ impl ConnectionListener {
     }
 }
 
-thread_local! {
-    /// True only for the duration of the `source.arm(on_result)` call inside
-    /// the loop in `arm` below. Lets `on_result` distinguish "the kernel
-    /// completion is arriving synchronously, on this very stack, before
-    /// `source.arm` has even returned" (`IN_ARM` true) from "this is a
-    /// genuine asynchronous completion, delivered later on a fresh
-    /// thread-pool callback stack" (`IN_ARM` false, since each new OS thread
-    /// — and each fresh call on a given thread, between iterations — starts
-    /// from `false`).
-    static IN_ARM: std::cell::Cell<bool> = std::cell::Cell::new(false);
-    /// Set by `on_result`'s success branch, but only when `IN_ARM` is true,
-    /// to ask the *currently running* `arm` loop iteration (below) to issue
-    /// the next accept itself on its next turn, instead of `on_result`
-    /// recursing into `arm` on its own stack. This is what turns an
-    /// unbounded chain of same-stack synchronous completions into a flat
-    /// loop with O(1) stack depth — see `arm`'s doc comment.
-    static REARM: std::cell::Cell<bool> = std::cell::Cell::new(false);
-}
-
 /// Issues (or re-issues) one accept and arranges for its completion to fire
 /// `ConnectionReceived` and then issue the *next* accept — a self-re-arming
 /// TP_IO completion chain running entirely on the default thread-pool
 /// callback environment, with no executor and no async task anywhere in the
 /// loop.
 ///
-/// # Synchronous completions are trampolined, not recursed
-/// The transport's `arm_accept` completion (`on_result`, built here) usually
-/// runs later, on a thread-pool worker thread, once the kernel delivers the
-/// completion. But per `tpio::submit`'s documented `Issue::Failed` behavior,
-/// it can instead run *synchronously*, on this call's own stack, before
-/// `AcceptSource::arm` even returns — the named-pipe transport's
-/// `ERROR_PIPE_CONNECTED` case (a client connected between `CreateNamedPipeW`
-/// and `ConnectNamedPipe`) is exactly this. A backlog of clients already
-/// queued to connect (a realistic over-subscription burst) means *every*
-/// re-arm in the backlog can complete synchronously this way. Naively
-/// re-arming by calling `arm` again from inside `on_result` would recurse
-/// once per queued client — one stack frame per connection — which a large
-/// enough backlog can grow past the pool thread's stack, and in Rust a stack
-/// overflow is an immediate process `abort()`, not a recoverable error.
+/// # Every completion is always asynchronous — no trampoline needed
+/// The transport's `arm_accept` completion (`on_result`, built here) is
+/// always invoked later, on a thread-pool worker thread, on its own fresh
+/// call stack — never synchronously, on this call's own stack, even for the
+/// named-pipe transport's `ERROR_PIPE_CONNECTED` case (a client connected
+/// between `CreateNamedPipeW` and `ConnectNamedPipe`). `tpio::submit`
+/// guarantees this: a synchronous issue failure (`Issue::Failed`, which
+/// covers `ERROR_PIPE_CONNECTED`) is re-dispatched to the default thread pool
+/// rather than invoking the completion inline (see `tpio::submit`'s doc
+/// comment). So `on_result`'s success branch can simply call `arm` again
+/// directly — each call to `arm` (whether the first, from `BindAsync`, or a
+/// re-arm, from `on_result`) issues exactly one accept and returns; the
+/// "chain" is just each completion, arriving on its own thread-pool callback,
+/// starting the next call. There is no reentrant recursion to bound and
+/// hence no trampoline: a large backlog of already-connected clients simply
+/// produces a long *sequence* of independent, O(1)-stack `arm` calls handed
+/// off one at a time across thread-pool callbacks, not a deep call stack.
 ///
-/// So the loop below, not `on_result`, is what issues each successive
-/// accept: `on_result`'s success branch only recurses into `arm` when it is
-/// *not* running synchronously inside this loop (`IN_ARM` false — a genuine
-/// async completion on a fresh callback stack, which is inherently bounded
-/// to one `arm` call per completion). When it *is* running synchronously
-/// (`IN_ARM` true), it just sets `REARM` and returns; the loop iteration
-/// that is still on the stack below it observes `REARM` once `source.arm`
-/// returns and loops around to issue the next accept itself, at the same
-/// stack depth. Depth is therefore O(1) regardless of backlog size on both
-/// paths: the synchronous path never grows the stack past one `arm` call's
-/// frames, and the async path starts a fresh (also O(1)) call per
-/// completion.
-///
-/// `seq`/`current_op`'s tagging (see their doc comments on `ListenerState`)
-/// predates this trampoline and guarded against a reentrant *recursive*
-/// `arm` call storing a newer op before an outer call still on the stack
-/// stored its own (now-stale) one. The trampoline removes that recursion on
-/// the synchronous path — only one `arm` loop is ever "in progress" on a
-/// given thread at a time now, storing strictly increasing `seq`s one at a
-/// time — but it's kept anyway as cheap defense in depth (e.g. against any
-/// future reentrancy this refactor didn't anticipate); it is not load-bearing
-/// for correctness anymore on the paths this function controls.
-///
-/// Returns `Err` only for a *synchronous* failure to issue the very first
-/// accept of this `arm` call (e.g. `CreateNamedPipeW` failing on a malformed
-/// name) — the only case a caller can act on, since every other error
-/// arrives asynchronously through `on_result` instead. `BindAsync`
-/// propagates this first accept's `Err`; a synchronous issue failure on a
-/// later, trampolined iteration (or a re-arm triggered from within
-/// `on_result`'s async path) is swallowed instead — there is nowhere to
-/// surface it to, and stopping the chain is the correct response either way.
+/// Returns `Err` only for a synchronous failure to issue *this* call's
+/// accept (e.g. `CreateNamedPipeW` failing on a malformed name). `BindAsync`
+/// propagates the first call's `Err` to its caller; a re-arm triggered from
+/// `on_result` ignores it instead (there is nowhere else to surface it to,
+/// and stopping the chain is the correct response either way).
 fn arm(state: Arc<ListenerState>) -> Result<()> {
-    let mut first_accept = true;
-    loop {
-        if state.closed.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        // Clone the `Arc<AcceptSource>` out and drop the `source` lock
-        // before calling `.arm()` on it below: `on_result` (invoked from
-        // inside that call, possibly synchronously) can read `source` again
-        // via the `REARM`/loop path, and it must not observe this lock still
-        // held.
-        let source = state.source.lock().unwrap().clone();
-        let Some(source) = source else {
-            // Not bound yet; nothing to do.
-            return Ok(());
-        };
-
-        let my_seq = state.seq.fetch_add(1, Ordering::AcqRel);
-
-        let state_for_cb = state.clone();
-        let on_result: Box<dyn FnOnce(Result<IInspectable>) + Send> = Box::new(move |res| {
-            if state_for_cb.closed.load(Ordering::Acquire) {
-                return;
-            }
-            match res {
-                Ok(stream) => {
-                    let endpoint = state_for_cb
-                        .endpoint
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .unwrap_or_default();
-                    let args: IInspectable = new_args(stream, endpoint).cast().unwrap();
-                    // Fire on this pool thread with a null sender — the
-                    // connection is carried by `args`, not the (nonexistent)
-                    // sender object. Guard against a panicking consumer
-                    // handler unwinding across this FFI-adjacent boundary.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        state_for_cb.event.call(|h| h.Invoke(None, &args));
-                    }));
-                    // Re-arm for the next connection. If this is running
-                    // synchronously inside the `arm` loop below (see the
-                    // doc comment above), trampoline instead of recursing:
-                    // just ask that loop to iterate. Otherwise this is a
-                    // genuine async completion on its own fresh stack, so
-                    // there is no unbounded recursion risk in calling `arm`
-                    // directly.
-                    if IN_ARM.with(std::cell::Cell::get) {
-                        REARM.with(|f| f.set(true));
-                    } else {
-                        let _ = arm(state_for_cb.clone());
-                    }
-                }
-                Err(_) => {
-                    // Hard accept failure (or a cancellation from Close
-                    // racing the in-flight accept). Stop without re-arming:
-                    // retrying a persistent failure here would hot-spin this
-                    // pool thread, and a cancellation means we're closing
-                    // anyway. (`REARM` is left `false`, so the loop below
-                    // will not iterate again either.)
-                }
-            }
-        });
-
-        REARM.with(|f| f.set(false));
-        IN_ARM.with(|f| f.set(true));
-        let armed = source.arm(on_result);
-        IN_ARM.with(|f| f.set(false));
-
-        let op = match armed {
-            Ok(op) => op,
-            Err(e) => {
-                return if first_accept {
-                    // The very first accept of this `arm` call failed to
-                    // issue at all — surface it to whoever called `arm`
-                    // (`BindAsync`, on the first call; a later re-arm's
-                    // caller ignores this `Err` anyway).
-                    Err(e)
-                } else {
-                    // A later, trampolined accept in this same backlog burst
-                    // failed to issue. Nothing upstream can act on this any
-                    // more precisely than "stop the chain" — same as an
-                    // internal recursive re-arm's ignored error used to.
-                    Ok(())
-                };
-            }
-        };
-        first_accept = false;
-
-        {
-            let mut cur = state.current_op.lock().unwrap();
-            let superseded = matches!(cur.as_ref(), Some((seq, _)) if *seq > my_seq);
-            if superseded {
-                // Some other, newer `arm` call already stored its op ahead
-                // of ours (out-of-contract with a single active chain — see
-                // this fn's doc comment — but kept as defense in depth).
-                // `cur` belongs to that other call now; touching it (e.g.
-                // the closed double-check below) would race/clobber
-                // something we don't own, so bail out immediately, same as
-                // this branch always has.
-                drop(cur);
-                drop(op);
-                return Ok(());
-            }
-            *cur = Some((my_seq, op));
-        }
-
-        // Double-check: a Close racing this re-arm (observed `closed` as
-        // false above, then flipped it true, and found no op yet to cancel
-        // because we hadn't stored it yet) must still cancel the op we just
-        // stored.
-        if state.closed.load(Ordering::Acquire) {
-            if let Some((_, op)) = state.current_op.lock().unwrap().take() {
-                op.cancel();
-            }
-        }
-
-        if REARM.with(std::cell::Cell::get) {
-            continue;
-        }
+    if state.closed.load(Ordering::Acquire) {
         return Ok(());
     }
+
+    // Clone the `Arc<AcceptSource>` out and drop the `source` lock before
+    // calling `.arm()` on it below — not required for correctness anymore
+    // (every completion now runs on a fresh, later stack, never reentering
+    // this call), but keeping the lock's scope minimal is cheap and avoids
+    // holding it across an FFI-adjacent call.
+    let source = state.source.lock().unwrap().clone();
+    let Some(source) = source else {
+        // Not bound yet; nothing to do.
+        return Ok(());
+    };
+
+    let state_cb = state.clone();
+    let on_result: Box<dyn FnOnce(Result<IInspectable>) + Send> = Box::new(move |res| {
+        if state_cb.closed.load(Ordering::Acquire) {
+            return;
+        }
+        match res {
+            Ok(stream) => {
+                let endpoint = state_cb
+                    .endpoint
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default();
+                fire_event(&state_cb, stream, endpoint);
+                // Re-arm for the next connection. Always runs on a fresh
+                // thread-pool callback stack (see this fn's doc comment), so
+                // this is never unbounded recursion.
+                let _ = arm(state_cb.clone());
+            }
+            Err(_) => {
+                // Hard accept failure (or a cancellation from Close racing
+                // the in-flight accept). Stop without re-arming: retrying a
+                // persistent failure here would hot-spin this pool thread,
+                // and a cancellation means we're closing anyway.
+            }
+        }
+    });
+
+    let op = source.arm(on_result)?;
+
+    *state.current_op.lock().unwrap() = Some(op);
+
+    // Double-check: a Close racing this re-arm (observed `closed` as false
+    // above, then flipped it true before this stored the op) must still
+    // cancel the op just stored.
+    if state.closed.load(Ordering::Acquire) {
+        if let Some(op) = state.current_op.lock().unwrap().take() {
+            op.cancel();
+        }
+    }
+
+    Ok(())
+}
+
+/// Wraps `stream`/`endpoint` into `IConnectionReceivedArgs` and fires
+/// `ConnectionReceived` on this thread-pool callback thread with a null
+/// sender — the connection is carried by `args`, not the (nonexistent)
+/// sender object. Guards against a panicking consumer handler unwinding
+/// across this FFI-adjacent boundary.
+fn fire_event(state: &Arc<ListenerState>, stream: IInspectable, endpoint: HSTRING) {
+    let args: IInspectable = new_args(stream, endpoint).cast().unwrap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.event.call(|h| h.Invoke(None, &args));
+    }));
 }
 
 impl IClosable_Impl for ConnectionListener_Impl {
@@ -477,7 +380,7 @@ impl IClosable_Impl for ConnectionListener_Impl {
     /// `ConnectionReceived` handlers.
     fn Close(&self) -> Result<()> {
         self.state.closed.store(true, Ordering::Release);
-        if let Some((_, op)) = self.state.current_op.lock().unwrap().take() {
+        if let Some(op) = self.state.current_op.lock().unwrap().take() {
             op.cancel();
         }
         self.state.event.clear();
@@ -778,49 +681,27 @@ mod listener_tests {
         assert!(listener.Information().is_err() || listener.Information().is_ok());
     }
 
-    /// Concurrent-backlog liveness test, NOT a forced repro of the original
-    /// stack-overflow bug -- see below for why a true repro was tried and
-    /// found impractical, per this task's explicit fallback allowance.
+    /// Concurrent-backlog liveness test. Originally written to probe a
+    /// stack-overflow risk from recursive same-stack re-arming under a
+    /// backlog of already-connected clients (the named-pipe transport's
+    /// `ERROR_PIPE_CONNECTED` synchronous-completion case — see
+    /// `pipe::arm_accept`'s doc comment); that risk is now structurally
+    /// impossible, since `tpio::submit` re-dispatches every synchronous
+    /// completion to the default thread pool instead of invoking it inline
+    /// (see `tpio::submit`'s and `arm`'s doc comments) — `on_result` never
+    /// runs on the stack of the `arm` call that armed it, so a re-arm from
+    /// `on_result` can never recurse, regardless of how large the connect
+    /// backlog is. This test is kept as a liveness/throughput check under
+    /// real concurrent connection load rather than a stack-safety repro:
     ///
     /// A horde of client threads is started *before* the listener is bound,
-    /// each hammer-retrying `NamedPipeClient::connect` with no backoff. The
-    /// intent was for many of these retries to already be spinning by the
-    /// time the chain's first pipe instance appears, racing to land in the
-    /// window between `CreateNamedPipeW` and `ConnectNamedPipe` inside the
-    /// chain's next re-arm -- the `ERROR_PIPE_CONNECTED` synchronous-
-    /// completion path (see `pipe::arm_accept`'s doc comment) that used to
-    /// make `on_result` recurse into `arm` on the same stack (see `arm`'s
-    /// doc comment for the trampoline this test exists to cover).
-    ///
-    /// This was verified NOT to be a reliable repro: with the trampoline
-    /// temporarily reverted back to plain recursion, this test still passed
-    /// at `N = 200` (this file's actual value) *and* at `N = 2000` in local
-    /// testing (24 logical processors) -- the gap between `CreateNamedPipeW`
-    /// and `ConnectNamedPipe` is narrow enough that user-mode thread
-    /// scheduling essentially never lands more than a few *consecutive*
-    /// synchronous completions in a row, regardless of how many client
-    /// threads are hammering the retry loop; reliably forcing a long enough
-    /// run to overflow a real thread stack would need control over kernel
-    /// scheduling (or a test-only synchronous-completion hook added to
-    /// `pipe.rs`) that's out of scope for this fix. So, per this task's
-    /// instructions, this is kept as the smaller, honestly-scoped
-    /// alternative: it exercises the re-arm chain under real concurrent
-    /// connection load and checks two things --
-    ///
-    ///  1. The process is still alive to make the assertions below at all
-    ///     (a real stack overflow is an unconditional `abort()` that would
-    ///     have taken the whole test binary down, not just failed an
-    ///     assertion) -- weak evidence given the finding above, but
-    ///     non-zero, and free.
-    ///  2. The chain still makes real forward progress (delivers most
-    ///     connections) under concurrent load, i.e. the trampoline restructuring
-    ///     didn't introduce a livelock/deadlock.
-    ///
-    /// The trampoline's actual stack-boundedness is established by
-    /// inspection (see `arm`'s doc comment: `IN_ARM`/`REARM` replace the
-    /// recursive call with a flat loop, so depth is O(1) regardless of
-    /// backlog size) rather than by this test. Functional event-delivery
-    /// coverage for the ordinary single- and multi-connection cases lives in
+    /// each hammer-retrying `NamedPipeClient::connect` with no backoff, to
+    /// produce a realistic over-subscription burst against the chain's
+    /// re-arm loop. The test then checks that the chain still makes real
+    /// forward progress (delivers most connections) under that load, i.e.
+    /// the pool-dispatch restructuring didn't introduce a livelock/deadlock.
+    /// Functional event-delivery coverage for the ordinary single- and
+    /// multi-connection cases lives in
     /// `connection_received_fires_with_working_stream` and
     /// `unix_connection_received_echo`.
     #[test]
@@ -873,9 +754,9 @@ mod listener_tests {
         listener.ConnectionReceived(&handler).unwrap();
         block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
 
-        // Bounded wait for the backlog to drain. If the trampoline fix
-        // regressed into a livelock, this loop's own timeout (not a
-        // process hang) is what fails the test.
+        // Bounded wait for the backlog to drain. If the pool-dispatch
+        // restructuring regressed into a livelock, this loop's own timeout
+        // (not a process hang) is what fails the test.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline
             && delivered.load(Ordering::Relaxed) < (N * 9 / 10)
