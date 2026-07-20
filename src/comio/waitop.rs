@@ -15,7 +15,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
 use windows::Win32::System::IO::OVERLAPPED;
 use windows_core::{Error, Result, HRESULT};
 
@@ -73,13 +72,10 @@ impl Drop for AwaitIo {
 /// completion callback registered with `submit` — it need not be
 /// `Send`/`'static`.
 ///
-/// Completion mapping: `ioresult == 0` is success (`Ok(bytes)`).
-/// `ERROR_PIPE_CONNECTED` is also mapped to success: it is the documented
-/// case where `ConnectNamedPipe` reports (via the synchronous-failure path)
-/// that a client already connected between pipe creation and the connect
-/// call — semantically a successful connect, not an error, even though no
-/// completion packet is ever queued for it. Every other nonzero code is
-/// `Err(Error::from_hresult(HRESULT::from_win32(ioresult)))`.
+/// Completion mapping: `ioresult == 0` is success (`Ok(bytes)`); every other
+/// nonzero code is `Err(Error::from_hresult(HRESULT::from_win32(ioresult)))`.
+/// (The `ConnectNamedPipe` "already connected" case surfaces as `ioresult == 0`
+/// too — `tpio` classifies it as `Issue::Completed(0, 0)`, not a failure.)
 pub(crate) fn await_io(
     reg: &Arc<IoReg>,
     issue: impl FnOnce(*mut OVERLAPPED) -> Issue,
@@ -90,7 +86,7 @@ pub(crate) fn await_io(
         tpio::submit(
             reg,
             Box::new(move |ioresult: u32, bytes: usize| {
-                let res = if ioresult == 0 || ioresult == ERROR_PIPE_CONNECTED.0 {
+                let res = if ioresult == 0 {
                     Ok(bytes)
                 } else {
                     Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
@@ -158,7 +154,7 @@ pub(crate) fn await_io_owning<P: Send + 'static>(
                 // and completed with `ERROR_OPERATION_ABORTED`), never
                 // earlier — see the contract above.
                 drop(payload);
-                let res = if ioresult == 0 || ioresult == ERROR_PIPE_CONNECTED.0 {
+                let res = if ioresult == 0 {
                     Ok(bytes)
                 } else {
                     Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
