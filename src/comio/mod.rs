@@ -40,14 +40,6 @@ pub(crate) fn check<T>(r: windows_core::Result<T>) -> T {
     r.expect("comio overlapped allocation failed")
 }
 
-/// The crate-shared `tp::Runtime` that `ConnectionListener`'s self-driving
-/// accept loops run on. Lazily created on first use; lives for the process.
-pub(crate) fn shared_runtime() -> &'static crate::tp::Runtime {
-    use std::sync::OnceLock;
-    static RT: OnceLock<crate::tp::Runtime> = OnceLock::new();
-    RT.get_or_init(crate::tp::Runtime::new)
-}
-
 #[cfg(test)]
 mod tests {
     use super::pipe::{NamedPipeClient, NamedPipeListener};

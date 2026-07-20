@@ -13,7 +13,7 @@
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
 use super::stream;
-use super::tpio::{IoReg, Issue};
+use super::tpio::{self, IoReg, Issue, OpHandle};
 use super::waitop::await_io_owning;
 use core::ffi::c_void;
 use std::mem;
@@ -261,6 +261,94 @@ impl UnixStreamListener {
                 Err(e)
             }
         }
+    }
+
+    /// Callback-based counterpart to [`UnixStreamListener::accept`], used by
+    /// `listener.rs`'s self-re-arming, executor-free accept chain via
+    /// [`tpio::submit`] directly instead of the `Future`-based `accept()`/
+    /// `await_io_owning`. Reuses `accept()`'s exact `AcceptEx` setup
+    /// (fresh accept socket, `ADDR_SLOT`-sized address buffer,
+    /// `SO_UPDATE_ACCEPT_CONTEXT` finish-up), but moves the address buffer
+    /// *and* the accept socket into the `tpio::submit` completion closure by
+    /// hand instead of going through `await_io_owning`: `tpio::submit`'s own
+    /// completion-callback discipline is exactly the kernel-gated keep-alive
+    /// `await_io_owning` builds on, so capturing both directly in the
+    /// closure here reproduces the same soundness argument (the closure —
+    /// and everything it owns — lives until the real kernel completion,
+    /// whether that's a natural finish or an aborted cancellation) without
+    /// going through a `Future` at all.
+    ///
+    /// `on_result` normally runs on a thread-pool worker thread; a
+    /// synchronous `AcceptEx` failure (rare — success, even the "already
+    /// connected" case, always queues a completion per
+    /// `classify_wsa_overlapped`) invokes it synchronously instead, before
+    /// this function returns.
+    ///
+    /// A synchronous failure to create the accept socket is returned as
+    /// `Err` directly, without ever invoking `on_result`.
+    pub(crate) fn arm_accept(
+        &self,
+        on_result: Box<dyn FnOnce(Result<IInspectable>) + Send>,
+    ) -> Result<OpHandle> {
+        let accept_sock = new_socket()?;
+        let listen_sock = SOCKET(self.reg.handle.0 as usize);
+
+        // Same kernel-owned-memory reasoning as `accept()`'s `addr_buf`:
+        // moved into the completion closure below so it outlives not just
+        // this call but the operation's real completion.
+        let mut addr_buf: Box<[u8; 2 * ADDR_SLOT]> = Box::new([0u8; 2 * ADDR_SLOT]);
+        let addr_ptr = addr_buf.as_mut_ptr() as usize;
+
+        let op = unsafe {
+            tpio::submit(
+                &self.reg,
+                Box::new(move |ioresult: u32, _bytes: usize| {
+                    // Keep the address buffer alive until this real
+                    // completion (success or aborted failure) — see the
+                    // doc comment above.
+                    drop(addr_buf);
+                    let res = if ioresult == 0 {
+                        let listen_val = listen_sock.0.to_ne_bytes();
+                        let finish = || -> Result<IInspectable> {
+                            sock_check(setsockopt(
+                                accept_sock,
+                                SOL_SOCKET,
+                                SO_UPDATE_ACCEPT_CONTEXT,
+                                Some(&listen_val),
+                            ))?;
+                            let reg = IoReg::register(HANDLE(accept_sock.0 as *mut c_void), true)?;
+                            Ok(stream::from_reg(reg))
+                        };
+                        match finish() {
+                            Ok(s) => Ok(s),
+                            Err(e) => {
+                                closesocket(accept_sock);
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        closesocket(accept_sock);
+                        Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
+                    };
+                    on_result(res);
+                }),
+                move |ovl| {
+                    let mut bytes = 0u32;
+                    let ok = AcceptEx(
+                        listen_sock,
+                        accept_sock,
+                        addr_ptr as *mut c_void,
+                        0, // complete on connect; do not wait for first data
+                        ADDR_SLOT as u32,
+                        ADDR_SLOT as u32,
+                        &mut bytes,
+                        ovl,
+                    );
+                    classify_wsa_overlapped(ok.as_bool())
+                },
+            )
+        };
+        Ok(op)
     }
 }
 

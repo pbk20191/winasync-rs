@@ -4,9 +4,11 @@
 //! engine.
 
 use super::stream;
-use super::tpio::{IoReg, Issue};
+use super::tpio::{self, IoReg, Issue, OpHandle};
 use super::waitop::await_io;
-use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_BUSY, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE,
+};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
     FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -15,7 +17,7 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
     PIPE_WAIT,
 };
-use windows_core::{Error, Result, HSTRING};
+use windows_core::{Error, Result, HRESULT, HSTRING};
 
 /// Server (listener) side of a named pipe. Each `accept()` creates a fresh
 /// overlapped pipe instance and waits for a client to connect to it.
@@ -93,6 +95,78 @@ impl NamedPipeListener {
 
         Ok(stream::from_reg(reg))
     }
+}
+
+/// Callback-based counterpart to [`NamedPipeListener::accept`], used by
+/// `listener.rs`'s self-re-arming, executor-free accept chain via
+/// [`tpio::submit`] directly instead of the `Future`-based `accept()`/
+/// `await_io`. Creates a fresh pipe instance, registers it, and issues the
+/// overlapped `ConnectNamedPipe` — the same flags/classification as
+/// `accept()` above, including the `ERROR_PIPE_CONNECTED` special case.
+///
+/// `on_result` is invoked exactly once: normally on a thread-pool worker
+/// thread when the kernel completion arrives, but — per `tpio::submit`'s
+/// documented `Issue::Failed` behavior — it may instead run synchronously,
+/// on the calling thread, *before this function returns*, whenever
+/// `ConnectNamedPipe` reports `ERROR_PIPE_CONNECTED` (a client connected
+/// between `CreateNamedPipeW` and this call) or any other synchronous
+/// failure. Callers that re-arm from within `on_result` must account for
+/// that reentrancy.
+///
+/// A synchronous failure to create/register the pipe instance itself is
+/// returned as `Err` directly, without ever invoking `on_result` — mirroring
+/// `accept()`'s own synchronous-failure behavior — so a bad pipe name (for
+/// instance) surfaces to the immediate caller rather than through the
+/// callback.
+pub(crate) fn arm_accept(
+    name: &str,
+    on_result: Box<dyn FnOnce(Result<windows_core::IInspectable>) + Send>,
+) -> Result<OpHandle> {
+    let wname = HSTRING::from(name);
+    let handle = unsafe {
+        CreateNamedPipeW(
+            &wname,
+            FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0),
+            PIPE_TYPE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            None,
+        )
+    };
+    if handle.is_invalid() {
+        return Err(Error::from_thread());
+    }
+    let reg = match IoReg::register(handle, false) {
+        Ok(reg) => reg,
+        Err(e) => {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(e);
+        }
+    };
+    let reg_for_complete = reg.clone();
+    let op = unsafe {
+        tpio::submit(
+            &reg,
+            Box::new(move |ioresult: u32, _bytes: usize| {
+                let res = if ioresult == 0 || ioresult == ERROR_PIPE_CONNECTED.0 {
+                    Ok(stream::from_reg(reg_for_complete))
+                } else {
+                    Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
+                };
+                on_result(res);
+            }),
+            move |ovl| match ConnectNamedPipe(handle, Some(ovl)) {
+                Ok(()) => Issue::Pending,
+                Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                Err(e) => Issue::Failed(e.code()),
+            },
+        )
+    };
+    Ok(op)
 }
 
 /// Client side of a named pipe.
