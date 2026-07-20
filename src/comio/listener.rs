@@ -277,25 +277,27 @@ impl ConnectionListener {
 /// callback environment, with no executor and no async task anywhere in the
 /// loop.
 ///
-/// # Every completion is always asynchronous — no trampoline needed
-/// The transport's `arm_accept` completion (`on_result`, built here) is
-/// always invoked later, on a thread-pool worker thread, on its own fresh
-/// call stack — never synchronously, on this call's own stack, even for the
-/// named-pipe transport's `ERROR_PIPE_CONNECTED` case (a client connected
-/// between `CreateNamedPipeW` and `ConnectNamedPipe`) or any other
-/// synchronous success (data already available, an immediate `AcceptEx`,
-/// ...). `tpio::submit` guarantees this: every synchronous issue outcome —
-/// `Issue::Failed` (hard failure) or `Issue::Completed` (synchronous
-/// success, which covers `ERROR_PIPE_CONNECTED`) — is re-dispatched to the
-/// default thread pool rather than invoking the completion inline (see
-/// `tpio::submit`'s doc comment). So `on_result`'s success branch can simply call `arm` again
-/// directly — each call to `arm` (whether the first, from `BindAsync`, or a
-/// re-arm, from `on_result`) issues exactly one accept and returns; the
-/// "chain" is just each completion, arriving on its own thread-pool callback,
-/// starting the next call. There is no reentrant recursion to bound and
-/// hence no trampoline: a large backlog of already-connected clients simply
-/// produces a long *sequence* of independent, O(1)-stack `arm` calls handed
-/// off one at a time across thread-pool callbacks, not a deep call stack.
+/// # The re-arm is deferred to the default pool — no reentrant recursion
+/// The transport's `arm_accept` completion (`on_result`, built here) usually
+/// runs later, on a thread-pool worker thread. But it can also run
+/// *synchronously*, inline on the thread that called `arm`, before
+/// `AcceptSource::arm` even returns — `tpio::submit` delivers a synchronous
+/// completion (the named-pipe `ERROR_PIPE_CONNECTED` "already connected"
+/// case, or any hard synchronous failure) on the caller's own stack. If
+/// `on_result` re-armed by calling `arm` directly on that synchronous path,
+/// a backlog of already-connected clients would recurse once per connection
+/// — one stack frame each — which a large enough backlog can overflow (a
+/// Rust stack overflow is an immediate process `abort`).
+///
+/// So `on_result` never calls `arm` directly; it hands the *re-arm* to the
+/// default thread pool via `windows_threading::submit`, which always starts
+/// the next `arm` on a fresh callback stack. Depth is therefore O(1)
+/// regardless of backlog: a burst of already-connected clients produces a
+/// long *sequence* of independent `arm` calls handed one at a time across
+/// pool callbacks, never a deep stack. This keeps the fix entirely inside
+/// the listener — the shared `tpio::submit` completion model is untouched,
+/// so ordinary stream reads/writes keep their existing inline-fast-path
+/// behavior.
 ///
 /// Returns `Err` only for a synchronous failure to issue *this* call's
 /// accept (e.g. `CreateNamedPipeW` failing on a malformed name). `BindAsync`
@@ -332,10 +334,17 @@ fn arm(state: Arc<ListenerState>) -> Result<()> {
                     .clone()
                     .unwrap_or_default();
                 fire_event(&state_cb, stream, endpoint);
-                // Re-arm for the next connection. Always runs on a fresh
-                // thread-pool callback stack (see this fn's doc comment), so
-                // this is never unbounded recursion.
-                let _ = arm(state_cb.clone());
+                // Re-arm for the next connection. `on_result` may be running
+                // synchronously, inline on the thread that called `arm` (the
+                // `ERROR_PIPE_CONNECTED` "already connected" case), so calling
+                // `arm` directly here could recurse once per already-queued
+                // client. Defer the re-arm to the default thread pool instead:
+                // it always starts on a fresh callback stack, bounding depth
+                // to O(1) (see this fn's doc comment).
+                let next = state_cb.clone();
+                windows_threading::submit(move || {
+                    let _ = arm(next);
+                });
             }
             Err(_) => {
                 // Hard accept failure (or a cancellation from Close racing

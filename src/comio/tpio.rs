@@ -11,13 +11,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Networking::WinSock::{closesocket, SOCKET};
-use windows::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows::Win32::System::Threading::{
     CancelThreadpoolIo, CloseThreadpoolIo, CreateThreadpoolIo, StartThreadpoolIo,
     PTP_CALLBACK_INSTANCE, PTP_IO,
 };
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
-use windows::Win32::System::WindowsProgramming::FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
 
 /// Number of live operation blocks (debug builds) — lets tests assert that
 /// cancel storms don't leak.
@@ -38,17 +36,6 @@ unsafe impl Sync for IoReg {}
 impl IoReg {
     /// Takes ownership of `handle` on success; on error the caller still owns
     /// (and must close) it.
-    ///
-    /// Also enables `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` on `handle`: every
-    /// classifier in this module (the `issue` closures passed to `submit`)
-    /// assumes this flag is set and reports a synchronous success as
-    /// `Issue::Completed` rather than `Issue::Pending` — so a completion
-    /// packet must never be queued for a call that already finished
-    /// synchronously, or the kernel's packet plus this function's re-dispatch
-    /// would both try to run `on_complete` (double delivery / use-after-free
-    /// on the freed `Op` block). `SetFileCompletionNotificationModes`'s error
-    /// is therefore propagated rather than ignored: if it ever failed, the
-    /// invariant every classifier depends on would silently not hold.
     pub(crate) fn register(handle: HANDLE, is_socket: bool) -> windows_core::Result<Arc<Self>> {
         let io = unsafe {
             // Default thread-pool callback environment (pcbe = NULL); no
@@ -56,18 +43,6 @@ impl IoReg {
             // the operation.
             CreateThreadpoolIo(handle, Some(io_complete), None, None)?
         };
-        if let Err(e) = unsafe {
-            SetFileCompletionNotificationModes(
-                handle,
-                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS as u8,
-            )
-        } {
-            // `io` was already created above; balance it before surfacing the
-            // error, mirroring the "caller still owns `handle`" contract —
-            // this function must not leak the TP_IO object it allocated.
-            unsafe { CloseThreadpoolIo(io) };
-            return Err(e);
-        }
         Ok(Arc::new(Self {
             handle,
             io,
@@ -107,18 +82,10 @@ impl Drop for IoReg {
 
 /// Outcome of issuing the overlapped call, as classified by the caller.
 pub(crate) enum Issue {
-    /// A completion callback will arrive: the call reported `ERROR_IO_PENDING`
-    /// (or the WinSock equivalent `WSA_IO_PENDING`).
+    /// A completion callback will arrive.
     Pending,
     /// Hard synchronous failure — no completion will arrive.
     Failed(windows_core::HRESULT),
-    /// Synchronous success — with `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` set
-    /// on the handle (see `IoReg::register`), no completion packet will ever
-    /// arrive for this call, even though it succeeded. `.0` is the Win32
-    /// success code to report to `on_complete` (0 for an ordinary success;
-    /// e.g. `ConnectNamedPipe`'s `ERROR_PIPE_CONNECTED` case is reported as
-    /// plain success — see `pipe.rs`), `.1` is the synchronous byte count.
-    Completed(u32, usize),
 }
 
 type CompleteFn = Box<dyn FnOnce(u32, usize) + Send>;
@@ -155,20 +122,15 @@ unsafe fn release_ref(op: *mut c_void) {
     }
 }
 
-/// Runs one operation's completion: marks it `fired`, takes and invokes
-/// `on_complete` (guarded by `catch_unwind` so a panicking callback can't
-/// skip the tail release below and leak the block), then releases the
-/// kernel-side reference. Shared by the real async completion path
-/// (`io_complete`, called by the thread pool on a genuine kernel completion)
-/// and `submit`'s synchronous-failure path (re-dispatched to the default
-/// pool instead of running inline — see `submit`'s doc comment) — both must
-/// release the kernel-side ref exactly once, and this is the one place that
-/// does it.
-///
-/// # Safety
-/// `overlapped` must be a live `*mut Op` that has not already had this
-/// function (or the equivalent inline path) run on it.
-unsafe fn complete_op(overlapped: *mut c_void, ioresult: u32, bytes: usize) {
+/// The single completion callback for every registered handle.
+unsafe extern "system" fn io_complete(
+    _: PTP_CALLBACK_INSTANCE,
+    _ctx: *mut c_void,
+    overlapped: *mut c_void,
+    ioresult: u32,
+    bytes: usize,
+    _io: PTP_IO,
+) {
     let header = unsafe { &(*(overlapped as *mut Op)).header };
     let cb = {
         let mut s = header.shared.lock().unwrap();
@@ -181,18 +143,6 @@ unsafe fn complete_op(overlapped: *mut c_void, ioresult: u32, bytes: usize) {
     // Tail: release the kernel-side reference (may free the block and, if it
     // held the last Arc<IoReg>, close the handle).
     unsafe { release_ref(overlapped) };
-}
-
-/// The single completion callback for every registered handle.
-unsafe extern "system" fn io_complete(
-    _: PTP_CALLBACK_INSTANCE,
-    _ctx: *mut c_void,
-    overlapped: *mut c_void,
-    ioresult: u32,
-    bytes: usize,
-    _io: PTP_IO,
-) {
-    unsafe { complete_op(overlapped, ioresult, bytes) };
 }
 
 /// Opaque handle to an in-flight operation, identifying it for cancellation.
@@ -222,26 +172,15 @@ impl Drop for OpHandle {
 }
 
 /// Allocates an op block, arms the TP_IO (`StartThreadpoolIo` *before*
-/// issuing), runs `issue`, and on `Failed` or `Completed` (collectively: any
-/// outcome for which no kernel completion packet is coming) balances with
-/// `CancelThreadpoolIo` and re-dispatches the completion to the process
-/// default thread pool (`windows_threading::submit`) instead of calling
-/// `on_complete` inline. This guarantees every completion — synchronous or
-/// asynchronous — is delivered on a thread-pool thread, never on the
-/// caller's own stack: callers (e.g. `ConnectionListener::arm`) can
-/// therefore treat `on_complete`/`on_result` as always running later, on a
-/// fresh callback stack, with no reentrancy to guard against.
+/// issuing), runs `issue`, and on `Failed` balances with
+/// `CancelThreadpoolIo` and calls `on_complete` synchronously.
 ///
 /// # Safety
 /// `issue` must issue exactly one overlapped operation on `reg.handle` using
 /// the provided OVERLAPPED pointer and classify its outcome truthfully:
-/// reporting `Failed`/`Completed` when a completion is still coming leads to
+/// reporting `Failed` when a completion is still coming leads to
 /// use-after-free; reporting `Pending` when none is coming leaks the block
-/// and permanently unbalances the TP_IO. `Completed` is truthful only when
-/// `reg`'s handle actually has `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` set
-/// (which `IoReg::register` guarantees) — otherwise a completion packet is
-/// *also* coming for the same synchronous success, and this re-dispatch would
-/// double-deliver.
+/// and permanently unbalances the TP_IO.
 pub(crate) unsafe fn submit(
     reg: &Arc<IoReg>,
     on_complete: CompleteFn,
@@ -263,56 +202,36 @@ pub(crate) unsafe fn submit(
 
     unsafe { StartThreadpoolIo(reg.io) };
     let outcome = unsafe { issue(&raw mut (*op).overlapped) };
-    // Both `Failed` and `Completed` mean no kernel completion packet is
-    // coming for this op (a hard synchronous failure never queues one; a
-    // synchronous success doesn't either, since `FILE_SKIP_COMPLETION_PORT_
-    // ON_SUCCESS` is set on every registered handle) — they differ only in
-    // the `(ioresult, bytes)` pair reported to `on_complete`. Compute that
-    // pair once and share the balancing + re-dispatch below.
-    let redispatch = match outcome {
-        Issue::Pending => None,
-        Issue::Failed(hr) => {
-            // Map the HRESULT to a nonzero Win32 error code: `windows`
-            // 0.62.2's `WIN32_ERROR` has no `from_error`/`from_hresult`
-            // conversion, so extract the low 16 bits when the HRESULT is in
-            // the FACILITY_WIN32 form (HRESULT_FROM_WIN32 layout), else fall
-            // back to a generic nonzero code (ERROR_GEN_FAILURE = 31). Only
-            // "nonzero" is load-bearing for callers.
-            let hr_val = hr.0 as u32;
-            let win32 = if (hr_val >> 16) & 0x7ff == 7 {
-                hr_val & 0xffff
-            } else {
-                31
-            };
-            Some((win32, 0usize))
-        }
-        Issue::Completed(ioresult, bytes) => Some((ioresult, bytes)),
-    };
-    if let Some((ioresult, bytes)) = redispatch {
+    if let Issue::Failed(hr) = outcome {
         unsafe {
-            // Balances the StartThreadpoolIo above: no kernel completion is
-            // coming for this op, so the TP_IO must be told not to expect
-            // one.
             CancelThreadpoolIo(reg.io);
+            let cb = {
+                let mut s = (*op).header.shared.lock().unwrap();
+                s.fired = true;
+                s.on_complete.take()
+            };
+            if let Some(cb) = cb {
+                // Map the HRESULT to a nonzero Win32 error code: `windows`
+                // 0.62.2's `WIN32_ERROR` has no `from_error`/`from_hresult`
+                // conversion, so extract the low 16 bits when the HRESULT is
+                // in the FACILITY_WIN32 form (HRESULT_FROM_WIN32 layout),
+                // else fall back to a generic nonzero code (ERROR_GEN_FAILURE
+                // = 31). Only "nonzero" is load-bearing for callers.
+                let hr_val = hr.0 as u32;
+                let win32 = if (hr_val >> 16) & 0x7ff == 7 {
+                    hr_val & 0xffff
+                } else {
+                    31
+                };
+                // Mirror io_complete: a panic in `cb` must not skip
+                // release_ref below, or the Op block (and its Arc<IoReg>)
+                // leaks permanently.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    cb(win32, 0)
+                }));
+            }
+            release_ref(op as *mut c_void);
         }
-        // Re-dispatch the completion to the default thread pool rather than
-        // calling `on_complete` inline: `op` (a raw pointer) is not `Send`,
-        // but the address it points to is Plain Old Data as far as the
-        // pool thread is concerned — `complete_op` re-derives the reference
-        // from it, exactly as `io_complete` does from the OVERLAPPED pointer
-        // the kernel hands back. `complete_op` sets `fired` (inside its own
-        // lock) before doing anything else observable, so an `OpHandle::cancel()`
-        // racing this dispatch either sees `fired` already true (no-op, the
-        // completion is already committed to running) or runs `CancelIoEx`
-        // on a handle with no operation outstanding (also a safe no-op,
-        // since the kernel never saw this op). `complete_op` releases the
-        // kernel-side ref exactly once, same as the async path — net
-        // refcount identical whether a completion arrives synchronously or
-        // asynchronously.
-        let op_addr = op as usize;
-        windows_threading::submit(move || unsafe {
-            complete_op(op_addr as *mut c_void, ioresult, bytes)
-        });
     }
     OpHandle { op }
 }
@@ -349,9 +268,8 @@ mod tests {
         let wptr = wbuf.as_ptr();
         let _wop = unsafe {
             submit(&sreg, Box::new(move |ioresult, bytes| { let _ = &wbuf; tx.send((ioresult, bytes)).unwrap(); }), |ovl| {
-                let mut written = 0u32;
-                match WriteFile(sreg.handle, Some(std::slice::from_raw_parts(wptr, 1)), Some(&mut written), Some(ovl)) {
-                    Ok(()) => Issue::Completed(0, written as usize),
+                match WriteFile(sreg.handle, Some(std::slice::from_raw_parts(wptr, 1)), None, Some(ovl)) {
+                    Ok(()) => Issue::Pending,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -367,9 +285,8 @@ mod tests {
         let rptr = rbuf.lock().unwrap().as_mut_ptr();
         let _rop = unsafe {
             submit(&creg, Box::new(move |ioresult, bytes| { let _ = &rbuf2; tx2.send((ioresult, bytes)).unwrap(); }), |ovl| {
-                let mut read = 0u32;
-                match ReadFile(creg.handle, Some(std::slice::from_raw_parts_mut(rptr, 1)), Some(&mut read), Some(ovl)) {
-                    Ok(()) => Issue::Completed(0, read as usize),
+                match ReadFile(creg.handle, Some(std::slice::from_raw_parts_mut(rptr, 1)), None, Some(ovl)) {
+                    Ok(()) => Issue::Pending,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -410,9 +327,8 @@ mod tests {
             let rptr = rbuf.as_ptr() as *mut u8;
             let rop = unsafe {
                 submit(&creg, Box::new(move |_ioresult, _bytes| { let _ = &rbuf; }), |ovl| {
-                    let mut read = 0u32;
-                    match ReadFile(creg.handle, Some(std::slice::from_raw_parts_mut(rptr, 1)), Some(&mut read), Some(ovl)) {
-                        Ok(()) => Issue::Completed(0, read as usize),
+                    match ReadFile(creg.handle, Some(std::slice::from_raw_parts_mut(rptr, 1)), None, Some(ovl)) {
+                        Ok(()) => Issue::Pending,
                         Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                         Err(e) => Issue::Failed(e.code()),
                     }

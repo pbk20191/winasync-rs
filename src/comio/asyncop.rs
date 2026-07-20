@@ -329,9 +329,8 @@ mod tests {
         let wp = buffer_ptr(&wib).unwrap();
         let sh = sreg.handle;
         let write_op = IoAsyncOp::<u32>::start_write(&sreg, wib.clone(), 2, move |ovl| {
-            let mut written = 0u32;
-            match unsafe { WriteFile(sh, Some(std::slice::from_raw_parts(wp, 2)), Some(&mut written), Some(ovl)) } {
-                Ok(()) => Issue::Completed(0, written as usize),
+            match unsafe { WriteFile(sh, Some(std::slice::from_raw_parts(wp, 2)), None, Some(ovl)) } {
+                Ok(()) => Issue::Pending,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                 Err(e) => Issue::Failed(e.code()),
             }
@@ -343,9 +342,8 @@ mod tests {
         let rp = buffer_ptr(&rib).unwrap();
         let ch = creg.handle;
         let read_op = IoAsyncOp::start_read(&creg, rib.clone(), (), move |ovl| {
-            let mut read = 0u32;
-            match unsafe { ReadFile(ch, Some(std::slice::from_raw_parts_mut(rp, 2)), Some(&mut read), Some(ovl)) } {
-                Ok(()) => Issue::Completed(0, read as usize),
+            match unsafe { ReadFile(ch, Some(std::slice::from_raw_parts_mut(rp, 2)), None, Some(ovl)) } {
+                Ok(()) => Issue::Pending,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                 Err(e) => Issue::Failed(e.code()),
             }
