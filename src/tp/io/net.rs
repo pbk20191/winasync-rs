@@ -401,7 +401,7 @@ impl TcpStream {
     pub fn read(
         &self,
         buf: Vec<u8>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send {
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
@@ -423,7 +423,7 @@ impl TcpStream {
     pub fn write(
         &self,
         buf: Vec<u8>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send {
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {

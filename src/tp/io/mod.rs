@@ -2,6 +2,7 @@
 //! operation block ([`Op`]) co-owned by the kernel while in flight, and the
 //! submit/complete/cancel protocol shared by files and sockets.
 
+pub mod async_rw;
 pub mod file;
 pub mod net;
 

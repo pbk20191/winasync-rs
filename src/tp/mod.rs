@@ -49,6 +49,10 @@ pub mod wait;
 #[allow(unused_imports)]
 pub use block_on::block_on;
 #[allow(unused_imports)]
+pub use io::async_rw::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, TcpStreamIo,
+};
+#[allow(unused_imports)]
 pub use io::file::File;
 #[allow(unused_imports)]
 pub use io::net::{TcpListener, TcpStream, UdpSocket};
