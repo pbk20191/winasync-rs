@@ -3,6 +3,13 @@
 //! IPv4 and IPv6 are both supported through `std::net::SocketAddr`; the sockaddr
 //! marshalling helpers ([`write_sockaddr`]/[`read_sockaddr`]) and socket
 //! creation ([`new_socket`]) are shared across all three.
+//!
+//! # IPv6 caveats
+//! An IPv6 socket is single-stack by default (Windows sets `IPV6_V6ONLY`), so an
+//! IPv6 listener does not accept IPv4-mapped connections; bind a second IPv4
+//! socket (or clear `IPV6_V6ONLY`) for dual-stack. `flowinfo`/`scope_id` are
+//! passed through to/from the OS `sockaddr_in6` as-is (no byte-swap); only
+//! non-zero flow labels crossing to a differing stack would be affected.
 
 use super::file::File;
 use super::{submit, IoRes, Issue, OpFuture};
