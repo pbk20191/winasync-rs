@@ -57,6 +57,19 @@ impl File {
         Self::open_impl(rt, path, GENERIC_READ.0 | GENERIC_WRITE.0, CREATE_ALWAYS)
     }
 
+    /// The raw file handle (for `TcpStream::transmit_file`). The returned handle
+    /// is only valid while this `File` (or a shared [`res_arc`](Self::res_arc)
+    /// clone) is alive.
+    pub(crate) fn handle(&self) -> windows::Win32::Foundation::HANDLE {
+        self.res.handle
+    }
+
+    /// A clone of the refcounted IO resource, used to keep the file handle alive
+    /// for the duration of a `TransmitFile` op issued on a *socket*.
+    pub(crate) fn res_arc(&self) -> Arc<IoRes> {
+        self.res.clone()
+    }
+
     fn start_read(&self, buf: Vec<u8>, pos: u64) -> OpFuture<Vec<u8>> {
         let handle = self.res.handle;
         unsafe {

@@ -4,6 +4,7 @@
 //! marshalling helpers ([`write_sockaddr`]/[`read_sockaddr`]) and socket
 //! creation ([`new_socket`]) are shared across all three.
 
+use super::file::File;
 use super::{submit, IoRes, Issue};
 use crate::tp::{Runtime, RuntimeInner};
 use core::ffi::c_void;
@@ -12,12 +13,12 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Once, OnceLock};
 use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx,
+    bind, closesocket, connect, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx,
     WSAGetLastError, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW, WSAStartup,
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
     IPPROTO, IPPROTO_TCP, IPPROTO_UDP, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
-    SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
+    SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TransmitFile,
     WINSOCK_SOCKET_TYPE, WSABUF, WSADATA, WSAID_CONNECTEX, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
 };
 
@@ -446,6 +447,16 @@ impl TcpStream {
         sock_check(unsafe { shutdown(self.res.socket(), SD_SEND) })
     }
 
+    /// A second handle onto the same socket (shared via the refcounted
+    /// `IoRes`); the socket closes only once all handles drop. Used by
+    /// `TcpStreamIo::split` to drive the read and write halves independently —
+    /// concurrent WSARecv (read) and WSASend (write) on one socket is supported.
+    pub(super) fn share(&self) -> TcpStream {
+        TcpStream {
+            res: self.res.clone(),
+        }
+    }
+
     /// The locally bound address of this connected socket.
     pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
         addr_of_socket(self.res.socket())
@@ -454,6 +465,37 @@ impl TcpStream {
     /// The remote peer's address.
     pub fn peer_addr(&self) -> windows_core::Result<SocketAddr> {
         peer_of_socket(self.res.socket())
+    }
+
+    /// Sends (part of) an open overlapped `file`'s contents over the socket
+    /// using the kernel's `TransmitFile` — a zero-copy path straight from the
+    /// file-system cache, without staging the bytes through user space.
+    ///
+    /// `offset` is the starting position in the file; `count == 0` sends from
+    /// `offset` to end of file. Resolves to the number of bytes transmitted.
+    /// The op completes on this socket's TP_IO like any other overlapped send.
+    pub fn transmit_file(
+        &self,
+        file: &File,
+        offset: u64,
+        count: u32,
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+        let sock = self.res.socket();
+        let file_handle = file.handle();
+        // Keep the file's IoRes (hence its HANDLE) alive for the op's lifetime.
+        let keepalive = file.res_arc();
+        let fut = unsafe {
+            submit(&self.res, keepalive, move |ovl, _keepalive| {
+                (*ovl).Anonymous.Anonymous.Offset = offset as u32;
+                (*ovl).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+                let ok = TransmitFile(sock, file_handle, count, 0, Some(ovl), None, 0);
+                classify_wsa_overlapped(ok.as_bool())
+            })
+        };
+        async move {
+            let (result, _keepalive) = fut.await;
+            result
+        }
     }
 }
 
@@ -548,6 +590,10 @@ impl UdpSocket {
 
     /// Receives one datagram into `buf`; resolves to the byte count plus the
     /// source address, and hands the buffer back.
+    ///
+    /// A datagram larger than `buf` is truncated to `buf.len()` and the op fails
+    /// with `WSAEMSGSIZE` (the Windows semantics for an oversized datagram); the
+    /// partial bytes are discarded. Size `buf` to the largest datagram expected.
     pub fn recv_from(
         &self,
         buf: Vec<u8>,
@@ -588,6 +634,65 @@ impl UdpSocket {
                 Err(e) => Err(e),
             };
             (out, payload.buf)
+        }
+    }
+
+    /// Sets the default peer: afterwards [`send`](Self::send)/[`recv`](Self::recv)
+    /// talk only to `addr`, and datagrams from other sources are dropped. UDP
+    /// `connect` is a local operation (no handshake), so this is synchronous.
+    pub fn connect(&self, addr: SocketAddr) -> windows_core::Result<()> {
+        let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let len = write_sockaddr(&addr, &mut storage);
+        sock_check(unsafe {
+            connect(self.res.socket(), &storage as *const _ as *const SOCKADDR, len)
+        })
+    }
+
+    /// Sends `buf` as one datagram to the connected peer (see
+    /// [`connect`](Self::connect)); resolves to the byte count and hands the
+    /// buffer back.
+    pub fn send(
+        &self,
+        buf: Vec<u8>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(&self.res, buf, move |ovl, buf| {
+                let wsabuf = WSABUF {
+                    len: buf.len() as u32,
+                    buf: windows_core::PSTR(buf.as_mut_ptr()),
+                };
+                let r = WSASend(sock, &[wsabuf], None, 0, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, buf) = fut.await;
+            (result, buf)
+        }
+    }
+
+    /// Receives one datagram from the connected peer into `buf`; resolves to the
+    /// byte count and hands the buffer back. Truncation fails with `WSAEMSGSIZE`
+    /// (see [`recv_from`](Self::recv_from)).
+    pub fn recv(
+        &self,
+        buf: Vec<u8>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
+                let wsabuf = WSABUF {
+                    len: p.buf.len() as u32,
+                    buf: windows_core::PSTR(p.buf.as_mut_ptr()),
+                };
+                let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.buf)
         }
     }
 }
@@ -755,6 +860,86 @@ mod tests {
             assert!(matches!(from, SocketAddr::V6(_)));
         }));
         result.expect("udp ipv6 roundtrip timed out");
+    }
+
+    #[test]
+    fn udp_connected_send_recv() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client_addr = client.local_addr().unwrap();
+
+            // Pin each socket to the other so send/recv work without addresses.
+            client.connect(server_addr).unwrap();
+            server.connect(client_addr).unwrap();
+
+            client.send(b"hi".to_vec()).await.0.unwrap();
+            let (n, b) = server.recv(vec![0u8; 64]).await;
+            assert_eq!(&b[..n.unwrap()], b"hi");
+
+            server.send(b"yo".to_vec()).await.0.unwrap();
+            let (n, b) = client.recv(vec![0u8; 64]).await;
+            assert_eq!(&b[..n.unwrap()], b"yo");
+        }));
+        result.expect("udp connected send/recv timed out");
+    }
+
+    #[test]
+    fn transmit_file_over_tcp() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let path = {
+                let mut p = std::env::temp_dir();
+                p.push(format!("tp_transmit_{}.bin", std::process::id()));
+                p.to_string_lossy().into_owned()
+            };
+            let content: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+            let file = crate::tp::File::create(&rt, &path).unwrap();
+            let (w, _) = file.write_at(content.clone(), 0).await;
+            assert_eq!(w.unwrap(), content.len());
+
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Server streams the whole file over the socket, then half-closes.
+            let server = rt.spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                let n = stream.transmit_file(&file, 0, 0).await.unwrap();
+                stream.shutdown_send().unwrap();
+                n
+            });
+
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let mut got = Vec::new();
+            loop {
+                let (n, b) = client.read(vec![0u8; 8192]).await;
+                let n = n.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&b[..n]);
+            }
+            let sent = server.await.unwrap();
+            (sent, got, content, path)
+        }));
+        let (sent, got, content, path) = result.expect("transmit_file timed out");
+        assert_eq!(sent, content.len());
+        assert_eq!(got, content);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
