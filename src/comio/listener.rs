@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use core::ffi::c_void;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Foundation::{IClosable_Impl, TypedEventHandler};
@@ -88,6 +89,20 @@ impl AcceptSource {
 /// accept chain (see [`arm`]), so `Close` can flip `closed`/cancel the
 /// in-flight accept out from under it, and the chain can tell it has been
 /// asked to stop.
+///
+/// # Handler gating
+/// The accept chain runs only while the listener is *wanted running*
+/// ([`want_running`]): not closed, bound (`source` is `Some`), *and* at least
+/// one `ConnectionReceived` handler is registered. Binding alone no longer
+/// accepts connections — without a consumer, an accepted stream would just be
+/// dropped. The chain is (re)started by whichever of `BindAsync` /
+/// `ConnectionReceived` completes that condition, and paused — the in-flight
+/// accept cancelled — when the last handler is removed. `running` is the
+/// "a chain is logically active" flag that serializes starts: it is CAS'd
+/// `false -> true` exactly once per chain start ([`ensure_running`]) and set
+/// back to `false` exactly once when the chain stops ([`stop_chain`], which
+/// also re-checks `want_running` and restarts to close the add-races-stop
+/// window).
 struct ListenerState {
     closed: AtomicBool,
     event: windows_core::Event<TypedEventHandler<IInspectable, IInspectable>>,
@@ -100,6 +115,12 @@ struct ListenerState {
     /// recurses/re-enters on the caller's own stack and a plain
     /// `Option<OpHandle>` (no sequence tag) is sufficient here.
     current_op: Mutex<Option<OpHandle>>,
+    /// Live `ConnectionReceived` tokens — `windows_core::Event` exposes no
+    /// count, so handler presence (the gating predicate) is tracked here.
+    handlers: Mutex<HashSet<i64>>,
+    /// Whether an accept chain is logically active. See the type-level
+    /// "Handler gating" note.
+    running: AtomicBool,
 }
 
 impl ListenerState {
@@ -110,6 +131,8 @@ impl ListenerState {
             endpoint: Mutex::new(None),
             source: Mutex::new(None),
             current_op: Mutex::new(None),
+            handlers: Mutex::new(HashSet::new()),
+            running: AtomicBool::new(false),
         }
     }
 }
@@ -150,6 +173,7 @@ impl Drop for ConnectionListener {
             op.cancel();
         }
         self.state.event.clear();
+        self.state.handlers.lock().unwrap().clear();
     }
 }
 
@@ -174,6 +198,13 @@ impl ConnectionListener {
 
     /// Registers `handler` to be invoked (on a thread-pool thread) for each
     /// accepted connection. Returns a token for `RemoveConnectionReceived`.
+    ///
+    /// Registering the *first* handler starts the accept chain if the listener
+    /// is already bound (handler gating — see [`ListenerState`]): a listener
+    /// with no `ConnectionReceived` consumer does not accept connections. A
+    /// failure to start the chain here (e.g. a malformed bound endpoint) is
+    /// intentionally not surfaced — registration still succeeds and returns
+    /// the token; the error path is `BindAsync`'s.
     #[allow(non_snake_case)]
     pub fn ConnectionReceived(
         &self,
@@ -182,33 +213,67 @@ impl ConnectionListener {
         if self.state.closed.load(Ordering::Acquire) {
             return Err(Error::from_hresult(RO_E_CLOSED));
         }
-        self.state.event.add(handler)
+        let token = self.state.event.add(handler)?;
+        let first = {
+            let mut h = self.state.handlers.lock().unwrap();
+            let was_empty = h.is_empty();
+            h.insert(token);
+            was_empty
+        };
+        if first {
+            // First consumer: start accepting (no-op if not bound yet).
+            let _ = ensure_running(self.state.clone());
+        }
+        Ok(token)
     }
 
     /// Revokes a previously registered `ConnectionReceived` handler.
+    ///
+    /// Removing the *last* handler pauses the accept chain (handler gating —
+    /// see [`ListenerState`]): the in-flight accept is cancelled so the
+    /// listener stops accepting connections no one would receive. A later
+    /// `ConnectionReceived` resumes it.
     #[allow(non_snake_case)]
     pub fn RemoveConnectionReceived(&self, token: i64) -> Result<()> {
         if self.state.closed.load(Ordering::Acquire) {
             return Err(Error::from_hresult(RO_E_CLOSED));
         }
         self.state.event.remove(token);
+        let now_empty = {
+            let mut h = self.state.handlers.lock().unwrap();
+            h.remove(&token);
+            h.is_empty()
+        };
+        if now_empty {
+            // No consumers left: cancel the in-flight accept. Its `on_result`
+            // (Err, from the cancellation) runs `stop_chain`, which — seeing
+            // `want_running` now false — leaves the chain stopped.
+            if let Some(op) = self.state.current_op.lock().unwrap().take() {
+                op.cancel();
+            }
+        }
         Ok(())
     }
 
     /// Records `endpoint` (the pipe name / socket path, depending on
-    /// transport) and issues the first accept of the self-re-arming
-    /// completion chain (see [`arm`]). For the named-pipe transport,
-    /// binding is deferred to the first `arm_accept` call (it creates its
-    /// own pipe instance); for the AF_UNIX transport, the persistent listen
-    /// socket is created here (so a bind error — e.g. a stale socket file —
-    /// surfaces synchronously from this call rather than later) and then
-    /// shared into the chain via `ListenerState::source`. Either way, a
-    /// synchronous failure to issue the *first* accept (e.g. a malformed
-    /// pipe name) is also surfaced synchronously from this call — only
-    /// re-arms triggered internally by a later completion can't propagate a
-    /// `Result` anywhere and instead just stop the chain (see `arm`). The
-    /// returned `IAsyncAction` is already completed once this call returns
-    /// `Ok`.
+    /// transport) and — *if a `ConnectionReceived` handler is already
+    /// registered* (handler gating, see [`ListenerState`]) — issues the first
+    /// accept of the self-re-arming completion chain (see [`arm`]). With no
+    /// handler yet, binding only records the endpoint/source; the chain starts
+    /// later, when the first handler is registered. For the named-pipe
+    /// transport, binding is deferred to the first `arm_accept` call (it
+    /// creates its own pipe instance); for the AF_UNIX transport, the
+    /// persistent listen socket is created here regardless of gating (so a
+    /// bind error — e.g. a stale socket file — surfaces synchronously from
+    /// this call rather than later) and then shared into the chain via
+    /// `ListenerState::source`.
+    ///
+    /// When a handler is present, a synchronous failure to issue the *first*
+    /// accept (e.g. a malformed pipe name) is surfaced synchronously from this
+    /// call — only re-arms triggered internally by a later completion can't
+    /// propagate a `Result` anywhere and instead just stop the chain (see
+    /// `arm`). The returned `IAsyncAction` is already completed once this call
+    /// returns `Ok`.
     ///
     /// # Not safe to call concurrently with an already-running accept chain
     /// Calling `BindAsync` again *sequentially* (e.g. to rebind after a
@@ -245,7 +310,10 @@ impl ConnectionListener {
         *self.state.source.lock().unwrap() = Some(Arc::new(source));
         *self.state.endpoint.lock().unwrap() = Some(endpoint.clone());
 
-        arm(self.state.clone())?;
+        // Start accepting only if a consumer is already registered (handler
+        // gating). No handler => no accept; the chain starts on the first
+        // `ConnectionReceived`.
+        ensure_running(self.state.clone())?;
 
         Ok(IAsyncAction::spawn(|| Ok(())))
     }
@@ -268,6 +336,67 @@ impl ConnectionListener {
             return Err(Error::from_hresult(RO_E_CLOSED));
         }
         Ok(self.state.endpoint.lock().unwrap().clone().unwrap_or_default())
+    }
+}
+
+/// The handler-gating predicate: the accept chain should be running iff the
+/// listener is not closed, is bound (`source` is `Some`), and has at least one
+/// registered `ConnectionReceived` handler. Each sub-lock is taken and
+/// released in turn (never nested) so there is no lock-ordering hazard with
+/// the mutating paths.
+fn want_running(state: &ListenerState) -> bool {
+    if state.closed.load(Ordering::Acquire) {
+        return false;
+    }
+    if state.source.lock().unwrap().is_none() {
+        return false;
+    }
+    !state.handlers.lock().unwrap().is_empty()
+}
+
+/// Starts the accept chain if it is wanted and not already running. The
+/// `running` CAS is the single serialization point: only the thread that flips
+/// it `false -> true` issues the first accept, so concurrent callers
+/// (`BindAsync`, `ConnectionReceived`, a restarting `stop_chain`) never start
+/// two overlapping chains. Returns the first accept's synchronous error (and
+/// releases the flag) so `BindAsync` can surface it; callers that can't act on
+/// an error ignore it.
+fn ensure_running(state: Arc<ListenerState>) -> Result<()> {
+    if !want_running(&state) {
+        return Ok(());
+    }
+    if state
+        .running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // A chain is already active; it will keep re-arming on its own.
+        return Ok(());
+    }
+    match arm(state.clone()) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Couldn't issue the first accept — release the flag so a later
+            // bind/handler can retry.
+            state.running.store(false, Ordering::Release);
+            Err(e)
+        }
+    }
+}
+
+/// Marks the chain stopped, then restarts it if it is (still/again) wanted.
+/// The restart closes the race where a handler is added — or the listener
+/// rebound — while an in-flight completion is on its way to parking the chain:
+/// that completion would otherwise store `running = false` *after* the adder's
+/// `ensure_running` CAS already failed against the still-`true` flag, leaving
+/// a wanted-but-stopped listener. Re-checking here (and re-CASing via
+/// `ensure_running`) guarantees forward progress; the CAS keeps it to a single
+/// chain. Recursion is bounded: the restart only re-enters `arm` when the
+/// listener is wanted, in which case `arm` issues an op and returns.
+fn stop_chain(state: Arc<ListenerState>) {
+    state.running.store(false, Ordering::Release);
+    if want_running(&state) {
+        let _ = ensure_running(state);
     }
 }
 
@@ -305,7 +434,10 @@ impl ConnectionListener {
 /// `on_result` ignores it instead (there is nowhere else to surface it to,
 /// and stopping the chain is the correct response either way).
 fn arm(state: Arc<ListenerState>) -> Result<()> {
-    if state.closed.load(Ordering::Acquire) {
+    if !want_running(&state) {
+        // Closed, unbound, or no handler — the chain must not run. Mark it
+        // stopped (and let `stop_chain` restart it if a handler raced back in).
+        stop_chain(state);
         return Ok(());
     }
 
@@ -316,13 +448,17 @@ fn arm(state: Arc<ListenerState>) -> Result<()> {
     // holding it across an FFI-adjacent call.
     let source = state.source.lock().unwrap().clone();
     let Some(source) = source else {
-        // Not bound yet; nothing to do.
+        // `want_running` observed a bound source a moment ago but it's gone
+        // now; nothing to arm. (Source is never cleared today, so this is a
+        // defensive path.)
+        stop_chain(state);
         return Ok(());
     };
 
     let state_cb = state.clone();
     let on_result: Box<dyn FnOnce(Result<IInspectable>) + Send> = Box::new(move |res| {
         if state_cb.closed.load(Ordering::Acquire) {
+            stop_chain(state_cb);
             return;
         }
         match res {
@@ -334,23 +470,32 @@ fn arm(state: Arc<ListenerState>) -> Result<()> {
                     .clone()
                     .unwrap_or_default();
                 fire_event(&state_cb, stream, endpoint);
-                // Re-arm for the next connection. `on_result` may be running
+                // Re-arm for the next connection — but only while still wanted
+                // (not closed, still bound, still has a handler); otherwise
+                // park the chain via `stop_chain`. `on_result` may be running
                 // synchronously, inline on the thread that called `arm` (the
                 // `ERROR_PIPE_CONNECTED` "already connected" case), so calling
                 // `arm` directly here could recurse once per already-queued
                 // client. Defer the re-arm to the default thread pool instead:
                 // it always starts on a fresh callback stack, bounding depth
                 // to O(1) (see this fn's doc comment).
-                let next = state_cb.clone();
-                windows_threading::submit(move || {
-                    let _ = arm(next);
-                });
+                if want_running(&state_cb) {
+                    let next = state_cb.clone();
+                    windows_threading::submit(move || {
+                        let _ = arm(next);
+                    });
+                } else {
+                    stop_chain(state_cb);
+                }
             }
             Err(_) => {
-                // Hard accept failure (or a cancellation from Close racing
-                // the in-flight accept). Stop without re-arming: retrying a
-                // persistent failure here would hot-spin this pool thread,
-                // and a cancellation means we're closing anyway.
+                // Hard accept failure, or a cancellation from Close / the last
+                // handler being removed racing the in-flight accept. Stop
+                // without re-arming: retrying a persistent failure here would
+                // hot-spin this pool thread, and a cancellation means we're
+                // closing or pausing anyway. `stop_chain` releases `running`
+                // and restarts only if the listener is wanted again.
+                stop_chain(state_cb);
             }
         }
     });
@@ -359,10 +504,11 @@ fn arm(state: Arc<ListenerState>) -> Result<()> {
 
     *state.current_op.lock().unwrap() = Some(op);
 
-    // Double-check: a Close racing this re-arm (observed `closed` as false
-    // above, then flipped it true before this stored the op) must still
-    // cancel the op just stored.
-    if state.closed.load(Ordering::Acquire) {
+    // Double-check: a Close — or the last `RemoveConnectionReceived` — racing
+    // this re-arm (observed as wanted above, then made unwanted before this
+    // stored the op) must still cancel the op just stored. The cancelled op's
+    // `on_result` (Err) then runs `stop_chain`.
+    if !want_running(&state) {
         if let Some(op) = state.current_op.lock().unwrap().take() {
             op.cancel();
         }
@@ -395,6 +541,7 @@ impl IClosable_Impl for ConnectionListener_Impl {
             op.cancel();
         }
         self.state.event.clear();
+        self.state.handlers.lock().unwrap().clear();
         Ok(())
     }
 }
@@ -680,9 +827,17 @@ mod listener_tests {
     /// must surface as an `Err` from `BindAsync` itself, not get swallowed
     /// (the way an internal re-arm's failure is, deliberately, — see
     /// `arm`'s doc comment).
+    ///
+    /// A handler is registered *before* `BindAsync` so the accept chain is
+    /// actually started by it (handler gating — with no handler, `BindAsync`
+    /// records the endpoint but issues no accept, so there would be no
+    /// error to surface; see the zero-handler case in
+    /// `accept_gated_on_handler`).
     #[test]
     fn bind_async_surfaces_first_accept_error() {
         let listener = ConnectionListener::named_pipe();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
+        listener.ConnectionReceived(&handler).unwrap();
         let err = listener
             .BindAsync(&HSTRING::from("not_a_valid_pipe_name"))
             .unwrap_err();
@@ -690,6 +845,65 @@ mod listener_tests {
         // The listener is otherwise still usable (BindAsync failing isn't
         // the same as Close): a well-formed retry should still work.
         assert!(listener.Information().is_err() || listener.Information().is_ok());
+    }
+
+    /// Handler gating: a bound listener with **no** `ConnectionReceived`
+    /// handler must not accept connections (no pipe instance is created, so a
+    /// client can't connect); registering the first handler starts accepting,
+    /// and the handler then receives the connection.
+    #[test]
+    fn accept_gated_on_handler() {
+        let name = format!(r"\\.\pipe\comio_listener_gate_{}", std::process::id());
+        let listener = ConnectionListener::named_pipe();
+
+        // Bind with no handler registered. Gating => no accept chain, so no
+        // pipe instance exists and a client connect must fail.
+        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            block_on(crate::comio::NamedPipeClient::connect(&name)).is_err(),
+            "connected to a listener that has no ConnectionReceived handler"
+        );
+
+        // Register the first handler => chain starts (the first pipe instance
+        // is created synchronously inside `ConnectionReceived`), so a client
+        // can now connect and the handler fires.
+        let (tx, rx) = mpsc::channel::<usize>();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
+            let a = args.as_ref().unwrap();
+            let cra: IConnectionReceivedArgs = a.cast().unwrap();
+            let raw = unsafe {
+                let mut raw = core::ptr::null_mut();
+                cra.Stream(&mut raw).ok()?;
+                raw as usize
+            };
+            let _ = tx.send(raw);
+            Ok(())
+        });
+        listener.ConnectionReceived(&handler).unwrap();
+
+        let client = {
+            let mut last = None;
+            for _ in 0..50 {
+                match block_on(crate::comio::NamedPipeClient::connect(&name)) {
+                    Ok(c) => {
+                        last = Some(c);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            last.expect("client failed to connect after a handler was registered")
+        };
+        let server_raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("no ConnectionReceived after registering a handler");
+        // Reconstitute + drop the delivered stream so the op doesn't linger.
+        let _server = unsafe { IInspectable::from_raw(server_raw as *mut core::ffi::c_void) };
+        drop(client);
+
+        let closable: IClosable = listener.cast().unwrap();
+        closable.Close().unwrap();
     }
 
     /// Concurrent-backlog liveness test. Originally written to probe a
