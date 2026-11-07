@@ -5,7 +5,7 @@
 //! creation ([`new_socket`]) are shared across all three.
 
 use super::file::File;
-use super::{submit, IoRes, Issue};
+use super::{submit, IoRes, Issue, OpFuture};
 use crate::tp::{Runtime, RuntimeInner};
 use core::ffi::c_void;
 use std::mem;
@@ -19,7 +19,9 @@ use windows::Win32::Networking::WinSock::{
     IPPROTO, IPPROTO_TCP, IPPROTO_UDP, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
     SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TransmitFile,
-    WINSOCK_SOCKET_TYPE, WSABUF, WSADATA, WSAID_CONNECTEX, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
+    TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT, TRANSMIT_PACKETS_ELEMENT_0,
+    TRANSMIT_PACKETS_ELEMENT_0_0, WINSOCK_SOCKET_TYPE, WSABUF, WSADATA, WSAID_CONNECTEX,
+    WSAID_TRANSMITPACKETS, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
 };
 
 /// Process-wide Winsock initialization; never torn down (`WSACleanup` is
@@ -207,6 +209,46 @@ fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
         return Err(wsa_last_err());
     }
     let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null ConnectEx");
+    let _ = PTR.set(f as usize);
+    Ok(f)
+}
+
+type TransmitPacketsFn = unsafe extern "system" fn(
+    s: SOCKET,
+    lppacketarray: *mut TRANSMIT_PACKETS_ELEMENT,
+    nelementcount: u32,
+    nsendsize: u32,
+    lpoverlapped: *mut windows::Win32::System::IO::OVERLAPPED,
+    dwflags: u32,
+) -> windows_core::BOOL;
+
+/// `TransmitPackets` is a provider extension (no direct export): fetch its
+/// function pointer via `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` once and
+/// cache it, like [`get_connectex`].
+fn get_transmitpackets(sock: SOCKET) -> windows_core::Result<TransmitPacketsFn> {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    if let Some(&p) = PTR.get() {
+        return Ok(unsafe { mem::transmute::<usize, TransmitPacketsFn>(p) });
+    }
+    let mut fptr: Option<TransmitPacketsFn> = None;
+    let mut bytes = 0u32;
+    let r = unsafe {
+        WSAIoctl(
+            sock,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            Some(&WSAID_TRANSMITPACKETS as *const _ as *const c_void),
+            size_of::<windows_core::GUID>() as u32,
+            Some(&mut fptr as *mut _ as *mut c_void),
+            size_of::<Option<TransmitPacketsFn>>() as u32,
+            &mut bytes,
+            None,
+            None,
+        )
+    };
+    if r != 0 {
+        return Err(wsa_last_err());
+    }
+    let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null TransmitPackets");
     let _ = PTR.set(f as usize);
     Ok(f)
 }
@@ -497,7 +539,136 @@ impl TcpStream {
             result
         }
     }
+
+    /// Sends a sequence of in-memory buffers and/or file ranges as one
+    /// `TransmitPackets` call — a single-syscall scatter of mixed memory and
+    /// file sources, transmitted in insertion order. Resolves to the total
+    /// number of bytes sent. See [`TransmitPackets`] for building the sequence.
+    pub fn transmit_packets(
+        &self,
+        packets: TransmitPackets,
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+        let sock = self.res.socket();
+        // Fetch the extension pointer and issue the op *synchronously*, so the
+        // returned async block captures only the (Send) OpFuture — never the
+        // non-Send HANDLEs, which are consumed here into the op block.
+        let started: windows_core::Result<OpFuture<TransmitPacketsPayload>> = (|| {
+            let transmit = get_transmitpackets(sock)?;
+            let TransmitPackets { elems } = packets;
+            let count = elems.len();
+            let payload = TransmitPacketsPayload {
+                elems,
+                array: Vec::with_capacity(count),
+            };
+            Ok(unsafe {
+                submit(&self.res, payload, move |ovl, p| {
+                    // Build the element array in place (it and the memory
+                    // buffers it points at all live in the op block for the
+                    // op's duration). Pre-reserved, so no realloc moves it.
+                    p.array.clear();
+                    for e in p.elems.iter_mut() {
+                        let el = match e {
+                            Elem::Mem(buf) => TRANSMIT_PACKETS_ELEMENT {
+                                dwElFlags: TP_ELEMENT_MEMORY,
+                                cLength: buf.len() as u32,
+                                Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
+                                    pBuffer: buf.as_mut_ptr() as *mut c_void,
+                                },
+                            },
+                            Elem::File {
+                                handle,
+                                offset,
+                                length,
+                                ..
+                            } => TRANSMIT_PACKETS_ELEMENT {
+                                dwElFlags: TP_ELEMENT_FILE,
+                                cLength: *length,
+                                Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
+                                    Anonymous: TRANSMIT_PACKETS_ELEMENT_0_0 {
+                                        nFileOffset: *offset,
+                                        hFile: *handle,
+                                    },
+                                },
+                            },
+                        };
+                        p.array.push(el);
+                    }
+                    let ok = transmit(
+                        sock,
+                        p.array.as_mut_ptr(),
+                        p.array.len() as u32,
+                        0,
+                        ovl,
+                        0,
+                    );
+                    classify_wsa_overlapped(ok.as_bool())
+                })
+            })
+        })();
+        async move {
+            match started {
+                Ok(fut) => fut.await.0,
+                Err(e) => Err(e),
+            }
+        }
+    }
 }
+
+/// One element of a [`TransmitPackets`] sequence: an owned memory buffer, or a
+/// range of an open file (kept alive via its `IoRes`).
+enum Elem {
+    Mem(Vec<u8>),
+    File {
+        /// Keeps the file handle valid for the op's lifetime.
+        _keep: Arc<IoRes>,
+        handle: HANDLE,
+        offset: i64,
+        length: u32,
+    },
+}
+
+/// A builder for [`TcpStream::transmit_packets`]: an ordered mix of in-memory
+/// buffers and open-file ranges, sent in one `TransmitPackets` syscall.
+#[derive(Default)]
+pub struct TransmitPackets {
+    elems: Vec<Elem>,
+}
+
+impl TransmitPackets {
+    /// A new, empty sequence.
+    pub fn new() -> Self {
+        Self { elems: Vec::new() }
+    }
+
+    /// Appends an in-memory buffer (sent inline).
+    pub fn bytes(mut self, buf: Vec<u8>) -> Self {
+        self.elems.push(Elem::Mem(buf));
+        self
+    }
+
+    /// Appends a byte range of an open overlapped `file` (`length == 0` sends to
+    /// end of file). The file is kept alive until the transmit completes.
+    pub fn file(mut self, file: &File, offset: i64, length: u32) -> Self {
+        self.elems.push(Elem::File {
+            _keep: file.res_arc(),
+            handle: file.handle(),
+            offset,
+            length,
+        });
+        self
+    }
+}
+
+/// Op-block payload for `TransmitPackets`: owns every memory buffer and file
+/// keepalive, plus the element array the kernel reads.
+struct TransmitPacketsPayload {
+    elems: Vec<Elem>,
+    array: Vec<TRANSMIT_PACKETS_ELEMENT>,
+}
+
+// All raw handles/pointers held here are plain kernel values / stable heap
+// pointers into this same payload; moving the payload is sound.
+unsafe impl Send for TransmitPacketsPayload {}
 
 /// Payload of a WSARecvFrom: the buffer, the flags word, and the source
 /// address slot — all written by the provider at completion time, so all must
@@ -939,6 +1110,58 @@ mod tests {
         let (sent, got, content, path) = result.expect("transmit_file timed out");
         assert_eq!(sent, content.len());
         assert_eq!(got, content);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transmit_packets_mem_and_file() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let path = {
+                let mut p = std::env::temp_dir();
+                p.push(format!("tp_packets_{}.bin", std::process::id()));
+                p.to_string_lossy().into_owned()
+            };
+            let body: Vec<u8> = (0..8000u32).map(|i| (i % 251) as u8).collect();
+            let file = crate::tp::File::create(&rt, &path).unwrap();
+            file.write_at(body.clone(), 0).await.0.unwrap();
+            let header = b"HDR:".to_vec();
+
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Server scatters an in-memory header + the whole file in one call.
+            let hdr = header.clone();
+            let server = rt.spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                let pk = TransmitPackets::new().bytes(hdr).file(&file, 0, 0);
+                let n = stream.transmit_packets(pk).await.unwrap();
+                stream.shutdown_send().unwrap();
+                n
+            });
+
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let mut got = Vec::new();
+            loop {
+                let (n, b) = client.read(vec![0u8; 8192]).await;
+                let n = n.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&b[..n]);
+            }
+            let sent = server.await.unwrap();
+            (sent, got, header, body, path)
+        }));
+        let (sent, got, header, body, path) = result.expect("transmit_packets timed out");
+        let mut expected = header;
+        expected.extend_from_slice(&body);
+        assert_eq!(got, expected, "scattered header+file bytes mismatch");
+        assert_eq!(sent, expected.len());
         let _ = std::fs::remove_file(&path);
     }
 
