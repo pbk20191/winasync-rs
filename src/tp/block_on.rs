@@ -53,20 +53,20 @@ impl Drop for Parker {
         }
     }
 }
+static VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |p| {
+        unsafe { Arc::increment_strong_count(p as *const Parker) };
+        raw_waker(p as *const Parker)
+    },
+    |p| {
+        let parker = unsafe { Arc::from_raw(p as *const Parker) };
+        parker.unpark();
+    },
+    |p| unsafe { (*(p as *const Parker)).unpark() },
+    |p| unsafe { drop(Arc::from_raw(p as *const Parker)) },
+);
 
 fn raw_waker(parker: *const Parker) -> RawWaker {
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |p| {
-            unsafe { Arc::increment_strong_count(p as *const Parker) };
-            raw_waker(p as *const Parker)
-        },
-        |p| {
-            let parker = unsafe { Arc::from_raw(p as *const Parker) };
-            parker.unpark();
-        },
-        |p| unsafe { (*(p as *const Parker)).unpark() },
-        |p| unsafe { drop(Arc::from_raw(p as *const Parker)) },
-    );
     RawWaker::new(parker as *const (), &VTABLE)
 }
 
