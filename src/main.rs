@@ -11,7 +11,7 @@ use winui3::Microsoft::UI::Dispatching::{DispatcherQueue, DispatcherQueueHandler
 
 /// Demo of the TP_* based async runtime in `src/tp/`.
 fn tp_demo() {
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
 
     let rt = tp::Runtime::new();
@@ -52,7 +52,8 @@ fn tp_demo() {
         let file_text = String::from_utf8(buf).unwrap();
 
         // Async TCP echo (AcceptEx / ConnectEx / WSARecv / WSASend)
-        let listener = tp::TcpListener::bind(&rt2, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener =
+            tp::TcpListener::bind(&rt2, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = rt2.spawn(async move {
             let s = listener.accept().await.unwrap();

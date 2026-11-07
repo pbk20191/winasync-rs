@@ -1,20 +1,23 @@
 //! Async TCP over TP_IO: `TcpListener` (AcceptEx) and `TcpStream`
-//! (ConnectEx / WSARecv / WSASend).
+//! (ConnectEx / WSARecv / WSASend). IPv4 and IPv6 are both supported through
+//! `std::net::SocketAddr`; the sockaddr marshalling helpers
+//! ([`write_sockaddr`]/[`read_sockaddr`]) are shared with the UDP code.
 
 use super::{submit, IoRes, Issue};
 use crate::tp::{Runtime, RuntimeInner};
 use core::ffi::c_void;
 use std::mem;
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Once, OnceLock};
 use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, getsockname, listen, setsockopt, shutdown, AcceptEx, WSAGetLastError,
-    WSAIoctl, WSARecv, WSASend, WSASocketW, WSAStartup, AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
-    IPPROTO_TCP, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT,
-    SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSADATA, WSAID_CONNECTEX, WSA_FLAG_OVERLAPPED,
-    WSA_IO_PENDING,
+    bind, closesocket, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx,
+    WSAGetLastError, WSAIoctl, WSARecv, WSASend, WSASocketW, WSAStartup, ADDRESS_FAMILY, AF_INET,
+    AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO, IPPROTO_TCP,
+    SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
+    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WINSOCK_SOCKET_TYPE, WSABUF, WSADATA,
+    WSAID_CONNECTEX, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
 };
 
 /// Process-wide Winsock initialization; never torn down (`WSACleanup` is
@@ -44,13 +47,19 @@ fn sock_check(r: i32) -> windows_core::Result<()> {
     }
 }
 
-fn new_socket() -> windows_core::Result<SOCKET> {
+/// Creates an overlapped socket of the given family/type/protocol. `WSASocketW`
+/// is wrapped by the `windows` crate to map `INVALID_SOCKET` to an `Err`.
+fn new_socket(
+    family: ADDRESS_FAMILY,
+    socktype: WINSOCK_SOCKET_TYPE,
+    proto: IPPROTO,
+) -> windows_core::Result<SOCKET> {
     wsa_init();
     unsafe {
         WSASocketW(
-            AF_INET.0 as i32,
-            SOCK_STREAM.0,
-            IPPROTO_TCP.0,
+            family.0 as i32,
+            socktype.0,
+            proto.0,
             None,
             0,
             WSA_FLAG_OVERLAPPED,
@@ -58,27 +67,105 @@ fn new_socket() -> windows_core::Result<SOCKET> {
     }
 }
 
-fn sockaddr_v4(addr: SocketAddrV4) -> SOCKADDR_IN {
-    SOCKADDR_IN {
-        sin_family: AF_INET,
-        sin_port: addr.port().to_be(),
-        sin_addr: IN_ADDR {
-            S_un: IN_ADDR_0 {
-                S_addr: u32::from(*addr.ip()).to_be(),
-            },
-        },
-        sin_zero: [0; 8],
+/// The address family a `SocketAddr` needs its socket created with.
+fn family_of(addr: &SocketAddr) -> ADDRESS_FAMILY {
+    match addr {
+        SocketAddr::V4(_) => AF_INET,
+        SocketAddr::V6(_) => AF_INET6,
     }
 }
 
-fn addr_of_socket(sock: SOCKET) -> windows_core::Result<SocketAddrV4> {
-    let mut sa = SOCKADDR_IN::default();
-    let mut len = size_of::<SOCKADDR_IN>() as i32;
-    sock_check(unsafe { getsockname(sock, &mut sa as *mut _ as *mut SOCKADDR, &mut len) })?;
-    Ok(SocketAddrV4::new(
-        u32::from_be(unsafe { sa.sin_addr.S_un.S_addr }).into(),
-        u16::from_be(sa.sin_port),
-    ))
+/// The `0.0.0.0:0` / `[::]:0` wildcard of a family, for the implicit local bind
+/// `ConnectEx` requires.
+fn wildcard(family: ADDRESS_FAMILY) -> SocketAddr {
+    if family == AF_INET6 {
+        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+    } else {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+    }
+}
+
+/// Marshals a `SocketAddr` into a zeroed `SOCKADDR_STORAGE`, returning the
+/// valid length (`sizeof(sockaddr_in|sockaddr_in6)`). Port is written in
+/// network byte order; the IPv4 address follows the existing `to_be` idiom so
+/// its in-memory bytes are the octets in order.
+fn write_sockaddr(addr: &SocketAddr, storage: &mut SOCKADDR_STORAGE) -> i32 {
+    unsafe {
+        match addr {
+            SocketAddr::V4(v4) => {
+                *(storage as *mut _ as *mut SOCKADDR_IN) = SOCKADDR_IN {
+                    sin_family: AF_INET,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: IN_ADDR {
+                        S_un: IN_ADDR_0 {
+                            S_addr: u32::from(*v4.ip()).to_be(),
+                        },
+                    },
+                    sin_zero: [0; 8],
+                };
+                size_of::<SOCKADDR_IN>() as i32
+            }
+            SocketAddr::V6(v6) => {
+                *(storage as *mut _ as *mut SOCKADDR_IN6) = SOCKADDR_IN6 {
+                    sin6_family: AF_INET6,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: IN6_ADDR {
+                        u: IN6_ADDR_0 {
+                            Byte: v6.ip().octets(),
+                        },
+                    },
+                    Anonymous: SOCKADDR_IN6_0 {
+                        sin6_scope_id: v6.scope_id(),
+                    },
+                };
+                size_of::<SOCKADDR_IN6>() as i32
+            }
+        }
+    }
+}
+
+/// Parses a `SOCKADDR_STORAGE` (as filled by `getsockname`/`getpeername`/a
+/// datagram source) back into a `SocketAddr`, dispatching on `ss_family`.
+fn read_sockaddr(storage: &SOCKADDR_STORAGE) -> windows_core::Result<SocketAddr> {
+    unsafe {
+        if storage.ss_family == AF_INET {
+            let sa = &*(storage as *const _ as *const SOCKADDR_IN);
+            Ok(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(u32::from_be(sa.sin_addr.S_un.S_addr)),
+                u16::from_be(sa.sin_port),
+            )))
+        } else if storage.ss_family == AF_INET6 {
+            let sa = &*(storage as *const _ as *const SOCKADDR_IN6);
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(sa.sin6_addr.u.Byte),
+                u16::from_be(sa.sin6_port),
+                sa.sin6_flowinfo,
+                sa.Anonymous.sin6_scope_id,
+            )))
+        } else {
+            // Neither AF_INET nor AF_INET6 — WSAEAFNOSUPPORT.
+            Err(windows_core::Error::from_hresult(
+                WIN32_ERROR(10047).to_hresult(),
+            ))
+        }
+    }
+}
+
+/// `getsockname` for a socket, as a `SocketAddr` (useful after binding port 0).
+fn addr_of_socket(sock: SOCKET) -> windows_core::Result<SocketAddr> {
+    let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+    let mut len = size_of::<SOCKADDR_STORAGE>() as i32;
+    sock_check(unsafe { getsockname(sock, &mut storage as *mut _ as *mut SOCKADDR, &mut len) })?;
+    read_sockaddr(&storage)
+}
+
+/// `getpeername` for a connected socket, as a `SocketAddr`.
+fn peer_of_socket(sock: SOCKET) -> windows_core::Result<SocketAddr> {
+    let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+    let mut len = size_of::<SOCKADDR_STORAGE>() as i32;
+    sock_check(unsafe { getpeername(sock, &mut storage as *mut _ as *mut SOCKADDR, &mut len) })?;
+    read_sockaddr(&storage)
 }
 
 type ConnectExFn = unsafe extern "system" fn(
@@ -159,25 +246,25 @@ unsafe impl Send for AcceptPayload {}
 /// A listening TCP socket bound to a [`Runtime`]'s pool.
 pub struct TcpListener {
     res: Arc<IoRes>,
+    /// The address family the listen socket was created with; accepted sockets
+    /// must be created with the same family for `AcceptEx`.
+    family: ADDRESS_FAMILY,
 }
 
 impl TcpListener {
-    pub fn bind(rt: &Runtime, addr: SocketAddrV4) -> windows_core::Result<TcpListener> {
-        let sock = new_socket()?;
+    /// Binds and listens on `addr` (IPv4 or IPv6).
+    pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpListener> {
+        let family = family_of(&addr);
+        let sock = new_socket(family, SOCK_STREAM, IPPROTO_TCP)?;
         let register = || -> windows_core::Result<Arc<IoRes>> {
-            let sa = sockaddr_v4(addr);
-            sock_check(unsafe {
-                bind(
-                    sock,
-                    &sa as *const _ as *const SOCKADDR,
-                    size_of::<SOCKADDR_IN>() as i32,
-                )
-            })?;
+            let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+            let len = write_sockaddr(&addr, &mut storage);
+            sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
             sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
             IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
         };
         match register() {
-            Ok(res) => Ok(TcpListener { res }),
+            Ok(res) => Ok(TcpListener { res, family }),
             Err(e) => {
                 unsafe { closesocket(sock) };
                 Err(e)
@@ -186,13 +273,13 @@ impl TcpListener {
     }
 
     /// The locally bound address (useful after binding port 0).
-    pub fn local_addr(&self) -> windows_core::Result<SocketAddrV4> {
+    pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
         addr_of_socket(self.res.socket())
     }
 
     /// Accepts one connection.
     pub async fn accept(&self) -> windows_core::Result<TcpStream> {
-        let accept_sock = new_socket()?;
+        let accept_sock = new_socket(self.family, SOCK_STREAM, IPPROTO_TCP)?;
         let listen_sock = self.res.socket();
         let fut = unsafe {
             submit(
@@ -222,7 +309,8 @@ impl TcpListener {
         let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
         let finish = || -> windows_core::Result<TcpStream> {
             // Until SO_UPDATE_ACCEPT_CONTEXT (value = the listen socket) the
-            // accepted socket is half-configured (shutdown/getsockname fail).
+            // accepted socket is half-configured (shutdown/getsockname/
+            // getpeername fail).
             let listen_val = listen_sock.0.to_ne_bytes();
             sock_check(unsafe {
                 setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
@@ -262,18 +350,16 @@ impl TcpStream {
         }
     }
 
-    /// Connects to `addr`.
-    pub async fn connect(rt: &Runtime, addr: SocketAddrV4) -> windows_core::Result<TcpStream> {
-        let sock = new_socket()?;
+    /// Connects to `addr` (IPv4 or IPv6).
+    pub async fn connect(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpStream> {
+        let family = family_of(&addr);
+        let sock = new_socket(family, SOCK_STREAM, IPPROTO_TCP)?;
         let prepared = (|| -> windows_core::Result<(ConnectExFn, TcpStream)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
-            let local = sockaddr_v4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
+            let mut local = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+            let local_len = write_sockaddr(&wildcard(family), &mut local);
             sock_check(unsafe {
-                bind(
-                    sock,
-                    &local as *const _ as *const SOCKADDR,
-                    size_of::<SOCKADDR_IN>() as i32,
-                )
+                bind(sock, &local as *const _ as *const SOCKADDR, local_len)
             })?;
             let connect_ex = get_connectex(sock)?;
             Ok((connect_ex, TcpStream::from_socket(&rt.inner, sock)?))
@@ -286,14 +372,15 @@ impl TcpStream {
             }
         };
 
-        let remote = sockaddr_v4(addr);
+        let mut remote = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let remote_len = write_sockaddr(&addr, &mut remote);
         let fut = unsafe {
-            submit(&stream.res, remote, move |ovl, sa| {
+            submit(&stream.res, (remote, remote_len), move |ovl, p| {
                 let mut sent = 0u32;
                 let ok = connect_ex(
                     sock,
-                    sa as *const _ as *const SOCKADDR,
-                    size_of::<SOCKADDR_IN>() as i32,
+                    &p.0 as *const _ as *const SOCKADDR,
+                    p.1,
                     core::ptr::null(),
                     0,
                     &mut sent,
@@ -358,8 +445,14 @@ impl TcpStream {
         sock_check(unsafe { shutdown(self.res.socket(), SD_SEND) })
     }
 
-    pub fn local_addr(&self) -> windows_core::Result<SocketAddrV4> {
+    /// The locally bound address of this connected socket.
+    pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
         addr_of_socket(self.res.socket())
+    }
+
+    /// The remote peer's address.
+    pub fn peer_addr(&self) -> windows_core::Result<SocketAddr> {
+        peer_of_socket(self.res.socket())
     }
 }
 
@@ -367,15 +460,17 @@ impl TcpStream {
 mod tests {
     use super::super::super::{block_on, timeout, Runtime};
     use super::*;
-    use std::net::Ipv4Addr;
     use std::time::Duration;
 
     #[test]
     fn tcp_echo_self_connect() {
         let rt = Runtime::new();
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
-            let listener =
-                TcpListener::bind(&rt, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
             let addr = listener.local_addr().unwrap();
             assert_ne!(addr.port(), 0);
 
@@ -383,6 +478,8 @@ mod tests {
             // half-closes, then half-close back.
             let server = rt.spawn(async move {
                 let stream = listener.accept().await.unwrap();
+                // Peer address is available post-SO_UPDATE_ACCEPT_CONTEXT.
+                assert!(stream.peer_addr().is_ok());
                 let mut total = 0usize;
                 let mut buf = vec![0u8; 4096];
                 loop {
@@ -403,6 +500,8 @@ mod tests {
 
             // Client: send a payload, read the echo back, then half-close.
             let client = TcpStream::connect(&rt, addr).await.unwrap();
+            // The client's peer address is the listener's address.
+            assert_eq!(client.peer_addr().unwrap().port(), addr.port());
             let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 231) as u8).collect();
             let mut sent = 0;
             while sent < payload.len() {
@@ -430,11 +529,44 @@ mod tests {
     }
 
     #[test]
+    fn tcp_echo_ipv6() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            assert!(matches!(addr, SocketAddr::V6(_)), "expected an IPv6 bind");
+            assert_ne!(addr.port(), 0);
+
+            let server = rt.spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                let (n, b) = stream.read(vec![0u8; 64]).await;
+                let n = n.unwrap();
+                stream.write(b[..n].to_vec()).await.0.unwrap();
+            });
+
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            assert!(matches!(client.peer_addr().unwrap(), SocketAddr::V6(_)));
+            client.write(b"v6ping".to_vec()).await.0.unwrap();
+            let (n, b) = client.read(vec![0u8; 64]).await;
+            assert_eq!(&b[..n.unwrap()], b"v6ping");
+            server.await.unwrap();
+        }));
+        result.expect("ipv6 echo test timed out");
+    }
+
+    #[test]
     fn cancel_storm_accept_and_read() {
         let rt = Runtime::new();
         block_on(timeout(&rt, Duration::from_secs(30), async {
-            let listener =
-                TcpListener::bind(&rt, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
             let addr = listener.local_addr().unwrap();
 
             // Repeatedly start accepts with no client and drop them mid-flight.

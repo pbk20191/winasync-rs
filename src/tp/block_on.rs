@@ -25,7 +25,16 @@ impl Parker {
     }
 
     fn unpark(&self) {
-        unsafe { check(SetEvent(self.event)) };
+        // Called from `Waker::wake`, which may run inside a thread-pool
+        // completion callback (an IO/timer/task completion waking the top-level
+        // future). A waker must not panic across that FFI boundary (module
+        // invariant #7), so this must stay panic-free — hence not `check`,
+        // whose panic policy is only sound for the OOM-only pool-alloc calls.
+        // `SetEvent` on this live, owned auto-reset handle cannot realistically
+        // fail; a spurious failure would at worst drop one wake, which the
+        // poll loop's recheck tolerates. Asserted in debug for visibility.
+        let r = unsafe { SetEvent(self.event) };
+        debug_assert!(r.is_ok(), "SetEvent failed in waker: {r:?}");
     }
 
     fn park(&self) {
