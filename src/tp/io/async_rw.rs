@@ -18,6 +18,14 @@
 //! side (one WSARecv in flight; a short caller buffer keeps the unread remainder
 //! for the next `poll_read`). This preserves the one-poll-to-one-syscall
 //! cancellation story of the owned-buffer API.
+//!
+//! # Full duplex
+//! [`TcpStreamIo`] is a [`ReadHalf`] + [`WriteHalf`] pair sharing the socket
+//! (via the refcounted `IoRes`). [`TcpStreamIo::split`] hands the two halves out
+//! so a reader and a writer can run concurrently (each owns its own in-flight
+//! op and staging; concurrent WSARecv + WSASend on one socket is supported) —
+//! the combinator methods need `&mut self`, so without splitting you cannot read
+//! and write the same adapter at once.
 
 use super::net::TcpStream;
 use std::pin::Pin;
@@ -28,6 +36,12 @@ use windows::Win32::Foundation::WIN32_ERROR;
 /// before the buffer is filled.
 fn eof_error() -> windows_core::Error {
     windows_core::Error::from_hresult(WIN32_ERROR(38).to_hresult())
+}
+
+/// `ERROR_WRITE_FAULT` as an `Error`, used by `write_all` if an underlying write
+/// makes no progress (reports 0 bytes on a non-empty buffer).
+fn write_zero_error() -> windows_core::Error {
+    windows_core::Error::from_hresult(WIN32_ERROR(29).to_hresult())
 }
 
 /// Poll out a `Poll<Result<T>>`, returning early on `Pending` / `Err`.
@@ -71,9 +85,8 @@ type DynIoFut = Pin<Box<dyn Future<Output = (windows_core::Result<usize>, Vec<u8
 
 const DEFAULT_READ_CAP: usize = 16 * 1024;
 
-/// An [`AsyncRead`] + [`AsyncWrite`] adapter around a [`TcpStream`]. Obtain one
-/// with [`TcpStream::into_io`] (or [`TcpStreamIo::new`]).
-pub struct TcpStreamIo {
+/// The readable half of a split [`TcpStreamIo`] (also usable standalone).
+pub struct ReadHalf {
     stream: TcpStream,
     read_cap: usize,
     /// In-flight WSARecv (owns the staging buffer the kernel writes into).
@@ -82,29 +95,16 @@ pub struct TcpStreamIo {
     read_spare: Option<Vec<u8>>,
     /// Bytes read but not yet handed to a caller: `(buffer, start, end)`.
     read_rem: Option<(Vec<u8>, usize, usize)>,
-    /// In-flight WSASend (owns the copied bytes the kernel reads from).
-    write_fut: Option<DynIoFut>,
-    /// A recycled write staging buffer awaiting reuse.
-    write_spare: Option<Vec<u8>>,
 }
 
-impl TcpStreamIo {
-    /// Wraps `stream` with a default read staging capacity.
-    pub fn new(stream: TcpStream) -> Self {
-        Self::with_capacity(stream, DEFAULT_READ_CAP)
-    }
-
-    /// Wraps `stream` with an explicit per-read staging capacity (the largest
-    /// amount a single underlying WSARecv will request).
-    pub fn with_capacity(stream: TcpStream, read_cap: usize) -> Self {
+impl ReadHalf {
+    fn new(stream: TcpStream, read_cap: usize) -> Self {
         Self {
             stream,
             read_cap: read_cap.max(1),
             read_fut: None,
             read_spare: None,
             read_rem: None,
-            write_fut: None,
-            write_spare: None,
         }
     }
 
@@ -112,15 +112,9 @@ impl TcpStreamIo {
     pub fn get_ref(&self) -> &TcpStream {
         &self.stream
     }
-
-    /// Recovers the stream. Any in-flight read/write staging is dropped (which
-    /// cancels an in-flight op, as with dropping an owned-buffer future).
-    pub fn into_inner(self) -> TcpStream {
-        self.stream
-    }
 }
 
-impl AsyncRead for TcpStreamIo {
+impl AsyncRead for ReadHalf {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -179,7 +173,31 @@ impl AsyncRead for TcpStreamIo {
     }
 }
 
-impl AsyncWrite for TcpStreamIo {
+/// The writable half of a split [`TcpStreamIo`] (also usable standalone).
+pub struct WriteHalf {
+    stream: TcpStream,
+    /// In-flight WSASend (owns the copied bytes the kernel reads from).
+    write_fut: Option<DynIoFut>,
+    /// A recycled write staging buffer awaiting reuse.
+    write_spare: Option<Vec<u8>>,
+}
+
+impl WriteHalf {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            write_fut: None,
+            write_spare: None,
+        }
+    }
+
+    /// Borrows the underlying stream (e.g. for `peer_addr`).
+    pub fn get_ref(&self) -> &TcpStream {
+        &self.stream
+    }
+}
+
+impl AsyncWrite for WriteHalf {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -225,6 +243,74 @@ impl AsyncWrite for TcpStreamIo {
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<windows_core::Result<()>> {
         ready_ok!(self.as_mut().poll_flush(cx));
         Poll::Ready(self.stream.shutdown_send())
+    }
+}
+
+/// An [`AsyncRead`] + [`AsyncWrite`] adapter around a [`TcpStream`], composed of
+/// a [`ReadHalf`] and a [`WriteHalf`]. Obtain one with [`TcpStream::into_io`],
+/// and [`split`](Self::split) it for concurrent full-duplex use.
+pub struct TcpStreamIo {
+    read: ReadHalf,
+    write: WriteHalf,
+}
+
+impl TcpStreamIo {
+    /// Wraps `stream` with a default read staging capacity.
+    pub fn new(stream: TcpStream) -> Self {
+        Self::with_capacity(stream, DEFAULT_READ_CAP)
+    }
+
+    /// Wraps `stream` with an explicit per-read staging capacity (the largest
+    /// amount a single underlying WSARecv will request).
+    pub fn with_capacity(stream: TcpStream, read_cap: usize) -> Self {
+        let write = WriteHalf::new(stream.share());
+        let read = ReadHalf::new(stream, read_cap);
+        Self { read, write }
+    }
+
+    /// Borrows the underlying stream (e.g. for `peer_addr`).
+    pub fn get_ref(&self) -> &TcpStream {
+        self.read.get_ref()
+    }
+
+    /// Recovers a handle to the stream. Any in-flight staging is dropped (which
+    /// cancels an in-flight op, as with dropping an owned-buffer future).
+    pub fn into_inner(self) -> TcpStream {
+        self.read.stream
+    }
+
+    /// Splits into independently-ownable read and write halves for concurrent
+    /// full-duplex use.
+    pub fn split(self) -> (ReadHalf, WriteHalf) {
+        (self.read, self.write)
+    }
+}
+
+impl AsyncRead for TcpStreamIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<windows_core::Result<usize>> {
+        Pin::new(&mut self.get_mut().read).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TcpStreamIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<windows_core::Result<usize>> {
+        Pin::new(&mut self.get_mut().write).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<windows_core::Result<()>> {
+        Pin::new(&mut self.get_mut().write).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<windows_core::Result<()>> {
+        Pin::new(&mut self.get_mut().write).poll_close(cx)
     }
 }
 
@@ -348,7 +434,7 @@ impl<W: AsyncWrite + Unpin + ?Sized> Future for WriteAll<'_, W> {
         while this.pos < this.buf.len() {
             let n = ready_ok!(Pin::new(&mut *this.writer).poll_write(cx, &this.buf[this.pos..]));
             if n == 0 {
-                return Poll::Ready(Err(eof_error()));
+                return Poll::Ready(Err(write_zero_error()));
             }
             this.pos += n;
         }
@@ -436,5 +522,44 @@ mod tests {
             server.await.unwrap()
         }));
         assert_eq!(result.expect("async_rw echo timed out"), 50_000);
+    }
+
+    #[test]
+    fn split_full_duplex() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Echo server over the combined adapter.
+            let server = rt.spawn(async move {
+                let mut io = listener.accept().await.unwrap().into_io();
+                let mut buf = vec![0u8; 10_000];
+                io.read_exact(&mut buf).await.unwrap();
+                io.write_all(&buf).await.unwrap();
+                io.close().await.unwrap();
+            });
+
+            // Client: split, then write (on a spawned task) and read
+            // concurrently — impossible without split, since both need &mut.
+            let (mut r, mut w) = TcpStream::connect(&rt, addr).await.unwrap().into_io().split();
+            let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+            let p2 = payload.clone();
+            let writer = rt.spawn(async move {
+                w.write_all(&p2).await.unwrap();
+                w.close().await.unwrap();
+            });
+
+            let mut echoed = vec![0u8; payload.len()];
+            r.read_exact(&mut echoed).await.unwrap();
+            writer.await.unwrap();
+            server.await.unwrap();
+            echoed == payload
+        }));
+        assert!(result.expect("split full-duplex timed out"));
     }
 }

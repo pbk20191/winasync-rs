@@ -50,7 +50,7 @@ pub mod wait;
 pub use block_on::block_on;
 #[allow(unused_imports)]
 pub use io::async_rw::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, TcpStreamIo,
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, TcpStreamIo, WriteHalf,
 };
 #[allow(unused_imports)]
 pub use io::file::File;
