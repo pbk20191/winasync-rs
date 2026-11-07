@@ -116,11 +116,57 @@ impl Runtime {
     pub fn submit<F: FnOnce() + Send + 'static>(&self, f: F) {
         unsafe { pool::try_submit(self.inner.pool.default_env(), f) }
     }
+
+    /// Runs `fut` to completion with its body executing **on the pool**, blocking
+    /// the calling thread until it finishes.
+    ///
+    /// Unlike the free [`block_on`] — which polls the future on the *calling*
+    /// thread — this spawns `fut` onto the pool (so every poll of its body, and
+    /// the synchronous code between its `await`s, runs on a pool thread) and the
+    /// caller only parks on the resulting [`JoinHandle`]. The future therefore
+    /// must be `Send + 'static`, as it crosses threads.
+    ///
+    /// # Panics
+    /// If the spawned task panicked (the panic is observed via its `JoinError`).
+    pub fn block_on<F>(&self, fut: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = self.spawn(fut);
+        block_on::block_on(async move { handle.await.expect("block_on: spawned task failed") })
+    }
 }
 
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_block_on_runs_body_on_pool() {
+        let rt = Runtime::new();
+        let caller = std::thread::current().id();
+        let (before, after) = rt.block_on(async move {
+            let before = std::thread::current().id();
+            yield_now().await;
+            let after = std::thread::current().id();
+            (before, after)
+        });
+        // The spawned body is polled on pool threads, never the caller's.
+        assert_ne!(before, caller, "first poll ran on the calling thread");
+        assert_ne!(after, caller, "post-await poll ran on the calling thread");
+    }
+
+    #[test]
+    fn runtime_block_on_returns_value() {
+        let rt = Runtime::new();
+        assert_eq!(rt.block_on(async { 20 + 22 }), 42);
     }
 }
 
