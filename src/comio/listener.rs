@@ -77,9 +77,8 @@ enum Transport {
 /// client cannot connect into a backlog (see [`ConnectionReceived`]). The cost
 /// is that an AF_UNIX bind error (e.g. a stale socket file) now surfaces when
 /// the chain first starts — synchronously from `BindAsync` if a handler is
-/// already registered, otherwise from the first `ConnectionReceived` (where it
-/// is swallowed, same as a deferred named-pipe error) — rather than always
-/// from `BindAsync`.
+/// already registered, otherwise surfaced from the first `ConnectionReceived`
+/// (same as a deferred named-pipe error) — rather than always from `BindAsync`.
 enum AcceptSource {
     NamedPipe(String),
     Unix {
@@ -238,10 +237,16 @@ impl ConnectionListener {
     ///
     /// Registering the *first* handler starts the accept chain if the listener
     /// is already bound (handler gating — see [`ListenerState`]): a listener
-    /// with no `ConnectionReceived` consumer does not accept connections. A
-    /// failure to start the chain here (e.g. a malformed bound endpoint) is
-    /// intentionally not surfaced — registration still succeeds and returns
-    /// the token; the error path is `BindAsync`'s.
+    /// with no `ConnectionReceived` consumer does not accept connections.
+    ///
+    /// If starting the chain fails synchronously (e.g. an endpoint bound before
+    /// any handler was registered turns out to be malformed, or an AF_UNIX
+    /// bind/listen error on a stale socket file — deferred first-accept errors
+    /// that handler gating pushes to the chain's actual start), that error is
+    /// surfaced from here and the just-added registration is rolled back, so the
+    /// listener is left exactly as it was before this call. This mirrors the
+    /// handler-first ordering, where the same first-accept error surfaces from
+    /// `BindAsync` instead.
     #[allow(non_snake_case)]
     pub fn ConnectionReceived(
         &self,
@@ -258,8 +263,14 @@ impl ConnectionListener {
             was_empty
         };
         if first {
-            // First consumer: start accepting (no-op if not bound yet).
-            let _ = ensure_running(self.state.clone());
+            // First consumer: start accepting (no-op if not bound yet). On a
+            // synchronous start failure, roll the registration back out so the
+            // listener is left untouched, then surface the error.
+            if let Err(e) = ensure_running(self.state.clone()) {
+                self.state.event.remove(token);
+                self.state.handlers.lock().unwrap().remove(&token);
+                return Err(e);
+            }
         }
         Ok(token)
     }
@@ -315,9 +326,10 @@ impl ConnectionListener {
     /// stale socket file) is surfaced synchronously from this call — only
     /// re-arms triggered internally by a later completion can't propagate a
     /// `Result` anywhere and instead just stop the chain (see [`drive`]). With
-    /// no handler, that first-accept error is deferred to whenever the chain
-    /// eventually starts. The returned `IAsyncAction` is already completed once
-    /// this call returns `Ok`.
+    /// no handler, that first-accept error is deferred to the first
+    /// `ConnectionReceived` call, which surfaces it there (see
+    /// [`ConnectionReceived`](Self::ConnectionReceived)). The returned
+    /// `IAsyncAction` is already completed once this call returns `Ok`.
     ///
     /// # Not safe to call concurrently with an already-running accept chain
     /// Calling `BindAsync` again *sequentially* (e.g. to rebind after a
@@ -911,6 +923,77 @@ mod listener_tests {
         // The listener is otherwise still usable (BindAsync failing isn't
         // the same as Close): a well-formed retry should still work.
         assert!(listener.Information().is_err() || listener.Information().is_ok());
+    }
+
+    /// The mirror of `bind_async_surfaces_first_accept_error` for the
+    /// bind-first-then-handler ordering: when a listener is bound *before* any
+    /// handler (so gating defers the first accept, and `BindAsync` itself
+    /// succeeds), a malformed endpoint's first-accept error is surfaced from
+    /// the first `ConnectionReceived` — not swallowed — and that failed
+    /// registration is rolled back (so a later, valid rebind + handler still
+    /// works from a clean slate).
+    #[test]
+    fn connection_received_surfaces_deferred_bind_error() {
+        let listener = ConnectionListener::named_pipe();
+
+        // No handler yet: gating means BindAsync records the (malformed)
+        // endpoint but issues no accept, so it succeeds.
+        block_on(
+            listener
+                .BindAsync(&HSTRING::from("not_a_valid_pipe_name"))
+                .unwrap()
+                .into_future(),
+        )
+        .unwrap();
+
+        // Registering the first handler starts the chain, which tries the first
+        // accept and fails synchronously — surfaced here, with the registration
+        // rolled back.
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
+        let err = listener.ConnectionReceived(&handler).unwrap_err();
+        assert_ne!(err.code().0, 0);
+        assert_ne!(err.code(), RO_E_CLOSED, "must be the accept error, not closed");
+
+        // Rollback left zero handlers, so re-adding is again the "first"
+        // handler. Rebind to a valid endpoint first (source still points at the
+        // bad name until then), then register: a clean slate works end to end.
+        let name = format!(r"\\.\pipe\comio_listener_deferred_{}", std::process::id());
+        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        let (tx, rx) = mpsc::channel::<usize>();
+        let handler2 = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
+            let a = args.as_ref().unwrap();
+            let cra: IConnectionReceivedArgs = a.cast().unwrap();
+            let raw = unsafe {
+                let mut raw = core::ptr::null_mut();
+                cra.Stream(&mut raw).ok()?;
+                raw as usize
+            };
+            let _ = tx.send(raw);
+            Ok(())
+        });
+        listener.ConnectionReceived(&handler2).unwrap();
+
+        let client = {
+            let mut last = None;
+            for _ in 0..50 {
+                match block_on(crate::comio::NamedPipeClient::connect(&name)) {
+                    Ok(c) => {
+                        last = Some(c);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            last.expect("client failed to connect after a clean rebind")
+        };
+        let server_raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("no ConnectionReceived after a clean rebind");
+        let _server = unsafe { IInspectable::from_raw(server_raw as *mut core::ffi::c_void) };
+        drop(client);
+
+        let closable: IClosable = listener.cast().unwrap();
+        closable.Close().unwrap();
     }
 
     /// Handler gating: a bound listener with **no** `ConnectionReceived`
