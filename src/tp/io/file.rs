@@ -4,14 +4,124 @@
 
 use super::{submit, IoRes, Issue, OpFuture};
 use crate::tp::Runtime;
-use std::sync::Arc;
+use core::ffi::c_void;
+use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{
     ERROR_HANDLE_EOF, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, CREATE_ALWAYS, FILE_CREATION_DISPOSITION,
-    FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, ReadFile, ReadFileScatter, WriteFile, WriteFileGather, CREATE_ALWAYS,
+    FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_NO_BUFFERING,
+    FILE_FLAG_OVERLAPPED, FILE_SEGMENT_ELEMENT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows::Win32::System::Memory::{
+    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+};
+use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+/// The system memory page size (cached), as required for the page-aligned
+/// buffers of `ReadFileScatter`/`WriteFileGather`.
+fn page_size() -> usize {
+    static PS: OnceLock<usize> = OnceLock::new();
+    *PS.get_or_init(|| {
+        let mut si = SYSTEM_INFO::default();
+        unsafe { GetSystemInfo(&mut si) };
+        si.dwPageSize as usize
+    })
+}
+
+/// A set of `pages` page-sized, page-aligned buffers (one `VirtualAlloc`
+/// region), for the scatter/gather file IO. Each page becomes one
+/// `FILE_SEGMENT_ELEMENT`. The whole region is addressable as one contiguous
+/// byte slice for filling/inspecting.
+pub struct PageBuffers {
+    ptr: *mut u8,
+    pages: usize,
+    page_size: usize,
+}
+
+// The pointer is a private, owned VirtualAlloc region; moving it is sound.
+unsafe impl Send for PageBuffers {}
+
+impl PageBuffers {
+    /// Allocates `pages` page-aligned pages (must be >= 1).
+    pub fn new(pages: usize) -> windows_core::Result<Self> {
+        let pages = pages.max(1);
+        let page_size = page_size();
+        let ptr = unsafe {
+            VirtualAlloc(None, pages * page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        };
+        if ptr.is_null() {
+            return Err(windows_core::Error::from_thread());
+        }
+        Ok(Self {
+            ptr: ptr as *mut u8,
+            pages,
+            page_size,
+        })
+    }
+
+    /// The number of pages.
+    pub fn pages(&self) -> usize {
+        self.pages
+    }
+
+    /// The page size these buffers are aligned/sized to.
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// The total byte length (`pages * page_size`).
+    pub fn len(&self) -> usize {
+        self.pages * self.page_size
+    }
+
+    /// Whether there are zero bytes (never true — there is always >= 1 page).
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// The region as one contiguous byte slice.
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len()) }
+    }
+
+    /// The region as one contiguous mutable byte slice.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len()) }
+    }
+}
+
+impl Drop for PageBuffers {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = VirtualFree(self.ptr as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+}
+
+/// Op-block payload for scatter/gather: owns the page buffers and the segment
+/// array (built in place, read by the kernel for the op's duration).
+struct VectorPayload {
+    buffers: PageBuffers,
+    segments: Vec<FILE_SEGMENT_ELEMENT>,
+}
+
+unsafe impl Send for VectorPayload {}
+
+impl VectorPayload {
+    /// Builds the null-terminated segment array pointing at each page.
+    fn build_segments(&mut self) {
+        self.segments.clear();
+        for i in 0..self.buffers.pages {
+            self.segments.push(FILE_SEGMENT_ELEMENT {
+                Buffer: unsafe { self.buffers.ptr.add(i * self.buffers.page_size) } as *mut c_void,
+            });
+        }
+        // NULL-terminator element.
+        self.segments.push(FILE_SEGMENT_ELEMENT { Alignment: 0 });
+    }
+}
 
 /// An overlapped file handle bound to a [`Runtime`]'s pool.
 pub struct File {
@@ -24,6 +134,7 @@ impl File {
         path: &str,
         access: u32,
         disposition: FILE_CREATION_DISPOSITION,
+        extra_flags: FILE_FLAGS_AND_ATTRIBUTES,
     ) -> windows_core::Result<File> {
         let handle = unsafe {
             CreateFileW(
@@ -32,7 +143,7 @@ impl File {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 disposition,
-                FILE_FLAG_OVERLAPPED,
+                FILE_FLAG_OVERLAPPED | extra_flags,
                 None,
             )?
         };
@@ -49,12 +160,51 @@ impl File {
 
     /// Opens an existing file for reading and writing.
     pub fn open(rt: &Runtime, path: &str) -> windows_core::Result<File> {
-        Self::open_impl(rt, path, GENERIC_READ.0 | GENERIC_WRITE.0, OPEN_EXISTING)
+        Self::open_impl(
+            rt,
+            path,
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+        )
     }
 
     /// Creates (or truncates) a file for reading and writing.
     pub fn create(rt: &Runtime, path: &str) -> windows_core::Result<File> {
-        Self::open_impl(rt, path, GENERIC_READ.0 | GENERIC_WRITE.0, CREATE_ALWAYS)
+        Self::open_impl(
+            rt,
+            path,
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            CREATE_ALWAYS,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+        )
+    }
+
+    /// Creates (or truncates) a file opened with `FILE_FLAG_NO_BUFFERING`, as
+    /// required by [`read_scatter`](Self::read_scatter) /
+    /// [`write_gather`](Self::write_gather). With no buffering, all offsets and
+    /// transfer sizes must be sector-aligned — the page-aligned, page-sized
+    /// [`PageBuffers`] and whole-page offsets satisfy this.
+    pub fn create_unbuffered(rt: &Runtime, path: &str) -> windows_core::Result<File> {
+        Self::open_impl(
+            rt,
+            path,
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            CREATE_ALWAYS,
+            FILE_FLAG_NO_BUFFERING,
+        )
+    }
+
+    /// Opens an existing file with `FILE_FLAG_NO_BUFFERING` for scatter/gather
+    /// IO (see [`create_unbuffered`](Self::create_unbuffered)).
+    pub fn open_unbuffered(rt: &Runtime, path: &str) -> windows_core::Result<File> {
+        Self::open_impl(
+            rt,
+            path,
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING,
+        )
     }
 
     /// The raw file handle (for `TcpStream::transmit_file`). The returned handle
@@ -122,6 +272,88 @@ impl File {
             })
         }
     }
+
+    /// Scatter-reads `buffers.len()` bytes at absolute offset `pos` into the
+    /// page-aligned `buffers` via `ReadFileScatter` (one overlapped op filling
+    /// every page). `pos` and the length are whole pages. Resolves to the number
+    /// of bytes read (0 at end of file) and hands the buffers back.
+    ///
+    /// The file must be opened unbuffered (see
+    /// [`open_unbuffered`](Self::open_unbuffered)); a buffered handle fails these
+    /// with `ERROR_INVALID_PARAMETER`.
+    pub fn read_scatter(
+        &self,
+        buffers: PageBuffers,
+        pos: u64,
+    ) -> impl Future<Output = (windows_core::Result<usize>, PageBuffers)> + Send + use<> {
+        let handle = self.res.handle;
+        let count = buffers.len() as u32;
+        let cap = buffers.pages() + 1;
+        let fut = unsafe {
+            submit(
+                &self.res,
+                VectorPayload {
+                    buffers,
+                    segments: Vec::with_capacity(cap),
+                },
+                move |ovl, p| {
+                    (*ovl).Anonymous.Anonymous.Offset = pos as u32;
+                    (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
+                    p.build_segments();
+                    match ReadFileScatter(handle, p.segments.as_ptr(), count, None, ovl) {
+                        Ok(()) => Issue::Pending,
+                        Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                        Err(e) => Issue::Failed(e.code()),
+                    }
+                },
+            )
+        };
+        async move {
+            let (result, payload) = fut.await;
+            let r = match result {
+                Err(e) if e.code() == ERROR_HANDLE_EOF.to_hresult() => Ok(0),
+                other => other,
+            };
+            (r, payload.buffers)
+        }
+    }
+
+    /// Gather-writes `buffers.len()` bytes at absolute offset `pos` from the
+    /// page-aligned `buffers` via `WriteFileGather` (one overlapped op draining
+    /// every page). `pos` and the length are whole pages. Resolves to the number
+    /// of bytes written and hands the buffers back.
+    pub fn write_gather(
+        &self,
+        buffers: PageBuffers,
+        pos: u64,
+    ) -> impl Future<Output = (windows_core::Result<usize>, PageBuffers)> + Send + use<> {
+        let handle = self.res.handle;
+        let count = buffers.len() as u32;
+        let cap = buffers.pages() + 1;
+        let fut = unsafe {
+            submit(
+                &self.res,
+                VectorPayload {
+                    buffers,
+                    segments: Vec::with_capacity(cap),
+                },
+                move |ovl, p| {
+                    (*ovl).Anonymous.Anonymous.Offset = pos as u32;
+                    (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
+                    p.build_segments();
+                    match WriteFileGather(handle, p.segments.as_ptr(), count, None, ovl) {
+                        Ok(()) => Issue::Pending,
+                        Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                        Err(e) => Issue::Failed(e.code()),
+                    }
+                },
+            )
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.buffers)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +390,32 @@ mod tests {
             // Past EOF reads 0.
             let (n, _) = file.read_at(vec![0u8; 16], 2 * 1024 * 1024).await;
             assert_eq!(n.unwrap(), 0);
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scatter_gather_roundtrip() {
+        let rt = Runtime::new();
+        let path = temp_path("scattergather");
+        block_on(async {
+            let file = File::create_unbuffered(&rt, &path).unwrap();
+            let ps = page_size();
+
+            // Fill two pages with a per-byte pattern and gather-write them.
+            let mut wb = PageBuffers::new(2).unwrap();
+            for (i, b) in wb.as_mut_slice().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            let expected = wb.as_slice().to_vec();
+            let (w, _wb) = file.write_gather(wb, 0).await;
+            assert_eq!(w.unwrap(), 2 * ps);
+
+            // Scatter-read them back into fresh pages.
+            let rb = PageBuffers::new(2).unwrap();
+            let (r, rb) = file.read_scatter(rb, 0).await;
+            assert_eq!(r.unwrap(), 2 * ps);
+            assert_eq!(rb.as_slice(), &expected[..]);
         });
         let _ = std::fs::remove_file(&path);
     }

@@ -53,7 +53,7 @@ pub use io::async_rw::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, TcpStreamIo, WriteHalf,
 };
 #[allow(unused_imports)]
-pub use io::file::File;
+pub use io::file::{File, PageBuffers};
 #[allow(unused_imports)]
 pub use io::net::{TcpListener, TcpStream, TransmitPackets, UdpSocket};
 #[allow(unused_imports)]
