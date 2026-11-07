@@ -1,7 +1,8 @@
-//! Async TCP over TP_IO: `TcpListener` (AcceptEx) and `TcpStream`
-//! (ConnectEx / WSARecv / WSASend). IPv4 and IPv6 are both supported through
-//! `std::net::SocketAddr`; the sockaddr marshalling helpers
-//! ([`write_sockaddr`]/[`read_sockaddr`]) are shared with the UDP code.
+//! Async sockets over TP_IO: `TcpListener` (AcceptEx), `TcpStream`
+//! (ConnectEx / WSARecv / WSASend), and `UdpSocket` (WSARecvFrom / WSASendTo).
+//! IPv4 and IPv6 are both supported through `std::net::SocketAddr`; the sockaddr
+//! marshalling helpers ([`write_sockaddr`]/[`read_sockaddr`]) and socket
+//! creation ([`new_socket`]) are shared across all three.
 
 use super::{submit, IoRes, Issue};
 use crate::tp::{Runtime, RuntimeInner};
@@ -12,12 +13,12 @@ use std::sync::{Arc, Once, OnceLock};
 use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx,
-    WSAGetLastError, WSAIoctl, WSARecv, WSASend, WSASocketW, WSAStartup, ADDRESS_FAMILY, AF_INET,
-    AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO, IPPROTO_TCP,
-    SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-    SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
-    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WINSOCK_SOCKET_TYPE, WSABUF, WSADATA,
-    WSAID_CONNECTEX, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
+    WSAGetLastError, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW, WSAStartup,
+    ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
+    IPPROTO, IPPROTO_TCP, IPPROTO_UDP, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
+    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
+    SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
+    WINSOCK_SOCKET_TYPE, WSABUF, WSADATA, WSAID_CONNECTEX, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
 };
 
 /// Process-wide Winsock initialization; never torn down (`WSACleanup` is
@@ -456,6 +457,141 @@ impl TcpStream {
     }
 }
 
+/// Payload of a WSARecvFrom: the buffer, the flags word, and the source
+/// address slot — all written by the provider at completion time, so all must
+/// live in the op block.
+struct RecvFromPayload {
+    buf: Vec<u8>,
+    flags: u32,
+    from: SOCKADDR_STORAGE,
+    from_len: i32,
+}
+
+// SOCKADDR_STORAGE is plain POD; the whole payload is safely sendable.
+unsafe impl Send for RecvFromPayload {}
+
+/// Payload of a WSASendTo: the buffer plus the destination address, which the
+/// provider reads while the send is in flight.
+struct SendToPayload {
+    buf: Vec<u8>,
+    to: SOCKADDR_STORAGE,
+    to_len: i32,
+}
+
+unsafe impl Send for SendToPayload {}
+
+/// A bound UDP socket on a [`Runtime`]'s pool. Supports connectionless
+/// `send_to`/`recv_from` over IPv4 or IPv6.
+pub struct UdpSocket {
+    res: Arc<IoRes>,
+}
+
+impl UdpSocket {
+    /// Binds a UDP socket to `addr` (IPv4 or IPv6).
+    pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<UdpSocket> {
+        let family = family_of(&addr);
+        let sock = new_socket(family, SOCK_DGRAM, IPPROTO_UDP)?;
+        let register = || -> windows_core::Result<Arc<IoRes>> {
+            let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+            let len = write_sockaddr(&addr, &mut storage);
+            sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
+            IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
+        };
+        match register() {
+            Ok(res) => Ok(UdpSocket { res }),
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                Err(e)
+            }
+        }
+    }
+
+    /// The locally bound address (useful after binding port 0).
+    pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
+        addr_of_socket(self.res.socket())
+    }
+
+    /// Sends `buf` as one datagram to `addr`; resolves to the byte count and
+    /// hands the buffer back.
+    pub fn send_to(
+        &self,
+        buf: Vec<u8>,
+        addr: SocketAddr,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send {
+        let sock = self.res.socket();
+        let mut to = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let to_len = write_sockaddr(&addr, &mut to);
+        let fut = unsafe {
+            submit(&self.res, SendToPayload { buf, to, to_len }, move |ovl, p| {
+                let wsabuf = WSABUF {
+                    len: p.buf.len() as u32,
+                    buf: windows_core::PSTR(p.buf.as_mut_ptr()),
+                };
+                let r = WSASendTo(
+                    sock,
+                    &[wsabuf],
+                    None,
+                    0,
+                    Some(&p.to as *const _ as *const SOCKADDR),
+                    p.to_len,
+                    Some(ovl),
+                    None,
+                );
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.buf)
+        }
+    }
+
+    /// Receives one datagram into `buf`; resolves to the byte count plus the
+    /// source address, and hands the buffer back.
+    pub fn recv_from(
+        &self,
+        buf: Vec<u8>,
+    ) -> impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, Vec<u8>)> + Send {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(
+                &self.res,
+                RecvFromPayload {
+                    buf,
+                    flags: 0,
+                    from: mem::zeroed::<SOCKADDR_STORAGE>(),
+                    from_len: size_of::<SOCKADDR_STORAGE>() as i32,
+                },
+                move |ovl, p| {
+                    let wsabuf = WSABUF {
+                        len: p.buf.len() as u32,
+                        buf: windows_core::PSTR(p.buf.as_mut_ptr()),
+                    };
+                    let r = WSARecvFrom(
+                        sock,
+                        &[wsabuf],
+                        None,
+                        &mut p.flags,
+                        Some(&mut p.from as *mut _ as *mut SOCKADDR),
+                        Some(&mut p.from_len),
+                        Some(ovl),
+                        None,
+                    );
+                    classify_wsa_overlapped(r == 0)
+                },
+            )
+        };
+        async move {
+            let (result, payload) = fut.await;
+            let out = match result {
+                Ok(n) => read_sockaddr(&payload.from).map(|addr| (n, addr)),
+                Err(e) => Err(e),
+            };
+            (out, payload.buf)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::{block_on, timeout, Runtime};
@@ -556,6 +692,69 @@ mod tests {
             server.await.unwrap();
         }));
         result.expect("ipv6 echo test timed out");
+    }
+
+    #[test]
+    fn udp_send_recv_roundtrip() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client_addr = client.local_addr().unwrap();
+
+            // Client -> server.
+            let (w, _) = client.send_to(b"ping".to_vec(), server_addr).await;
+            assert_eq!(w.unwrap(), 4);
+
+            let (r, b) = server.recv_from(vec![0u8; 64]).await;
+            let (n, from) = r.unwrap();
+            assert_eq!(&b[..n], b"ping");
+            // The datagram's source is the client's bound address.
+            assert_eq!(from.port(), client_addr.port());
+
+            // Server echoes back to the reported source.
+            let (w, _) = server.send_to(b"pong".to_vec(), from).await;
+            assert_eq!(w.unwrap(), 4);
+            let (r, b) = client.recv_from(vec![0u8; 64]).await;
+            let (n, _) = r.unwrap();
+            assert_eq!(&b[..n], b"pong");
+        }));
+        result.expect("udp roundtrip timed out");
+    }
+
+    #[test]
+    fn udp_ipv6_roundtrip() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
+            )
+            .unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+            assert!(matches!(server_addr, SocketAddr::V6(_)));
+
+            client.send_to(b"v6dgram".to_vec(), server_addr).await.0.unwrap();
+            let (r, b) = server.recv_from(vec![0u8; 64]).await;
+            let (n, from) = r.unwrap();
+            assert_eq!(&b[..n], b"v6dgram");
+            assert!(matches!(from, SocketAddr::V6(_)));
+        }));
+        result.expect("udp ipv6 roundtrip timed out");
     }
 
     #[test]

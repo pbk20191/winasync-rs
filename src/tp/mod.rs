@@ -51,7 +51,7 @@ pub use block_on::block_on;
 #[allow(unused_imports)]
 pub use io::file::File;
 #[allow(unused_imports)]
-pub use io::net::{TcpListener, TcpStream};
+pub use io::net::{TcpListener, TcpStream, UdpSocket};
 #[allow(unused_imports)]
 pub use pool::{Pool, PoolBuilder, Priority, Scope};
 #[allow(unused_imports)]
