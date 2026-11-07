@@ -270,6 +270,13 @@ impl ConnectionListener {
     /// see [`ListenerState`]): the in-flight accept is cancelled so the
     /// listener stops accepting connections no one would receive. A later
     /// `ConnectionReceived` resumes it.
+    ///
+    /// One inherent race remains: if the in-flight accept *completes* (a client
+    /// connected) in the instant between here cancelling it and the completion
+    /// running, that one already-accepted connection is delivered to an empty
+    /// handler set and dropped. The accept was already in flight, so it can't be
+    /// un-accepted; this is the usual accept/stop boundary race and is bounded
+    /// to at most that single connection.
     #[allow(non_snake_case)]
     pub fn RemoveConnectionReceived(&self, token: i64) -> Result<()> {
         if self.state.closed.load(Ordering::Acquire) {
@@ -283,8 +290,8 @@ impl ConnectionListener {
         };
         if now_empty {
             // No consumers left: cancel the in-flight accept. Its `on_result`
-            // (Err, from the cancellation) runs `stop_chain`, which — seeing
-            // `want_running` now false — leaves the chain stopped.
+            // (Err, from the cancellation) runs the release/handoff, which —
+            // seeing `want_running` now false — leaves the chain stopped.
             if let Some(op) = self.state.current_op.lock().unwrap().take() {
                 op.cancel();
             }
@@ -325,6 +332,15 @@ impl ConnectionListener {
     /// orphaning an in-flight accept (untracked, so `Close`/`Drop` can no
     /// longer cancel it). Callers that need to rebind must serialize
     /// `BindAsync` calls themselves.
+    ///
+    /// Note a first-accept error-surfacing asymmetry on *rebind*: a fresh bind
+    /// (no chain yet) issues the first accept inline and surfaces its error, but
+    /// a rebind over a still-running chain can't claim `running` synchronously
+    /// (the old chain still holds it until its cancelled accept completes on the
+    /// pool), so the new source's first accept — and any error from it — happens
+    /// later on the restart path and is not surfaced from this call. Rebind onto
+    /// a questionable endpoint after an explicit `Close` (or a fresh listener)
+    /// if you need the error synchronously.
     #[allow(non_snake_case)]
     pub fn BindAsync(&self, endpoint: &HSTRING) -> Result<IAsyncAction> {
         if self.state.closed.load(Ordering::Acquire) {
