@@ -59,34 +59,60 @@ enum Transport {
     Unix,
 }
 
-/// The concrete accept source `arm` re-arms against once `BindAsync` has
-/// bound it, shared (behind an `Arc`, cloned out of `ListenerState::source`)
-/// rather than referenced directly, so that `arm` can drop
+/// The concrete accept source `try_arm` re-arms against once `BindAsync` has
+/// recorded it, shared (behind an `Arc`, cloned out of `ListenerState::source`)
+/// rather than referenced directly, so that `try_arm` can drop
 /// `ListenerState::source`'s lock before calling `AcceptSource::arm` on it —
-/// `tpio::submit` guarantees `on_result` (built by `arm`, passed down into
+/// `tpio::submit` guarantees `on_result` (built by `try_arm`, passed down into
 /// `AcceptSource::arm`) always runs later, on a thread-pool thread, never on
 /// this call's own stack, but cloning the `Arc` out first keeps the lock's
 /// scope minimal regardless.
+///
+/// Neither transport does any kernel work at `BindAsync` time: the named-pipe
+/// variant holds only the name (each `arm` creates a fresh instance), and the
+/// AF_UNIX variant holds the path and binds/listens *lazily* on the first
+/// `arm` (then reuses the one persistent socket). Deferring the unix
+/// `bind`/`listen` is what makes handler gating complete for that transport
+/// too: with no handler the chain never arms, so no listen socket exists and a
+/// client cannot connect into a backlog (see [`ConnectionReceived`]). The cost
+/// is that an AF_UNIX bind error (e.g. a stale socket file) now surfaces when
+/// the chain first starts — synchronously from `BindAsync` if a handler is
+/// already registered, otherwise from the first `ConnectionReceived` (where it
+/// is swallowed, same as a deferred named-pipe error) — rather than always
+/// from `BindAsync`.
 enum AcceptSource {
     NamedPipe(String),
-    Unix(super::UnixStreamListener),
+    Unix {
+        path: String,
+        /// `None` until the first `arm` binds the persistent listen socket.
+        listener: Mutex<Option<super::UnixStreamListener>>,
+    },
 }
 
 impl AcceptSource {
     /// Issues one accept via the underlying transport's callback-based
     /// primitive (`pipe::arm_accept` / `UnixStreamListener::arm_accept`),
-    /// both built directly on `tpio::submit` — no `Future`, no executor.
+    /// both built directly on `tpio::submit` — no `Future`, no executor. For
+    /// AF_UNIX, lazily binds the persistent listen socket on first use (so its
+    /// bind/listen error surfaces here as an `Err`, and so gating prevents the
+    /// socket from existing at all until there is a handler).
     fn arm(&self, on_result: Box<dyn FnOnce(Result<IInspectable>) + Send>) -> Result<OpHandle> {
         match self {
             AcceptSource::NamedPipe(name) => super::pipe::arm_accept(name, on_result),
-            AcceptSource::Unix(l) => l.arm_accept(on_result),
+            AcceptSource::Unix { path, listener } => {
+                let mut guard = listener.lock().unwrap();
+                if guard.is_none() {
+                    *guard = Some(super::UnixStreamListener::bind(path)?);
+                }
+                guard.as_ref().unwrap().arm_accept(on_result)
+            }
         }
     }
 }
 
 /// Shared, `Send + Sync` state behind a [`ConnectionListener`]: held both by
 /// the COM object itself and by the closures driving its self-re-arming
-/// accept chain (see [`arm`]), so `Close` can flip `closed`/cancel the
+/// accept chain (see [`drive`]), so `Close` can flip `closed`/cancel the
 /// in-flight accept out from under it, and the chain can tell it has been
 /// asked to stop.
 ///
@@ -97,22 +123,29 @@ impl AcceptSource {
 /// accepts connections — without a consumer, an accepted stream would just be
 /// dropped. The chain is (re)started by whichever of `BindAsync` /
 /// `ConnectionReceived` completes that condition, and paused — the in-flight
-/// accept cancelled — when the last handler is removed. `running` is the
-/// "a chain is logically active" flag that serializes starts: it is CAS'd
-/// `false -> true` exactly once per chain start ([`ensure_running`]) and set
-/// back to `false` exactly once when the chain stops ([`stop_chain`], which
-/// also re-checks `want_running` and restarts to close the add-races-stop
-/// window).
+/// accept cancelled — when the last handler is removed.
+///
+/// The whole chain is driven by one non-recursive loop ([`drive`]); `try_arm`
+/// issues a single accept and never manages lifecycle itself, so there is no
+/// `drive`/`arm`/stop mutual recursion. Two atomics coordinate starts:
+/// * `running` — "a chain is logically active"; CAS'd `false -> true` exactly
+///   once per chain start and back to `false` exactly once when it stops.
+/// * `restart_pending` — set when a would-be starter loses the `running` CAS to
+///   a chain that is already (or concurrently) stopping; the stopping chain
+///   consumes it on release and restarts, closing the add-races-stop window
+///   *without* restarting on every failure (so a persistent hard accept error
+///   can never hot-spin the pool). The set-then-recheck handshake across these
+///   two atomics uses `SeqCst` so a start request can never be lost.
 struct ListenerState {
     closed: AtomicBool,
     event: windows_core::Event<TypedEventHandler<IInspectable, IInspectable>>,
     endpoint: Mutex<Option<HSTRING>>,
-    /// Set once by `BindAsync`, read (cloned) by every `arm` call.
+    /// Set once by `BindAsync`, read (cloned) by every `try_arm` call.
     source: Mutex<Option<Arc<AcceptSource>>>,
     /// The in-flight accept's `OpHandle`. `tpio::submit` guarantees every
     /// completion — synchronous or asynchronous — is delivered on a
-    /// thread-pool thread (see `tpio::submit`'s doc comment), so `arm` never
-    /// recurses/re-enters on the caller's own stack and a plain
+    /// thread-pool thread (see `tpio::submit`'s doc comment), so `try_arm`
+    /// never recurses/re-enters on the caller's own stack and a plain
     /// `Option<OpHandle>` (no sequence tag) is sufficient here.
     current_op: Mutex<Option<OpHandle>>,
     /// Live `ConnectionReceived` tokens — `windows_core::Event` exposes no
@@ -121,6 +154,9 @@ struct ListenerState {
     /// Whether an accept chain is logically active. See the type-level
     /// "Handler gating" note.
     running: AtomicBool,
+    /// A start was requested while `running` was still held by a stopping
+    /// chain; the chain restarts once on release. See the "Handler gating" note.
+    restart_pending: AtomicBool,
 }
 
 impl ListenerState {
@@ -133,6 +169,7 @@ impl ListenerState {
             current_op: Mutex::new(None),
             handlers: Mutex::new(HashSet::new()),
             running: AtomicBool::new(false),
+            restart_pending: AtomicBool::new(false),
         }
     }
 }
@@ -258,22 +295,22 @@ impl ConnectionListener {
     /// Records `endpoint` (the pipe name / socket path, depending on
     /// transport) and — *if a `ConnectionReceived` handler is already
     /// registered* (handler gating, see [`ListenerState`]) — issues the first
-    /// accept of the self-re-arming completion chain (see [`arm`]). With no
+    /// accept of the self-re-arming completion chain (see [`drive`]). With no
     /// handler yet, binding only records the endpoint/source; the chain starts
-    /// later, when the first handler is registered. For the named-pipe
-    /// transport, binding is deferred to the first `arm_accept` call (it
-    /// creates its own pipe instance); for the AF_UNIX transport, the
-    /// persistent listen socket is created here regardless of gating (so a
-    /// bind error — e.g. a stale socket file — surfaces synchronously from
-    /// this call rather than later) and then shared into the chain via
-    /// `ListenerState::source`.
+    /// later, when the first handler is registered. Neither transport does any
+    /// kernel work until the chain first arms (see [`AcceptSource`]): the
+    /// named-pipe instance and the AF_UNIX listen socket are both created on
+    /// the first accept, so a bound-but-handler-less listener holds no kernel
+    /// resources and accepts nothing.
     ///
     /// When a handler is present, a synchronous failure to issue the *first*
-    /// accept (e.g. a malformed pipe name) is surfaced synchronously from this
-    /// call — only re-arms triggered internally by a later completion can't
-    /// propagate a `Result` anywhere and instead just stop the chain (see
-    /// `arm`). The returned `IAsyncAction` is already completed once this call
-    /// returns `Ok`.
+    /// accept (a malformed pipe name, or an AF_UNIX bind/listen error such as a
+    /// stale socket file) is surfaced synchronously from this call — only
+    /// re-arms triggered internally by a later completion can't propagate a
+    /// `Result` anywhere and instead just stop the chain (see [`drive`]). With
+    /// no handler, that first-accept error is deferred to whenever the chain
+    /// eventually starts. The returned `IAsyncAction` is already completed once
+    /// this call returns `Ok`.
     ///
     /// # Not safe to call concurrently with an already-running accept chain
     /// Calling `BindAsync` again *sequentially* (e.g. to rebind after a
@@ -282,7 +319,7 @@ impl ConnectionListener {
     /// chain, so nothing is orphaned. But calling `BindAsync` from one
     /// thread while a previously started accept chain is still actively
     /// running (not yet superseded) on another is not supported: the
-    /// `current_op` handoff in `arm` assumes a single active chain at a
+    /// `current_op` handoff in `try_arm` assumes a single active chain at a
     /// time, and a concurrent rebind racing it could store a new `source`/
     /// cancel the wrong `current_op` out from under the other chain,
     /// orphaning an in-flight accept (untracked, so `Close`/`Drop` can no
@@ -303,9 +340,13 @@ impl ConnectionListener {
 
         let source = match self.transport {
             Transport::NamedPipe => AcceptSource::NamedPipe(endpoint.to_string()),
-            Transport::Unix => AcceptSource::Unix(super::UnixStreamListener::bind(
-                &endpoint.to_string(),
-            )?),
+            // The AF_UNIX listen socket is bound lazily on the first accept
+            // (see `AcceptSource`), not here, so that handler gating also keeps
+            // the socket from existing until there is a consumer.
+            Transport::Unix => AcceptSource::Unix {
+                path: endpoint.to_string(),
+                listener: Mutex::new(None),
+            },
         };
         *self.state.source.lock().unwrap() = Some(Arc::new(source));
         *self.state.endpoint.lock().unwrap() = Some(endpoint.clone());
@@ -354,111 +395,126 @@ fn want_running(state: &ListenerState) -> bool {
     !state.handlers.lock().unwrap().is_empty()
 }
 
-/// Starts the accept chain if it is wanted and not already running. The
-/// `running` CAS is the single serialization point: only the thread that flips
-/// it `false -> true` issues the first accept, so concurrent callers
-/// (`BindAsync`, `ConnectionReceived`, a restarting `stop_chain`) never start
-/// two overlapping chains. Returns the first accept's synchronous error (and
-/// releases the flag) so `BindAsync` can surface it; callers that can't act on
-/// an error ignore it.
-fn ensure_running(state: Arc<ListenerState>) -> Result<()> {
-    if !want_running(&state) {
-        return Ok(());
-    }
-    if state
-        .running
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        // A chain is already active; it will keep re-arming on its own.
-        return Ok(());
-    }
-    match arm(state.clone()) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Couldn't issue the first accept — release the flag so a later
-            // bind/handler can retry.
-            state.running.store(false, Ordering::Release);
-            Err(e)
+/// Releases the `running` flag and reports whether the chain should restart —
+/// i.e. a start was explicitly requested (`restart_pending`) *and* the listener
+/// is still wanted. Restart happens *only* on an explicit request, never on a
+/// bare stop/failure, so a persistent hard accept error can never hot-spin the
+/// pool. The `SeqCst` store/swap pairs with the `SeqCst` set/load in [`drive`]'s
+/// lost-CAS branch to form a Dekker-style handshake: it is impossible for a
+/// requester and a releaser to miss each other (that would require a cycle in
+/// the single total order `SeqCst` imposes), so a start request is never lost.
+fn release_running(state: &Arc<ListenerState>) -> bool {
+    state.running.store(false, Ordering::SeqCst);
+    state.restart_pending.swap(false, Ordering::SeqCst) && want_running(state)
+}
+
+/// The single, non-recursive accept-chain driver.
+///
+/// `acquired` is `false` for a cold start (`BindAsync` / `ConnectionReceived`):
+/// the loop first claims the `running` flag via a CAS. It is `true` for a re-arm
+/// continuation already owning the flag (scheduled by `on_result` onto the pool).
+/// The `running` CAS is the single serialization point — only the thread that
+/// flips `false -> true` issues accepts, so concurrent starters never run two
+/// overlapping chains.
+///
+/// Everything is a loop, never recursion: when the chain must stop but a restart
+/// was requested in the meantime (the add-races-stop handoff), the loop simply
+/// re-iterates instead of re-entering itself. `try_arm` likewise never calls
+/// back into `drive`, and `on_result`'s re-arm is handed to a *fresh* pool stack
+/// via `windows_threading::submit` — so chain depth is O(1) regardless of how
+/// large a synchronous connect backlog is (a burst of already-connected clients
+/// becomes a long *sequence* of pool callbacks, never a deep stack; a Rust stack
+/// overflow would be an immediate process `abort`).
+///
+/// Returns the first accept's synchronous error on a cold start so `BindAsync`
+/// can surface it (a malformed pipe name, an AF_UNIX bind/listen error, …); a
+/// re-arm continuation has nowhere to surface it and ignores it.
+fn drive(state: Arc<ListenerState>, mut acquired: bool) -> Result<()> {
+    loop {
+        if !acquired {
+            if !want_running(&state) {
+                return Ok(());
+            }
+            if state
+                .running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                // A chain already owns `running`. Record that a (re)start is
+                // wanted so that chain restarts when it stops, then close the
+                // lost-request window: if it released `running` between our CAS
+                // and now, retry rather than trust it to have seen our request.
+                state.restart_pending.store(true, Ordering::SeqCst);
+                if !state.running.load(Ordering::SeqCst) {
+                    continue;
+                }
+                return Ok(());
+            }
+            acquired = true;
+        }
+
+        // We own `running`.
+        match try_arm(&state) {
+            // Armed; `on_result` drives the next step.
+            Ok(true) => return Ok(()),
+            // No longer wanted (closed / unbound / no handler). Release; if a
+            // start was requested meanwhile, reclaim and retry, else stop.
+            Ok(false) => {
+                acquired = false;
+                if release_running(&state) {
+                    continue;
+                }
+                return Ok(());
+            }
+            // Couldn't issue the accept. Release and surface the error — unless
+            // a start was explicitly requested meanwhile, in which case retry
+            // once (bounded by the flag, so no hot-spin on a persistent error).
+            Err(e) => {
+                if release_running(&state) {
+                    acquired = false;
+                    continue;
+                }
+                return Err(e);
+            }
         }
     }
 }
 
-/// Marks the chain stopped, then restarts it if it is (still/again) wanted.
-/// The restart closes the race where a handler is added — or the listener
-/// rebound — while an in-flight completion is on its way to parking the chain:
-/// that completion would otherwise store `running = false` *after* the adder's
-/// `ensure_running` CAS already failed against the still-`true` flag, leaving
-/// a wanted-but-stopped listener. Re-checking here (and re-CASing via
-/// `ensure_running`) guarantees forward progress; the CAS keeps it to a single
-/// chain. Recursion is bounded: the restart only re-enters `arm` when the
-/// listener is wanted, in which case `arm` issues an op and returns.
-fn stop_chain(state: Arc<ListenerState>) {
-    state.running.store(false, Ordering::Release);
-    if want_running(&state) {
-        let _ = ensure_running(state);
-    }
+/// Starts the accept chain if it is wanted and not already running; propagates
+/// the first accept's synchronous error. Thin cold-start entry to [`drive`].
+fn ensure_running(state: Arc<ListenerState>) -> Result<()> {
+    drive(state, false)
 }
 
-/// Issues (or re-issues) one accept and arranges for its completion to fire
-/// `ConnectionReceived` and then issue the *next* accept — a self-re-arming
-/// TP_IO completion chain running entirely on the default thread-pool
-/// callback environment, with no executor and no async task anywhere in the
-/// loop.
-///
-/// # The re-arm is deferred to the default pool — no reentrant recursion
-/// The transport's `arm_accept` completion (`on_result`, built here) usually
-/// runs later, on a thread-pool worker thread. But it can also run
-/// *synchronously*, inline on the thread that called `arm`, before
-/// `AcceptSource::arm` even returns — `tpio::submit` delivers a synchronous
-/// completion (the named-pipe `ERROR_PIPE_CONNECTED` "already connected"
-/// case, or any hard synchronous failure) on the caller's own stack. If
-/// `on_result` re-armed by calling `arm` directly on that synchronous path,
-/// a backlog of already-connected clients would recurse once per connection
-/// — one stack frame each — which a large enough backlog can overflow (a
-/// Rust stack overflow is an immediate process `abort`).
-///
-/// So `on_result` never calls `arm` directly; it hands the *re-arm* to the
-/// default thread pool via `windows_threading::submit`, which always starts
-/// the next `arm` on a fresh callback stack. Depth is therefore O(1)
-/// regardless of backlog: a burst of already-connected clients produces a
-/// long *sequence* of independent `arm` calls handed one at a time across
-/// pool callbacks, never a deep stack. This keeps the fix entirely inside
-/// the listener — the shared `tpio::submit` completion model is untouched,
-/// so ordinary stream reads/writes keep their existing inline-fast-path
-/// behavior.
-///
-/// Returns `Err` only for a synchronous failure to issue *this* call's
-/// accept (e.g. `CreateNamedPipeW` failing on a malformed name). `BindAsync`
-/// propagates the first call's `Err` to its caller; a re-arm triggered from
-/// `on_result` ignores it instead (there is nowhere else to surface it to,
-/// and stopping the chain is the correct response either way).
-fn arm(state: Arc<ListenerState>) -> Result<()> {
-    if !want_running(&state) {
-        // Closed, unbound, or no handler — the chain must not run. Mark it
-        // stopped (and let `stop_chain` restart it if a handler raced back in).
-        stop_chain(state);
-        return Ok(());
+/// Issues exactly one accept and installs its completion (`on_result`), which
+/// fires `ConnectionReceived` and schedules the next step. Does *not* touch the
+/// `running`/`restart_pending` lifecycle — the caller ([`drive`]) owns that — so
+/// it can never recurse into the chain machinery. Returns:
+/// * `Ok(true)`  — an accept was issued; its `OpHandle` is stored in `current_op`.
+/// * `Ok(false)` — the listener is no longer wanted; nothing was issued.
+/// * `Err(e)`    — a synchronous failure to issue the accept (a malformed pipe
+///   name, or the AF_UNIX `bind`/`listen` on the first arm).
+fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
+    if !want_running(state) {
+        return Ok(false);
     }
 
     // Clone the `Arc<AcceptSource>` out and drop the `source` lock before
-    // calling `.arm()` on it below — not required for correctness anymore
-    // (every completion now runs on a fresh, later stack, never reentering
-    // this call), but keeping the lock's scope minimal is cheap and avoids
-    // holding it across an FFI-adjacent call.
+    // calling `.arm()` on it below — keeps the lock scope minimal and avoids
+    // holding it across an FFI-adjacent call. (`tpio::submit` always delivers
+    // the completion on a later pool stack, never inline here.)
     let source = state.source.lock().unwrap().clone();
     let Some(source) = source else {
-        // `want_running` observed a bound source a moment ago but it's gone
-        // now; nothing to arm. (Source is never cleared today, so this is a
-        // defensive path.)
-        stop_chain(state);
-        return Ok(());
+        // `want_running` saw a bound source a moment ago but it's gone now;
+        // nothing to arm. (Source is never cleared today — defensive.)
+        return Ok(false);
     };
 
     let state_cb = state.clone();
     let on_result: Box<dyn FnOnce(Result<IInspectable>) + Send> = Box::new(move |res| {
         if state_cb.closed.load(Ordering::Acquire) {
-            stop_chain(state_cb);
+            // Closed: just release (`want_running` is false, so no restart).
+            let _ = release_running(&state_cb);
             return;
         }
         match res {
@@ -470,32 +526,26 @@ fn arm(state: Arc<ListenerState>) -> Result<()> {
                     .clone()
                     .unwrap_or_default();
                 fire_event(&state_cb, stream, endpoint);
-                // Re-arm for the next connection — but only while still wanted
-                // (not closed, still bound, still has a handler); otherwise
-                // park the chain via `stop_chain`. `on_result` may be running
-                // synchronously, inline on the thread that called `arm` (the
-                // `ERROR_PIPE_CONNECTED` "already connected" case), so calling
-                // `arm` directly here could recurse once per already-queued
-                // client. Defer the re-arm to the default thread pool instead:
-                // it always starts on a fresh callback stack, bounding depth
-                // to O(1) (see this fn's doc comment).
-                if want_running(&state_cb) {
-                    let next = state_cb.clone();
-                    windows_threading::submit(move || {
-                        let _ = arm(next);
-                    });
-                } else {
-                    stop_chain(state_cb);
-                }
+                // Re-arm on a *fresh* pool stack, continuing to own `running`
+                // (`drive(.., true)`). Handing the re-arm to the pool bounds
+                // chain depth to O(1) even when completions arrive synchronously
+                // (the named-pipe `ERROR_PIPE_CONNECTED` "already connected"
+                // backlog case); `drive` itself parks the chain if it is no
+                // longer wanted.
+                let next = state_cb.clone();
+                windows_threading::submit(move || {
+                    let _ = drive(next, true);
+                });
             }
             Err(_) => {
                 // Hard accept failure, or a cancellation from Close / the last
-                // handler being removed racing the in-flight accept. Stop
-                // without re-arming: retrying a persistent failure here would
-                // hot-spin this pool thread, and a cancellation means we're
-                // closing or pausing anyway. `stop_chain` releases `running`
-                // and restarts only if the listener is wanted again.
-                stop_chain(state_cb);
+                // handler being removed. Release the flag; restart only if a
+                // start was explicitly requested meanwhile (the add-races-stop
+                // handoff) — never on a bare failure, so a persistent error
+                // can't hot-spin the pool.
+                if release_running(&state_cb) {
+                    let _ = drive(state_cb, false);
+                }
             }
         }
     });
@@ -505,16 +555,16 @@ fn arm(state: Arc<ListenerState>) -> Result<()> {
     *state.current_op.lock().unwrap() = Some(op);
 
     // Double-check: a Close — or the last `RemoveConnectionReceived` — racing
-    // this re-arm (observed as wanted above, then made unwanted before this
-    // stored the op) must still cancel the op just stored. The cancelled op's
-    // `on_result` (Err) then runs `stop_chain`.
-    if !want_running(&state) {
+    // this arm (observed as wanted above, then made unwanted before the op was
+    // stored) must still cancel the op just stored. The cancelled op's
+    // `on_result` (Err) then runs the release/handoff.
+    if !want_running(state) {
         if let Some(op) = state.current_op.lock().unwrap().take() {
             op.cancel();
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Wraps `stream`/`endpoint` into `IConnectionReceivedArgs` and fires
@@ -826,7 +876,7 @@ mod listener_tests {
     /// `CreateNamedPipeW` fails synchronously inside `pipe::arm_accept`)
     /// must surface as an `Err` from `BindAsync` itself, not get swallowed
     /// (the way an internal re-arm's failure is, deliberately, — see
-    /// `arm`'s doc comment).
+    /// `drive`'s doc comment).
     ///
     /// A handler is registered *before* `BindAsync` so the accept chain is
     /// actually started by it (handler gating — with no handler, `BindAsync`
@@ -906,6 +956,81 @@ mod listener_tests {
         closable.Close().unwrap();
     }
 
+    /// Handler gating is reversible: removing the *last* `ConnectionReceived`
+    /// handler pauses accepting (the in-flight accept is cancelled, so the pipe
+    /// instance disappears and a client can no longer connect), and registering
+    /// a handler again resumes it. This exercises the remove-then-re-add
+    /// handoff (`restart_pending`) and a lazily re-created pipe instance.
+    #[test]
+    fn pause_and_resume_on_handler_toggle() {
+        let name = format!(r"\\.\pipe\comio_listener_toggle_{}", std::process::id());
+        let listener = ConnectionListener::named_pipe();
+
+        // Helper: build a handler that smuggles the delivered stream identity.
+        let make_handler = |tx: mpsc::Sender<usize>| {
+            TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
+                let a = args.as_ref().unwrap();
+                let cra: IConnectionReceivedArgs = a.cast().unwrap();
+                let raw = unsafe {
+                    let mut raw = core::ptr::null_mut();
+                    cra.Stream(&mut raw).ok()?;
+                    raw as usize
+                };
+                let _ = tx.send(raw);
+                Ok(())
+            })
+        };
+        let connect_once = |name: &str| {
+            let mut last = None;
+            for _ in 0..50 {
+                match block_on(crate::comio::NamedPipeClient::connect(name)) {
+                    Ok(c) => {
+                        last = Some(c);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            last
+        };
+
+        // Bind with a handler, confirm a connection is delivered.
+        let (tx1, rx1) = mpsc::channel::<usize>();
+        let h1 = make_handler(tx1);
+        let token = listener.ConnectionReceived(&h1).unwrap();
+        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        let c1 = connect_once(&name).expect("first connect failed");
+        let raw1 = rx1
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("no delivery while a handler was registered");
+        let _s1 = unsafe { IInspectable::from_raw(raw1 as *mut core::ffi::c_void) };
+        drop(c1);
+
+        // Remove the last handler => chain pauses. Give the cancellation time
+        // to tear the pipe instance down, then a connect must fail.
+        listener.RemoveConnectionReceived(token).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            block_on(crate::comio::NamedPipeClient::connect(&name)).is_err(),
+            "listener kept accepting after its last handler was removed"
+        );
+
+        // Re-add a handler => chain resumes (restart_pending handoff / lazy
+        // re-arm), and a connection is delivered again.
+        let (tx2, rx2) = mpsc::channel::<usize>();
+        let h2 = make_handler(tx2);
+        listener.ConnectionReceived(&h2).unwrap();
+        let c2 = connect_once(&name).expect("connect failed after re-adding a handler");
+        let raw2 = rx2
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("no delivery after the chain resumed");
+        let _s2 = unsafe { IInspectable::from_raw(raw2 as *mut core::ffi::c_void) };
+        drop(c2);
+
+        let closable: IClosable = listener.cast().unwrap();
+        closable.Close().unwrap();
+    }
+
     /// Concurrent-backlog liveness test. Originally written to probe a
     /// stack-overflow risk from recursive same-stack re-arming under a
     /// backlog of already-connected clients (the named-pipe transport's
@@ -913,8 +1038,8 @@ mod listener_tests {
     /// `pipe::arm_accept`'s doc comment); that risk is now structurally
     /// impossible, since `tpio::submit` re-dispatches every synchronous
     /// completion to the default thread pool instead of invoking it inline
-    /// (see `tpio::submit`'s and `arm`'s doc comments) — `on_result` never
-    /// runs on the stack of the `arm` call that armed it, so a re-arm from
+    /// (see `tpio::submit`'s and `drive`'s doc comments) — `on_result` never
+    /// runs on the stack of the `try_arm` call that armed it, so a re-arm from
     /// `on_result` can never recurse, regardless of how large the connect
     /// backlog is. This test is kept as a liveness/throughput check under
     /// real concurrent connection load rather than a stack-safety repro:
