@@ -466,6 +466,63 @@ impl<W: AsyncWrite + Unpin + ?Sized> Future for CloseFut<'_, W> {
     }
 }
 
+/// Bridges the bespoke [`AsyncRead`]/[`AsyncWrite`] traits to the `futures-io`
+/// ecosystem traits (enabled by the `futures-io` feature), so these types can
+/// be used with `futures`/`tokio-util` combinators. Errors are mapped from
+/// `windows_core::Error` into `std::io::Error`.
+#[cfg(feature = "futures-io")]
+mod futures_compat {
+    use super::*;
+    use std::io;
+
+    fn map<T>(p: Poll<windows_core::Result<T>>) -> Poll<io::Result<T>> {
+        match p {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(v)) => Poll::Ready(Ok(v)),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
+        }
+    }
+
+    macro_rules! impl_futures_read {
+        ($t:ty) => {
+            impl futures_io::AsyncRead for $t {
+                fn poll_read(
+                    self: Pin<&mut Self>,
+                    cx: &mut Context<'_>,
+                    buf: &mut [u8],
+                ) -> Poll<io::Result<usize>> {
+                    map(<$t as AsyncRead>::poll_read(self, cx, buf))
+                }
+            }
+        };
+    }
+
+    macro_rules! impl_futures_write {
+        ($t:ty) => {
+            impl futures_io::AsyncWrite for $t {
+                fn poll_write(
+                    self: Pin<&mut Self>,
+                    cx: &mut Context<'_>,
+                    buf: &[u8],
+                ) -> Poll<io::Result<usize>> {
+                    map(<$t as AsyncWrite>::poll_write(self, cx, buf))
+                }
+                fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    map(<$t as AsyncWrite>::poll_flush(self, cx))
+                }
+                fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                    map(<$t as AsyncWrite>::poll_close(self, cx))
+                }
+            }
+        };
+    }
+
+    impl_futures_read!(TcpStreamIo);
+    impl_futures_write!(TcpStreamIo);
+    impl_futures_read!(ReadHalf);
+    impl_futures_write!(WriteHalf);
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::{block_on, timeout, Runtime};
@@ -561,5 +618,16 @@ mod tests {
             echoed == payload
         }));
         assert!(result.expect("split full-duplex timed out"));
+    }
+
+    #[cfg(feature = "futures-io")]
+    #[test]
+    fn implements_futures_io_traits() {
+        fn assert_read<T: futures_io::AsyncRead>() {}
+        fn assert_write<T: futures_io::AsyncWrite>() {}
+        assert_read::<TcpStreamIo>();
+        assert_write::<TcpStreamIo>();
+        assert_read::<ReadHalf>();
+        assert_write::<WriteHalf>();
     }
 }

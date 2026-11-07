@@ -44,5 +44,13 @@ version = "0.2.1"
 #[target.'cfg(windows)'.build-dependencies]
 #embed-resource = "3.0.9"
 
+[dependencies.futures-io]
+version = "0.3"
+optional = true
+
+[features]
+# Bridge tp's AsyncRead/AsyncWrite to the futures-io ecosystem traits.
+futures-io = ["dep:futures-io"]
+
 [build-dependencies]
 embed-resource = "3.0.9"
