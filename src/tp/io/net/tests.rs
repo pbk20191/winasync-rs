@@ -431,7 +431,6 @@
     fn skip_completion_on_success_echoes_and_leaks_nothing() {
         use crate::common::overlapped::INLINE_COMPLETIONS;
         let rt = Runtime::new();
-        let before = super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed);
         let inline_before = INLINE_COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed);
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
             let listener = TcpListener::bind(
@@ -494,15 +493,20 @@
         }
         let _ = inline_before;
         drop(rt);
-        for _ in 0..200 {
-            if super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == before {
+        // `LIVE_OPS` is process-global, so the only value this test can
+        // assert on is the quiescent one: a snapshot taken at entry counts
+        // whatever concurrently running tests happened to have in flight
+        // then, and comparing against it fails when they finish first.
+        // Waiting for zero is what every other leak check here does.
+        for _ in 0..500 {
+            if super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(
             super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
-            before,
+            0,
             "op blocks leaked on the skip-completion path"
         );
     }
