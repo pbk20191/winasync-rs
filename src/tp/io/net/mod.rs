@@ -370,6 +370,27 @@ struct AcceptIntoPayload {
     addr_buf: Box<[u8; 2 * ADDR_SLOT]>,
 }
 
+/// Payload for [`TcpListener::accept_with_data`]: like [`AcceptPayload`], but
+/// the single AcceptEx output buffer holds `recv_len` bytes of first-segment
+/// data **before** the two address slots, so it is one heap `Vec` instead of a
+/// fixed array.
+struct AcceptDataPayload {
+    accept_sock: SOCKET,
+    /// `recv_len + 2 * ADDR_SLOT` bytes: data, then local addr, then remote.
+    buf: Vec<u8>,
+    recv_len: usize,
+}
+
+impl Drop for AcceptDataPayload {
+    fn drop(&mut self) {
+        if self.accept_sock != INVALID_SOCKET {
+            unsafe { closesocket(self.accept_sock) };
+        }
+    }
+}
+
+unsafe impl Send for AcceptDataPayload {}
+
 /// Payload of a WSARecv: the buffer plus the flags word, which the provider
 /// may write at completion time and therefore must live in the op block.
 struct RecvPayload {

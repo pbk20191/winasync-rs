@@ -86,6 +86,73 @@ impl TcpListener {
         }
     }
 
+    /// Accepts one connection **and** its first segment in a single op, saving
+    /// the extra `WSARecv` round trip for protocols where the client speaks
+    /// first (HTTP, TLS ClientHello, a length-prefixed request header).
+    ///
+    /// Resolves to the stream plus however many bytes arrived — never more than
+    /// `recv_len`, often fewer, since one TCP segment is all the kernel waits
+    /// for. Zero bytes are possible when the first segment is empty.
+    ///
+    /// Caveat: with a non-zero receive length AcceptEx does **not** complete on
+    /// the TCP handshake alone — it waits for data. A client that connects and
+    /// stays silent holds the accept (and its accept socket) indefinitely, so a
+    /// server exposed to untrusted peers should pair this with
+    /// `SO_CONNECT_TIME` reaping or a timeout. Use [`accept`](Self::accept) when
+    /// the server speaks first.
+    pub async fn accept_with_data(
+        &self,
+        recv_len: usize,
+    ) -> windows_core::Result<(TcpStream, Vec<u8>)> {
+        let accept_sock = new_socket(self.family, SOCK_STREAM, IPPROTO_TCP)?;
+        let listen_sock = self.res.socket();
+        let fut = unsafe {
+            submit(
+                &self.res,
+                AcceptDataPayload {
+                    accept_sock,
+                    buf: vec![0u8; recv_len + 2 * ADDR_SLOT],
+                    recv_len,
+                },
+                |ovl, p| {
+                    let mut bytes = 0u32;
+                    let ok = AcceptEx(
+                        listen_sock,
+                        p.accept_sock,
+                        p.buf.as_mut_ptr() as *mut c_void,
+                        p.recv_len as u32,
+                        ADDR_SLOT as u32,
+                        ADDR_SLOT as u32,
+                        &mut bytes,
+                        ovl,
+                    );
+                    classify_wsa_overlapped(ok.as_bool())
+                },
+            )
+        };
+        let (result, mut payload) = fut.await;
+        // The completion byte count covers only the received data, not the
+        // address slots (those are filled regardless).
+        let received = result?;
+        let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
+        let mut data = mem::take(&mut payload.buf);
+        data.truncate(received.min(payload.recv_len));
+        let finish = || -> windows_core::Result<TcpStream> {
+            let listen_val = listen_sock.0.to_ne_bytes();
+            sock_check(unsafe {
+                setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
+            })?;
+            TcpStream::from_socket(&self.res.rt, sock)
+        };
+        match finish() {
+            Ok(stream) => Ok((stream, data)),
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                Err(e)
+            }
+        }
+    }
+
     /// Accepts the next connection into a socket recycled from
     /// [`TcpStream::into_reusable`], skipping the per-connection `socket()` and —
     /// crucially — the completion-port re-association, which Windows forbids (a

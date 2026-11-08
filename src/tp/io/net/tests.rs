@@ -407,6 +407,31 @@
     }
 
     #[test]
+    fn accept_with_data_gets_first_segment() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = rt.spawn(async move {
+                let (stream, data) = listener.accept_with_data(64).await.unwrap();
+                // The accepted socket is fully usable; the data came for free.
+                assert!(stream.peer_addr().is_ok());
+                data
+            });
+
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            client.write(b"GET / HTTP/1.1".to_vec()).await.0.unwrap();
+            let data = server.await.unwrap();
+            assert_eq!(&data, b"GET / HTTP/1.1");
+        }));
+        result.expect("accept_with_data timed out");
+    }
+
+    #[test]
     fn udp_vectored_roundtrip() {
         let rt = Runtime::new();
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
