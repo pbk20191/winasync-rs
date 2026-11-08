@@ -6,7 +6,6 @@
 
 pub mod asyncop;
 pub mod buffer;
-pub mod future_op;
 pub mod listener;
 pub mod pipe;
 pub mod stream;
@@ -34,10 +33,6 @@ pub use listener::{ConnectionListener, IConnectionReceivedArgs};
 pub(crate) use stream::from_reg;
 #[allow(unused_imports)]
 pub use unix::{UnixStreamListener, UnixStreamSocket};
-// Expose a Rust `Future` to WinRT as an awaitable `IAsyncOperation`/`IAsyncAction`
-// via a `Completer` the producer fulfils (`future_op.rs`).
-#[allow(unused_imports)]
-pub use future_op::{action, operation, ActionCompleter, Completer};
 
 /// Thread pool / overlapped calls only fail on resource exhaustion; map those
 /// to a panic, matching `tp`'s policy.
