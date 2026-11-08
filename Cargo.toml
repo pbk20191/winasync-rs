@@ -3,6 +3,23 @@ name = "rustwinui3loop"
 version = "0.1.0"
 edition = "2024"
 
+# `cdylib` builds the same library a second time as a DLL, which is the form
+# COM can load: `comio::activation` exports `DllGetClassObject` and friends
+# from it, so the transports are reachable by `CoCreateInstance` from any
+# language, not only by linking this crate. `lib` stays first — Rust callers,
+# the demo bin and the test harness all use the rlib, and nothing about the
+# cdylib changes what they see.
+[lib]
+crate-type = ["lib", "cdylib"]
+
+# Renamed off the package name because the cdylib now claims
+# `rustwinui3loop.pdb`, which a bin of the same name would also emit —
+# cargo warns on the collision and says it may become a hard error. There is
+# still only one bin, so `cargo run` is unaffected.
+[[bin]]
+name = "rustwinui3loop-demo"
+path = "src/main.rs"
+
 [dependencies]
 windows-core = "0.62.2"
 
@@ -64,6 +81,10 @@ comio = [
     "windows/Win32_System_Pipes",
     "windows/Win32_System_WinRT",
     "windows/Win32_Security",
+    # The activation path: class factories, self-registration, module path.
+    "windows/Win32_System_Com",
+    "windows/Win32_System_Registry",
+    "windows/Win32_System_LibraryLoader",
 ]
 
 # DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.

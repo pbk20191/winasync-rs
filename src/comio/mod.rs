@@ -8,6 +8,7 @@
 //! those endpoints.
 #![allow(dead_code)]
 
+pub mod activation;
 pub mod asyncop;
 pub mod buffer;
 pub mod connector;

@@ -1,0 +1,15 @@
+; Export list for the cdylib, which is the COM in-process server.
+;
+; Rust already exports these four through `#[unsafe(no_mangle)]`, so this
+; file is not what makes them reachable — `PRIVATE` is. Without it MSVC warns
+; LNK4104 on each one: these names are only ever reached by `GetProcAddress`
+; from the COM loader, never linked against, so putting them in the generated
+; import library would invite a caller to bind to them statically. `PRIVATE`
+; keeps them in the DLL's export table and out of the .lib.
+;
+; See src/comio/activation.rs for what each one does.
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE

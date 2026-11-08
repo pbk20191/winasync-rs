@@ -1,6 +1,7 @@
 //! Demo binary for the engines in this crate's library.
 
-#[cfg(feature = "comio")]
+// Only the three-engine demo tail below consumes it.
+#[cfg(all(feature = "tp", feature = "comio", feature = "dq"))]
 use rustwinui3loop::comio;
 #[cfg(feature = "dq")]
 use rustwinui3loop::dq;
