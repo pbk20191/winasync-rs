@@ -73,11 +73,19 @@
 //! sides and sends posted before any are awaited, so neither engine is
 //! serialized against the other.
 //!
-//! On this machine, 64-byte datagrams over loopback: the overlapped path
-//! leads slightly at **queue depth 1** (~0.94x), parity arrives at **depth
-//! 2**, and RIO pulls to ~**1.5x** by depth 128. Deferred sends plus one
-//! commit are doing much of that — RIO can hand a whole batch to the provider
-//! in one crossing, and the overlapped API has no equivalent.
+//! On this machine, 64-byte datagrams over loopback, **both engines fed from
+//! the same slab pool**: roughly parity at queue depth 1 (~1.03x) widening to
+//! ~**1.3x** by depth 128. Deferred sends plus one commit account for much of
+//! that — RIO can hand a whole batch to the provider in one crossing, and the
+//! overlapped API has no equivalent.
+//!
+//! That figure moved twice while the benchmark was being made fair. Awaiting
+//! each overlapped send in turn, against a batched RIO, flattered RIO by
+//! ~1.8x; feeding the overlapped side recycled `Vec`s while RIO used
+//! registered slices still flattered it to ~1.5x. Only once both took
+//! identical pooled memory — which `common::buffer` made possible — did the
+//! number settle. Read any single-number claim about these engines with
+//! that in mind, including this one.
 //!
 //! Treat those as this workload's numbers only. Published comparisons of
 //! *request/response* traffic at depth 1 put RIO far behind IOCP, because

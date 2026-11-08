@@ -13,6 +13,7 @@
 
 use super::file::File;
 use super::{submit, IoRes, OpFuture};
+use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::{Runtime, RuntimeInner};
 pub(crate) use crate::common::sockaddr::{
     addr_of_socket, family_of, peer_of_socket, read_sockaddr, wildcard, write_sockaddr,
@@ -205,8 +206,8 @@ unsafe impl Send for AcceptDataPayload {}
 
 /// Payload of a WSARecv: the buffer plus the flags word, which the provider
 /// may write at completion time and therefore must live in the op block.
-pub(in crate::tp::io) struct RecvPayload {
-    pub(in crate::tp::io) buf: Vec<u8>,
+pub(in crate::tp::io) struct RecvPayload<B> {
+    pub(in crate::tp::io) buf: B,
     pub(in crate::tp::io) flags: u32,
 }
 

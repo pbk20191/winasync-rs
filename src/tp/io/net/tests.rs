@@ -761,6 +761,62 @@
         assert_eq!(iter_cmsgs(&buf[..8]).count(), 0);
     }
 
+    /// Pooled slab memory straight through the overlapped engine — the
+    /// point of the buffer trait. No `Vec` anywhere on the IO path.
+    #[test]
+    fn pooled_buffers_go_through_tcp_and_udp() {
+        use crate::common::buffer::SlabPool;
+        let rt = Runtime::new();
+        let pool = SlabPool::new(256, 4).unwrap();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            // TCP
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = rt.spawn(async move {
+                let s = listener.accept().await.unwrap();
+                let (n, b) = s.read(vec![0u8; 64]).await;
+                let n = n.unwrap();
+                assert_eq!(&b[..n], b"slab");
+            });
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let mut out = pool.acquire().unwrap();
+            out[..4].copy_from_slice(b"slab");
+            out.set_len(4);
+            let (n, out) = client.write(out).await;
+            assert_eq!(n.unwrap(), 4);
+            server.await.unwrap();
+            drop(out);
+
+            // UDP, receiving into a pooled slice this time.
+            let rx = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let tx = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let rx_addr = rx.local_addr().unwrap();
+            let mut dgram = pool.acquire().unwrap();
+            dgram[..3].copy_from_slice(b"pop");
+            dgram.set_len(3);
+            tx.send_to(dgram, rx_addr).await.0.unwrap();
+
+            let landing = pool.acquire().unwrap();
+            let (r, landing) = rx.recv_from(landing).await;
+            let (n, _from) = r.unwrap();
+            assert_eq!(&landing[..n], b"pop");
+        }));
+        result.expect("pooled buffer roundtrip timed out");
+        assert_eq!(pool.available(), 4, "every slice returned to the pool");
+    }
+
     #[test]
     fn udp_vectored_roundtrip() {
         let rt = Runtime::new();

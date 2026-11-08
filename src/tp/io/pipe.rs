@@ -2,6 +2,7 @@
 //! `tp`-native counterpart to comio's WinRT-shaped named pipe).
 
 use super::{submit, IoRes, Issue};
+use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::Runtime;
 use std::sync::Arc;
 use windows::Win32::Foundation::{
@@ -25,14 +26,16 @@ pub struct NamedPipeStream {
 
 impl NamedPipeStream {
     /// Reads into `buf`; resolves to the byte count and hands the buffer back.
-    pub fn read(
+    pub fn read<B: IoBufMut>(
         &self,
-        buf: Vec<u8>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let handle = self.res.handle;
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
-                match ReadFile(handle, Some(&mut buf[..]), None, Some(ovl)) {
+                let slice =
+                    core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::len(buf));
+                match ReadFile(handle, Some(slice), None, Some(ovl)) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
@@ -43,14 +46,15 @@ impl NamedPipeStream {
     }
 
     /// Writes `buf`; resolves to the byte count and hands the buffer back.
-    pub fn write(
+    pub fn write<B: IoBuf>(
         &self,
-        buf: Vec<u8>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let handle = self.res.handle;
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
-                match WriteFile(handle, Some(&buf[..]), None, Some(ovl)) {
+                let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
+                match WriteFile(handle, Some(slice), None, Some(ovl)) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),

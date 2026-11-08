@@ -20,6 +20,10 @@ pub mod overlapped;
 // socket transport in both overlapped runtimes.
 #[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 pub mod winsock;
+// Owned buffers for completion-based IO, plus a slab pool. Not for `comio`,
+// whose streams speak WinRT `IBuffer` instead.
+#[cfg(any(feature = "tp", feature = "rio"))]
+pub mod buffer;
 // SOCKADDR conversions: neutral, used by every socket engine.
 #[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 pub mod sockaddr;

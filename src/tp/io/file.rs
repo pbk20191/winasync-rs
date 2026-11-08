@@ -3,6 +3,7 @@
 //! the op block so cancellation can hand it to the completion callback).
 
 use super::{submit, IoRes, Issue, OpFuture};
+use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::Runtime;
 use core::ffi::c_void;
 use std::sync::{Arc, OnceLock};
@@ -238,13 +239,15 @@ impl File {
         self.res.clone()
     }
 
-    fn start_read(&self, buf: Vec<u8>, pos: u64) -> OpFuture<Vec<u8>> {
+    fn start_read<B: IoBufMut>(&self, buf: B, pos: u64) -> OpFuture<B> {
         let handle = self.res.handle;
         unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 (*ovl).Anonymous.Anonymous.Offset = pos as u32;
                 (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
-                match ReadFile(handle, Some(&mut buf[..]), None, Some(ovl)) {
+                let slice =
+                    core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::len(buf));
+                match ReadFile(handle, Some(slice), None, Some(ovl)) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
@@ -255,11 +258,11 @@ impl File {
 
     /// Reads into `buf` at absolute offset `pos`. Resolves to the number of
     /// bytes read (0 at end of file) and hands the buffer back.
-    pub fn read_at(
+    pub fn read_at<B: IoBufMut>(
         &self,
-        buf: Vec<u8>,
+        buf: B,
         pos: u64,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send {
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let fut = self.start_read(buf, pos);
         async move {
             let (result, buf) = fut.await;
@@ -272,17 +275,18 @@ impl File {
 
     /// Writes `buf` at absolute offset `pos`. Resolves to the number of bytes
     /// written and hands the buffer back.
-    pub fn write_at(
+    pub fn write_at<B: IoBuf>(
         &self,
-        buf: Vec<u8>,
+        buf: B,
         pos: u64,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send {
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let handle = self.res.handle;
         unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 (*ovl).Anonymous.Anonymous.Offset = pos as u32;
                 (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
-                match WriteFile(handle, Some(&buf[..]), None, Some(ovl)) {
+                let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
+                match WriteFile(handle, Some(slice), None, Some(ovl)) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),

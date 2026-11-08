@@ -47,11 +47,18 @@ fn overlapped_rate(rt: &Runtime, depth: usize) -> f64 {
     let _ = server.set_skip_completion_on_success();
     let _ = client.set_skip_completion_on_success();
 
-    // Recycled buffers. RIO hands slices back from a registered pool, so
-    // allocating a Vec per operation here would measure the allocator as
-    // much as the engine.
-    let mut free_recv: Vec<Vec<u8>> = (0..depth.max(1)).map(|_| vec![0u8; 2048]).collect();
-    let mut free_send: Vec<Vec<u8>> = (0..depth.max(1)).map(|_| vec![7u8; PAYLOAD]).collect();
+    // Both engines now take the same pooled slab memory, so this compares
+    // the engines rather than two allocation strategies.
+    let slab = crate::common::buffer::SlabPool::new(2048, (depth.max(1) * 2) as u32).unwrap();
+    let mut free_recv: Vec<_> = (0..depth.max(1)).map(|_| slab.acquire().unwrap()).collect();
+    let mut free_send: Vec<_> = (0..depth.max(1))
+        .map(|_| {
+            let mut b = slab.acquire().unwrap();
+            b[..PAYLOAD].fill(7);
+            b.set_len(PAYLOAD);
+            b
+        })
+        .collect();
 
     let start = Instant::now();
     let mut done = 0usize;

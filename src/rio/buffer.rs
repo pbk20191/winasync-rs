@@ -26,179 +26,128 @@
 //! one registration per concurrent operation, which the page-granularity note
 //! above argues against.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{RIO_BUF, RIO_BUFFERID};
-use windows::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-};
 
 use super::rq::RIO_INVALID_BUFFERID;
 use super::table::rio_table;
+use crate::common::buffer::{IoBuf, IoBufMut, SlabBuf, SlabPool};
 
-/// A slab of memory registered with RIO once and handed out in fixed-size
-/// slices.
+/// A [`SlabPool`] whose whole region is registered with RIO.
 ///
-/// Always used behind an `Arc`: a slice keeps its pool alive, and the
-/// registration must outlive every operation that referenced it.
+/// The slab arithmetic — one reservation, fixed slices, return on drop — is
+/// `common`'s; this adds the registration and the per-slice `RIO_BUF`
+/// descriptor, which is all RIO actually needs on top.
 pub struct RioBufferPool {
-    base: *mut u8,
-    /// Total slab size; `slice_size * slice_count`.
-    len: usize,
+    slab: Arc<SlabPool>,
     id: RIO_BUFFERID,
-    slice_size: usize,
-    /// Indices of slices not currently handed out.
-    free: Mutex<Vec<u32>>,
 }
-
-// The slab is plain memory owned by this pool; the buffer id is an opaque
-// kernel ordinal. Handing slices between threads is the point.
-unsafe impl Send for RioBufferPool {}
-unsafe impl Sync for RioBufferPool {}
 
 impl RioBufferPool {
     /// Allocates and registers a slab of `slice_count` slices of
     /// `slice_size` bytes.
-    ///
-    /// The slab is one `VirtualAlloc` reservation, so it is page-aligned and
-    /// the whole thing is one registration.
     pub fn new(slice_size: usize, slice_count: u32) -> windows_core::Result<Arc<Self>> {
-        assert!(slice_size > 0 && slice_count > 0, "empty pool");
         let table = rio_table()?;
-        let len = slice_size
-            .checked_mul(slice_count as usize)
-            .expect("pool size overflows usize");
-
-        let base = unsafe {
-            VirtualAlloc(
-                None,
-                len,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        } as *mut u8;
-        if base.is_null() {
-            return Err(windows_core::Error::from_thread());
-        }
-
+        let slab = SlabPool::new(slice_size, slice_count)?;
+        let (base, len) = slab.region();
         let id = unsafe {
             (table.raw().RIORegisterBuffer.unwrap())(windows_core::PCSTR(base), len as u32)
         };
         if id == RIO_INVALID_BUFFERID {
-            let err = crate::common::winsock::wsa_last_err();
-            unsafe {
-                let _ = VirtualFree(base as *mut _, 0, MEM_RELEASE);
-            }
-            return Err(err);
+            return Err(crate::common::winsock::wsa_last_err());
         }
-
-        Ok(Arc::new(Self {
-            base,
-            len,
-            id,
-            slice_size,
-            free: Mutex::new((0..slice_count).rev().collect()),
-        }))
+        Ok(Arc::new(Self { slab, id }))
     }
 
     /// Takes a slice, or `None` when every slice is out.
-    ///
-    /// Non-blocking by design: RIO's backpressure is explicit everywhere
-    /// (a full request queue fails the call with `WSAENOBUFS` rather than
-    /// waiting), and a buffer pool that blocks would hide that.
     pub fn acquire(self: &Arc<Self>) -> Option<RioSlice> {
-        let index = self.free.lock().unwrap().pop()?;
+        let buf = self.slab.acquire()?;
         Some(RioSlice {
             pool: self.clone(),
-            index,
-            len: self.slice_size,
+            buf,
         })
     }
 
-    /// Slices currently available.
     pub fn available(&self) -> usize {
-        self.free.lock().unwrap().len()
+        self.slab.available()
     }
 
-    /// Bytes per slice.
     pub fn slice_size(&self) -> usize {
-        self.slice_size
-    }
-
-    fn release(&self, index: u32) {
-        self.free.lock().unwrap().push(index);
+        self.slab.slice_size()
     }
 }
 
 impl Drop for RioBufferPool {
-    /// Deregisters before freeing. Reaching here means no [`RioSlice`] is
-    /// alive — each holds an `Arc` of this pool — and therefore that no
-    /// operation still references the registration.
+    /// Deregisters before the slab is freed. Reaching here means no
+    /// [`RioSlice`] is alive — each holds an `Arc` of this pool — and
+    /// therefore that no operation still references the registration.
     fn drop(&mut self) {
         if let Ok(table) = rio_table() {
             unsafe { (table.raw().RIODeregisterBuffer.unwrap())(self.id) };
         }
-        unsafe {
-            let _ = VirtualFree(self.base as *mut _, 0, MEM_RELEASE);
-        }
+        // The slab's own Drop releases the region, after this.
     }
 }
 
-/// One slice of a [`RioBufferPool`], returned to the pool when dropped.
+/// One slice of a [`RioBufferPool`], returned to it when dropped.
 pub struct RioSlice {
     pool: Arc<RioBufferPool>,
-    index: u32,
-    len: usize,
+    buf: SlabBuf,
 }
 
 impl RioSlice {
-    /// The descriptor an operation passes to RIO, covering `len` bytes from
-    /// this slice's start.
+    /// The descriptor an operation passes to RIO: which registration, where
+    /// in it, and how much.
     pub(crate) fn rio_buf(&self) -> RIO_BUF {
         RIO_BUF {
             BufferId: self.pool.id,
-            Offset: self.index * self.pool.slice_size as u32,
-            Length: self.len as u32,
+            Offset: self.buf.offset() as u32,
+            Length: IoBuf::len(&self.buf) as u32,
         }
     }
 
-    /// Narrows the slice to its first `len` bytes — how a send says "only
-    /// this much is payload". Capped at the slice size.
+    /// Narrows the slice to its first `len` bytes — how a send says how much
+    /// is payload. Capped at the slice size.
     pub fn set_len(&mut self, len: usize) {
-        self.len = len.min(self.pool.slice_size);
+        self.buf.set_len(len);
     }
 
     /// Restores the slice to its full size, for reuse as a receive buffer.
     pub fn reset_len(&mut self) {
-        self.len = self.pool.slice_size;
-    }
-
-    fn offset(&self) -> usize {
-        self.index as usize * self.pool.slice_size
+        self.buf.reset_len();
     }
 }
 
 impl core::ops::Deref for RioSlice {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.pool.base.add(self.offset()), self.len) }
+        &self.buf
     }
 }
 
 impl core::ops::DerefMut for RioSlice {
     fn deref_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.pool.base.add(self.offset()), self.len) }
+        &mut self.buf
     }
 }
 
-impl Drop for RioSlice {
-    fn drop(&mut self) {
-        self.pool.release(self.index);
+// A RIO slice is a perfectly ordinary owned IO buffer; it is only RIO's
+// *operations* that insist on this type, because the memory has to be
+// registered.
+unsafe impl IoBuf for RioSlice {
+    fn stable_ptr(&self) -> *const u8 {
+        self.buf.stable_ptr()
+    }
+    fn len(&self) -> usize {
+        IoBuf::len(&self.buf)
     }
 }
 
-// A slice is an index into a pool that is itself Send + Sync.
-unsafe impl Send for RioSlice {}
-unsafe impl Sync for RioSlice {}
+unsafe impl IoBufMut for RioSlice {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.buf.stable_mut_ptr()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -213,8 +162,7 @@ mod tests {
         let mut b = pool.acquire().unwrap();
         assert_eq!(pool.available(), 2);
 
-        // Distinct regions of one registration: same BufferId, different
-        // offsets, and writes must not disturb each other.
+        // Distinct regions of one registration.
         let (ba, bb) = (a.rio_buf(), b.rio_buf());
         assert_eq!(ba.BufferId, bb.BufferId);
         assert_ne!(ba.Offset, bb.Offset);
@@ -225,11 +173,9 @@ mod tests {
         assert!(a.iter().all(|&x| x == 0xAA));
         assert!(b.iter().all(|&x| x == 0xBB));
 
-        // set_len narrows the descriptor without moving it.
         a.set_len(10);
         assert_eq!(a.rio_buf().Length, 10);
         assert_eq!(a.rio_buf().Offset, ba.Offset);
-        assert_eq!(a.len(), 10);
         a.reset_len();
         assert_eq!(a.len(), 256);
 
@@ -248,9 +194,8 @@ mod tests {
 
     #[test]
     fn slice_outlives_pool_handle() {
-        // The pool handle goes away while a slice is still out; the
-        // registration must survive, because an in-flight RIO op could still
-        // reference it and there is no way to cancel one.
+        // The registration must survive a dropped pool handle: an in-flight
+        // RIO op could still reference it, and there is no way to cancel one.
         let mut slice = {
             let pool = RioBufferPool::new(128, 1).expect("registration");
             let s = pool.acquire().unwrap();

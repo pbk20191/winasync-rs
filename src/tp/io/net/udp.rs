@@ -6,25 +6,25 @@ use super::*;
 /// Payload of a WSARecvFrom: the buffer, the flags word, and the source
 /// address slot — all written by the provider at completion time, so all must
 /// live in the op block.
-struct RecvFromPayload {
-    buf: Vec<u8>,
+struct RecvFromPayload<B> {
+    buf: B,
     flags: u32,
     from: SOCKADDR_STORAGE,
     from_len: i32,
 }
 
 // SOCKADDR_STORAGE is plain POD; the whole payload is safely sendable.
-unsafe impl Send for RecvFromPayload {}
+unsafe impl<B: Send> Send for RecvFromPayload<B> {}
 
 /// Payload of a WSASendTo: the buffer plus the destination address, which the
 /// provider reads while the send is in flight.
-struct SendToPayload {
-    buf: Vec<u8>,
+struct SendToPayload<B> {
+    buf: B,
     to: SOCKADDR_STORAGE,
     to_len: i32,
 }
 
-unsafe impl Send for SendToPayload {}
+unsafe impl<B: Send> Send for SendToPayload<B> {}
 
 /// Vectored counterpart of [`RecvFromPayload`]: the shared buffer/`WSABUF` pair
 /// plus the source-address slot the provider fills.
@@ -112,19 +112,19 @@ impl UdpSocket {
 
     /// Sends `buf` as one datagram to `addr`; resolves to the byte count and
     /// hands the buffer back.
-    pub fn send_to(
+    pub fn send_to<B: IoBuf>(
         &self,
-        buf: Vec<u8>,
+        buf: B,
         addr: SocketAddr,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send {
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let sock = self.res.socket();
         let mut to = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let to_len = write_sockaddr(&addr, &mut to);
         let fut = unsafe {
             submit(&self.res, SendToPayload { buf, to, to_len }, move |ovl, p| {
                 let wsabuf = WSABUF {
-                    len: p.buf.len() as u32,
-                    buf: windows_core::PSTR(p.buf.as_mut_ptr()),
+                    len: IoBuf::len(&p.buf) as u32,
+                    buf: windows_core::PSTR(p.buf.stable_ptr() as *mut u8),
                 };
                 let r = WSASendTo(
                     sock,
@@ -151,10 +151,10 @@ impl UdpSocket {
     /// A datagram larger than `buf` is truncated to `buf.len()` and the op fails
     /// with `WSAEMSGSIZE` (the Windows semantics for an oversized datagram); the
     /// partial bytes are discarded. Size `buf` to the largest datagram expected.
-    pub fn recv_from(
+    pub fn recv_from<B: IoBufMut>(
         &self,
-        buf: Vec<u8>,
-    ) -> impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, Vec<u8>)> + Send {
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, B)> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(
@@ -167,8 +167,8 @@ impl UdpSocket {
                 },
                 move |ovl, p| {
                     let wsabuf = WSABUF {
-                        len: p.buf.len() as u32,
-                        buf: windows_core::PSTR(p.buf.as_mut_ptr()),
+                        len: IoBuf::len(&p.buf) as u32,
+                        buf: windows_core::PSTR(p.buf.stable_mut_ptr()),
                     };
                     let r = WSARecvFrom(
                         sock,
@@ -291,16 +291,16 @@ impl UdpSocket {
     /// Sends `buf` as one datagram to the connected peer (see
     /// [`connect`](Self::connect)); resolves to the byte count and hands the
     /// buffer back.
-    pub fn send(
+    pub fn send<B: IoBuf>(
         &self,
-        buf: Vec<u8>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let wsabuf = WSABUF {
-                    len: buf.len() as u32,
-                    buf: windows_core::PSTR(buf.as_mut_ptr()),
+                    len: IoBuf::len(buf) as u32,
+                    buf: windows_core::PSTR(buf.stable_ptr() as *mut u8),
                 };
                 let r = WSASend(sock, &[wsabuf], None, 0, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
@@ -315,16 +315,16 @@ impl UdpSocket {
     /// Receives one datagram from the connected peer into `buf`; resolves to the
     /// byte count and hands the buffer back. Truncation fails with `WSAEMSGSIZE`
     /// (see [`recv_from`](Self::recv_from)).
-    pub fn recv(
+    pub fn recv<B: IoBufMut>(
         &self,
-        buf: Vec<u8>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
                 let wsabuf = WSABUF {
-                    len: p.buf.len() as u32,
-                    buf: windows_core::PSTR(p.buf.as_mut_ptr()),
+                    len: IoBuf::len(&p.buf) as u32,
+                    buf: windows_core::PSTR(p.buf.stable_mut_ptr()),
                 };
                 let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
