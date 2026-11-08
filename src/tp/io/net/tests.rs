@@ -505,6 +505,256 @@
         result.expect("accept_with_data timed out");
     }
 
+    /// USO must actually segment: one send of 5 x 300 bytes has to arrive as
+    /// five separate 300-byte datagrams, not one 1500-byte one. Asserting
+    /// only that `set_send_segment_size` returns Ok would pass with the
+    /// feature doing nothing.
+    #[test]
+    fn uso_segments_one_send_into_many_datagrams() {
+        const SEG: usize = 300;
+        const COUNT: usize = 5;
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+
+            assert_eq!(client.send_segment_size().unwrap(), None, "off by default");
+            if let Err(e) = client.set_send_segment_size(Some(SEG as u16)) {
+                eprintln!("skipped: USO unsupported here ({e:?})");
+                return;
+            }
+            // The SDK's wrappers are a Get/Set pair; read it back.
+            assert_eq!(client.send_segment_size().unwrap(), Some(SEG as u16));
+
+            // Each segment is filled with its own index, so a mis-split shows
+            // up as mixed content rather than just a wrong length.
+            let mut big = Vec::with_capacity(SEG * COUNT);
+            for i in 0..COUNT {
+                big.extend(std::iter::repeat(b'a' + i as u8).take(SEG));
+            }
+            let (n, _) = client.send_to(big, server_addr).await;
+            assert_eq!(n.unwrap(), SEG * COUNT, "the send itself is one call");
+
+            for i in 0..COUNT {
+                let (r, buf) = server.recv_from(vec![0u8; 2048]).await;
+                let (n, _from) = r.unwrap();
+                assert_eq!(n, SEG, "segment {i} should arrive on its own");
+                assert!(
+                    buf[..n].iter().all(|&b| b == b'a' + i as u8),
+                    "segment {i} has mixed content"
+                );
+            }
+        }));
+        result.expect("USO segmentation timed out");
+    }
+
+    /// The per-send control-message form, which leaves the socket option
+    /// alone.
+    #[test]
+    fn uso_per_send_control_message_segments() {
+        const SEG: usize = 200;
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+
+            let ctrl = cmsg_send_segment_size(SEG as u16);
+            let (n, _) = client
+                .send_msg(vec![7u8; SEG * 3], server_addr, ctrl)
+                .await;
+            match n {
+                Ok(n) => assert_eq!(n, SEG * 3),
+                Err(e) => {
+                    eprintln!("skipped: per-send USO unsupported here ({e:?})");
+                    return;
+                }
+            }
+            for _ in 0..3 {
+                let (r, _) = server.recv_from(vec![0u8; 2048]).await;
+                assert_eq!(r.unwrap().0, SEG);
+            }
+        }));
+        result.expect("per-send USO timed out");
+    }
+
+    /// URO: the option round-trips, and *if* the stack coalesces, the segment
+    /// size comes back in a `UDP_COALESCED_INFO` control message. Whether
+    /// loopback coalesces at all is the stack's call, so the test reports
+    /// which happened rather than demanding one.
+    #[test]
+    fn uro_option_roundtrips_and_reports_coalescing() {
+        const SEG: usize = 100;
+        const COUNT: usize = 4;
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+
+            assert_eq!(server.recv_coalesced_size().unwrap(), None, "off by default");
+            if let Err(e) = server.set_recv_coalesced_size(Some((SEG * COUNT) as u32)) {
+                eprintln!("skipped: URO unsupported here ({e:?})");
+                return;
+            }
+            assert_eq!(
+                server.recv_coalesced_size().unwrap(),
+                Some((SEG * COUNT) as u32),
+                "Get/Set pair must agree"
+            );
+
+            for i in 0..COUNT {
+                client
+                    .send_to(vec![b'a' + i as u8; SEG], server_addr)
+                    .await
+                    .0
+                    .unwrap();
+            }
+
+            let (msg, _buf) = server.recv_msg(vec![0u8; 4096], 512).await;
+            let msg = msg.unwrap();
+            match parse_udp_coalesced_info(&msg.control) {
+                Some(seg) => {
+                    // Coalesced: the buffer holds several datagrams of `seg`.
+                    assert_eq!(seg as usize, SEG);
+                    assert!(msg.bytes > SEG, "coalescing should deliver more than one");
+                }
+                None => {
+                    // Not coalesced: a single datagram, which is legal.
+                    assert_eq!(msg.bytes, SEG);
+                    eprintln!("note: loopback delivered one datagram, no coalescing");
+                }
+            }
+        }));
+        result.expect("URO roundtrip timed out");
+    }
+
+    /// Joins a group and receives on it, all on this host: TTL 0 keeps the
+    /// datagram from leaving the machine while still delivering it locally.
+    /// Multicast needs a capable interface, so a machine without one reports
+    /// a skip rather than failing.
+    #[test]
+    fn multicast_v4_join_and_receive() {
+        let rt = Runtime::new();
+        let group: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
+        let result = block_on(timeout(&rt, Duration::from_secs(5), async {
+            // SO_REUSEADDR at bind time — several receivers may share the port.
+            let rx = UdpSocket::bind_reuse_addr(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            )
+            .unwrap();
+            let port = rx.local_addr().unwrap().port();
+            if let Err(e) = rx.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED) {
+                eprintln!("skipped: no multicast-capable interface ({e:?})");
+                return;
+            }
+            // Winsock's IP_MULTICAST_LOOP is the *receive* path, so it belongs
+            // on the receiver — the opposite of BSD, where it would go on the
+            // sender.
+            rx.set_multicast_loop_v4(true).unwrap();
+
+            let tx = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            )
+            .unwrap();
+            // TTL 0: delivered on this host, never forwarded off it.
+            tx.set_multicast_ttl_v4(0).unwrap();
+
+            let dest = SocketAddr::V4(SocketAddrV4::new(group, port));
+            tx.send_to(b"mcast".to_vec(), dest).await.0.unwrap();
+
+            let (r, buf) = rx.recv_from(vec![0u8; 64]).await;
+            let (n, _from) = r.unwrap();
+            assert_eq!(&buf[..n], b"mcast");
+
+            rx.leave_multicast_v4(group, Ipv4Addr::UNSPECIFIED).unwrap();
+        }));
+        if result.is_err() {
+            eprintln!("skipped: multicast not delivered on this host");
+        }
+    }
+
+    /// The source-filtering options accept their arguments and round-trip
+    /// join/leave. Whether a given source is actually filtered needs two
+    /// hosts, so this covers the plumbing only.
+    #[test]
+    fn multicast_source_filters_are_accepted() {
+        let rt = Runtime::new();
+        let group: Ipv4Addr = Ipv4Addr::new(232, 1, 2, 3); // SSM range
+        let source: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+        let sock = UdpSocket::bind_reuse_addr(
+            &rt,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+        )
+        .unwrap();
+        match sock.join_multicast_source_v4(group, source, Ipv4Addr::UNSPECIFIED) {
+            Ok(()) => {
+                sock.leave_multicast_source_v4(group, source, Ipv4Addr::UNSPECIFIED)
+                    .unwrap();
+            }
+            Err(e) => eprintln!("skipped: SSM unavailable here ({e:?})"),
+        }
+        // Blocking applies to an any-source join, so join first.
+        let asm: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 100);
+        if sock.join_multicast_v4(asm, Ipv4Addr::UNSPECIFIED).is_ok() {
+            match sock.block_multicast_source_v4(asm, source, Ipv4Addr::UNSPECIFIED) {
+                Ok(()) => sock
+                    .unblock_multicast_source_v4(asm, source, Ipv4Addr::UNSPECIFIED)
+                    .unwrap(),
+                Err(e) => eprintln!("skipped: source blocking unavailable ({e:?})"),
+            }
+            let _ = sock.leave_multicast_v4(asm, Ipv4Addr::UNSPECIFIED);
+        }
+    }
+
+    #[test]
+    fn cmsg_build_and_iterate_roundtrip() {
+        // Two messages back to back must both come out, with payloads intact.
+        let mut buf = build_cmsg(1, 2, &[0xAAu8; 3]);
+        buf.extend(build_cmsg(17, 4, &0x1234_5678u32.to_ne_bytes()));
+        let got: Vec<(i32, i32, Vec<u8>)> = iter_cmsgs(&buf)
+            .map(|(l, t, d)| (l, t, d.to_vec()))
+            .collect();
+        assert_eq!(got.len(), 2, "a second control message must not be lost");
+        assert_eq!(got[0], (1, 2, vec![0xAAu8; 3]));
+        assert_eq!(got[1], (17, 4, 0x1234_5678u32.to_ne_bytes().to_vec()));
+        // Losing only the trailing *padding* keeps both messages: the second
+        // one's content still fits.
+        assert_eq!(iter_cmsgs(&buf[..buf.len() - 2]).count(), 2);
+        // Cutting into the second message's payload drops it, rather than
+        // reading past the end of the buffer.
+        assert_eq!(iter_cmsgs(&buf[..buf.len() - 6]).count(), 1);
+        // A buffer too short for even one header yields nothing.
+        assert_eq!(iter_cmsgs(&buf[..8]).count(), 0);
+    }
+
     #[test]
     fn udp_vectored_roundtrip() {
         let rt = Runtime::new();

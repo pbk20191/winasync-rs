@@ -52,9 +52,34 @@ pub struct UdpSocket {
 impl UdpSocket {
     /// Binds a UDP socket to `addr` (IPv4 or IPv6).
     pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<UdpSocket> {
+        Self::bind_impl(rt, addr, false)
+    }
+
+    /// Binds with `SO_REUSEADDR`, so several sockets on this host can hold the
+    /// same port — the usual arrangement for multicast receivers, where more
+    /// than one process wants the same group's stream.
+    ///
+    /// It is a separate constructor rather than a setter because the option
+    /// only has meaning *before* `bind`: setting it afterwards succeeds and
+    /// does nothing.
+    pub fn bind_reuse_addr(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<UdpSocket> {
+        Self::bind_impl(rt, addr, true)
+    }
+
+    fn bind_impl(
+        rt: &Runtime,
+        addr: SocketAddr,
+        reuse_addr: bool,
+    ) -> windows_core::Result<UdpSocket> {
         let family = family_of(&addr);
         let sock = new_socket(family, SOCK_DGRAM, IPPROTO_UDP)?;
         let register = || -> windows_core::Result<Arc<IoRes>> {
+            if reuse_addr {
+                let v: u32 = 1;
+                sock_check(unsafe {
+                    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, Some(&v.to_ne_bytes()))
+                })?;
+            }
             let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
             let len = write_sockaddr(&addr, &mut storage);
             sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
@@ -69,7 +94,6 @@ impl UdpSocket {
         }
     }
 
-    /// The locally bound address (useful after binding port 0).
     /// Skips the completion packet whenever an op on this handle completes
     /// **synchronously** — a datagram already sitting in the socket
     /// buffer, or a send that fits in it. The op is then finished on the issuing
@@ -365,6 +389,285 @@ pub struct ReceivedMsg {
 impl UdpSocket {
     /// Enables `IP_PKTINFO` so `recv_msg` receives the local interface/address a
     /// datagram arrived on as an `IN_PKTINFO` control message (IPv4).
+    /// Enables **UDP Segmentation Offload** (USO): hands the stack one large
+    /// buffer and lets it cut the buffer into datagrams of `segment_size`
+    /// bytes, instead of making one `WSASendTo` call per datagram.
+    ///
+    /// The last segment may be short. `None` turns it off.
+    ///
+    /// This is the cheap end of high-rate UDP sending: the saving is one
+    /// user/kernel transition per *batch* rather than per datagram, with no
+    /// change to the buffer model and no separate engine — the stack (and, if
+    /// it supports it, the NIC) does the segmentation. Where the hardware does
+    /// not offload, the stack segments in software and the win is smaller but
+    /// still positive.
+    ///
+    /// Applies to every subsequent send on this socket; for a per-send size,
+    /// pass [`cmsg_send_segment_size`] to [`send_msg`](Self::send_msg)
+    /// instead.
+    pub fn set_send_segment_size(&self, segment_size: Option<u16>) -> windows_core::Result<()> {
+        let v: u32 = segment_size.unwrap_or(0) as u32;
+        sock_check(unsafe {
+            setsockopt(
+                self.res.socket(),
+                IPPROTO_UDP.0,
+                UDP_SEND_MSG_SIZE,
+                Some(&v.to_ne_bytes()),
+            )
+        })
+    }
+
+    // ---- Multicast -------------------------------------------------------
+    //
+    // Joins are per (group, interface): a socket joins on one interface at a
+    // time, and joining on several means several calls. Bind the socket
+    // before joining — a membership is attached to the bound port.
+
+    fn set_udp_opt(&self, level: i32, name: i32, value: &[u8]) -> windows_core::Result<()> {
+        sock_check(unsafe { setsockopt(self.res.socket(), level, name, Some(value)) })
+    }
+
+    fn mreq_v4(group: Ipv4Addr, interface: Ipv4Addr) -> IP_MREQ {
+        IP_MREQ {
+            imr_multiaddr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from(group).to_be(),
+                },
+            },
+            imr_interface: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from(interface).to_be(),
+                },
+            },
+        }
+    }
+
+    fn mreq_source_v4(group: Ipv4Addr, source: Ipv4Addr, interface: Ipv4Addr) -> IP_MREQ_SOURCE {
+        IP_MREQ_SOURCE {
+            imr_multiaddr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from(group).to_be(),
+                },
+            },
+            imr_sourceaddr: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from(source).to_be(),
+                },
+            },
+            imr_interface: IN_ADDR {
+                S_un: IN_ADDR_0 {
+                    S_addr: u32::from(interface).to_be(),
+                },
+            },
+        }
+    }
+
+    fn as_bytes<T>(v: &T) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) }
+    }
+
+    /// Joins an IPv4 multicast group on `interface` (`Ipv4Addr::UNSPECIFIED`
+    /// lets the stack choose). Any-source multicast: traffic from every
+    /// sender to the group is accepted.
+    pub fn join_multicast_v4(
+        &self,
+        group: Ipv4Addr,
+        interface: Ipv4Addr,
+    ) -> windows_core::Result<()> {
+        let m = Self::mreq_v4(group, interface);
+        self.set_udp_opt(IPPROTO_IP.0, IP_ADD_MEMBERSHIP, Self::as_bytes(&m))
+    }
+
+    /// Leaves a group joined by [`join_multicast_v4`](Self::join_multicast_v4).
+    pub fn leave_multicast_v4(
+        &self,
+        group: Ipv4Addr,
+        interface: Ipv4Addr,
+    ) -> windows_core::Result<()> {
+        let m = Self::mreq_v4(group, interface);
+        self.set_udp_opt(IPPROTO_IP.0, IP_DROP_MEMBERSHIP, Self::as_bytes(&m))
+    }
+
+    /// Joins an IPv6 multicast group on the interface with index
+    /// `interface_index` (0 = let the stack choose).
+    pub fn join_multicast_v6(
+        &self,
+        group: Ipv6Addr,
+        interface_index: u32,
+    ) -> windows_core::Result<()> {
+        let m = IPV6_MREQ {
+            ipv6mr_multiaddr: IN6_ADDR {
+                u: IN6_ADDR_0 { Byte: group.octets() },
+            },
+            ipv6mr_interface: interface_index,
+        };
+        self.set_udp_opt(IPPROTO_IPV6.0, IPV6_ADD_MEMBERSHIP, Self::as_bytes(&m))
+    }
+
+    /// Leaves a group joined by [`join_multicast_v6`](Self::join_multicast_v6).
+    pub fn leave_multicast_v6(
+        &self,
+        group: Ipv6Addr,
+        interface_index: u32,
+    ) -> windows_core::Result<()> {
+        let m = IPV6_MREQ {
+            ipv6mr_multiaddr: IN6_ADDR {
+                u: IN6_ADDR_0 { Byte: group.octets() },
+            },
+            ipv6mr_interface: interface_index,
+        };
+        self.set_udp_opt(IPPROTO_IPV6.0, IPV6_DROP_MEMBERSHIP, Self::as_bytes(&m))
+    }
+
+    /// Source-specific multicast (SSM): joins `group` but accepts traffic from
+    /// `source` only, filtering in the network rather than in user code.
+    pub fn join_multicast_source_v4(
+        &self,
+        group: Ipv4Addr,
+        source: Ipv4Addr,
+        interface: Ipv4Addr,
+    ) -> windows_core::Result<()> {
+        let m = Self::mreq_source_v4(group, source, interface);
+        self.set_udp_opt(IPPROTO_IP.0, IP_ADD_SOURCE_MEMBERSHIP, Self::as_bytes(&m))
+    }
+
+    /// Leaves one source of an SSM join.
+    pub fn leave_multicast_source_v4(
+        &self,
+        group: Ipv4Addr,
+        source: Ipv4Addr,
+        interface: Ipv4Addr,
+    ) -> windows_core::Result<()> {
+        let m = Self::mreq_source_v4(group, source, interface);
+        self.set_udp_opt(IPPROTO_IP.0, IP_DROP_SOURCE_MEMBERSHIP, Self::as_bytes(&m))
+    }
+
+    /// Blocks one source on an *any-source* join — the inverse filter to
+    /// [`join_multicast_source_v4`](Self::join_multicast_source_v4).
+    pub fn block_multicast_source_v4(
+        &self,
+        group: Ipv4Addr,
+        source: Ipv4Addr,
+        interface: Ipv4Addr,
+    ) -> windows_core::Result<()> {
+        let m = Self::mreq_source_v4(group, source, interface);
+        self.set_udp_opt(IPPROTO_IP.0, IP_BLOCK_SOURCE, Self::as_bytes(&m))
+    }
+
+    /// Unblocks a source blocked by
+    /// [`block_multicast_source_v4`](Self::block_multicast_source_v4).
+    pub fn unblock_multicast_source_v4(
+        &self,
+        group: Ipv4Addr,
+        source: Ipv4Addr,
+        interface: Ipv4Addr,
+    ) -> windows_core::Result<()> {
+        let m = Self::mreq_source_v4(group, source, interface);
+        self.set_udp_opt(IPPROTO_IP.0, IP_UNBLOCK_SOURCE, Self::as_bytes(&m))
+    }
+
+    /// Hop limit for outgoing IPv4 multicast (default 1 — link-local only).
+    pub fn set_multicast_ttl_v4(&self, ttl: u32) -> windows_core::Result<()> {
+        self.set_udp_opt(IPPROTO_IP.0, IP_MULTICAST_TTL, &ttl.to_ne_bytes())
+    }
+
+    /// Hop limit for outgoing IPv6 multicast (default 1).
+    pub fn set_multicast_hops_v6(&self, hops: u32) -> windows_core::Result<()> {
+        self.set_udp_opt(IPPROTO_IPV6.0, IPV6_MULTICAST_HOPS, &hops.to_ne_bytes())
+    }
+
+    /// Interface for outgoing IPv4 multicast.
+    pub fn set_multicast_if_v4(&self, interface: Ipv4Addr) -> windows_core::Result<()> {
+        let addr = u32::from(interface).to_be();
+        self.set_udp_opt(IPPROTO_IP.0, IP_MULTICAST_IF, &addr.to_ne_bytes())
+    }
+
+    /// Interface index for outgoing IPv6 multicast.
+    pub fn set_multicast_if_v6(&self, interface_index: u32) -> windows_core::Result<()> {
+        self.set_udp_opt(
+            IPPROTO_IPV6.0,
+            IPV6_MULTICAST_IF,
+            &interface_index.to_ne_bytes(),
+        )
+    }
+
+    /// **Winsock's `IP_MULTICAST_LOOP` is not the BSD/UNIX one.**
+    ///
+    /// On UNIX the option governs the *send* path: whether a datagram this
+    /// socket sends is looped back to local members. On Winsock it governs
+    /// the *receive* path: whether this socket receives datagrams sent from
+    /// the local host. Code ported either way silently targets the wrong
+    /// direction, because both platforms accept the call and neither errors.
+    ///
+    /// Set it on the socket whose *reception* you want to change.
+    pub fn set_multicast_loop_v4(&self, on: bool) -> windows_core::Result<()> {
+        let v: u32 = on as u32;
+        self.set_udp_opt(IPPROTO_IP.0, IP_MULTICAST_LOOP, &v.to_ne_bytes())
+    }
+
+    /// IPv6 counterpart of
+    /// [`set_multicast_loop_v4`](Self::set_multicast_loop_v4) — same Winsock
+    /// receive-path semantics.
+    pub fn set_multicast_loop_v6(&self, on: bool) -> windows_core::Result<()> {
+        let v: u32 = on as u32;
+        self.set_udp_opt(IPPROTO_IPV6.0, IPV6_MULTICAST_LOOP, &v.to_ne_bytes())
+    }
+
+    /// Reads back the socket-wide USO segment size; `None` when off.
+    pub fn send_segment_size(&self) -> windows_core::Result<Option<u16>> {
+        Ok(match self.get_udp_dword(UDP_SEND_MSG_SIZE)? {
+            0 => None,
+            v => Some(v as u16),
+        })
+    }
+
+    /// Reads back the URO coalescing limit; `None` when off.
+    pub fn recv_coalesced_size(&self) -> windows_core::Result<Option<u32>> {
+        Ok(match self.get_udp_dword(UDP_RECV_MAX_COALESCED_SIZE)? {
+            0 => None,
+            v => Some(v),
+        })
+    }
+
+    /// `getsockopt(IPPROTO_UDP, name)` for the DWORD-valued UDP options,
+    /// matching the SDK's inline wrappers (which pass `sizeof(DWORD)` in and
+    /// let the provider write the length back).
+    fn get_udp_dword(&self, name: i32) -> windows_core::Result<u32> {
+        let mut v: u32 = 0;
+        let mut len = size_of::<u32>() as i32;
+        sock_check(unsafe {
+            getsockopt(
+                self.res.socket(),
+                IPPROTO_UDP.0,
+                name,
+                windows_core::PSTR(&mut v as *mut u32 as *mut u8),
+                &mut len,
+            )
+        })?;
+        Ok(v)
+    }
+
+    /// Enables **UDP Receive Coalescing** (URO): lets the stack deliver several
+    /// datagrams in one receive, up to `max_coalesced_size` bytes total.
+    ///
+    /// The receive buffer must be at least that large. The segment size the
+    /// stack used is reported per receive in a `UDP_COALESCED_INFO` control
+    /// message — read it with [`parse_udp_coalesced_info`], since without it
+    /// the datagram boundaries inside the buffer are unknowable.
+    ///
+    /// `None` turns it off.
+    pub fn set_recv_coalesced_size(&self, max_coalesced_size: Option<u32>) -> windows_core::Result<()> {
+        let v: u32 = max_coalesced_size.unwrap_or(0);
+        sock_check(unsafe {
+            setsockopt(
+                self.res.socket(),
+                IPPROTO_UDP.0,
+                UDP_RECV_MAX_COALESCED_SIZE,
+                Some(&v.to_ne_bytes()),
+            )
+        })
+    }
+
     pub fn set_recv_pktinfo(&self, on: bool) -> windows_core::Result<()> {
         let v: i32 = on as i32;
         sock_check(unsafe {
@@ -499,20 +802,104 @@ impl UdpSocket {
     }
 }
 
-/// Parses the first `IP_PKTINFO` control message out of a `recv_msg` control
-/// buffer, returning the local address the datagram arrived on (IPv4).
+/// `WSA_CMSG_ALIGN` — control-message headers and payloads are pointer-aligned.
+const fn cmsg_align(n: usize) -> usize {
+    n.next_multiple_of(size_of::<usize>())
+}
+
+/// Offset from a control message's start to its payload.
+const fn cmsg_data_offset() -> usize {
+    cmsg_align(size_of::<CMSGHDR>())
+}
+
+/// Builds a one-message control buffer for [`UdpSocket::send_msg`].
+pub fn build_cmsg(level: i32, ty: i32, data: &[u8]) -> Vec<u8> {
+    let data_off = cmsg_data_offset();
+    // cmsg_len counts the unpadded header + payload; the buffer itself is
+    // padded so a following message would start aligned.
+    let cmsg_len = data_off + data.len();
+    let mut buf = vec![0u8; cmsg_align(cmsg_len)];
+    let hdr = CMSGHDR {
+        cmsg_len,
+        cmsg_level: level,
+        cmsg_type: ty,
+    };
+    unsafe {
+        core::ptr::write_unaligned(buf.as_mut_ptr() as *mut CMSGHDR, hdr);
+    }
+    buf[data_off..data_off + data.len()].copy_from_slice(data);
+    buf
+}
+
+/// Walks a received control buffer, yielding `(level, type, payload)` per
+/// message.
+///
+/// A datagram can carry several — `IP_PKTINFO` alongside `UDP_COALESCED_INFO`,
+/// for instance — so a parser that only ever looks at the first one silently
+/// misses the rest.
+pub fn iter_cmsgs(control: &[u8]) -> impl Iterator<Item = (i32, i32, &[u8])> {
+    let data_off = cmsg_data_offset();
+    let mut pos = 0usize;
+    core::iter::from_fn(move || {
+        if pos + data_off > control.len() {
+            return None;
+        }
+        // The buffer comes from the provider with no alignment guarantee of
+        // its own beyond the Vec's, so read the header unaligned.
+        let hdr: CMSGHDR =
+            unsafe { core::ptr::read_unaligned(control[pos..].as_ptr() as *const CMSGHDR) };
+        if hdr.cmsg_len < data_off || pos + hdr.cmsg_len > control.len() {
+            return None;
+        }
+        let data = &control[pos + data_off..pos + hdr.cmsg_len];
+        pos += cmsg_align(hdr.cmsg_len);
+        Some((hdr.cmsg_level, hdr.cmsg_type, data))
+    })
+}
+
+/// Control message setting the USO segment size for **one** `send_msg`,
+/// without touching the socket-wide option.
+///
+/// ```ignore
+/// let ctrl = cmsg_send_segment_size(1200);
+/// sock.send_msg(big_buffer, dest, ctrl).await;
+/// ```
+pub fn cmsg_send_segment_size(segment_size: u16) -> Vec<u8> {
+    build_cmsg(
+        IPPROTO_UDP.0,
+        UDP_SEND_MSG_SIZE,
+        &(segment_size as u32).to_ne_bytes(),
+    )
+}
+
+/// Parses the `UDP_COALESCED_INFO` control message, giving the segment size
+/// the stack used when coalescing — i.e. how to cut the received buffer back
+/// into datagrams.
+///
+/// Absent when only one datagram was delivered, which is the common case; a
+/// caller should then treat the whole buffer as a single datagram.
+///
+/// Note that `UDP_COALESCED_INFO` (the control-message type) and
+/// `UDP_RECV_MAX_COALESCED_SIZE` (the socket option) are both `3`, in
+/// different namespaces — they are not interchangeable.
+pub fn parse_udp_coalesced_info(control: &[u8]) -> Option<u32> {
+    for (level, ty, data) in iter_cmsgs(control) {
+        if level == IPPROTO_UDP.0 && ty == UDP_COALESCED_INFO as i32 && data.len() >= 4 {
+            return Some(u32::from_ne_bytes([data[0], data[1], data[2], data[3]]));
+        }
+    }
+    None
+}
+
+/// Parses the `IP_PKTINFO` control message out of a `recv_msg` control buffer,
+/// returning the local address the datagram arrived on (IPv4).
 pub fn parse_ip_pktinfo(control: &[u8]) -> Option<Ipv4Addr> {
-    let hdr_size = size_of::<CMSGHDR>();
-    // WSA_CMSG_ALIGN to pointer size; data follows the aligned header.
-    let data_off = hdr_size.next_multiple_of(size_of::<usize>());
-    if control.len() < data_off + size_of::<IN_PKTINFO>() {
-        return None;
+    for (level, ty, data) in iter_cmsgs(control) {
+        if level == IPPROTO_IP.0 && ty == IP_PKTINFO && data.len() >= size_of::<IN_PKTINFO>() {
+            let pktinfo = unsafe { core::ptr::read_unaligned(data.as_ptr() as *const IN_PKTINFO) };
+            let addr = unsafe { pktinfo.ipi_addr.S_un.S_addr };
+            return Some(Ipv4Addr::from(u32::from_be(addr)));
+        }
     }
-    let hdr = unsafe { &*(control.as_ptr() as *const CMSGHDR) };
-    if hdr.cmsg_level != IPPROTO_IP.0 || hdr.cmsg_type != IP_PKTINFO {
-        return None;
-    }
-    let pktinfo = unsafe { &*(control[data_off..].as_ptr() as *const IN_PKTINFO) };
-    let addr = unsafe { pktinfo.ipi_addr.S_un.S_addr };
-    Some(Ipv4Addr::from(u32::from_be(addr)))
+    None
 }

@@ -23,6 +23,13 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::Networking::WinSock::{
+    IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, IPV6_DROP_MEMBERSHIP, IPV6_MREQ,
+    IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF, IPV6_MULTICAST_LOOP,
+    IP_ADD_MEMBERSHIP, IP_ADD_SOURCE_MEMBERSHIP, IP_BLOCK_SOURCE, IP_DROP_MEMBERSHIP,
+    IP_DROP_SOURCE_MEMBERSHIP, IP_MREQ, IP_MREQ_SOURCE, IP_MULTICAST_IF,
+    IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_UNBLOCK_SOURCE, SO_REUSEADDR,
+    getsockopt,
+    UDP_COALESCED_INFO, UDP_RECV_MAX_COALESCED_SIZE, UDP_SEND_MSG_SIZE,
     bind, closesocket, connect, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW,
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
     IPPROTO, IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, SD_SEND, SOCKADDR,
@@ -334,4 +341,9 @@ mod udp;
 mod tests;
 
 pub use tcp::{ReusableSocket, TcpListener, TcpStream, TransmitPackets};
-pub use udp::{parse_ip_pktinfo, ReceivedMsg, UdpSocket};
+// Consumed by tests and by callers of this crate, not by the binary itself.
+#[allow(unused_imports)]
+pub use udp::{
+    build_cmsg, cmsg_send_segment_size, iter_cmsgs, parse_ip_pktinfo, parse_udp_coalesced_info,
+    ReceivedMsg, UdpSocket,
+};
