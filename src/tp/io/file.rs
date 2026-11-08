@@ -207,6 +207,24 @@ impl File {
         )
     }
 
+    /// Skips the completion packet whenever an op on this handle completes
+    /// **synchronously**, finishing it on the issuing thread with no pool
+    /// hand-off and no context switch.
+    ///
+    /// Worth little on most file workloads: measured on NTFS, even a re-read
+    /// of just-written (cached) data comes back `ERROR_IO_PENDING`, so there
+    /// is nothing to skip. It costs nothing to enable and the benefit depends
+    /// entirely on whether the file system answers synchronously — profile
+    /// before assuming it helps. The socket transports are where this mode
+    /// actually pays.
+    ///
+    /// Enable it before issuing ops. Issue closures report a synchronous
+    /// success as a fact and the core applies this mode, so there is no
+    /// per-op contract to get wrong; semantics are unchanged, only sooner.
+    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
+        self.res.set_skip_completion_on_success()
+    }
+
     /// The raw file handle (for `TcpStream::transmit_file`). The returned handle
     /// is only valid while this `File` (or a shared [`res_arc`](Self::res_arc)
     /// clone) is alive.
@@ -365,6 +383,40 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("tp_io_test_{}_{name}", std::process::id()));
         p.to_string_lossy().into_owned()
+    }
+
+    /// The socket side of skip-completion is covered in `net::tests`; this is
+    /// the file side, which reaches the kernel through `ReadFile`/`WriteFile`
+    /// rather than Winsock.
+    ///
+    /// Unlike the socket test this does **not** assert that the inline path
+    /// fires. Measured on NTFS, every op here — including a re-read of
+    /// just-written data — returns `ERROR_IO_PENDING`, so there is no
+    /// synchronous completion to skip. The mode is correctly in effect; it
+    /// simply has nothing to do on this workload. What matters is that
+    /// enabling it changes no results.
+    #[test]
+    fn skip_completion_on_success_file_roundtrip() {
+        let path = temp_path("skip_completion.bin");
+        let rt = Runtime::new();
+
+        block_on(async {
+            let f = File::create(&rt, &path).unwrap();
+            f.set_skip_completion_on_success().unwrap();
+            let (n, _) = f.write_at(b"skip-completion".to_vec(), 0).await;
+            assert_eq!(n.unwrap(), 15);
+            // Re-read what we just wrote: it is in the cache, so the read
+            // completes without ever going to the disk or the pool.
+            let (n, buf) = f.read_at(vec![0u8; 15], 0).await;
+            assert_eq!(n.unwrap(), 15);
+            assert_eq!(&buf, b"skip-completion");
+            // Past end of file: the EOF path is a synchronous *failure*,
+            // mapped to Ok(0), and is unaffected by the mode.
+            let (n, _) = f.read_at(vec![0u8; 8], 4096).await;
+            assert_eq!(n.unwrap(), 0);
+        });
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

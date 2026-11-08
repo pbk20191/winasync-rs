@@ -137,6 +137,18 @@ impl HvStream {
         Ok(stream)
     }
 
+    /// Skips the completion packet whenever an op on this handle completes
+    /// **synchronously** — VMBus hands small messages over without
+    /// ever blocking. The op is then finished on the issuing
+    /// thread, with no pool hand-off and no context switch.
+    ///
+    /// Enable it before issuing ops. Issue closures report a synchronous
+    /// success as a fact and the core applies this mode, so there is no
+    /// per-op contract to get wrong; semantics are unchanged, only sooner.
+    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
+        self.res.set_skip_completion_on_success()
+    }
+
     /// Which partition is on the other end, and which service it reached.
     ///
     /// For a host service this is the authorization primitive: a listener on

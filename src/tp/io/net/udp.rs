@@ -70,6 +70,18 @@ impl UdpSocket {
     }
 
     /// The locally bound address (useful after binding port 0).
+    /// Skips the completion packet whenever an op on this handle completes
+    /// **synchronously** — a datagram already sitting in the socket
+    /// buffer, or a send that fits in it. The op is then finished on the issuing
+    /// thread, with no pool hand-off and no context switch.
+    ///
+    /// Enable it before issuing ops. Issue closures report a synchronous
+    /// success as a fact and the core applies this mode, so there is no
+    /// per-op contract to get wrong; semantics are unchanged, only sooner.
+    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
+        self.res.set_skip_completion_on_success()
+    }
+
     pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
         addr_of_socket(self.res.socket())
     }
