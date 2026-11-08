@@ -7,7 +7,7 @@
 //! future that started it is dropped — cancellation is asynchronous). The
 //! `AsyncRead`/`AsyncWrite` traits instead hand out *borrowed* slices per poll.
 //! Bridging the two safely requires the adapter to own an internal staging
-//! buffer and the in-flight [`OpFuture`](super::OpFuture) (boxed): the kernel
+//! buffer and the in-flight `OpFuture` (boxed): the kernel
 //! only ever writes into the adapter-owned buffer, never the caller's slice, so
 //! dropping a combinator future mid-op can never leave the kernel writing into
 //! freed/foreign memory. Data is copied between the staging buffer and the

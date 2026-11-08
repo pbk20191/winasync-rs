@@ -1,4 +1,4 @@
-//! Bridges [`tpio::submit`]'s callback-based completion model to
+//! Bridges `tpio::submit`'s callback-based completion model to
 //! `std::future::Future`, for one-shot overlapped operations whose result is
 //! just a byte count (often irrelevant) or an error — e.g. the server side
 //! of `ConnectNamedPipe`, and (later) AF_UNIX `AcceptEx`/`ConnectEx`. Kept
@@ -7,7 +7,7 @@
 //! Shape mirrors [`super::asyncop`]'s `IoAsyncOp`: a `Mutex`-guarded slot
 //! holds the pending result and the last-registered `Waker`, filled by the
 //! `tpio::submit` completion callback, which also wakes the task. The
-//! returned [`OpHandle`] is stored so the future's `Drop` can cancel the
+//! returned `OpHandle` is stored so the future's `Drop` can cancel the
 //! operation if it is abandoned before completion.
 
 use super::tpio::{self, IoReg, Issue, OpHandle};
@@ -65,7 +65,7 @@ impl Drop for AwaitIo {
     }
 }
 
-/// Issues one overlapped operation via [`tpio::submit`] and returns a Future
+/// Issues one overlapped operation via `tpio::submit` and returns a Future
 /// resolving to the byte count on success or the classified error.
 ///
 /// `issue` runs synchronously inside `submit` on the calling thread (exactly

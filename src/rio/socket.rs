@@ -217,7 +217,7 @@ impl RioUdpSocket {
     }
 
     /// Resizes this socket's outstanding-operation budget; see
-    /// [`RequestQueue::resize`](super::rq::RequestQueue::resize).
+    /// `RequestQueue::resize`.
     pub fn resize_queue(&self, max_recv: u32, max_send: u32) -> windows_core::Result<()> {
         self.rq.resize(max_recv, max_send)
     }

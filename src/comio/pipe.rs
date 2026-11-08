@@ -1,5 +1,5 @@
 //! Named-pipe transport: `NamedPipeListener`/`NamedPipeClient` produce
-//! `OverlappedDuplexStream`s (via [`stream::from_reg`]) over Win32 named
+//! `OverlappedDuplexStream`s (via `stream::from_reg`) over Win32 named
 //! pipes, the first end-to-end transport built on the `comio` overlapped-IO
 //! engine.
 

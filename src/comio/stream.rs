@@ -1,7 +1,7 @@
 //! `OverlappedDuplexStream`: a COM object implementing WinRT
 //! `IInputStream`/`IOutputStream`/`IClosable` over a Win32 `HANDLE`/`SOCKET`
-//! registered with [`super::tpio::IoReg`]. `ReadAsync`/`WriteAsync` start
-//! overlapped IO via [`super::asyncop::IoAsyncOp`] and return the same WinRT
+//! registered with `super::tpio::IoReg`. `ReadAsync`/`WriteAsync` start
+//! overlapped IO via `super::asyncop::IoAsyncOp` and return the same WinRT
 //! async-operation types `StreamSocket` returns, so transports built on this
 //! type are drop-in compatible with `windows-future`'s awaiting and with
 //! `DataReader`/`DataWriter`.

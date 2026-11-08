@@ -22,8 +22,30 @@ use crate::common::hvaddr::{HvSocketAddr, HV_GUID_WILDCARD};
 /// RO_E_CLOSED — returned by members of a closed listener/stream.
 pub(crate) const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
 
-/// E_INVALIDARG — a bind form this listener's transport does not accept.
-const E_INVALIDARG: HRESULT = HRESULT(0x80070057u32 as i32);
+/// E_POINTER — a null out-parameter from a COM caller.
+const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
+
+/// The members every listener here shares, on a vtable so a COM caller can
+/// reach them. GUID frozen — do not change or reuse.
+///
+/// Binding is deliberately *not* here. Each transport is addressed
+/// differently — a pipe name, a filesystem path, a pair of GUIDs — and
+/// putting all three binds on one interface is exactly what forced the
+/// previous single listener type to answer `E_INVALIDARG` for the two that
+/// did not apply to it. Each listener now exposes only the bind it has, so
+/// that error case is gone at the type level.
+///
+/// A **classic COM** interface, deriving from `IUnknown`, like
+/// [`IConnectionReceivedArgs`] beside it: a hand-written `#[interface]`
+/// cannot be a WinRT interface, which would need generated bindings from a
+/// `.winmd`. So these listeners are reachable by `QueryInterface` and a class
+/// factory, not by `RoActivateInstance`.
+#[interface("1f4c7d6a-9b2e-4a85-8d13-6c0f5a2b7e94")]
+pub unsafe trait IConnectionListener: IUnknown {
+    fn ConnectionReceived(&self, handler: *mut c_void, result: *mut i64) -> HRESULT;
+    fn RemoveConnectionReceived(&self, token: i64) -> HRESULT;
+    fn Information(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT;
+}
 
 /// Custom fixed-IID interface exposing the stream/endpoint pair delivered by
 /// a `ConnectionReceived` event. GUID frozen here — do not change or reuse.
@@ -80,76 +102,68 @@ pub(crate) fn new_args(stream: IInspectable, endpoint: HSTRING) -> IConnectionRe
     ConnectionReceivedArgs { stream, endpoint }.into()
 }
 
-/// Which comio transport a [`ConnectionListener`] accepts connections over.
-enum Transport {
-    NamedPipe,
-    Unix,
-    HyperV,
-}
-
-/// The concrete accept source `try_arm` re-arms against once `BindAsync` has
-/// recorded it, shared (behind an `Arc`, cloned out of `ListenerState::source`)
-/// rather than referenced directly, so that `try_arm` can drop
-/// `ListenerState::source`'s lock before calling `AcceptSource::arm` on it —
-/// `tpio::submit` guarantees `on_result` (built by `try_arm`, passed down into
-/// `AcceptSource::arm`) always runs later, on a thread-pool thread, never on
-/// this call's own stack, but cloning the `Arc` out first keeps the lock's
-/// scope minimal regardless.
+/// How a listener issues one accept.
 ///
-/// Neither transport does any kernel work at `BindAsync` time: the named-pipe
-/// variant holds only the name (each `arm` creates a fresh instance), and the
-/// AF_UNIX variant holds the path and binds/listens *lazily* on the first
-/// `arm` (then reuses the one persistent socket). Deferring the unix
-/// `bind`/`listen` is what makes handler gating complete for that transport
-/// too: with no handler the chain never arms, so no listen socket exists and a
-/// client cannot connect into a backlog (see [`ConnectionListener::ConnectionReceived`]). The cost
-/// is that an AF_UNIX bind error (e.g. a stale socket file) now surfaces when
-/// the chain first starts — synchronously from `BindAsync` if a handler is
-/// already registered, otherwise surfaced from the first `ConnectionReceived`
-/// (same as a deferred named-pipe error) — rather than always from `BindAsync`.
-enum AcceptSource {
-    NamedPipe(String),
-    Unix {
-        path: String,
-        /// `None` until the first `arm` binds the persistent listen socket.
-        listener: Mutex<Option<super::UnixStreamListener>>,
-    },
-    /// AF_HYPERV, bound lazily on the first `arm` for the same gating reason
-    /// as the AF_UNIX variant. A bind error here (most often
-    /// `WSAEAFNOSUPPORT` where the Hyper-V socket provider is absent, or
-    /// `WSAEADDRINUSE` for a service GUID already listened on) surfaces on the
-    /// chain's first start, exactly like the unix one.
-    HyperV {
-        addr: HvSocketAddr,
-        listener: Mutex<Option<super::HvStreamListener>>,
-    },
+/// A trait rather than an enum because each transport is now its own COM
+/// type: the shared accept chain only ever needs "arm one accept", and
+/// keeping that the whole contract is what lets the three listeners share
+/// every other line of this module.
+///
+/// No transport does kernel work when it is bound. The named-pipe source
+/// holds only the name (each `arm` creates a fresh instance); the socket
+/// sources hold the address and bind/listen *lazily* on the first `arm`, then
+/// reuse the one listen socket. Deferring that bind is what makes handler
+/// gating complete: with no handler the chain never arms, so no listen socket
+/// exists and a client cannot connect into a backlog. The cost is that a bind
+/// error — a stale AF_UNIX socket file, `WSAEAFNOSUPPORT` where the Hyper-V
+/// provider is absent — surfaces when the chain first starts rather than from
+/// the bind call.
+///
+/// Held behind an `Arc` in `ListenerState::source` and cloned out before use,
+/// so `try_arm` can drop that lock before arming.
+pub(crate) trait AcceptSource: Send + Sync {
+    /// Issues one accept through the transport's callback-based primitive
+    /// (`pipe::arm_accept` / `*StreamListener::arm_accept`), each built
+    /// directly on `tpio::submit` — no `Future`, no executor.
+    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle>;
 }
 
-impl AcceptSource {
-    /// Issues one accept via the underlying transport's callback-based
-    /// primitive (`pipe::arm_accept` / `UnixStreamListener::arm_accept`),
-    /// both built directly on `tpio::submit` — no `Future`, no executor. For
-    /// AF_UNIX, lazily binds the persistent listen socket on first use (so its
-    /// bind/listen error surfaces here as an `Err`, and so gating prevents the
-    /// socket from existing at all until there is a handler).
+struct PipeSource(String);
+
+impl AcceptSource for PipeSource {
     fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
-        match self {
-            AcceptSource::NamedPipe(name) => super::pipe::arm_accept(name, on_result),
-            AcceptSource::Unix { path, listener } => {
-                let mut guard = listener.lock().unwrap();
-                if guard.is_none() {
-                    *guard = Some(super::UnixStreamListener::bind(path)?);
-                }
-                guard.as_ref().unwrap().arm_accept(on_result)
-            }
-            AcceptSource::HyperV { addr, listener } => {
-                let mut guard = listener.lock().unwrap();
-                if guard.is_none() {
-                    *guard = Some(super::HvStreamListener::bind(*addr)?);
-                }
-                guard.as_ref().unwrap().arm_accept(on_result)
-            }
+        super::pipe::arm_accept(&self.0, on_result)
+    }
+}
+
+struct UnixSource {
+    path: String,
+    /// `None` until the first `arm` binds the persistent listen socket.
+    listener: Mutex<Option<super::UnixStreamListener>>,
+}
+
+impl AcceptSource for UnixSource {
+    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
+        let mut guard = self.listener.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(super::UnixStreamListener::bind(&self.path)?);
         }
+        guard.as_ref().unwrap().arm_accept(on_result)
+    }
+}
+
+struct HyperVSource {
+    addr: HvSocketAddr,
+    listener: Mutex<Option<super::HvStreamListener>>,
+}
+
+impl AcceptSource for HyperVSource {
+    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
+        let mut guard = self.listener.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(super::HvStreamListener::bind(self.addr)?);
+        }
+        guard.as_ref().unwrap().arm_accept(on_result)
     }
 }
 
@@ -184,7 +198,7 @@ struct ListenerState {
     event: windows_core::Event<TypedEventHandler<IInspectable, IInspectable>>,
     endpoint: Mutex<Option<HSTRING>>,
     /// Set once by `BindAsync`, read (cloned) by every `try_arm` call.
-    source: Mutex<Option<Arc<AcceptSource>>>,
+    source: Mutex<Option<Arc<dyn AcceptSource>>>,
     /// The in-flight accept's `OpHandle`. `tpio::submit` guarantees every
     /// completion — synchronous or asynchronous — is delivered on a
     /// thread-pool thread (see `tpio::submit`'s doc comment), so `try_arm`
@@ -217,96 +231,35 @@ impl ListenerState {
     }
 }
 
-/// A WinRT-native, `StreamSocketListener`-shaped connection listener: raises
-/// `ConnectionReceived` for each inbound connection accepted on its
-/// transport, self-re-arming a TP_IO completion chain on the default
-/// thread-pool callback environment (`pcbe = NULL`) — the same environment
-/// every other `comio` IO op runs on — once `BindAsync` is called. There is
-/// no private executor and no async task backing this: each accept's
-/// completion, delivered by the thread pool, itself issues the next accept
-/// before returning.
-#[implement(windows::Foundation::IClosable)]
-pub struct ConnectionListener {
+/// Shared behaviour of every listener here, held by each transport's COM type.
+///
+/// Not itself a COM object: the three listeners differ only in how they are
+/// addressed, so everything else — handler registration, the self-re-arming
+/// accept chain, teardown — lives here once and each type delegates to it.
+pub(crate) struct ListenerCore {
     state: Arc<ListenerState>,
-    transport: Transport,
 }
 
-impl Drop for ConnectionListener {
-    /// Breaks the `Arc<ListenerState>` <-> accept-chain reference cycle: the
-    /// in-flight accept's completion closure (captured by the `Op` block
-    /// `tpio::submit` allocates, held alive by the kernel until the real
-    /// completion fires) captures a clone of `state` via `on_result`, so
-    /// without this the last COM reference going away would leak the state,
-    /// the pending overlapped op, and (if a client ever connected) resume
-    /// firing events on a listener nobody references anymore. This is not
-    /// part of the COM refcount cycle — the chain captures
-    /// `Arc<ListenerState>`, never the `ComObject`/COM pointer itself — so
-    /// this inner `Drop` is guaranteed to run once the COM object's refcount
-    /// reaches zero, even if `Close` was never called. Performs the same
-    /// teardown as `IClosable_Impl::Close`; safe to run again after an
-    /// explicit `Close` since `closed.store`/`event.clear` are idempotent
-    /// and `current_op.lock().unwrap().take()` is already `None` the second
-    /// time.
-    fn drop(&mut self) {
-        self.state.closed.store(true, Ordering::Release);
-        if let Some(op) = self.state.current_op.lock().unwrap().take() {
-            op.cancel();
+impl ListenerCore {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(ListenerState::new()),
         }
-        self.state.event.clear();
-        self.state.handlers.lock().unwrap().clear();
-    }
-}
-
-impl ConnectionListener {
-    /// Constructs a listener bound to the named-pipe transport. Nothing is
-    /// created on disk/in the kernel until `BindAsync` is called.
-    pub fn named_pipe() -> ComObject<ConnectionListener> {
-        ComObject::new(ConnectionListener {
-            state: Arc::new(ListenerState::new()),
-            transport: Transport::NamedPipe,
-        })
     }
 
-    /// Constructs a listener bound to the AF_UNIX transport. Nothing is
-    /// created on disk/in the kernel until `BindAsync` is called.
-    pub fn unix() -> ComObject<ConnectionListener> {
-        ComObject::new(ConnectionListener {
-            state: Arc::new(ListenerState::new()),
-            transport: Transport::Unix,
-        })
-    }
-
-    /// Constructs a listener bound to the Hyper-V socket (AF_HYPERV)
-    /// transport. Nothing is created in the kernel until
-    /// [`BindEndpointAsync`](Self::BindEndpointAsync) or
-    /// [`BindServiceNameAsync`](Self::BindServiceNameAsync) is called.
+    /// Registers `handler`, invoked on a thread-pool thread per accepted
+    /// connection; returns a token for `remove_connection_received`.
     ///
-    /// This transport addresses by GUID pair, not by string, so plain
-    /// [`BindAsync`](Self::BindAsync) is rejected on it with `E_INVALIDARG`.
-    pub fn hyper_v() -> ComObject<ConnectionListener> {
-        ComObject::new(ConnectionListener {
-            state: Arc::new(ListenerState::new()),
-            transport: Transport::HyperV,
-        })
-    }
-
-    /// Registers `handler` to be invoked (on a thread-pool thread) for each
-    /// accepted connection. Returns a token for `RemoveConnectionReceived`.
+    /// Registering the *first* handler starts the accept chain if the
+    /// listener is already bound (handler gating — see [`ListenerState`]): a
+    /// listener with no consumer does not accept connections.
     ///
-    /// Registering the *first* handler starts the accept chain if the listener
-    /// is already bound (handler gating — see [`ListenerState`]): a listener
-    /// with no `ConnectionReceived` consumer does not accept connections.
-    ///
-    /// If starting the chain fails synchronously (e.g. an endpoint bound before
-    /// any handler was registered turns out to be malformed, or an AF_UNIX
-    /// bind/listen error on a stale socket file — deferred first-accept errors
-    /// that handler gating pushes to the chain's actual start), that error is
-    /// surfaced from here and the just-added registration is rolled back, so the
-    /// listener is left exactly as it was before this call. This mirrors the
-    /// handler-first ordering, where the same first-accept error surfaces from
-    /// `BindAsync` instead.
-    #[allow(non_snake_case)]
-    pub fn ConnectionReceived(
+    /// If starting the chain fails synchronously — a malformed endpoint bound
+    /// before any handler existed, or a stale AF_UNIX socket file — that
+    /// error surfaces here and the registration is rolled back, leaving the
+    /// listener exactly as it was. Bind-after-handler ordering surfaces the
+    /// same error from the bind instead.
+    fn connection_received(
         &self,
         handler: &TypedEventHandler<IInspectable, IInspectable>,
     ) -> Result<i64> {
@@ -316,51 +269,34 @@ impl ConnectionListener {
         let token = self.state.event.add(handler)?;
         let first = {
             let mut h = self.state.handlers.lock().unwrap();
-            let was_empty = h.is_empty();
             h.insert(token);
-            was_empty
+            h.len() == 1
         };
         if first {
-            // First consumer: start accepting (no-op if not bound yet). On a
-            // synchronous start failure, roll the registration back out so the
-            // listener is left untouched, then surface the error.
             if let Err(e) = ensure_running(self.state.clone()) {
-                self.state.event.remove(token);
                 self.state.handlers.lock().unwrap().remove(&token);
+                self.state.event.remove(token);
                 return Err(e);
             }
         }
         Ok(token)
     }
 
-    /// Revokes a previously registered `ConnectionReceived` handler.
-    ///
-    /// Removing the *last* handler pauses the accept chain (handler gating —
-    /// see [`ListenerState`]): the in-flight accept is cancelled so the
-    /// listener stops accepting connections no one would receive. A later
-    /// `ConnectionReceived` resumes it.
-    ///
-    /// One inherent race remains: if the in-flight accept *completes* (a client
-    /// connected) in the instant between here cancelling it and the completion
-    /// running, that one already-accepted connection is delivered to an empty
-    /// handler set and dropped. The accept was already in flight, so it can't be
-    /// un-accepted; this is the usual accept/stop boundary race and is bounded
-    /// to at most that single connection.
-    #[allow(non_snake_case)]
-    pub fn RemoveConnectionReceived(&self, token: i64) -> Result<()> {
+    /// Removes a handler. Removing the last one pauses the chain and cancels
+    /// the in-flight accept.
+    fn remove_connection_received(&self, token: i64) -> Result<()> {
         if self.state.closed.load(Ordering::Acquire) {
             return Err(Error::from_hresult(RO_E_CLOSED));
         }
         self.state.event.remove(token);
-        let now_empty = {
+        let last = {
             let mut h = self.state.handlers.lock().unwrap();
             h.remove(&token);
             h.is_empty()
         };
-        if now_empty {
+        if last {
             // No consumers left: cancel the in-flight accept. Its `on_result`
-            // (Err, from the cancellation) runs the release/handoff, which —
-            // seeing `want_running` now false — leaves the chain stopped.
+            // observes the cancellation and releases the chain.
             if let Some(op) = self.state.current_op.lock().unwrap().take() {
                 op.cancel();
             }
@@ -368,162 +304,400 @@ impl ConnectionListener {
         Ok(())
     }
 
-    /// Records `endpoint` (the pipe name / socket path, depending on
-    /// transport) and — *if a `ConnectionReceived` handler is already
-    /// registered* (handler gating, see [`ListenerState`]) — issues the first
-    /// accept of the self-re-arming completion chain (see [`drive`]). With no
-    /// handler yet, binding only records the endpoint/source; the chain starts
-    /// later, when the first handler is registered. Neither transport does any
-    /// kernel work until the chain first arms (see [`AcceptSource`]): the
-    /// named-pipe instance and the AF_UNIX listen socket are both created on
-    /// the first accept, so a bound-but-handler-less listener holds no kernel
-    /// resources and accepts nothing.
-    ///
-    /// When a handler is present, a synchronous failure to issue the *first*
-    /// accept (a malformed pipe name, or an AF_UNIX bind/listen error such as a
-    /// stale socket file) is surfaced synchronously from this call — only
-    /// re-arms triggered internally by a later completion can't propagate a
-    /// `Result` anywhere and instead just stop the chain (see [`drive`]). With
-    /// no handler, that first-accept error is deferred to the first
-    /// `ConnectionReceived` call, which surfaces it there (see
-    /// [`ConnectionListener::ConnectionReceived`](Self::ConnectionReceived)). The returned
-    /// `IAsyncAction` is already completed once this call returns `Ok`.
-    ///
-    /// # Not safe to call concurrently with an already-running accept chain
-    /// Calling `BindAsync` again *sequentially* (e.g. to rebind after a
-    /// prior `Close`-less reconfiguration) is fine: this call cancels the
-    /// previous `current_op` and replaces `source` before installing the new
-    /// chain, so nothing is orphaned. But calling `BindAsync` from one
-    /// thread while a previously started accept chain is still actively
-    /// running (not yet superseded) on another is not supported: the
-    /// `current_op` handoff in `try_arm` assumes a single active chain at a
-    /// time, and a concurrent rebind racing it could store a new `source`/
-    /// cancel the wrong `current_op` out from under the other chain,
-    /// orphaning an in-flight accept (untracked, so `Close`/`Drop` can no
-    /// longer cancel it). Callers that need to rebind must serialize
-    /// `BindAsync` calls themselves.
-    ///
-    /// Note a first-accept error-surfacing asymmetry on *rebind*: a fresh bind
-    /// (no chain yet) issues the first accept inline and surfaces its error, but
-    /// a rebind over a still-running chain can't claim `running` synchronously
-    /// (the old chain still holds it until its cancelled accept completes on the
-    /// pool), so the new source's first accept — and any error from it — happens
-    /// later on the restart path and is not surfaced from this call. Rebind onto
-    /// a questionable endpoint after an explicit `Close` (or a fresh listener)
-    /// if you need the error synchronously.
-    #[allow(non_snake_case)]
-    pub fn BindAsync(&self, endpoint: &HSTRING) -> Result<IAsyncAction> {
-        let source = match self.transport {
-            Transport::NamedPipe => AcceptSource::NamedPipe(endpoint.to_string()),
-            // The AF_UNIX listen socket is bound lazily on the first accept
-            // (see `AcceptSource`), not here, so that handler gating also keeps
-            // the socket from existing until there is a consumer.
-            Transport::Unix => AcceptSource::Unix {
-                path: endpoint.to_string(),
-                listener: Mutex::new(None),
-            },
-            // A Hyper-V endpoint is a GUID pair; there is no string form of it
-            // this listener accepts.
-            Transport::HyperV => return Err(Error::from_hresult(E_INVALIDARG)),
-        };
-        self.install_source(source, endpoint.clone())
+    /// The endpoint this listener is bound to, or `RO_E_CLOSED` once closed.
+    fn information(&self) -> Result<HSTRING> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        Ok(self
+            .state
+            .endpoint
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default())
     }
 
-    /// Binds the Hyper-V listener to one partition's `service_id` — the
-    /// AF_HYPERV counterpart of `StreamSocketListener::BindEndpointAsync`,
-    /// whose `(HostName, serviceName)` pair this mirrors: `vm_id` says *which
+    fn close(&self) -> Result<()> {
+        self.state.closed.store(true, Ordering::Release);
+        if let Some(op) = self.state.current_op.lock().unwrap().take() {
+            op.cancel();
+        }
+        self.state.event.clear();
+        self.state.handlers.lock().unwrap().clear();
+        Ok(())
+    }
+
+    /// Shared tail of every bind: swap in the accept source and (re)start the
+    /// chain if a consumer is already registered.
+    ///
+    /// Rebinding while a chain is running is not supported: the `current_op`
+    /// handoff assumes one active chain, and a concurrent rebind could cancel
+    /// the wrong op and orphan an in-flight accept. Serialize binds.
+    ///
+    /// Note an error-surfacing asymmetry on *rebind*: a fresh bind issues the
+    /// first accept inline and surfaces its error, but a rebind over a
+    /// running chain cannot claim `running` synchronously, so the new
+    /// source's first accept happens on the restart path and its error is not
+    /// returned from here. Rebind after an explicit `Close`, or onto a fresh
+    /// listener, if you need that error synchronously.
+    fn install_source(&self, source: Arc<dyn AcceptSource>, label: HSTRING) -> Result<IAsyncAction> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        // A second bind replacing an in-flight chain must not orphan an
+        // uncancellable accept: cancel whatever is armed before installing.
+        if let Some(op) = self.state.current_op.lock().unwrap().take() {
+            op.cancel();
+        }
+        *self.state.source.lock().unwrap() = Some(source);
+        *self.state.endpoint.lock().unwrap() = Some(label);
+
+        // Start accepting only if a consumer is already registered; otherwise
+        // the chain starts on the first `ConnectionReceived`.
+        ensure_running(self.state.clone())?;
+        Ok(IAsyncAction::spawn(|| Ok(())))
+    }
+}
+
+impl Drop for ListenerCore {
+    /// Breaks the `Arc<ListenerState>` <-> accept-chain reference cycle: the
+    /// in-flight accept's completion closure (captured by the `Op` block
+    /// `tpio::submit` allocates, held alive by the kernel until the real
+    /// completion fires) captures a clone of `state`, so without this the
+    /// last COM reference going away would leak the state, the pending
+    /// overlapped op, and — if a client ever connected — resume firing events
+    /// on a listener nobody references any more. The chain captures
+    /// `Arc<ListenerState>`, never the COM pointer, so this is not part of
+    /// the COM refcount cycle and is guaranteed to run once the refcount
+    /// reaches zero even if `Close` was never called. Idempotent with an
+    /// explicit `Close`.
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+/// The named-pipe listener's own bind, on a vtable.
+///
+/// One interface per transport rather than one shared bind: the addressing
+/// genuinely differs, and this is what lets each listener offer only the bind
+/// it has. A COM caller discovers which it holds by `QueryInterface`.
+///
+/// GUID frozen — do not change or reuse.
+#[interface("c0a5e7b1-3d94-4f26-8b57-2e1a906c4df3")]
+pub unsafe trait INamedPipeListenerBind: IUnknown {
+    fn BindAsync(
+        &self,
+        name: core::mem::ManuallyDrop<HSTRING>,
+        result: *mut *mut c_void,
+    ) -> HRESULT;
+}
+
+/// The AF_UNIX listener's own bind. GUID frozen.
+#[interface("4e8d12fa-6b30-4c71-a9e5-8f0b37d62a1c")]
+pub unsafe trait IUnixListenerBind: IUnknown {
+    fn BindAsync(
+        &self,
+        path: core::mem::ManuallyDrop<HSTRING>,
+        result: *mut *mut c_void,
+    ) -> HRESULT;
+}
+
+/// The Hyper-V listener's own binds. GUID frozen.
+#[interface("7a26c9e4-1f85-4b03-bd68-50c9a4e7138b")]
+pub unsafe trait IHyperVListenerBind: IUnknown {
+    fn BindEndpointAsync(
+        &self,
+        vm_id: *const windows_core::GUID,
+        service_id: *const windows_core::GUID,
+        result: *mut *mut c_void,
+    ) -> HRESULT;
+    fn BindServiceNameAsync(
+        &self,
+        service_id: *const windows_core::GUID,
+        result: *mut *mut c_void,
+    ) -> HRESULT;
+}
+
+/// Hands an `IAsyncAction` back through a vtable out-parameter.
+fn out_action(action: Result<IAsyncAction>, result: *mut *mut c_void) -> HRESULT {
+    if result.is_null() {
+        return E_POINTER;
+    }
+    match action {
+        Ok(a) => {
+            unsafe { *result = a.into_raw() };
+            HRESULT(0)
+        }
+        Err(e) => e.code(),
+    }
+}
+
+impl INamedPipeListenerBind_Impl for NamedPipeConnectionListener_Impl {
+    unsafe fn BindAsync(
+        &self,
+        name: core::mem::ManuallyDrop<HSTRING>,
+        result: *mut *mut c_void,
+    ) -> HRESULT {
+        // `ManuallyDrop` by value is the HSTRING in-param ABI: the handle is
+        // passed by value and stays the caller's to free.
+        out_action(self.bind(&name), result)
+    }
+}
+
+impl IUnixListenerBind_Impl for UnixConnectionListener_Impl {
+    unsafe fn BindAsync(
+        &self,
+        path: core::mem::ManuallyDrop<HSTRING>,
+        result: *mut *mut c_void,
+    ) -> HRESULT {
+        out_action(self.bind(&path), result)
+    }
+}
+
+impl IHyperVListenerBind_Impl for HyperVConnectionListener_Impl {
+    unsafe fn BindEndpointAsync(
+        &self,
+        vm_id: *const windows_core::GUID,
+        service_id: *const windows_core::GUID,
+        result: *mut *mut c_void,
+    ) -> HRESULT {
+        if vm_id.is_null() || service_id.is_null() {
+            return E_POINTER;
+        }
+        out_action(
+            self.bind_endpoint(unsafe { &*vm_id }, unsafe { &*service_id }),
+            result,
+        )
+    }
+
+    unsafe fn BindServiceNameAsync(
+        &self,
+        service_id: *const windows_core::GUID,
+        result: *mut *mut c_void,
+    ) -> HRESULT {
+        if service_id.is_null() {
+            return E_POINTER;
+        }
+        out_action(self.bind_service_name(unsafe { &*service_id }), result)
+    }
+}
+
+/// Generates one transport's COM type: the shared members on
+/// [`IConnectionListener`], `Close` on `IClosable`, and inherent Rust
+/// equivalents so Rust callers need no `cast`.
+///
+/// Every body delegates to [`ListenerCore`]; only the impl blocks repeat,
+/// because `#[implement]` generates a per-type trait that cannot be blanket
+/// implemented. The `_Impl` name is passed in rather than pasted, to avoid a
+/// proc-macro dependency for one concatenation.
+macro_rules! listener_impls {
+    ($name:ident, $impl_name:ident) => {
+        impl $name {
+            /// Creates the listener. Nothing is created on disk or in the
+            /// kernel until it is bound *and* has a handler.
+            #[allow(clippy::new_without_default)]
+            pub fn new() -> ComObject<$name> {
+                ComObject::new($name {
+                    core: ListenerCore::new(),
+                })
+            }
+
+            /// Typed Rust equivalent of the vtable's `ConnectionReceived`.
+            ///
+            /// These three are `snake_case` while the binds below keep their
+            /// WinRT-mirroring names, because only these three also exist on
+            /// [`IConnectionListener`]: `ComObject` derefs through the
+            /// generated `_Impl` type, so same-named inherent methods would
+            /// be shadowed by the raw vtable ones. Separate names keep the
+            /// typed surface and the ABI surface from colliding.
+            pub fn connection_received(
+                &self,
+                handler: &TypedEventHandler<IInspectable, IInspectable>,
+            ) -> Result<i64> {
+                self.core.connection_received(handler)
+            }
+
+            /// Typed Rust equivalent of the vtable's
+            /// `RemoveConnectionReceived`.
+            pub fn remove_connection_received(&self, token: i64) -> Result<()> {
+                self.core.remove_connection_received(token)
+            }
+
+            /// Typed Rust equivalent of the vtable's `Information`.
+            pub fn information(&self) -> Result<HSTRING> {
+                self.core.information()
+            }
+        }
+
+        impl IConnectionListener_Impl for $impl_name {
+            unsafe fn ConnectionReceived(
+                &self,
+                handler: *mut core::ffi::c_void,
+                result: *mut i64,
+            ) -> HRESULT {
+                if handler.is_null() || result.is_null() {
+                    return E_POINTER;
+                }
+                // Borrowed, not consumed: the caller keeps ownership of the
+                // handler it passed in.
+                let h = unsafe {
+                    core::mem::ManuallyDrop::new(TypedEventHandler::<
+                        IInspectable,
+                        IInspectable,
+                    >::from_raw(handler))
+                };
+                match self.core.connection_received(&h) {
+                    Ok(token) => {
+                        unsafe { *result = token };
+                        HRESULT(0)
+                    }
+                    Err(e) => e.code(),
+                }
+            }
+
+            unsafe fn RemoveConnectionReceived(&self, token: i64) -> HRESULT {
+                match self.core.remove_connection_received(token) {
+                    Ok(()) => HRESULT(0),
+                    Err(e) => e.code(),
+                }
+            }
+
+            unsafe fn Information(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT {
+                if result.is_null() {
+                    return E_POINTER;
+                }
+                match self.core.information() {
+                    Ok(s) => {
+                        unsafe { *result = core::mem::ManuallyDrop::new(s) };
+                        HRESULT(0)
+                    }
+                    Err(e) => e.code(),
+                }
+            }
+        }
+
+        impl IClosable_Impl for $impl_name {
+            fn Close(&self) -> Result<()> {
+                self.core.close()
+            }
+        }
+    };
+}
+
+/// A listener that accepts named-pipe connections.
+///
+/// Binding creates nothing on its own: the accept chain — and with it any
+/// pipe instance — starts only once the listener is both bound and has a
+/// `ConnectionReceived` handler.
+#[implement(
+    IConnectionListener,
+    INamedPipeListenerBind,
+    windows::Foundation::IClosable
+)]
+pub struct NamedPipeConnectionListener {
+    core: ListenerCore,
+}
+
+/// A listener that accepts AF_UNIX (Unix domain socket) connections.
+///
+/// The listen socket is created on the first accept, so binding alone leaves
+/// nothing on disk.
+#[implement(
+    IConnectionListener,
+    IUnixListenerBind,
+    windows::Foundation::IClosable
+)]
+pub struct UnixConnectionListener {
+    core: ListenerCore,
+}
+
+/// A listener that accepts Hyper-V socket (AF_HYPERV) connections.
+///
+/// The listen socket is created on the first accept, as for AF_UNIX.
+#[implement(
+    IConnectionListener,
+    IHyperVListenerBind,
+    windows::Foundation::IClosable
+)]
+pub struct HyperVConnectionListener {
+    core: ListenerCore,
+}
+
+// The struct declarations stay out of the macro: `#[implement]` is a
+// proc-macro and does not survive being handed a `macro_rules` metavariable
+// as an interface name. Only the bodies, which are identical, are generated.
+listener_impls!(NamedPipeConnectionListener, NamedPipeConnectionListener_Impl);
+listener_impls!(UnixConnectionListener, UnixConnectionListener_Impl);
+listener_impls!(HyperVConnectionListener, HyperVConnectionListener_Impl);
+
+impl NamedPipeConnectionListener {
+    /// Binds to a pipe name such as `\\.\pipe\example`.
+    ///
+    /// No pipe instance exists until the accept chain starts; each accept
+    /// creates a fresh one.
+        pub fn bind(&self, name: &HSTRING) -> Result<IAsyncAction> {
+        self.core
+            .install_source(Arc::new(PipeSource(name.to_string())), name.clone())
+    }
+}
+
+impl UnixConnectionListener {
+    /// Binds to a filesystem path.
+    ///
+    /// The socket is bound lazily on the first accept, so a stale socket file
+    /// surfaces as an error from whichever of this call or the first
+    /// `ConnectionReceived` completes the gating condition.
+        pub fn bind(&self, path: &HSTRING) -> Result<IAsyncAction> {
+        self.core.install_source(
+            Arc::new(UnixSource {
+                path: path.to_string(),
+                listener: Mutex::new(None),
+            }),
+            path.clone(),
+        )
+    }
+}
+
+impl HyperVConnectionListener {
+    /// Binds to one partition's `service_id` — the AF_HYPERV counterpart of
+    /// `StreamSocketListener::BindEndpointAsync`, whose
+    /// `(HostName, serviceName)` pair this mirrors: `vm_id` says *which
     /// partition*, `service_id` says *which endpoint inside it*.
     ///
     /// GUIDs rather than a `HostName` because WinRT has no way to spell this
     /// endpoint: `HostNameType` is `DomainName | Ipv4 | Ipv6 | Bluetooth`.
     ///
     /// Use `HV_GUID_WILDCARD` for `vm_id` to accept from any partition — or
-    /// just call [`BindServiceNameAsync`](Self::BindServiceNameAsync), which
-    /// is exactly that. Rejected with `E_INVALIDARG` on a named-pipe or
-    /// AF_UNIX listener.
-    #[allow(non_snake_case)]
-    pub fn BindEndpointAsync(
+    /// just call [`bind_service_name`](Self::bind_service_name).
+        pub fn bind_endpoint(
         &self,
         vm_id: &windows_core::GUID,
         service_id: &windows_core::GUID,
     ) -> Result<IAsyncAction> {
-        if !matches!(self.transport, Transport::HyperV) {
-            return Err(Error::from_hresult(E_INVALIDARG));
-        }
         let addr = HvSocketAddr::new(*vm_id, *service_id);
-        let label = HSTRING::from(format!("{:?}/{:?}", addr.vm_id, addr.service_id));
-        self.install_source(
-            AcceptSource::HyperV {
+        let label = HSTRING::from(addr.to_string());
+        self.core.install_source(
+            Arc::new(HyperVSource {
                 addr,
                 listener: Mutex::new(None),
-            },
+            }),
             label,
         )
     }
 
-    /// Binds the Hyper-V listener to `service_id` on *any* partition — the
-    /// AF_HYPERV counterpart of `StreamSocketListener::BindServiceNameAsync`.
+    /// Binds `service_id` on *any* partition — the AF_HYPERV counterpart of
+    /// `StreamSocketListener::BindServiceNameAsync`.
     ///
     /// The analogy is exact: where WinRT's version binds a service on every
-    /// local adapter, this binds a service GUID with `HV_GUID_WILDCARD` as the
-    /// VM id, accepting from any partition. Rejected with `E_INVALIDARG` on a
-    /// named-pipe or AF_UNIX listener.
-    #[allow(non_snake_case)]
-    pub fn BindServiceNameAsync(&self, service_id: &windows_core::GUID) -> Result<IAsyncAction> {
-        self.BindEndpointAsync(&HV_GUID_WILDCARD, service_id)
-    }
-
-    /// Shared tail of every `Bind*Async`: swap in the new accept source and
-    /// (re)start the chain if a consumer is already registered.
-    fn install_source(&self, source: AcceptSource, label: HSTRING) -> Result<IAsyncAction> {
-        if self.state.closed.load(Ordering::Acquire) {
-            return Err(Error::from_hresult(RO_E_CLOSED));
-        }
-
-        // A second bind replacing an in-flight chain must not orphan an
-        // uncancellable accept: cancel whatever is currently armed before
-        // installing the new source.
-        if let Some(op) = self.state.current_op.lock().unwrap().take() {
-            op.cancel();
-        }
-
-        *self.state.source.lock().unwrap() = Some(Arc::new(source));
-        *self.state.endpoint.lock().unwrap() = Some(label);
-
-        // Start accepting only if a consumer is already registered (handler
-        // gating). No handler => no accept; the chain starts on the first
-        // `ConnectionReceived`.
-        ensure_running(self.state.clone())?;
-
-        Ok(IAsyncAction::spawn(|| Ok(())))
-    }
-
-    /// Returns the endpoint this listener is bound to (the pipe name / socket
-    /// path passed to `BindAsync`), or `RO_E_CLOSED` once the listener has
-    /// been closed. A minimal stand-in for `StreamSocketListenerInformation`:
-    /// a full info object is unneeded (YAGNI) — callers that already have the
-    /// endpoint string (they passed it to `BindAsync`) rarely need this, but
-    /// it's here for API parity with `StreamSocketListener::Information()`.
-    ///
-    /// Note: unlike `StreamSocketListener`, there is intentionally no
-    /// `Control`/`ListenerControl`-style object here (e.g. for tuning
-    /// backlog or pipe-instance count) — the spec's richer shape is scoped
-    /// down to what's actually used (YAGNI); add one if/when a caller needs
-    /// to configure that.
-    #[allow(non_snake_case)]
-    pub fn Information(&self) -> Result<HSTRING> {
-        if self.state.closed.load(Ordering::Acquire) {
-            return Err(Error::from_hresult(RO_E_CLOSED));
-        }
-        Ok(self.state.endpoint.lock().unwrap().clone().unwrap_or_default())
+    /// local adapter, this binds a service GUID with `HV_GUID_WILDCARD` as
+    /// the VM id, accepting from any partition.
+        pub fn bind_service_name(&self, service_id: &windows_core::GUID) -> Result<IAsyncAction> {
+        self.bind_endpoint(&HV_GUID_WILDCARD, service_id)
     }
 }
 
-/// The handler-gating predicate: the accept chain should be running iff the
-/// listener is not closed, is bound (`source` is `Some`), and has at least one
-/// registered `ConnectionReceived` handler. Each sub-lock is taken and
-/// released in turn (never nested) so there is no lock-ordering hazard with
-/// the mutating paths.
+
 fn want_running(state: &ListenerState) -> bool {
     if state.closed.load(Ordering::Acquire) {
         return false;
@@ -731,23 +905,6 @@ fn fire_event(state: &Arc<ListenerState>, stream: IInspectable, endpoint: HSTRIN
     }));
 }
 
-impl IClosable_Impl for ConnectionListener_Impl {
-    /// Idempotent: flips `closed` (guarding every other member), cancels the
-    /// in-flight accept (`CancelIoEx` via `OpHandle::cancel`, which also
-    /// stops the chain from re-arming — its `on_result` observes `closed`
-    /// before doing anything else), and clears all registered
-    /// `ConnectionReceived` handlers.
-    fn Close(&self) -> Result<()> {
-        self.state.closed.store(true, Ordering::Release);
-        if let Some(op) = self.state.current_op.lock().unwrap().take() {
-            op.cancel();
-        }
-        self.state.event.clear();
-        self.state.handlers.lock().unwrap().clear();
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,7 +946,7 @@ mod listener_tests {
     #[test]
     fn connection_received_fires_with_working_stream() {
         let name = format!(r"\\.\pipe\comio_listener_{}", std::process::id());
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
 
         // `IInspectable` (and hence the accepted stream) isn't `Send` — same
         // reasoning as `comio::tests::cancel_storm` — so `TypedEventHandler`'s
@@ -812,8 +969,8 @@ mod listener_tests {
             let _ = tx.send(raw);
             Ok(())
         });
-        listener.ConnectionReceived(&handler).unwrap();
-        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
 
         // Client connects (short retry to cover the inter-instance window
         // between the loop's pipe instances).
@@ -868,7 +1025,7 @@ mod listener_tests {
             assert_eq!(std::slice::from_raw_parts(buffer_ptr(&echoed).unwrap(), 4), b"echo");
         }
 
-        // `ConnectionListener::named_pipe()` returns a `ComObject<ConnectionListener>`:
+        // `NamedPipeConnectionListener::new()` returns a `ComObject<ConnectionListener>`:
         // inherent methods (`ConnectionReceived`/`BindAsync` above) are reached
         // through its `Deref` chain, and `IClosable::Close` is reached via
         // `ComObject::cast` (a `QueryInterface`) rather than `IClosable::from`,
@@ -887,7 +1044,7 @@ mod listener_tests {
         let _ = std::fs::remove_file(&path);
         let p = path.to_string_lossy().into_owned();
 
-        let listener = ConnectionListener::unix();
+        let listener = UnixConnectionListener::new();
         let (tx, rx) = mpsc::channel::<usize>();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
             let a = args.as_ref().unwrap();
@@ -900,8 +1057,8 @@ mod listener_tests {
             let _ = tx.send(raw);
             Ok(())
         });
-        listener.ConnectionReceived(&handler).unwrap();
-        block_on(listener.BindAsync(&HSTRING::from(&p)).unwrap().into_future()).unwrap();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&p)).unwrap().into_future()).unwrap();
 
         let client = block_on(crate::comio::UnixStreamSocket::connect(&p)).unwrap();
         let server_raw = rx
@@ -943,26 +1100,125 @@ mod listener_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Drives a listener entirely through `IConnectionListener`'s vtable —
+    /// no inherent Rust method, no concrete type — which is what an external
+    /// COM caller sees. The previous tests all called the Rust surface, so
+    /// they could not have caught a broken vtable.
     #[test]
-    fn hyper_v_rejects_string_bind_and_others_reject_guid_bind() {
-        let service = windows_core::GUID::from_u128(0x7c41_e0d2_31ab_4f6e_a2b5_c80d93f14e77);
+    fn com_vtable_surface_works_for_every_transport() {
+        fn exercise(obj: windows_core::IUnknown, expect_endpoint: &str) {
+            let l: IConnectionListener = obj.cast().expect("QI IConnectionListener");
 
-        // A GUID endpoint has no string form this listener accepts.
-        let hv = ConnectionListener::hyper_v();
-        let e = hv.BindAsync(&HSTRING::from("loopback")).unwrap_err();
-        assert_eq!(e.code(), E_INVALIDARG);
+            let (tx, _rx) = mpsc::channel::<()>();
+            let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_, _| {
+                let _ = tx.send(());
+                Ok(())
+            });
 
-        // ...and conversely the string transports have no GUID endpoint.
-        let unix = ConnectionListener::unix();
-        assert_eq!(
-            unix.BindEndpointAsync(&HV_GUID_WILDCARD, &service).unwrap_err().code(),
-            E_INVALIDARG
-        );
-        let pipe = ConnectionListener::named_pipe();
-        assert_eq!(
-            pipe.BindServiceNameAsync(&service).unwrap_err().code(),
-            E_INVALIDARG
-        );
+            // Register through the vtable.
+            let mut token = 0i64;
+            unsafe {
+                l.ConnectionReceived(handler.as_raw(), &mut token)
+                    .ok()
+                    .expect("vtable ConnectionReceived");
+            }
+            assert_ne!(token, 0, "a real token came back through the vtable");
+
+            // Read the endpoint through the vtable.
+            let mut s = core::mem::ManuallyDrop::new(HSTRING::new());
+            unsafe { l.Information(&mut s).ok().expect("vtable Information") };
+            let got = core::mem::ManuallyDrop::into_inner(s).to_string();
+            assert_eq!(got, expect_endpoint);
+
+            // Remove through the vtable, then close through IClosable.
+            unsafe {
+                l.RemoveConnectionReceived(token)
+                    .ok()
+                    .expect("vtable RemoveConnectionReceived")
+            };
+            let c: IClosable = l.cast().expect("QI IClosable");
+            c.Close().expect("Close");
+
+            // Closed members report RO_E_CLOSED through the vtable too.
+            let mut s2 = core::mem::ManuallyDrop::new(HSTRING::new());
+            let hr = unsafe { l.Information(&mut s2) };
+            assert_eq!(hr, RO_E_CLOSED);
+        }
+
+        let pipe_name = format!(r"\\.\pipe\comvtable_{}", std::process::id());
+        // Bind through the vtable too, so the whole COM surface is covered:
+        // without this a COM caller could register a handler but never start
+        // the listener.
+        let pipe = NamedPipeConnectionListener::new();
+        {
+            let b: INamedPipeListenerBind = pipe.cast().expect("QI INamedPipeListenerBind");
+            let mut action = core::ptr::null_mut();
+            unsafe {
+                b.BindAsync(
+                    core::mem::ManuallyDrop::new(HSTRING::from(&pipe_name)),
+                    &mut action,
+                )
+                .ok()
+                .expect("vtable BindAsync");
+                assert!(!action.is_null());
+                drop(IAsyncAction::from_raw(action));
+            }
+        }
+        exercise(pipe.cast().unwrap(), &pipe_name);
+
+        let unix = UnixConnectionListener::new();
+        let path = std::env::temp_dir()
+            .join(format!("comvtable_{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        {
+            let b: IUnixListenerBind = unix.cast().expect("QI IUnixListenerBind");
+            let mut action = core::ptr::null_mut();
+            unsafe {
+                b.BindAsync(
+                    core::mem::ManuallyDrop::new(HSTRING::from(&path)),
+                    &mut action,
+                )
+                .ok()
+                .expect("vtable BindAsync");
+                drop(IAsyncAction::from_raw(action));
+            }
+        }
+        exercise(unix.cast().unwrap(), &path);
+        let _ = std::fs::remove_file(&path);
+
+        let hv = HyperVConnectionListener::new();
+        let svc = windows_core::GUID::from_u128(0x3b1f_0a27_55c4_4e8d_9a62_71d0e3f48b05);
+        let hv_bound = {
+            let b: IHyperVListenerBind = hv.cast().expect("QI IHyperVListenerBind");
+            let mut action = core::ptr::null_mut();
+            let hr = unsafe { b.BindServiceNameAsync(&svc, &mut action) };
+            if hr.is_ok() {
+                unsafe { drop(IAsyncAction::from_raw(action)) };
+            }
+            hr.is_ok()
+        };
+        if hv_bound {
+            let label = HvSocketAddr::new(HV_GUID_WILDCARD, svc).to_string();
+            exercise(hv.cast().unwrap(), &label);
+        } else {
+            eprintln!("skipped Hyper-V leg: AF_HYPERV unavailable");
+        }
+    }
+
+    /// What used to be a runtime check. Each listener now exposes only the
+    /// bind its addressing supports, so the mismatches this once asserted
+    /// (`E_INVALIDARG` from a string bind on Hyper-V, from a GUID bind on the
+    /// other two) are compile errors instead. Kept as a note so the removal
+    /// is not mistaken for lost coverage; see the commented lines.
+    #[test]
+    fn mismatched_binds_do_not_compile() {
+        let hv = HyperVConnectionListener::new();
+        let pipe = NamedPipeConnectionListener::new();
+        // hv.BindAsync(&HSTRING::from("loopback"));            // no such method
+        // pipe.BindServiceNameAsync(&windows_core::GUID::zeroed()); // no such method
+        let _ = (hv, pipe);
     }
 
     #[test]
@@ -972,7 +1228,7 @@ mod listener_tests {
         // socket provider at all reports a skip instead of failing.
         let service = windows_core::GUID::from_u128(0x5a83_c7e1_9b04_4d26_8f17_63ca0e2b95d8);
 
-        let listener = ConnectionListener::hyper_v();
+        let listener = HyperVConnectionListener::new();
         let (tx, rx) = mpsc::channel::<(usize, HSTRING)>();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
             let a = args.as_ref().unwrap();
@@ -990,10 +1246,10 @@ mod listener_tests {
             let _ = tx.send((raw, remote));
             Ok(())
         });
-        listener.ConnectionReceived(&handler).unwrap();
+        listener.connection_received(&handler).unwrap();
         // Handler is registered, so the lazy AF_HYPERV bind happens here and
         // its error (e.g. WSAEAFNOSUPPORT) surfaces synchronously.
-        if let Err(e) = listener.BindServiceNameAsync(&service) {
+        if let Err(e) = listener.bind_service_name(&service) {
             eprintln!("skipped: AF_HYPERV listener bind unavailable ({e:?})");
             return;
         }
@@ -1061,17 +1317,17 @@ mod listener_tests {
         use crate::common::block_on;
         use windows::Foundation::IClosable;
         let name = format!(r"\\.\pipe\comio_listener_leak_{}", std::process::id());
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
-        listener.ConnectionReceived(&handler).unwrap();
-        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
         // No client connects; the chain is parked in an in-flight ConnectNamedPipe.
         std::thread::sleep(std::time::Duration::from_millis(50));
         // Information returns the endpoint; then close.
-        assert_eq!(listener.Information().unwrap().to_string(), name);
+        assert_eq!(listener.information().unwrap().to_string(), name);
         let closable: IClosable = listener.cast().unwrap();
         closable.Close().unwrap();
-        assert_eq!(listener.Information().unwrap_err().code(), RO_E_CLOSED);
+        assert_eq!(listener.information().unwrap_err().code(), RO_E_CLOSED);
         #[cfg(debug_assertions)]
         {
             for _ in 0..500 {
@@ -1092,10 +1348,10 @@ mod listener_tests {
     fn drop_without_close_no_leak() {
         use crate::common::block_on;
         let name = format!(r"\\.\pipe\comio_listener_dropleak_{}", std::process::id());
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
-        listener.ConnectionReceived(&handler).unwrap();
-        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
         // No client connects; the chain is parked in an in-flight ConnectNamedPipe.
         std::thread::sleep(std::time::Duration::from_millis(50));
         // Drop the sole COM reference WITHOUT calling Close(). This proves
@@ -1120,16 +1376,16 @@ mod listener_tests {
 
     #[test]
     fn members_after_close_return_ro_e_closed() {
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
         let closable: IClosable = listener.cast().unwrap();
         closable.Close().unwrap();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
         assert_eq!(
-            listener.ConnectionReceived(&handler).unwrap_err().code(),
+            listener.connection_received(&handler).unwrap_err().code(),
             RO_E_CLOSED
         );
         assert_eq!(
-            listener.BindAsync(&HSTRING::from("x")).unwrap_err().code(),
+            listener.bind(&HSTRING::from("x")).unwrap_err().code(),
             RO_E_CLOSED
         );
         // Second Close is a no-op.
@@ -1150,16 +1406,16 @@ mod listener_tests {
     /// `accept_gated_on_handler`).
     #[test]
     fn bind_async_surfaces_first_accept_error() {
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
-        listener.ConnectionReceived(&handler).unwrap();
+        listener.connection_received(&handler).unwrap();
         let err = listener
-            .BindAsync(&HSTRING::from("not_a_valid_pipe_name"))
+            .bind(&HSTRING::from("not_a_valid_pipe_name"))
             .unwrap_err();
         assert_ne!(err.code().0, 0);
         // The listener is otherwise still usable (BindAsync failing isn't
         // the same as Close): a well-formed retry should still work.
-        assert!(listener.Information().is_err() || listener.Information().is_ok());
+        assert!(listener.information().is_err() || listener.information().is_ok());
     }
 
     /// The mirror of `bind_async_surfaces_first_accept_error` for the
@@ -1171,13 +1427,13 @@ mod listener_tests {
     /// works from a clean slate).
     #[test]
     fn connection_received_surfaces_deferred_bind_error() {
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
 
         // No handler yet: gating means BindAsync records the (malformed)
         // endpoint but issues no accept, so it succeeds.
         block_on(
             listener
-                .BindAsync(&HSTRING::from("not_a_valid_pipe_name"))
+                .bind(&HSTRING::from("not_a_valid_pipe_name"))
                 .unwrap()
                 .into_future(),
         )
@@ -1187,7 +1443,7 @@ mod listener_tests {
         // accept and fails synchronously — surfaced here, with the registration
         // rolled back.
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));
-        let err = listener.ConnectionReceived(&handler).unwrap_err();
+        let err = listener.connection_received(&handler).unwrap_err();
         assert_ne!(err.code().0, 0);
         assert_ne!(err.code(), RO_E_CLOSED, "must be the accept error, not closed");
 
@@ -1195,7 +1451,7 @@ mod listener_tests {
         // handler. Rebind to a valid endpoint first (source still points at the
         // bad name until then), then register: a clean slate works end to end.
         let name = format!(r"\\.\pipe\comio_listener_deferred_{}", std::process::id());
-        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
         let (tx, rx) = mpsc::channel::<usize>();
         let handler2 = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
             let a = args.as_ref().unwrap();
@@ -1208,7 +1464,7 @@ mod listener_tests {
             let _ = tx.send(raw);
             Ok(())
         });
-        listener.ConnectionReceived(&handler2).unwrap();
+        listener.connection_received(&handler2).unwrap();
 
         let client = {
             let mut last = None;
@@ -1240,11 +1496,11 @@ mod listener_tests {
     #[test]
     fn accept_gated_on_handler() {
         let name = format!(r"\\.\pipe\comio_listener_gate_{}", std::process::id());
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
 
         // Bind with no handler registered. Gating => no accept chain, so no
         // pipe instance exists and a client connect must fail.
-        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
             block_on(crate::comio::NamedPipeClient::connect(&name)).is_err(),
@@ -1266,7 +1522,7 @@ mod listener_tests {
             let _ = tx.send(raw);
             Ok(())
         });
-        listener.ConnectionReceived(&handler).unwrap();
+        listener.connection_received(&handler).unwrap();
 
         let client = {
             let mut last = None;
@@ -1300,7 +1556,7 @@ mod listener_tests {
     #[test]
     fn pause_and_resume_on_handler_toggle() {
         let name = format!(r"\\.\pipe\comio_listener_toggle_{}", std::process::id());
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
 
         // Helper: build a handler that smuggles the delivered stream identity.
         let make_handler = |tx: mpsc::Sender<usize>| {
@@ -1333,8 +1589,8 @@ mod listener_tests {
         // Bind with a handler, confirm a connection is delivered.
         let (tx1, rx1) = mpsc::channel::<usize>();
         let h1 = make_handler(tx1);
-        let token = listener.ConnectionReceived(&h1).unwrap();
-        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        let token = listener.connection_received(&h1).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
         let c1 = connect_once(&name).expect("first connect failed");
         let raw1 = rx1
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -1344,7 +1600,7 @@ mod listener_tests {
 
         // Remove the last handler => chain pauses. Give the cancellation time
         // to tear the pipe instance down, then a connect must fail.
-        listener.RemoveConnectionReceived(token).unwrap();
+        listener.remove_connection_received(token).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(150));
         assert!(
             block_on(crate::comio::NamedPipeClient::connect(&name)).is_err(),
@@ -1355,7 +1611,7 @@ mod listener_tests {
         // re-arm), and a connection is delivered again.
         let (tx2, rx2) = mpsc::channel::<usize>();
         let h2 = make_handler(tx2);
-        listener.ConnectionReceived(&h2).unwrap();
+        listener.connection_received(&h2).unwrap();
         let c2 = connect_once(&name).expect("connect failed after re-adding a handler");
         let raw2 = rx2
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -1430,15 +1686,15 @@ mod listener_tests {
             })
             .collect();
 
-        let listener = ConnectionListener::named_pipe();
+        let listener = NamedPipeConnectionListener::new();
         let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_cb = delivered.clone();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, _args| {
             delivered_cb.fetch_add(1, Ordering::Relaxed);
             Ok(())
         });
-        listener.ConnectionReceived(&handler).unwrap();
-        block_on(listener.BindAsync(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
 
         // Bounded wait for the backlog to drain. If the pool-dispatch
         // restructuring regressed into a livelock, this loop's own timeout

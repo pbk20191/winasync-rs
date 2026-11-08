@@ -3,7 +3,7 @@
 //! Everything here is single-threaded (`!Send`): tasks are owned locally on
 //! the DQ thread as `Rc`s, with no atomics. Cross-thread wakeups are handled
 //! entirely by `dq::waker`, which reaches back into this module only through
-//! the `Waker` handed to [`TaskObj::poll_task`].
+//! the `Waker` handed to `TaskObj::poll_task`.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};

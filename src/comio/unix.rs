@@ -1,6 +1,6 @@
 //! AF_UNIX (Unix domain socket) transport: `UnixStreamListener` (`AcceptEx`)
 //! and `UnixStreamSocket` (`ConnectEx` fetched via `WSAIoctl`), producing
-//! `OverlappedDuplexStream`s (via [`stream::from_reg`]) registered as
+//! `OverlappedDuplexStream`s (via `stream::from_reg`) registered as
 //! sockets (`is_socket = true`), so `ReadAsync`/`WriteAsync` drive
 //! `WSARecv`/`WSASend`. Mirrors `src/tp/io/net.rs`'s AF_INET
 //! `TcpListener`/`TcpStream`, but with `AF_UNIX`/`SOCKADDR_UN` addressing and
@@ -82,7 +82,7 @@ const ADDR_SLOT: usize = size_of::<SOCKADDR_UN>() + 16;
 
 
 /// A listening AF_UNIX socket, registered with the thread pool's TP_IO so
-/// `AcceptEx` can be driven through [`super::waitop::await_io`].
+/// `AcceptEx` can be driven through `super::waitop::await_io`.
 pub struct UnixStreamListener {
     reg: Arc<IoReg>,
 }

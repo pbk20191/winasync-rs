@@ -7,9 +7,9 @@
 //! tracking whether the handler has been assigned. The differences are:
 //!
 //! * the progress type `P` is fixed to `u32`;
-//! * the result is filled by a [`super::tpio::submit`] completion callback instead of
+//! * the result is filled by a `super::tpio::submit` completion callback instead of
 //!   a synchronous closure; and
-//! * the [`OpHandle`] returned by `submit` is stored in the state so
+//! * the `OpHandle` returned by `submit` is stored in the state so
 //!   `IAsyncInfo::Cancel` can cancel the in-flight IO.
 
 use super::check;

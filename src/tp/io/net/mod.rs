@@ -2,7 +2,7 @@
 //! (ConnectEx / WSARecv / WSASend), and `UdpSocket` (WSARecvFrom / WSASendTo).
 //! IPv4 and IPv6 are both supported through `std::net::SocketAddr`; the sockaddr
 //! marshalling helpers ([`write_sockaddr`]/[`read_sockaddr`]) and socket
-//! creation ([`new_socket`]) are shared across all three.
+//! creation (`new_socket`) are shared across all three.
 //!
 //! # IPv6 caveats
 //! An IPv6 socket is single-stack by default (Windows sets `IPV6_V6ONLY`), so an
@@ -60,7 +60,7 @@ pub(super) fn new_socket(
     new_socket_with(family, socktype, proto, 0)
 }
 
-/// [`new_socket`] plus `extra_flags`, OR-ed into the `WSASocketW` flags
+/// `new_socket` plus `extra_flags`, OR-ed into the `WSASocketW` flags
 /// beside `WSA_FLAG_OVERLAPPED`.
 ///
 /// The seam another engine needs: a socket may have to be created with flags

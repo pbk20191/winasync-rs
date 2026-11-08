@@ -1,6 +1,6 @@
 //! Hyper-V socket (AF_HYPERV) transport: `HvStreamListener` (`AcceptEx`) and
 //! `HvStreamSocket` (`ConnectEx` fetched via `WSAIoctl`), producing
-//! `OverlappedDuplexStream`s (via [`stream::from_reg`]) registered as sockets
+//! `OverlappedDuplexStream`s (via `stream::from_reg`) registered as sockets
 //! (`is_socket = true`), so `ReadAsync`/`WriteAsync` drive `WSARecv`/`WSASend`.
 //!
 //! This is a **pillar-3 gap filler**, not a WinRT duplicate: `Windows.Networking.Sockets`
@@ -67,7 +67,7 @@ const ADDR_SLOT: usize = size_of::<SockaddrHv>() + 16;
 
 
 /// A listening Hyper-V socket, registered with the thread pool's TP_IO so
-/// `AcceptEx` can be driven through [`await_io_owning`].
+/// `AcceptEx` can be driven through `await_io_owning`.
 pub struct HvStreamListener {
     reg: Arc<IoReg>,
 }
