@@ -182,6 +182,11 @@ impl IoAsyncOp<IBuffer> {
         // — a write-after-free. Pass `()` (or any trivial value) when `issue`
         // needs no such keep-alive (e.g. the `ReadFile` path).
         keep_alive: impl Send + 'static,
+        // Invoked (once) with the number of bytes transferred on a *successful*
+        // completion (and with 0 on clean EOF), before the result is published.
+        // Lets a positional stream advance its cursor by the real byte count
+        // from inside the completion; sequential streams pass a no-op.
+        on_bytes: impl FnOnce(usize) + Send + 'static,
         // `issue` is run synchronously inside `submit` on the calling thread,
         // so — unlike the completion callback — it need not be `Send`/`'static`.
         issue: impl FnOnce(*mut OVERLAPPED) -> Issue,
@@ -204,9 +209,11 @@ impl IoAsyncOp<IBuffer> {
                     let _ = &keep_alive;
                     let out = out_agile.resolve().expect("resolve agile IBuffer");
                     let res = if ioresult == 0 {
+                        on_bytes(bytes);
                         let _ = out.SetLength(bytes as u32);
                         Ok(out)
                     } else if ioresult == ERROR_HANDLE_EOF.0 {
+                        on_bytes(0);
                         let _ = out.SetLength(0);
                         Ok(out)
                     } else {
@@ -235,6 +242,9 @@ impl IoAsyncOp<u32> {
         reg: &Arc<IoReg>,
         out: IBuffer,
         _count_hint: u32,
+        // Invoked (once) with the number of bytes written on success, before
+        // the result is published — lets a positional stream advance its cursor.
+        on_bytes: impl FnOnce(usize) + Send + 'static,
         // See `start_read`: `issue` runs synchronously and need not be `Send`.
         issue: impl FnOnce(*mut OVERLAPPED) -> Issue,
     ) -> IAsyncOperationWithProgress<u32, u32> {
@@ -254,6 +264,7 @@ impl IoAsyncOp<u32> {
                     // this point) the agile reference to the source buffer.
                     let _ = &out_agile;
                     let res = if ioresult == 0 {
+                        on_bytes(bytes);
                         Ok(bytes as u32)
                     } else {
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
@@ -328,7 +339,7 @@ mod tests {
         wbuf.SetLength(2).unwrap();
         let wp = buffer_ptr(&wib).unwrap();
         let sh = sreg.handle;
-        let write_op = IoAsyncOp::<u32>::start_write(&sreg, wib.clone(), 2, move |ovl| {
+        let write_op = IoAsyncOp::<u32>::start_write(&sreg, wib.clone(), 2, |_| {}, move |ovl| {
             match unsafe { WriteFile(sh, Some(std::slice::from_raw_parts(wp, 2)), None, Some(ovl)) } {
                 Ok(()) => Issue::Pending,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
@@ -341,7 +352,7 @@ mod tests {
         let rib: IBuffer = rbuf.clone().into();
         let rp = buffer_ptr(&rib).unwrap();
         let ch = creg.handle;
-        let read_op = IoAsyncOp::start_read(&creg, rib.clone(), (), move |ovl| {
+        let read_op = IoAsyncOp::start_read(&creg, rib.clone(), (), |_| {}, move |ovl| {
             match unsafe { ReadFile(ch, Some(std::slice::from_raw_parts_mut(rp, 2)), None, Some(ovl)) } {
                 Ok(()) => Issue::Pending,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,

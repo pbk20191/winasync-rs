@@ -8,6 +8,7 @@ pub mod asyncop;
 pub mod buffer;
 pub mod listener;
 pub mod pipe;
+pub mod random_access;
 pub mod stream;
 pub mod tpio;
 pub mod unix;
@@ -33,6 +34,9 @@ pub use listener::{ConnectionListener, IConnectionReceivedArgs};
 pub(crate) use stream::from_reg;
 #[allow(unused_imports)]
 pub use unix::{UnixStreamListener, UnixStreamSocket};
+// WinRT-native `IRandomAccessStream` over an overlapped file (`random_access.rs`).
+#[allow(unused_imports)]
+pub use random_access::RandomAccessFileStream;
 
 /// Thread pool / overlapped calls only fail on resource exhaustion; map those
 /// to a panic, matching `tp`'s policy.
