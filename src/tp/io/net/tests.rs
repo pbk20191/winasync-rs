@@ -314,6 +314,17 @@
     }
 
     #[test]
+    /// Known to fail rarely, and not yet reproduced: 60 isolated runs and 15
+    /// full-suite runs came back clean, so there is no verified fix here —
+    /// only enough diagnostics that the next occurrence names itself instead
+    /// of printing a bare `unwrap` panic.
+    ///
+    /// The leading hypothesis is TIME_WAIT, which this test is unusually
+    /// exposed to: the reused socket keeps its local binding, so
+    /// `reconnect(addr)` recreates the *identical* four-tuple the first
+    /// connection just tore down. If that is it, the failure will show as
+    /// `WSAEADDRINUSE` (10048) out of `reconnect` and the fix is to give the
+    /// second connection a different remote port, not to wait longer.
     fn disconnect_reconnect_client() {
         let rt = Runtime::new();
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
@@ -325,22 +336,32 @@
             let addr = listener.local_addr().unwrap();
 
             // First connection on a fresh client socket.
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
-            let s1 = listener.accept().await.unwrap();
-            client.write(b"one".to_vec()).await.0.unwrap();
+            let client = TcpStream::connect(&rt, addr)
+                .await
+                .expect("first connect");
+            let local = client.local_addr().ok();
+            let s1 = listener.accept().await.expect("first accept");
+            client.write(b"one".to_vec()).await.0.expect("first write");
             let (n, b) = s1.read(vec![0u8; 8]).await;
-            assert_eq!(&b[..n.unwrap()], b"one");
+            assert_eq!(&b[..n.expect("first read")], b"one");
 
             // Finish the connection (close the peer), then disconnect + reuse the
             // SAME client handle and reconnect — no new socket()/bind()/register.
             drop(s1);
-            client.disconnect(true).await.unwrap();
-            client.reconnect(addr).await.unwrap();
+            client
+                .disconnect(true)
+                .await
+                .expect("graceful DisconnectEx after the peer closed");
+            client.reconnect(addr).await.unwrap_or_else(|e| {
+                panic!(
+                    "reconnect to {addr} from {local:?} failed: {e:?}                      (10048 = WSAEADDRINUSE, i.e. the four-tuple is still in TIME_WAIT)"
+                )
+            });
 
-            let s2 = listener.accept().await.unwrap();
-            client.write(b"two".to_vec()).await.0.unwrap();
+            let s2 = listener.accept().await.expect("second accept");
+            client.write(b"two".to_vec()).await.0.expect("second write");
             let (n, b) = s2.read(vec![0u8; 8]).await;
-            assert_eq!(&b[..n.unwrap()], b"two");
+            assert_eq!(&b[..n.expect("second read")], b"two");
         }));
         result.expect("disconnect/reconnect timed out");
     }
