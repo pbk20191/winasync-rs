@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    closesocket, RIO_MSG_DEFER, SOCKADDR, SOCKADDR_INET, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM,
+    closesocket, RIO_MSG_DEFER, RIO_MSG_DONT_NOTIFY, SOCKADDR, SOCKADDR_INET, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM,
 };
 
 use super::buffer::RioSlice;
@@ -182,6 +182,44 @@ impl RioUdpSocket {
     ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
     {
         self.rq.post(slice, true, RIO_MSG_DEFER)
+    }
+
+    /// Posts a receive whose completion will **not** raise a notification
+    /// (`RIO_MSG_DONT_NOTIFY`).
+    ///
+    /// The result still lands in the completion queue; it just does not wake
+    /// anyone. That is the building block for a hybrid loop: poll the queue
+    /// while traffic is heavy and pay nothing per completion, and arm a
+    /// notification only when it runs dry. Published measurements have that
+    /// arrangement doing nearly all the work on a couple of threads where a
+    /// notify-per-completion design kept every thread busy.
+    ///
+    /// On a pool-driven queue this means the completion may sit undispatched
+    /// until some *other* operation's notification fires — so use it with
+    /// [`RioCq::polling`](super::cq::RioCq::polling) or an IOCP loop that
+    /// drains on its own schedule.
+    pub fn recv_without_notify(
+        &self,
+        slice: RioSlice,
+    ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
+    {
+        self.rq.post(slice, false, RIO_MSG_DONT_NOTIFY)
+    }
+
+    /// Send counterpart of
+    /// [`recv_without_notify`](Self::recv_without_notify).
+    pub fn send_without_notify(
+        &self,
+        slice: RioSlice,
+    ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
+    {
+        self.rq.post(slice, true, RIO_MSG_DONT_NOTIFY)
+    }
+
+    /// Resizes this socket's outstanding-operation budget; see
+    /// [`RequestQueue::resize`](super::rq::RequestQueue::resize).
+    pub fn resize_queue(&self, max_recv: u32, max_send: u32) -> windows_core::Result<()> {
+        self.rq.resize(max_recv, max_send)
     }
 
     /// Dispatches everything queued by
@@ -419,6 +457,79 @@ mod tests {
             assert_eq!(seen, [b"d1".as_slice(), b"d2".as_slice()]);
         }));
         result.expect("deferred send timed out");
+    }
+
+    /// A polling queue with notification-free posts: no event, no TP_WAIT,
+    /// no IOCP — the caller drains when it chooses. This is the shape of a
+    /// hybrid loop's hot path.
+    #[test]
+    fn polling_queue_with_notification_free_posts() {
+        use super::super::cq::RioCq;
+        let cq = RioCq::polling(64).expect("polling cq");
+        let pool = RioBufferPool::new(512, 4).expect("pool");
+        let rq = RqConfig {
+            max_outstanding_recv: 8,
+            max_outstanding_send: 8,
+        };
+        let server = RioUdpSocket::bind(&cq, v4(), rq).expect("server");
+        let client = RioUdpSocket::bind(&cq, v4(), rq).expect("client");
+        client.connect(server.local_addr().unwrap()).unwrap();
+
+        // notify() is a no-op here, so one drain-and-rearm loop works across
+        // every mode.
+        cq.notify().expect("no-op in polling mode");
+
+        let rx = server
+            .recv_without_notify(pool.acquire().unwrap())
+            .expect("post recv");
+        let mut out = pool.acquire().unwrap();
+        out[..4].copy_from_slice(b"poll");
+        out.set_len(4);
+        let tx = client.send_without_notify(out).expect("post send");
+
+        let mut drained = 0usize;
+        for _ in 0..1000 {
+            drained += cq.drain().expect("queue not corrupt");
+            if drained >= 2 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(drained, 2, "both completions came back without any notification");
+
+        assert_eq!(crate::common::block_on(tx).0.unwrap(), 4);
+        let (n, slice) = crate::common::block_on(rx);
+        assert_eq!(&slice[..n.unwrap()], b"poll");
+    }
+
+    /// Request queues grow live; shrinking below what is outstanding is
+    /// refused rather than silently dropping work.
+    #[test]
+    fn request_queue_resizes() {
+        let rt = Runtime::new();
+        let cq = RioCq::new(&rt, 256).expect("cq");
+        let pool = RioBufferPool::new(512, 8).expect("pool");
+        let sock = RioUdpSocket::bind(
+            &cq,
+            v4(),
+            RqConfig {
+                max_outstanding_recv: 2,
+                max_outstanding_send: 2,
+            },
+        )
+        .expect("socket");
+
+        let _a = sock.recv(pool.acquire().unwrap()).expect("first");
+        let _b = sock.recv(pool.acquire().unwrap()).expect("second");
+        assert!(sock.recv(pool.acquire().unwrap()).is_err(), "cap enforced");
+
+        sock.resize_queue(6, 6).expect("grow");
+        let _c = sock.recv(pool.acquire().unwrap()).expect("room after growing");
+
+        // Three receives are outstanding; shrinking under that is refused.
+        const WSAETOOMANYREFS: u32 = 10059;
+        let err = sock.resize_queue(1, 1).expect_err("shrink below outstanding");
+        assert_eq!(err.code(), windows_core::HRESULT::from_win32(WSAETOOMANYREFS));
     }
 
     /// The request queue is a hard cap, reported synchronously — RIO's

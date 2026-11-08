@@ -41,15 +41,25 @@
 //! # Experimental
 //!
 //! This engine exists to cover a *concept* — registered buffers plus a drained
-//! completion queue — not because it is faster here. Published measurements
-//! put RIO ahead only at high datagram rates on ≥10 GbE links with many
-//! concurrent sockets; at 1 GbE the difference is nil, and on loopback at low
-//! concurrency IOCP has measured an order of magnitude *better*, because IOCP
-//! can complete an operation inline (see
+//! completion queue — rather than because it is always faster. What it
+//! actually does here is measured, not assumed: `bench.rs` compares it with
+//! the overlapped `UdpSocket` across queue depths, buffers recycled on both
+//! sides and sends posted before any are awaited, so neither engine is
+//! serialized against the other.
+//!
+//! On this machine, 64-byte datagrams over loopback: the overlapped path
+//! leads slightly at **queue depth 1** (~0.94x), parity arrives at **depth
+//! 2**, and RIO pulls to ~**1.5x** by depth 128. Deferred sends plus one
+//! commit are doing much of that — RIO can hand a whole batch to the provider
+//! in one crossing, and the overlapped API has no equivalent.
+//!
+//! Treat those as this workload's numbers only. Published comparisons of
+//! *request/response* traffic at depth 1 put RIO far behind IOCP, because
+//! IOCP can complete an operation inline (see
 //! `IoReg::set_skip_completion_on_success`) while RIO must round-trip every
-//! result through the queue. Every test here runs on loopback — RIO's worst
-//! case — so this crate's suite can show that the engine is correct, never
-//! that it is fast.
+//! result through the queue — and a loopback suite cannot say anything about
+//! the ≥10 GbE links where RIO's published wins come from. Run the benchmark
+//! on the traffic you actually have.
 //!
 //! Two further constraints shape the API and are not going to change:
 //! operations cannot be cancelled (only `closesocket`, whose completions
@@ -58,6 +68,7 @@
 // other runtime modules.
 #![allow(dead_code)]
 
+mod bench;
 pub mod buffer;
 pub mod cq;
 pub mod rq;

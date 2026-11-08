@@ -31,15 +31,23 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
-/// Number of live op blocks (debug builds) — leak tests assert this settles to 0.
-#[cfg(debug_assertions)]
+/// Number of live op blocks — leak tests assert this settles back to 0.
+///
+/// Always *defined* so tests and re-exports compile in every profile, but
+/// only *updated* in debug builds: the counter is diagnostic, and a release
+/// build should not pay an atomic per operation for it. A release run
+/// therefore sees it pinned at 0, which makes the leak assertions trivially
+/// true there — they are meaningful in the debug runs the suite normally
+/// uses.
 pub static LIVE_OPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Ops finished inline because their handle had opted out of the completion
-/// packet (debug builds). Without this a skip-mode handle whose flag silently
-/// failed to take effect would behave identically — correct, just not faster —
-/// so tests assert this actually moves.
-#[cfg(debug_assertions)]
+/// packet. Without this a skip-mode handle whose flag silently failed to take
+/// effect would behave identically — correct, just not faster — so tests
+/// assert this actually moves.
+///
+/// Same debug-only update rule as [`LIVE_OPS`], so the assertion that it
+/// moves is itself gated to debug builds.
 pub static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// A handle registered with a pool's TP_IO; owns the kernel handle + TP_IO.

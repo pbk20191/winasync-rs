@@ -180,6 +180,23 @@ impl RequestQueue {
         Ok(async move { resolve(rx).await })
     }
 
+    /// Resizes the queue's outstanding-operation budget.
+    ///
+    /// Growing is live. Shrinking below the number currently outstanding is
+    /// refused with `WSAETOOMANYREFS`, and the sum across every socket on a
+    /// completion queue must still fit that queue — grow the completion queue
+    /// first if it will not.
+    pub(crate) fn resize(&self, max_recv: u32, max_send: u32) -> windows_core::Result<()> {
+        let table = rio_table()?;
+        let rq = self.raw();
+        let ok = unsafe { (table.raw().RIOResizeRequestQueue.unwrap())(rq, max_recv, max_send) };
+        if ok.as_bool() {
+            Ok(())
+        } else {
+            Err(wsa_last_err())
+        }
+    }
+
     /// Dispatches everything queued with `RIO_MSG_DEFER`.
     pub(crate) fn commit_sends(&self) -> windows_core::Result<()> {
         let table = rio_table()?;

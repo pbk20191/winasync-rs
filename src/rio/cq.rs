@@ -35,8 +35,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Networking::WinSock::{
-    RIORESULT, RIO_CORRUPT_CQ, RIO_CQ, RIO_EVENT_COMPLETION, RIO_NOTIFICATION_COMPLETION,
-    RIO_NOTIFICATION_COMPLETION_0, RIO_NOTIFICATION_COMPLETION_0_0,
+    RIORESULT, RIO_CORRUPT_CQ, RIO_CQ, RIO_EVENT_COMPLETION, RIO_IOCP_COMPLETION,
+    RIO_NOTIFICATION_COMPLETION, RIO_NOTIFICATION_COMPLETION_0,
+    RIO_NOTIFICATION_COMPLETION_0_0, RIO_NOTIFICATION_COMPLETION_0_1,
 };
 use windows::Win32::System::Threading::{
     CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait, SetThreadpoolWait,
@@ -107,7 +108,23 @@ struct CqState {
     armed: AtomicBool,
     /// Set at teardown so the pump stops re-arming.
     closing: AtomicBool,
-    _rt: Arc<RuntimeInner>,
+    /// Which mechanism delivers notifications; decides whether `RIONotify`
+    /// applies at all and whether this crate owns a pump.
+    mode: Mode,
+    /// Held only in [`Mode::Pool`], so the pool outlives its own callbacks.
+    _rt: Option<Arc<RuntimeInner>>,
+}
+
+/// How a completion queue announces that it has results.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// An event plus a TP_WAIT on this crate's pool; the pump is ours.
+    Pool,
+    /// An IOCP the caller owns. The caller recognises the packet and calls
+    /// [`RioCq::drain`] then [`RioCq::notify`] itself.
+    Iocp,
+    /// No notification at all; the caller polls [`RioCq::drain`].
+    Polling,
 }
 
 // RIO_CQ and the event are kernel handles shared with the pool's threads.
@@ -120,10 +137,29 @@ unsafe fn release_cq_state(ctx: *mut core::ffi::c_void) {
     unsafe { drop(Arc::from_raw(ctx as *const CqState)) }
 }
 
-/// A RIO completion queue plus the pump that drains it.
+/// A RIO completion queue.
+///
+/// # Driving it
+///
+/// RIO is a submission engine, not a scheduler: something has to notice that
+/// the queue has results and drain it. This type supports the three ways
+/// Windows offers, because a RIO queue is rarely the only engine in a
+/// process:
+///
+/// * [`new`](Self::new) — an event and a TP_WAIT on this crate's pool. The
+///   pump is ours; nothing else is required of the caller.
+/// * [`with_iocp`](Self::with_iocp) — **a completion port the caller owns**,
+///   which may well belong to another library's runtime. RIO posts one packet
+///   per notification carrying the caller's key and OVERLAPPED pointer; on
+///   seeing it the caller calls [`drain`](Self::drain) and then
+///   [`notify`](Self::notify). This is the interop path: an existing IOCP
+///   loop gains RIO sockets without a second set of threads.
+/// * [`polling`](Self::polling) — no notification at all. The caller drains
+///   on its own schedule, which is the lowest-latency and highest-CPU option.
 pub struct RioCq {
     state: Arc<CqState>,
-    wait: Mutex<PTP_WAIT>,
+    /// Present only in [`Mode::Pool`].
+    wait: Mutex<Option<PTP_WAIT>>,
 }
 
 unsafe impl Send for RioCq {}
@@ -137,12 +173,9 @@ impl RioCq {
     /// `sum(max_outstanding) <= size`, and honouring that is what makes
     /// overflow structurally impossible rather than something to handle.
     pub fn new(rt: &Runtime, size: u32) -> windows_core::Result<Arc<Self>> {
-        let table = rio_table()?;
-
         // Manual-reset: with NotifyReset the event is cleared by the next
         // RIONotify, not by the signal.
         let event = unsafe { CreateEventW(None, true, false, None)? };
-
         let notify = RIO_NOTIFICATION_COMPLETION {
             Type: RIO_EVENT_COMPLETION,
             Anonymous: RIO_NOTIFICATION_COMPLETION_0 {
@@ -152,14 +185,15 @@ impl RioCq {
                 },
             },
         };
-        let cq = unsafe { (table.raw().RIOCreateCompletionQueue.unwrap())(size, &notify) };
-        if cq == RIO_INVALID_CQ {
-            let err = wsa_last_err();
-            unsafe {
-                let _ = CloseHandle(event);
+        let cq = match create_cq(size, Some(&notify)) {
+            Ok(cq) => cq,
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(event);
+                }
+                return Err(e);
             }
-            return Err(err);
-        }
+        };
 
         let state = Arc::new(CqState {
             header: CtxHeader {
@@ -169,7 +203,8 @@ impl RioCq {
             event,
             armed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
-            _rt: rt.inner.clone(),
+            mode: Mode::Pool,
+            _rt: Some(rt.inner.clone()),
         });
 
         let ctx = Arc::into_raw(state.clone());
@@ -185,8 +220,8 @@ impl RioCq {
             Err(e) => {
                 // Hand the leaked Arc back before unwinding the construction.
                 unsafe { drop(Arc::from_raw(ctx)) };
+                close_cq(cq);
                 unsafe {
-                    (table.raw().RIOCloseCompletionQueue.unwrap())(cq);
                     let _ = CloseHandle(event);
                 }
                 return Err(e);
@@ -195,11 +230,133 @@ impl RioCq {
 
         let this = Arc::new(RioCq {
             state: state.clone(),
-            wait: Mutex::new(wait),
+            wait: Mutex::new(Some(wait)),
         });
         // Arm for the first time: notify, then wait, in that order.
         arm(&state, wait)?;
         Ok(this)
+    }
+
+    /// Creates a queue that notifies **an IOCP the caller owns**.
+    ///
+    /// RIO posts one completion packet per notification, carrying `key` as
+    /// the completion key and `overlapped` as the `OVERLAPPED*`, with a byte
+    /// count of zero. The pointer is a tag only — RIO never writes through it
+    /// — but it must be non-null and must stay valid and unique for this
+    /// queue's life, since it is how the caller tells this queue's packets
+    /// from its own IO.
+    ///
+    /// On receiving that packet the caller drains and re-arms:
+    ///
+    /// ```ignore
+    /// // inside the caller's existing GetQueuedCompletionStatus loop
+    /// if overlapped == my_rio_tag {
+    ///     cq.drain();
+    ///     cq.notify()?;          // arm the next notification
+    /// }
+    /// ```
+    ///
+    /// Nothing about the caller's IOCP is assumed beyond its handle, so the
+    /// port may belong to another runtime entirely.
+    ///
+    /// # Safety
+    /// `iocp` must be a valid completion port handle and `overlapped` a
+    /// pointer that outlives this queue and is not used for any other
+    /// operation.
+    pub unsafe fn with_iocp(
+        iocp: HANDLE,
+        key: usize,
+        overlapped: *mut core::ffi::c_void,
+        size: u32,
+    ) -> windows_core::Result<Arc<Self>> {
+        assert!(!overlapped.is_null(), "RIO_IOCP_COMPLETION requires a non-null OVERLAPPED tag");
+        let notify = RIO_NOTIFICATION_COMPLETION {
+            Type: RIO_IOCP_COMPLETION,
+            Anonymous: RIO_NOTIFICATION_COMPLETION_0 {
+                Iocp: RIO_NOTIFICATION_COMPLETION_0_1 {
+                    IocpHandle: iocp,
+                    CompletionKey: key as *mut core::ffi::c_void,
+                    Overlapped: overlapped,
+                },
+            },
+        };
+        let cq = create_cq(size, Some(&notify))?;
+        let this = Self::externally_driven(cq, Mode::Iocp);
+        // Arm the first notification here rather than making the caller
+        // remember to: an unarmed queue is silent, which looks like a
+        // delivery failure rather than a missing call.
+        notify_state(&this.state)?;
+        Ok(this)
+    }
+
+    /// Creates a queue with no notification: the caller polls
+    /// [`drain`](Self::drain).
+    ///
+    /// `RIONotify` is invalid on such a queue — [`notify`](Self::notify) is a
+    /// no-op here rather than an error, so one drain-and-rearm loop can serve
+    /// every mode.
+    pub fn polling(size: u32) -> windows_core::Result<Arc<Self>> {
+        let cq = create_cq(size, None)?;
+        Ok(Self::externally_driven(cq, Mode::Polling))
+    }
+
+    fn externally_driven(cq: RIO_CQ, mode: Mode) -> Arc<Self> {
+        Arc::new(RioCq {
+            state: Arc::new(CqState {
+                header: CtxHeader {
+                    release: release_cq_state,
+                },
+                cq,
+                event: HANDLE(core::ptr::null_mut()),
+                armed: AtomicBool::new(false),
+                closing: AtomicBool::new(false),
+                mode,
+                _rt: None,
+            }),
+            wait: Mutex::new(None),
+        })
+    }
+
+    /// Drains every available completion, dispatching each to its waiter.
+    ///
+    /// Returns how many were dispatched, or `None` if the provider reported
+    /// `RIO_CORRUPT_CQ`. Only for the externally driven modes; a pool-driven
+    /// queue drains itself, and a second consumer would break RIO's
+    /// single-consumer rule for `RIODequeueCompletion`.
+    pub fn drain(&self) -> Option<usize> {
+        debug_assert_ne!(
+            self.state.mode,
+            Mode::Pool,
+            "a pool-driven queue already has a consumer"
+        );
+        drain(&self.state)
+    }
+
+    /// Arms the next notification (`RIONotify`).
+    ///
+    /// Call it after each [`drain`](Self::drain); RIO notifies once per arm.
+    /// A no-op in polling mode, where there is nothing to arm.
+    pub fn notify(&self) -> windows_core::Result<()> {
+        if self.state.mode == Mode::Polling {
+            return Ok(());
+        }
+        notify_state(&self.state)
+    }
+
+    /// Resizes the completion queue.
+    ///
+    /// Must stay at or above the sum of every attached socket's outstanding
+    /// budget — that invariant is what makes the queue impossible to
+    /// overflow — so grow this before growing a request queue, and shrink it
+    /// only after.
+    pub fn resize(&self, size: u32) -> windows_core::Result<()> {
+        let table = rio_table()?;
+        let ok = unsafe { (table.raw().RIOResizeCompletionQueue.unwrap())(self.state.cq, size) };
+        if ok.as_bool() {
+            Ok(())
+        } else {
+            Err(wsa_last_err())
+        }
     }
 
     pub(crate) fn raw(&self) -> RIO_CQ {
@@ -207,9 +364,33 @@ impl RioCq {
     }
 }
 
-/// `RIONotify` followed immediately by `SetThreadpoolWait`, per Microsoft's
-/// documented pattern. Returns without arming if the queue is closing.
-fn arm(state: &Arc<CqState>, wait: PTP_WAIT) -> windows_core::Result<()> {
+/// `RIOCreateCompletionQueue`, with `None` meaning a polling queue.
+fn create_cq(
+    size: u32,
+    notify: Option<&RIO_NOTIFICATION_COMPLETION>,
+) -> windows_core::Result<RIO_CQ> {
+    let table = rio_table()?;
+    let cq = unsafe {
+        (table.raw().RIOCreateCompletionQueue.unwrap())(
+            size,
+            notify.map_or(core::ptr::null(), |n| n as *const _),
+        )
+    };
+    if cq == RIO_INVALID_CQ {
+        return Err(wsa_last_err());
+    }
+    Ok(cq)
+}
+
+fn close_cq(cq: RIO_CQ) {
+    if let Ok(table) = rio_table() {
+        unsafe { (table.raw().RIOCloseCompletionQueue.unwrap())(cq) };
+    }
+}
+
+/// Arms one notification. Skipped while a previous one is outstanding, since
+/// `RIONotify` answers `WSAEALREADY` in that case.
+fn notify_state(state: &CqState) -> windows_core::Result<()> {
     if state.closing.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -223,6 +404,16 @@ fn arm(state: &Arc<CqState>, wait: PTP_WAIT) -> windows_core::Result<()> {
             ));
         }
     }
+    Ok(())
+}
+
+/// `RIONotify` followed immediately by `SetThreadpoolWait`, per Microsoft's
+/// documented pattern — pool mode only.
+fn arm(state: &Arc<CqState>, wait: PTP_WAIT) -> windows_core::Result<()> {
+    if state.closing.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    notify_state(state)?;
     // Must follow RIONotify: with NotifyReset the event is cleared by that
     // call, so arming first could latch a stale signal.
     unsafe { SetThreadpoolWait(wait, Some(state.event), None) };
@@ -298,7 +489,15 @@ unsafe extern "system" fn pump_callback(
 impl Drop for RioCq {
     fn drop(&mut self) {
         self.state.closing.store(true, Ordering::Release);
-        let wait = *self.wait.lock().unwrap();
+        let wait = match *self.wait.lock().unwrap() {
+            Some(w) => w,
+            None => {
+                // Externally driven: no pump of ours to stop, and no context
+                // reference was handed to a callback object.
+                close_cq(self.state.cq);
+                return;
+            }
+        };
         unsafe {
             // Cancel the pending wait, then let any running callback finish.
             SetThreadpoolWait(wait, None, None);
@@ -313,11 +512,113 @@ impl Drop for RioCq {
         // CloseThreadpoolWait above finalized the callback object, which
         // ran `release_cq_state` and dropped the context reference — the
         // environment's single release path. Nothing to release here.
-        if let Ok(table) = rio_table() {
-            unsafe { (table.raw().RIOCloseCompletionQueue.unwrap())(self.state.cq) };
-        }
+        close_cq(self.state.cq);
         unsafe {
             let _ = CloseHandle(self.state.event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::buffer::RioBufferPool;
+    use super::super::rq::RqConfig;
+    use super::super::socket::RioUdpSocket;
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use windows::Win32::System::IO::{
+        CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
+    };
+
+    fn v4() -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    }
+
+    /// RIO driven by a completion port this crate does not own and knows
+    /// nothing about — the interop path for an existing IOCP runtime.
+    ///
+    /// No thread pool, no TP_WAIT: the loop below is all a foreign runtime
+    /// would need to add.
+    #[test]
+    fn rio_driven_by_a_foreign_iocp() {
+        // A bare completion port, as any other library would have.
+        let iocp = unsafe {
+            CreateIoCompletionPort(windows::Win32::Foundation::INVALID_HANDLE_VALUE, None, 0, 1)
+        }
+        .expect("iocp");
+
+        // The tag RIO stamps on its notifications. Boxed so it has a stable,
+        // unique address for the queue's whole life.
+        let tag: Box<OVERLAPPED> = Box::new(unsafe { core::mem::zeroed() });
+        let tag_ptr = Box::into_raw(tag);
+        const RIO_KEY: usize = 0x5249_4F00; // 'RIO ' — any value the caller picks
+
+        let cq = unsafe {
+            RioCq::with_iocp(iocp, RIO_KEY, tag_ptr as *mut core::ffi::c_void, 64)
+        }
+        .expect("iocp-driven cq");
+
+        let pool = RioBufferPool::new(512, 4).expect("pool");
+        // sum(max_outstanding) must not exceed the queue size, and RIO
+        // enforces it: two sockets at 8+8 fit a 64-entry queue with room to
+        // spare, whereas RqConfig::default() (64+64 each) would be refused
+        // with WSAENOBUFS at bind.
+        let rq = RqConfig {
+            max_outstanding_recv: 8,
+            max_outstanding_send: 8,
+        };
+        let server = RioUdpSocket::bind(&cq, v4(), rq).expect("server");
+        let client = RioUdpSocket::bind(&cq, v4(), rq).expect("client");
+        client.connect(server.local_addr().unwrap()).unwrap();
+
+        let rx = server.recv(pool.acquire().unwrap()).expect("post recv");
+        let mut out = pool.acquire().unwrap();
+        out[..4].copy_from_slice(b"iocp");
+        out.set_len(4);
+        let tx = client.send(out).expect("post send");
+
+        // The foreign runtime's loop: wait on its own port, recognise RIO's
+        // packet by the tag, drain, re-arm.
+        let mut drained = 0usize;
+        for _ in 0..8 {
+            let mut bytes = 0u32;
+            let mut key = 0usize;
+            let mut ovl: *mut OVERLAPPED = core::ptr::null_mut();
+            let ok = unsafe {
+                GetQueuedCompletionStatus(iocp, &mut bytes, &mut key, &mut ovl, 2000)
+            };
+            if ok.is_err() {
+                break;
+            }
+            assert_eq!(key, RIO_KEY, "RIO stamped the key we gave it");
+            assert_eq!(ovl, tag_ptr, "and the OVERLAPPED tag we gave it");
+            assert_eq!(bytes, 0, "a notification carries no byte count");
+            drained += cq.drain().expect("queue not corrupt");
+            cq.notify().expect("re-arm");
+            if drained >= 2 {
+                break;
+            }
+        }
+        assert_eq!(drained, 2, "both the send and the receive completed");
+
+        let (sent, _) = block_on_ready(tx);
+        assert_eq!(sent.unwrap(), 4);
+        let (got, slice) = block_on_ready(rx);
+        let n = got.unwrap();
+        assert_eq!(&slice[..n], b"iocp");
+
+        drop(server);
+        drop(client);
+        drop(cq);
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(iocp);
+            drop(Box::from_raw(tag_ptr));
+        }
+    }
+
+    /// Polls a future that is already complete. The completions were
+    /// dispatched by the drain above, so no executor is involved.
+    fn block_on_ready<F: Future>(fut: F) -> F::Output {
+        crate::common::block_on(fut)
     }
 }

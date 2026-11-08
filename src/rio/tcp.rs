@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    closesocket, connect, listen, IPPROTO_TCP, RIO_MSG_DEFER, SOCKADDR, SOCKADDR_STORAGE,
+    closesocket, connect, listen, IPPROTO_TCP, RIO_MSG_DEFER, RIO_MSG_DONT_NOTIFY, SOCKADDR, SOCKADDR_STORAGE,
     SOCKET, SOCK_STREAM, SOMAXCONN,
 };
 
@@ -169,6 +169,32 @@ impl RioTcpStream {
     ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
     {
         self.rq.post(slice, true, RIO_MSG_DEFER)
+    }
+
+    /// Posts a send whose completion raises no notification
+    /// (`RIO_MSG_DONT_NOTIFY`); see
+    /// [`RioUdpSocket::recv_without_notify`](super::socket::RioUdpSocket::recv_without_notify).
+    pub fn send_without_notify(
+        &self,
+        slice: RioSlice,
+    ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
+    {
+        self.rq.post(slice, true, RIO_MSG_DONT_NOTIFY)
+    }
+
+    /// Receive counterpart of
+    /// [`send_without_notify`](Self::send_without_notify).
+    pub fn recv_without_notify(
+        &self,
+        slice: RioSlice,
+    ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
+    {
+        self.rq.post(slice, false, RIO_MSG_DONT_NOTIFY)
+    }
+
+    /// Resizes this stream's outstanding-operation budget.
+    pub fn resize_queue(&self, max_recv: u32, max_send: u32) -> windows_core::Result<()> {
+        self.rq.resize(max_recv, max_send)
     }
 
     /// Dispatches everything queued by
