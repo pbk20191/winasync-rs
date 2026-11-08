@@ -102,7 +102,7 @@ enum Transport {
 /// `arm` (then reuses the one persistent socket). Deferring the unix
 /// `bind`/`listen` is what makes handler gating complete for that transport
 /// too: with no handler the chain never arms, so no listen socket exists and a
-/// client cannot connect into a backlog (see [`ConnectionReceived`]). The cost
+/// client cannot connect into a backlog (see [`ConnectionListener::ConnectionReceived`]). The cost
 /// is that an AF_UNIX bind error (e.g. a stale socket file) now surfaces when
 /// the chain first starts — synchronously from `BindAsync` if a handler is
 /// already registered, otherwise surfaced from the first `ConnectionReceived`
@@ -386,7 +386,7 @@ impl ConnectionListener {
     /// `Result` anywhere and instead just stop the chain (see [`drive`]). With
     /// no handler, that first-accept error is deferred to the first
     /// `ConnectionReceived` call, which surfaces it there (see
-    /// [`ConnectionReceived`](Self::ConnectionReceived)). The returned
+    /// [`ConnectionListener::ConnectionReceived`](Self::ConnectionReceived)). The returned
     /// `IAsyncAction` is already completed once this call returns `Ok`.
     ///
     /// # Not safe to call concurrently with an already-running accept chain

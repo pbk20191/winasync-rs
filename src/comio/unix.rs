@@ -134,7 +134,7 @@ impl Drop for AcceptSockGuard {
 unsafe impl Send for AcceptSockGuard {}
 
 /// A listening AF_UNIX socket, registered with the thread pool's TP_IO so
-/// `AcceptEx` can be driven through [`await_io`].
+/// `AcceptEx` can be driven through [`super::waitop::await_io`].
 pub struct UnixStreamListener {
     reg: Arc<IoReg>,
 }

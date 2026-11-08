@@ -126,9 +126,11 @@ pub struct HvStreamListener {
 impl HvStreamListener {
     /// Binds a new AF_HYPERV socket to `addr` and starts listening.
     ///
-    /// Bind the VM id to `HV_GUID_WILDCARD` to accept from any partition; the
-    /// service id must be registered under `GuestCommunicationServices` for
-    /// guests to reach it (host-to-host loopback does not need that).
+    /// Bind the VM id to `HV_GUID_WILDCARD` to accept from any partition. For
+    /// a **guest** to reach the service, its GUID must first be registered on
+    /// the host — see the registration section in [`crate::common::hvaddr`].
+    /// Host-to-host loopback works without it, so a listener that answers
+    /// locally may still be unreachable from a VM.
     pub fn bind(addr: HvSocketAddr) -> Result<Self> {
         let sock = new_socket()?;
         let register = || -> Result<Arc<IoReg>> {

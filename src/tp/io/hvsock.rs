@@ -250,8 +250,13 @@ pub struct HvListener {
 }
 
 impl HvListener {
-    /// Binds and listens on `addr`. The service id must be registered under
-    /// `GuestCommunicationServices` for guests (or loopback) to reach it.
+    /// Binds and listens on `addr`.
+    ///
+    /// Bind the VM id to `HV_GUID_WILDCARD` to accept from any partition. For
+    /// a **guest** to reach the service, its GUID must first be registered on
+    /// the host — see the registration section in [`crate::common::hvaddr`].
+    /// Host-to-host loopback works without it, so a listener that answers
+    /// locally may still be unreachable from a VM.
     pub fn bind(rt: &Runtime, addr: HvSocketAddr) -> windows_core::Result<HvListener> {
         let sock = hv_socket()?;
         let register = || -> windows_core::Result<Arc<IoRes>> {

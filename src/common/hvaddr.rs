@@ -11,11 +11,44 @@
 //! Addressing is a pair of GUIDs rather than address + port:
 //!   * **VM id** — which partition ([`HV_GUID_LOOPBACK`], [`HV_GUID_PARENT`],
 //!     [`HV_GUID_CHILDREN`], [`HV_GUID_WILDCARD`], or a specific VM's id).
-//!   * **service id** — which endpoint inside it. For a guest to reach a host
-//!     service the GUID must be registered under
-//!     `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices`
-//!     (admin, one key per service GUID). Host-to-host loopback does not need
-//!     the registration.
+//!   * **service id** — which endpoint inside it.
+//!
+//! # Registering a host service so guests can reach it
+//!
+//! Binding a service id is not enough to make it reachable **from a guest**.
+//! Only service GUIDs registered on the host cross VMBus, so the failure looks
+//! like this: `bind` and `listen` succeed, the host can reach itself over
+//! [`HV_GUID_LOOPBACK`], and a guest's `connect` fails anyway. Host-to-host
+//! loopback needs no registration, which is exactly why a test suite can pass
+//! while guests cannot connect.
+//!
+//! The registration is one registry key per service, under
+//! `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices`:
+//!
+//! ```text
+//! GuestCommunicationServices\
+//!     <service-guid>\            key name = the service id, hyphenated, no braces
+//!         ElementName  REG_SZ    a display name for the service
+//! ```
+//!
+//! Writing under `HKLM` needs **administrator rights**, and the key persists
+//! until something removes it — it is machine provisioning, not something a
+//! socket library does at run time, so this crate deliberately ships no helper
+//! for it. Do it from your installer, your configuration management, or by
+//! hand:
+//!
+//! ```powershell
+//! $svc = '5a83c7e1-9b04-4d26-8f17-63ca0e2b95d8'
+//! $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\$svc"
+//! New-Item -Path $key -Force | Out-Null
+//! Set-ItemProperty -Path $key -Name ElementName -Value 'my service'
+//! ```
+//!
+//! For a **Linux guest** connecting over `AF_VSOCK`, register the GUID that
+//! [`vsock_service_id`] builds for the port — a guest dialling vsock port 5000
+//! reaches the service registered as
+//! `00001388-facb-11e6-bd58-64006a7986d3`. The guest side needs no
+//! registration of its own; this is host-side configuration only.
 
 use super::winsock::sock_check;
 use windows::Win32::Networking::WinSock::{
