@@ -51,7 +51,7 @@ fn wsa_last_err() -> windows_core::Error {
     windows_core::Error::from_hresult(wsa_last_hr())
 }
 
-fn sock_check(r: i32) -> windows_core::Result<()> {
+pub(super) fn sock_check(r: i32) -> windows_core::Result<()> {
     if r == 0 {
         Ok(())
     } else {
@@ -61,7 +61,7 @@ fn sock_check(r: i32) -> windows_core::Result<()> {
 
 /// Creates an overlapped socket of the given family/type/protocol. `WSASocketW`
 /// is wrapped by the `windows` crate to map `INVALID_SOCKET` to an `Err`.
-fn new_socket(
+pub(super) fn new_socket(
     family: ADDRESS_FAMILY,
     socktype: WINSOCK_SOCKET_TYPE,
     proto: IPPROTO,
@@ -193,7 +193,7 @@ type ConnectExFn = unsafe extern "system" fn(
 /// `ConnectEx` is not a direct export: fetch its provider function pointer via
 /// `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` once and cache it (the base
 /// TCP provider's pointer is process-stable).
-fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
+pub(super) fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
     if let Some(&p) = PTR.get() {
         return Ok(unsafe { mem::transmute::<usize, ConnectExFn>(p) });
@@ -324,7 +324,7 @@ fn get_disconnectex(sock: SOCKET) -> windows_core::Result<DisconnectExFn> {
     Ok(f)
 }
 
-fn classify_wsa_overlapped(succeeded: bool) -> Issue {
+pub(super) fn classify_wsa_overlapped(succeeded: bool) -> Issue {
     if succeeded {
         // Synchronous success still queues a completion (we never set
         // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS).
@@ -337,7 +337,7 @@ fn classify_wsa_overlapped(succeeded: bool) -> Issue {
 }
 
 /// AcceptEx address slot: sockaddr size + 16 bytes, per the API contract.
-const ADDR_SLOT: usize = size_of::<SOCKADDR_STORAGE>() + 16;
+pub(super) const ADDR_SLOT: usize = size_of::<SOCKADDR_STORAGE>() + 16;
 
 /// Owns the pre-created accept socket and address buffer while AcceptEx is in
 /// flight. If the op is cancelled the completion callback frees the block and

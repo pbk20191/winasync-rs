@@ -58,6 +58,10 @@ pub use io::net::{
     ReusableSocket, TcpListener, TcpStream, TransmitFlags, TransmitPackets, UdpSocket,
 };
 #[allow(unused_imports)]
+pub use io::pipe::{NamedPipeClient, NamedPipeListener, NamedPipeStream};
+#[allow(unused_imports)]
+pub use io::unix::{UnixListener, UnixStream};
+#[allow(unused_imports)]
 pub use pool::{Pool, PoolBuilder, Priority, Scope};
 #[allow(unused_imports)]
 pub use task::{JoinError, JoinHandle};

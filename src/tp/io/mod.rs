@@ -10,6 +10,8 @@
 pub mod async_rw;
 pub mod file;
 pub mod net;
+pub mod pipe;
+pub mod unix;
 
 use crate::common::overlapped::{self as ov, Completion, IoReg, OpHandle};
 use crate::tp::RuntimeInner;
