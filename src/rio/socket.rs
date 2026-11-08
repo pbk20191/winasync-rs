@@ -3,7 +3,8 @@
 //!
 //! # How this differs from `tp::io::net::UdpSocket`
 //!
-//! * **Buffers come from a [`RioBufferPool`]**, not from the caller's `Vec`.
+//! * **Buffers come from a [`super::buffer::RioBufferPool`]**, not from the
+//!   caller's `Vec`.
 //! * **The request queue is sized up front.** `max_outstanding_*` is a hard
 //!   cap; exceeding it fails the call with `WSAENOBUFS` *synchronously*
 //!   rather than queueing. That is the backpressure signal, not an error to
@@ -20,11 +21,20 @@
 
 use std::sync::{Arc, Mutex};
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, WSASocketW,
-    WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
+    bind, closesocket, RIO_MSG_COMMIT_ONLY, RIO_MSG_DEFER, SOCKADDR, SOCKADDR_INET,
+    SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, WSASocketW, WSA_FLAG_OVERLAPPED,
+    WSA_FLAG_REGISTERED_IO,
 };
 
+/// `WSAENOBUFS` (10055 = 0x2747) as a win32 HRESULT — what an exhausted
+/// address pool reports, matching the request queue's own backpressure
+/// signal. Pinned by a test, since hand-assembling the code is easy to get
+/// wrong.
+pub(crate) const WSAENOBUFS: i32 = 10055;
+const WSAENOBUFS_HRESULT: windows_core::HRESULT = windows_core::HRESULT(0x8007_2747u32 as i32);
+
 use super::buffer::RioSlice;
+use crate::tp::io::net::read_sockaddr;
 use super::cq::{CompleteFn, Request, RioCq, RIO_INVALID_CQ};
 use super::table::rio_table;
 use crate::common::oneshot;
@@ -58,6 +68,10 @@ impl Default for RqConfig {
 /// A UDP socket driven by Registered I/O.
 pub struct RioUdpSocket {
     sock: SOCKET,
+    /// Registered slots for the `RIO_BUF` addresses that `RIOReceiveEx` /
+    /// `RIOSendEx` need. Sized to the request queue, so a post that the queue
+    /// would accept always finds a slot.
+    addrs: Arc<super::buffer::RioBufferPool>,
     rq: Mutex<windows::Win32::Networking::WinSock::RIO_RQ>,
     /// Keeps the completion queue — and its pump — alive for this socket's
     /// whole life, including the completions that arrive after close.
@@ -119,9 +133,21 @@ impl RioUdpSocket {
             Ok(rq)
         };
 
+        let addrs = match super::buffer::RioBufferPool::new(
+            size_of::<SOCKADDR_INET>(),
+            config.max_outstanding_recv + config.max_outstanding_send,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                return Err(e);
+            }
+        };
+
         match build() {
             Ok(rq) => Ok(Self {
                 sock,
+                addrs,
                 rq: Mutex::new(rq),
                 _cq: cq.clone(),
             }),
@@ -180,10 +206,192 @@ impl RioUdpSocket {
         })
     }
 
+    /// Receives from any peer, reporting the source address — the unconnected
+    /// counterpart of [`recv`](Self::recv), over `RIOReceiveEx`.
+    ///
+    /// RIO takes the address as a `RIO_BUF` too, so it must live in a
+    /// registered buffer: the socket keeps a small internal pool for that,
+    /// sized to its request queue, and the slot is released with the
+    /// completion.
+    pub fn recv_from(
+        &self,
+        slice: RioSlice,
+    ) -> windows_core::Result<
+        impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, RioSlice)> + use<>,
+    > {
+        self.post_ex(slice, None)
+    }
+
+    /// Sends `slice` to `dest` without connecting, over `RIOSendEx`.
+    pub fn send_to(
+        &self,
+        slice: RioSlice,
+        dest: SocketAddr,
+    ) -> windows_core::Result<
+        impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, RioSlice)> + use<>,
+    > {
+        self.post_ex(slice, Some(dest))
+    }
+
+    /// Queues a send without executing it (`RIO_MSG_DEFER`), to be released
+    /// later by [`commit_sends`](Self::commit_sends).
+    ///
+    /// Deferring lets several sends be handed to the provider and then
+    /// dispatched with one crossing, which is the send-side half of what a
+    /// completion queue does for results. Each deferred send still completes
+    /// individually.
+    pub fn send_deferred(
+        &self,
+        slice: RioSlice,
+    ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
+    {
+        self.post_flags(slice, true, RIO_MSG_DEFER)
+    }
+
+    /// Dispatches everything queued by
+    /// [`send_deferred`](Self::send_deferred) (`RIO_MSG_COMMIT_ONLY`).
+    ///
+    /// Microsoft documents this as the one request-queue entry point that
+    /// does *not* need to be serialized with other sends — it may run on
+    /// another thread concurrently with a `RIOSend` on the same queue. This
+    /// implementation still takes the socket's lock, because the lock also
+    /// guards the queue handle itself and the cost is a non-issue next to the
+    /// dispatch.
+    pub fn commit_sends(&self) -> windows_core::Result<()> {
+        let table = rio_table()?;
+        let rq = *self.rq.lock().unwrap();
+        let ok = unsafe {
+            (table.raw().RIOSend.unwrap())(rq, core::ptr::null(), 0, RIO_MSG_COMMIT_ONLY, core::ptr::null())
+        };
+        if ok.as_bool() {
+            Ok(())
+        } else {
+            Err(wsa_last_err())
+        }
+    }
+
+    fn post_ex(
+        &self,
+        slice: RioSlice,
+        dest: Option<SocketAddr>,
+    ) -> windows_core::Result<
+        impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, RioSlice)> + use<>,
+    > {
+        let table = rio_table()?;
+        let (tx, rx) = oneshot::channel::<(
+            windows_core::Result<(usize, SocketAddr)>,
+            Option<RioSlice>,
+        )>();
+
+        // The address travels in its own registered slice, because RIO names
+        // it with a RIO_BUF like any other buffer.
+        let mut addr_slice = self
+            .addrs
+            .acquire()
+            .ok_or_else(|| windows_core::Error::from_hresult(WSAENOBUFS_HRESULT))?;
+        addr_slice.set_len(size_of::<SOCKADDR_INET>());
+        if let Some(dest) = dest {
+            let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
+            write_sockaddr(&dest, &mut storage);
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &storage as *const _ as *const u8,
+                    size_of::<SOCKADDR_INET>(),
+                )
+            };
+            addr_slice.copy_from_slice(bytes);
+        } else {
+            addr_slice.fill(0);
+        }
+        let addr_buf = addr_slice.rio_buf();
+        let data_buf = slice.rio_buf();
+
+        // The closure owns the address slice: by the time it runs, the kernel
+        // has finished with the buffer, so reading the peer here is sound and
+        // the slot returns to the pool on the way out.
+        let complete: CompleteFn = Box::new(move |status, bytes, data| {
+            let result = if status == 0 {
+                let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        addr_slice.as_ptr(),
+                        &mut storage as *mut _ as *mut u8,
+                        size_of::<SOCKADDR_INET>(),
+                    );
+                }
+                read_sockaddr(&storage).map(|a| (bytes as usize, a))
+            } else {
+                Err(windows_core::Error::from_hresult(
+                    windows::Win32::Foundation::WIN32_ERROR(status as u32).to_hresult(),
+                ))
+            };
+            drop(addr_slice);
+            let _ = tx.send((result, data));
+        });
+
+        let request = Request {
+            complete,
+            slice: Some(slice),
+        };
+        let ctx = request.into_context();
+
+        let rq = *self.rq.lock().unwrap();
+        let ok = unsafe {
+            if dest.is_some() {
+                (table.raw().RIOSendEx.unwrap())(
+                    rq,
+                    &data_buf,
+                    1,
+                    core::ptr::null(),
+                    &addr_buf,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    ctx,
+                )
+                .as_bool()
+            } else {
+                (table.raw().RIOReceiveEx.unwrap())(
+                    rq,
+                    &data_buf,
+                    1,
+                    core::ptr::null(),
+                    &addr_buf,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    ctx,
+                ) != 0
+            }
+        };
+        if !ok {
+            let err = wsa_last_err();
+            let _ = unsafe { Box::from_raw(ctx as *mut Request) };
+            return Err(err);
+        }
+
+        Ok(async move {
+            match rx.await {
+                Ok((result, slice)) => (result, slice.expect("pump returns the slice")),
+                Err(_) => unreachable!("the pump always completes a posted request"),
+            }
+        })
+    }
+
     fn post(
         &self,
         slice: RioSlice,
         is_send: bool,
+    ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
+    {
+        self.post_flags(slice, is_send, 0)
+    }
+
+    fn post_flags(
+        &self,
+        slice: RioSlice,
+        is_send: bool,
+        flags: u32,
     ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
     {
         let table = rio_table()?;
@@ -213,9 +421,9 @@ impl RioUdpSocket {
         let rq = *self.rq.lock().unwrap();
         let ok = unsafe {
             if is_send {
-                (table.raw().RIOSend.unwrap())(rq, &buf, 1, 0, ctx)
+                (table.raw().RIOSend.unwrap())(rq, &buf, 1, flags, ctx)
             } else {
-                (table.raw().RIOReceive.unwrap())(rq, &buf, 1, 0, ctx)
+                (table.raw().RIOReceive.unwrap())(rq, &buf, 1, flags, ctx)
             }
         };
         if !ok.as_bool() {
@@ -304,6 +512,94 @@ mod tests {
         drop(pool);
         drop(cq);
         drop(rt);
+    }
+
+    #[test]
+    fn wsaenobufs_hresult_is_assembled_correctly() {
+        assert_eq!(
+            WSAENOBUFS_HRESULT,
+            windows_core::HRESULT::from_win32(WSAENOBUFS as u32)
+        );
+    }
+
+    /// Unconnected send/receive over RIOSendEx/RIOReceiveEx, where RIO names
+    /// the peer address with a RIO_BUF of its own.
+    #[test]
+    fn rio_udp_addressed_roundtrip() {
+        let rt = Runtime::new();
+        let cq = RioCq::new(&rt, 256).expect("completion queue");
+        let pool = RioBufferPool::new(2048, 8).expect("buffer pool");
+
+        let server = RioUdpSocket::bind(&cq, v4(), RqConfig::default()).expect("server");
+        let client = RioUdpSocket::bind(&cq, v4(), RqConfig::default()).expect("client");
+        let server_addr = server.local_addr().unwrap();
+        let client_addr = client.local_addr().unwrap();
+
+        let result = block_on(timeout(&rt, Duration::from_secs(5), async {
+            let rx = server
+                .recv_from(pool.acquire().unwrap())
+                .expect("post recv_from");
+
+            let mut tx_slice = pool.acquire().unwrap();
+            tx_slice[..4].copy_from_slice(b"addr");
+            tx_slice.set_len(4);
+            let tx = client
+                .send_to(tx_slice, server_addr)
+                .expect("post send_to");
+            let (sent, _s) = tx.await;
+            assert_eq!(sent.unwrap().0, 4);
+
+            let (got, slice) = rx.await;
+            let (n, from) = got.unwrap();
+            assert_eq!(&slice[..n], b"addr");
+            // The source address came back through the registered address
+            // slot, not from a connect.
+            assert_eq!(from.port(), client_addr.port());
+        }));
+        result.expect("addressed RIO roundtrip timed out");
+
+        drop(server);
+        drop(client);
+        assert_eq!(pool.available(), 8, "data slices all returned");
+    }
+
+    /// Deferred sends are queued and only dispatched by the commit.
+    #[test]
+    fn deferred_sends_dispatch_on_commit() {
+        let rt = Runtime::new();
+        let cq = RioCq::new(&rt, 256).expect("completion queue");
+        let pool = RioBufferPool::new(1024, 8).expect("buffer pool");
+
+        let server = RioUdpSocket::bind(&cq, v4(), RqConfig::default()).expect("server");
+        let client = RioUdpSocket::bind(&cq, v4(), RqConfig::default()).expect("client");
+        client.connect(server.local_addr().unwrap()).unwrap();
+
+        let result = block_on(timeout(&rt, Duration::from_secs(5), async {
+            let r1 = server.recv(pool.acquire().unwrap()).expect("recv 1");
+            let r2 = server.recv(pool.acquire().unwrap()).expect("recv 2");
+
+            let mut a = pool.acquire().unwrap();
+            a[..2].copy_from_slice(b"d1");
+            a.set_len(2);
+            let mut b = pool.acquire().unwrap();
+            b[..2].copy_from_slice(b"d2");
+            b.set_len(2);
+
+            let s1 = client.send_deferred(a).expect("defer 1");
+            let s2 = client.send_deferred(b).expect("defer 2");
+            // Nothing has gone out yet; one crossing releases both.
+            client.commit_sends().expect("commit");
+
+            assert_eq!(s1.await.0.unwrap(), 2);
+            assert_eq!(s2.await.0.unwrap(), 2);
+
+            let (n1, b1) = r1.await;
+            let (n2, b2) = r2.await;
+            let mut seen = [&b1[..n1.unwrap()], &b2[..n2.unwrap()]];
+            seen.sort();
+            assert_eq!(seen, [b"d1".as_slice(), b"d2".as_slice()]);
+        }));
+        result.expect("deferred send timed out");
     }
 
     /// The request queue is a hard cap, reported synchronously — RIO's

@@ -125,7 +125,7 @@ pub(crate) fn write_sockaddr(addr: &SocketAddr, storage: &mut SOCKADDR_STORAGE) 
 
 /// Parses a `SOCKADDR_STORAGE` (as filled by `getsockname`/`getpeername`/a
 /// datagram source) back into a `SocketAddr`, dispatching on `ss_family`.
-fn read_sockaddr(storage: &SOCKADDR_STORAGE) -> windows_core::Result<SocketAddr> {
+pub(crate) fn read_sockaddr(storage: &SOCKADDR_STORAGE) -> windows_core::Result<SocketAddr> {
     unsafe {
         if storage.ss_family == AF_INET {
             let sa = &*(storage as *const _ as *const SOCKADDR_IN);
