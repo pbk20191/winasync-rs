@@ -34,9 +34,38 @@
 //!
 //! RIO covers send and receive only — there is no RIO accept or connect, so
 //! connection setup still goes through `AcceptEx`/`ConnectEx`. It is a TCP/IP
-//! provider facility, so the AF_UNIX and AF_HYPERV transports cannot use it.
+//! provider facility: `WSA_FLAG_REGISTERED_IO` is rejected with `WSAEINVAL`
+//! at socket creation for AF_UNIX, AF_HYPERV and raw sockets, so the
+//! non-IP transports in `tp` cannot use it.
+//!
+//! # Experimental
+//!
+//! This engine exists to cover a *concept* — registered buffers plus a drained
+//! completion queue — not because it is faster here. Published measurements
+//! put RIO ahead only at high datagram rates on ≥10 GbE links with many
+//! concurrent sockets; at 1 GbE the difference is nil, and on loopback at low
+//! concurrency IOCP has measured an order of magnitude *better*, because IOCP
+//! can complete an operation inline (see
+//! `IoReg::set_skip_completion_on_success`) while RIO must round-trip every
+//! result through the queue. Every test here runs on loopback — RIO's worst
+//! case — so this crate's suite can show that the engine is correct, never
+//! that it is fast.
+//!
+//! Two further constraints shape the API and are not going to change:
+//! operations cannot be cancelled (only `closesocket`, whose completions
+//! still arrive afterwards), and neither queue is internally synchronized.
 // Engine under construction: pieces land before their consumers do, as in the
 // other runtime modules.
 #![allow(dead_code)]
 
+pub mod buffer;
+pub mod cq;
+pub mod socket;
 pub(crate) mod table;
+
+#[allow(unused_imports)]
+pub use buffer::{RioBufferPool, RioSlice};
+#[allow(unused_imports)]
+pub use cq::RioCq;
+#[allow(unused_imports)]
+pub use socket::{RioUdpSocket, RqConfig};

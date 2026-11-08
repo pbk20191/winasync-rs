@@ -87,7 +87,7 @@ fn wildcard(family: ADDRESS_FAMILY) -> SocketAddr {
 /// valid length (`sizeof(sockaddr_in|sockaddr_in6)`). Port is written in
 /// network byte order; the IPv4 address follows the existing `to_be` idiom so
 /// its in-memory bytes are the octets in order.
-fn write_sockaddr(addr: &SocketAddr, storage: &mut SOCKADDR_STORAGE) -> i32 {
+pub(crate) fn write_sockaddr(addr: &SocketAddr, storage: &mut SOCKADDR_STORAGE) -> i32 {
     unsafe {
         match addr {
             SocketAddr::V4(v4) => {
@@ -151,7 +151,7 @@ fn read_sockaddr(storage: &SOCKADDR_STORAGE) -> windows_core::Result<SocketAddr>
 }
 
 /// `getsockname` for a socket, as a `SocketAddr` (useful after binding port 0).
-fn addr_of_socket(sock: SOCKET) -> windows_core::Result<SocketAddr> {
+pub(crate) fn addr_of_socket(sock: SOCKET) -> windows_core::Result<SocketAddr> {
     let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
     let mut len = size_of::<SOCKADDR_STORAGE>() as i32;
     sock_check(unsafe { getsockname(sock, &mut storage as *mut _ as *mut SOCKADDR, &mut len) })?;
