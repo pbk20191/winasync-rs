@@ -238,12 +238,76 @@ impl ListenerState {
 /// accept chain, teardown — lives here once and each type delegates to it.
 pub(crate) struct ListenerCore {
     state: Arc<ListenerState>,
+    /// Backs the dispatch `Accept`; `None` until a dispatch `Bind` turns the
+    /// `ConnectionReceived` event into a queue. Stays `None` for every
+    /// caller that uses the event directly, which is all of them except a
+    /// script — see [`super::dispatch`].
+    accept_queue: Mutex<Option<super::dispatch::AcceptQueue>>,
 }
 
 impl ListenerCore {
     fn new() -> Self {
         Self {
             state: Arc::new(ListenerState::new()),
+            accept_queue: Mutex::new(None),
+        }
+    }
+
+    /// Starts queueing accepted connections so a script can pull them.
+    ///
+    /// Registers one handler of this module's own, which is also what starts
+    /// the accept chain — so from here on connections are accepted and held
+    /// rather than waited for, which is what lets a single-threaded script
+    /// bind, connect and accept in that order without deadlocking.
+    ///
+    /// Idempotent: the dispatch `Bind` calls it every time, and rebinding
+    /// must not stack up handlers or lose the connections already queued.
+    pub(crate) fn start_queue(&self) -> Result<()> {
+        let mut slot = self.accept_queue.lock().unwrap();
+        if slot.is_some() {
+            return Ok(());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_sender, args| {
+            let Some(args) = args.as_ref() else {
+                return Ok(());
+            };
+            let args: IConnectionReceivedArgs = args.cast()?;
+            let stream = unsafe {
+                let mut raw = core::ptr::null_mut();
+                args.Stream(&mut raw).ok()?;
+                IInspectable::from_raw(raw)
+            };
+            // A raw COM interface is not `Send`, and this handler runs on a
+            // thread-pool thread while `Accept` waits on another. An
+            // `AgileReference` is the sanctioned way across — the same one
+            // `asyncop` already uses to carry an `IBuffer` to its
+            // completion.
+            let stream = windows_core::AgileReference::new(&stream)?;
+            // A closed receiver just means nobody is calling `Accept` any
+            // more; the chain is torn down by `close`, not from here.
+            let _ = tx.send(stream);
+            Ok(())
+        });
+        let token = self.connection_received(&handler)?;
+        *slot = Some(super::dispatch::AcceptQueue::new(rx, token));
+        Ok(())
+    }
+
+    /// Pops one queued connection, waiting up to `timeout_ms`.
+    ///
+    /// Holds the queue lock across the wait, so concurrent `Accept` calls
+    /// serialize. An `mpsc::Receiver` admits one reader at a time anyway,
+    /// and the callers this exists for are single-threaded scripts.
+    pub(crate) fn accept_queued(&self, timeout_ms: u32) -> Result<IInspectable> {
+        let slot = self.accept_queue.lock().unwrap();
+        match slot.as_ref() {
+            // `Accept` before `Bind`: nothing is listening, so say that
+            // rather than block for the timeout and report one.
+            None => Err(Error::from_hresult(
+                windows::Win32::Foundation::E_ILLEGAL_METHOD_CALL,
+            )),
+            Some(q) => q.pop(timeout_ms),
         }
     }
 
@@ -593,7 +657,8 @@ macro_rules! listener_impls {
 #[implement(
     IConnectionListener,
     INamedPipeListenerBind,
-    windows::Foundation::IClosable
+    windows::Foundation::IClosable,
+    windows::Win32::System::Com::IDispatch
 )]
 pub struct NamedPipeConnectionListener {
     core: ListenerCore,
@@ -606,7 +671,8 @@ pub struct NamedPipeConnectionListener {
 #[implement(
     IConnectionListener,
     IUnixListenerBind,
-    windows::Foundation::IClosable
+    windows::Foundation::IClosable,
+    windows::Win32::System::Com::IDispatch
 )]
 pub struct UnixConnectionListener {
     core: ListenerCore,
@@ -618,7 +684,8 @@ pub struct UnixConnectionListener {
 #[implement(
     IConnectionListener,
     IHyperVListenerBind,
-    windows::Foundation::IClosable
+    windows::Foundation::IClosable,
+    windows::Win32::System::Com::IDispatch
 )]
 pub struct HyperVConnectionListener {
     core: ListenerCore,
@@ -696,6 +763,128 @@ impl HyperVConnectionListener {
         self.bind_endpoint(&HV_GUID_WILDCARD, service_id)
     }
 }
+
+// ---------------------------------------------------------------------------
+// The late-bound surface
+//
+// Every listener offers the same three members past its bind; only the
+// addressing differs, which is the same split the vtables already make. The
+// bind members are the blocking shape of `BindAsync` and they also start the
+// accept queue — see `super::dispatch` for why both of those are what a
+// script needs rather than what the vtable hands a compiled caller.
+// ---------------------------------------------------------------------------
+
+use super::dispatch::{self, Dispatchable};
+use windows::Win32::System::Variant::VARIANT;
+
+/// DISPIDs shared by all three listeners. Frozen: hosts cache
+/// `GetIDsOfNames` results.
+const ACCEPT: i32 = 2;
+const INFORMATION: i32 = 3;
+const CLOSE: i32 = 4;
+
+/// The three members that do not depend on how the listener is addressed.
+fn shared_member(core: &ListenerCore, dispid: i32, args: &[VARIANT]) -> Result<VARIANT> {
+    match dispid {
+        ACCEPT => {
+            dispatch::expect_args(args, 1)?;
+            let timeout_ms = dispatch::as_u32(&args[0])?;
+            dispatch::object(&core.accept_queued(timeout_ms)?)
+        }
+        INFORMATION => {
+            dispatch::expect_args(args, 0)?;
+            Ok(dispatch::bstr(&core.information()?.to_string()))
+        }
+        CLOSE => {
+            dispatch::expect_args(args, 0)?;
+            core.close()?;
+            Ok(dispatch::empty())
+        }
+        _ => Err(Error::from_hresult(
+            windows::Win32::Foundation::DISP_E_MEMBERNOTFOUND,
+        )),
+    }
+}
+
+/// Builds a listener's member table: the bind members it is given, plus the
+/// three every listener shares.
+///
+/// A macro producing the whole slice rather than one expanding to the shared
+/// entries alone, because a `macro_rules!` call in expression position
+/// cannot expand to a comma-separated list.
+macro_rules! members {
+    ($(($name:literal, $id:expr)),* $(,)?) => {
+        &[
+            $(dispatch::Member { name: $name, dispid: $id },)*
+            dispatch::Member { name: "Accept", dispid: ACCEPT },
+            dispatch::Member { name: "Information", dispid: INFORMATION },
+            dispatch::Member { name: "Close", dispid: CLOSE },
+        ]
+    };
+}
+
+impl Dispatchable for NamedPipeConnectionListener {
+    const MEMBERS: &'static [dispatch::Member] = members![("Bind", 1)];
+
+    fn invoke_member(&self, dispid: i32, args: &[VARIANT]) -> Result<VARIANT> {
+        if dispid == 1 {
+            dispatch::expect_args(args, 1)?;
+            let name = HSTRING::from(dispatch::as_string(&args[0])?);
+            // Waited on rather than returned: a script cannot await, and the
+            // bind error it would otherwise never see is the whole point.
+            self.bind(&name)?.join()?;
+            self.core.start_queue()?;
+            return Ok(dispatch::empty());
+        }
+        shared_member(&self.core, dispid, args)
+    }
+}
+
+impl Dispatchable for UnixConnectionListener {
+    const MEMBERS: &'static [dispatch::Member] = members![("Bind", 1)];
+
+    fn invoke_member(&self, dispid: i32, args: &[VARIANT]) -> Result<VARIANT> {
+        if dispid == 1 {
+            dispatch::expect_args(args, 1)?;
+            let path = HSTRING::from(dispatch::as_string(&args[0])?);
+            self.bind(&path)?.join()?;
+            self.core.start_queue()?;
+            return Ok(dispatch::empty());
+        }
+        shared_member(&self.core, dispid, args)
+    }
+}
+
+impl Dispatchable for HyperVConnectionListener {
+    const MEMBERS: &'static [dispatch::Member] =
+        members![("BindEndpoint", 1), ("BindServiceName", 5)];
+
+    fn invoke_member(&self, dispid: i32, args: &[VARIANT]) -> Result<VARIANT> {
+        match dispid {
+            1 => {
+                dispatch::expect_args(args, 2)?;
+                let vm = dispatch::as_guid(&args[0])?;
+                let service = dispatch::as_guid(&args[1])?;
+                self.bind_endpoint(&vm, &service)?.join()?;
+                self.core.start_queue()?;
+                Ok(dispatch::empty())
+            }
+            5 => {
+                dispatch::expect_args(args, 1)?;
+                let service = dispatch::as_guid(&args[0])?;
+                self.bind_service_name(&service)?.join()?;
+                self.core.start_queue()?;
+                Ok(dispatch::empty())
+            }
+            _ => shared_member(&self.core, dispid, args),
+        }
+    }
+}
+
+dispatch::impl_dispatch!(NamedPipeConnectionListener, NamedPipeConnectionListener_Impl);
+dispatch::impl_dispatch!(UnixConnectionListener, UnixConnectionListener_Impl);
+dispatch::impl_dispatch!(HyperVConnectionListener, HyperVConnectionListener_Impl);
+
 
 
 fn want_running(state: &ListenerState) -> bool {

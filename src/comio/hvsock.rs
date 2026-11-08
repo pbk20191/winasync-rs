@@ -20,9 +20,10 @@ use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
 use super::connector::{
-    connect_op, out_operation, out_transport, IHyperVConnector, IHyperVConnector_Impl,
-    IStreamConnector, IStreamConnector_Impl, E_POINTER,
+    E_POINTER, IHyperVConnector, IHyperVConnector_Impl, IStreamConnector, IStreamConnector_Impl,
+    connect_op, out_operation, out_transport,
 };
+use super::dispatch;
 use super::listener::Accepted;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
@@ -226,8 +227,16 @@ impl HvStreamListener {
 }
 
 /// Client side of a Hyper-V socket connection.
-#[windows_core::implement(IStreamConnector, IHyperVConnector)]
+#[windows_core::implement(
+    IStreamConnector,
+    IHyperVConnector,
+    windows::Win32::System::Com::IDispatch
+)]
 pub struct HvStreamSocket;
+
+/// The one spelling of this transport's name, shared by the vtable's
+/// `Transport` and the dispatch member of the same name.
+const TRANSPORT: &str = "hyperv";
 
 impl HvStreamSocket {
     /// Connects to `addr`, returning the connection as a duplex WinRT stream.
@@ -374,7 +383,7 @@ impl IStreamConnector_Impl for HvStreamSocket_Impl {
         &self,
         result: *mut core::mem::ManuallyDrop<windows_core::HSTRING>,
     ) -> windows_core::HRESULT {
-        out_transport("hyperv", result)
+        out_transport(TRANSPORT, result)
     }
 }
 
@@ -394,3 +403,45 @@ impl IHyperVConnector_Impl for HvStreamSocket_Impl {
         )
     }
 }
+
+/// The late-bound surface: `Transport` as the vtable has it, and `Connect`
+/// as the blocking shape of `ConnectAsync` — see `dispatch`'s module docs
+/// for why a script gets the second rather than the first.
+impl dispatch::Dispatchable for HvStreamSocket {
+    const MEMBERS: &'static [dispatch::Member] = &[
+        dispatch::Member {
+            name: "Transport",
+            dispid: 1,
+        },
+        dispatch::Member {
+            name: "Connect",
+            dispid: 2,
+        },
+    ];
+
+    fn invoke_member(
+        &self,
+        dispid: i32,
+        args: &[windows::Win32::System::Variant::VARIANT],
+    ) -> windows_core::Result<windows::Win32::System::Variant::VARIANT> {
+        match dispid {
+            1 => {
+                dispatch::expect_args(args, 0)?;
+                Ok(dispatch::bstr(TRANSPORT))
+            }
+            2 => {
+                // Two GUIDs, which a script writes as strings — braced
+                // or bare, both accepted.
+                dispatch::expect_args(args, 2)?;
+                let vm = dispatch::as_guid(&args[0])?;
+                let service = dispatch::as_guid(&args[1])?;
+                dispatch::object(&self.connect_async(&vm, &service).join()?)
+            }
+            _ => Err(windows_core::Error::from_hresult(
+                windows::Win32::Foundation::DISP_E_MEMBERNOTFOUND,
+            )),
+        }
+    }
+}
+
+dispatch::impl_dispatch!(HvStreamSocket, HvStreamSocket_Impl);

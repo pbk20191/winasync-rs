@@ -245,9 +245,79 @@ fn com_activation_round_trip_through_the_registered_dll() {
     let closable: windows::Foundation::IClosable = events.cast().unwrap();
     closable.Close().unwrap();
 
+    // --- And the same thing from a language that has no vtables -----------
+    powershell_round_trip();
+
     // The module stays loaded on purpose: `DllCanUnloadNow` returns S_FALSE,
     // and objects created above are still alive in this scope. Dropping the
     // reference `LoadLibraryW` took is all this undoes.
     drop(_registered);
     unsafe { FreeLibrary(module) }.expect("FreeLibrary");
+}
+
+/// Runs the whole transport from Windows PowerShell, in its own process.
+///
+/// This is the only check that nothing in the chain quietly depends on being
+/// called from Rust. PowerShell has no way to declare `INamedPipeConnector`;
+/// every call below goes out as `GetIDsOfNames` then `Invoke`, through a
+/// COM automation layer written years before this crate. If the DISPIDs, the
+/// `DISPPARAMS` argument order, the VARIANT types or the registration were
+/// wrong, it is this that would notice.
+///
+/// `powershell.exe` rather than `pwsh`: Windows PowerShell ships with the
+/// OS, so the test does not depend on anything being installed. It also runs
+/// STA by default, which exercises the apartment the `ThreadingModel = Both`
+/// registration claims to support.
+fn powershell_round_trip() {
+    let pipe = format!(r"\\.\pipe\comio_ps_{}", std::process::id());
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$name = '{pipe}'
+
+$listener = New-Object -ComObject Rustwinui3loop.NamedPipeConnectionListener
+$listener.Bind($name)
+if ($listener.Information() -ne $name) {{ throw "Information: $($listener.Information())" }}
+
+$client = New-Object -ComObject Rustwinui3loop.NamedPipeClient
+if ($client.Transport() -ne 'namedpipe') {{ throw "Transport: $($client.Transport())" }}
+
+# Connect first, Accept second: the listener queued the connection at Bind,
+# which is what lets one thread do both.
+$clientStream = $client.Connect($name)
+$serverStream = $listener.Accept(5000)
+
+$sent = 'hello from powershell'
+$n = $clientStream.WriteText($sent)
+if ($n -ne $sent.Length) {{ throw "WriteText returned $n" }}
+$got = $serverStream.ReadText(64)
+if ($got -ne $sent) {{ throw "ReadText: '$got'" }}
+
+$serverStream.WriteText('ack') | Out-Null
+$back = $clientStream.ReadText(64)
+if ($back -ne 'ack') {{ throw "reverse: '$back'" }}
+
+$clientStream.Close()
+$listener.Close()
+Write-Output 'ROUND-TRIP-OK'
+"#
+    );
+
+    let path = std::env::temp_dir().join(format!("comio_dispatch_{}.ps1", std::process::id()));
+    std::fs::write(&path, script).expect("write script");
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&path)
+        .output()
+        .expect("spawn powershell");
+    let _ = std::fs::remove_file(&path);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("ROUND-TRIP-OK"),
+        "PowerShell could not drive the objects.\nstatus: {:?}\nstdout: {}\nstderr: {}",
+        out.status,
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

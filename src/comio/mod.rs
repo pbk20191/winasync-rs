@@ -12,6 +12,7 @@ pub mod activation;
 pub mod asyncop;
 pub mod buffer;
 pub mod connector;
+pub mod dispatch;
 pub mod hvsock;
 pub mod listener;
 pub mod pipe;

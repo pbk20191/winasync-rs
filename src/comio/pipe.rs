@@ -4,9 +4,10 @@
 //! engine.
 
 use super::connector::{
-    out_operation, out_transport, INamedPipeConnector, INamedPipeConnector_Impl,
-    IStreamConnector, IStreamConnector_Impl,
+    INamedPipeConnector, INamedPipeConnector_Impl, IStreamConnector, IStreamConnector_Impl,
+    out_operation, out_transport,
 };
+use super::dispatch;
 use super::stream;
 use super::tpio::{self, IoReg, Issue, OpHandle};
 use super::waitop::await_io;
@@ -174,8 +175,17 @@ pub(crate) fn arm_accept(
 }
 
 /// Client side of a named pipe.
-#[windows_core::implement(IStreamConnector, INamedPipeConnector)]
+#[windows_core::implement(
+    IStreamConnector,
+    INamedPipeConnector,
+    windows::Win32::System::Com::IDispatch
+)]
 pub struct NamedPipeClient;
+
+/// The one spelling of this transport's name, shared by the vtable's
+/// `Transport` and the dispatch member of the same name so the two cannot
+/// drift apart.
+const TRANSPORT: &str = "namedpipe";
 
 impl NamedPipeClient {
     /// Opens the client end of an existing named pipe. If every server
@@ -274,7 +284,7 @@ impl IStreamConnector_Impl for NamedPipeClient_Impl {
         &self,
         result: *mut core::mem::ManuallyDrop<windows_core::HSTRING>,
     ) -> windows_core::HRESULT {
-        out_transport("namedpipe", result)
+        out_transport(TRANSPORT, result)
     }
 }
 
@@ -287,6 +297,45 @@ impl INamedPipeConnector_Impl for NamedPipeClient_Impl {
         out_operation(self.connect_async(&name), result)
     }
 }
+
+/// The late-bound surface: `Transport` as the vtable has it, and `Connect`
+/// as the blocking shape of `ConnectAsync` — see `dispatch`'s module docs
+/// for why a script gets the second rather than the first.
+impl dispatch::Dispatchable for NamedPipeClient {
+    const MEMBERS: &'static [dispatch::Member] = &[
+        dispatch::Member {
+            name: "Transport",
+            dispid: 1,
+        },
+        dispatch::Member {
+            name: "Connect",
+            dispid: 2,
+        },
+    ];
+
+    fn invoke_member(
+        &self,
+        dispid: i32,
+        args: &[windows::Win32::System::Variant::VARIANT],
+    ) -> windows_core::Result<windows::Win32::System::Variant::VARIANT> {
+        match dispid {
+            1 => {
+                dispatch::expect_args(args, 0)?;
+                Ok(dispatch::bstr(TRANSPORT))
+            }
+            2 => {
+                dispatch::expect_args(args, 1)?;
+                let name = windows_core::HSTRING::from(dispatch::as_string(&args[0])?);
+                dispatch::object(&self.connect_async(&name).join()?)
+            }
+            _ => Err(windows_core::Error::from_hresult(
+                windows::Win32::Foundation::DISP_E_MEMBERNOTFOUND,
+            )),
+        }
+    }
+}
+
+dispatch::impl_dispatch!(NamedPipeClient, NamedPipeClient_Impl);
 
 #[cfg(test)]
 mod tests {

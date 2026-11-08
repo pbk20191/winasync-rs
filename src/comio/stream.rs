@@ -57,7 +57,12 @@ impl Drop for AcceptSockGuard {
 unsafe impl Send for AcceptSockGuard {}
 
 /// A duplex WinRT stream over one overlapped-registered handle/socket.
-#[implement(IInputStream, IOutputStream, windows::Foundation::IClosable)]
+#[implement(
+    IInputStream,
+    IOutputStream,
+    windows::Foundation::IClosable,
+    windows::Win32::System::Com::IDispatch
+)]
 pub struct OverlappedDuplexStream {
     reg: Arc<IoReg>,
     closed: std::sync::atomic::AtomicBool,
@@ -192,6 +197,98 @@ impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
         Ok(IAsyncOperation::<bool>::spawn(|| Ok(true)))
     }
 }
+
+/// The late-bound surface, which is what makes the rest of the dispatch
+/// layer worth anything: `Connect` and `Accept` hand a script one of these,
+/// and without members it could call, it would be holding an opaque object.
+///
+/// Text rather than bytes. A script's natural argument is a string, and
+/// binary would mean `SAFEARRAY` of `VT_UI1` on both sides — worth adding
+/// when something needs it, but every protocol these transports are reached
+/// with from a script so far is line-oriented. `ReadText` decodes lossily
+/// for the same reason: a script has no way to act on a decode error, and
+/// failing the call would lose the bytes that did arrive.
+///
+/// Implemented on the generated wrapper, not on `OverlappedDuplexStream`:
+/// `ReadAsync`/`WriteAsync`/`Close` are trait impls that live there.
+impl crate::comio::dispatch::Dispatchable for OverlappedDuplexStream_Impl {
+    const MEMBERS: &'static [crate::comio::dispatch::Member] = &[
+        crate::comio::dispatch::Member {
+            name: "WriteText",
+            dispid: 1,
+        },
+        crate::comio::dispatch::Member {
+            name: "ReadText",
+            dispid: 2,
+        },
+        crate::comio::dispatch::Member {
+            name: "Close",
+            dispid: 3,
+        },
+    ];
+
+    fn invoke_member(
+        &self,
+        dispid: i32,
+        args: &[windows::Win32::System::Variant::VARIANT],
+    ) -> Result<windows::Win32::System::Variant::VARIANT> {
+        use crate::comio::buffer::{buffer_ptr, new_buffer};
+        use crate::comio::dispatch;
+        use windows::Storage::Streams::{IBuffer, InputStreamOptions};
+        use windows_core::Interface;
+
+        match dispid {
+            // WriteText(text) -> bytes written
+            1 => {
+                dispatch::expect_args(args, 1)?;
+                let bytes = dispatch::as_string(&args[0])?.into_bytes();
+                let len = u32::try_from(bytes.len()).map_err(|_| {
+                    windows_core::Error::from_hresult(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                    )
+                })?;
+                let buf = new_buffer(len.max(1))?;
+                let ib: IBuffer = buf.cast()?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer_ptr(&ib)?, bytes.len())
+                };
+                ib.SetLength(len)?;
+                let wrote = IOutputStream_Impl::WriteAsync(self, (&ib).into())?.join()?;
+                Ok(dispatch::i32v(wrote as i32))
+            }
+            // ReadText(maxBytes) -> what arrived, possibly fewer bytes
+            2 => {
+                dispatch::expect_args(args, 1)?;
+                let max = dispatch::as_u32(&args[0])?.max(1);
+                let buf = new_buffer(max)?;
+                let ib: IBuffer = buf.cast()?;
+                let got = IInputStream_Impl::ReadAsync(
+                    self,
+                    (&ib).into(),
+                    max,
+                    InputStreamOptions(0),
+                )?
+                .join()?;
+                let n = got.Length()? as usize;
+                let text = unsafe {
+                    String::from_utf8_lossy(std::slice::from_raw_parts(buffer_ptr(&got)?, n))
+                        .into_owned()
+                };
+                Ok(dispatch::bstr(&text))
+            }
+            3 => {
+                dispatch::expect_args(args, 0)?;
+                IClosable_Impl::Close(self)?;
+                Ok(dispatch::empty())
+            }
+            _ => Err(windows_core::Error::from_hresult(
+                windows::Win32::Foundation::DISP_E_MEMBERNOTFOUND,
+            )),
+        }
+    }
+}
+
+crate::comio::dispatch::impl_dispatch!(wrapper OverlappedDuplexStream_Impl);
 
 #[cfg(test)]
 mod tests {

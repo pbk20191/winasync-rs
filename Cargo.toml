@@ -85,6 +85,9 @@ comio = [
     "windows/Win32_System_Com",
     "windows/Win32_System_Registry",
     "windows/Win32_System_LibraryLoader",
+    # The late-binding path: IDispatch and the VARIANTs it speaks in.
+    "windows/Win32_System_Ole",
+    "windows/Win32_System_Variant",
 ]
 
 # DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.

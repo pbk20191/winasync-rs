@@ -42,12 +42,17 @@
 //! of its own. `regsvr32 rustwinui3loop.dll` then `CoCreateInstance` is the
 //! whole setup.
 //!
-//! Late binding is the line this does not cross. None of these classes
-//! implement `IDispatch` and none ship a type library, so a scripting host
-//! can *create* them — `New-Object -ComObject Rustwinui3loop.NamedPipeClient`
-//! succeeds — and then has no way to call a method on what it got. That is a
-//! separate piece of work (an `IDispatch` implementation, or an IDL-compiled
-//! `.tlb` to bind against), not something the registration is missing.
+//! Scripting hosts work too, through [`super::dispatch`]: every class here
+//! also implements `IDispatch`, so
+//! `New-Object -ComObject Rustwinui3loop.NamedPipeClient` is followed by
+//! calls that actually run. The members a script sees are named and shaped
+//! differently from the vtable's — blocking where the vtable is async — and
+//! that module explains why.
+//!
+//! What is still missing is a type library. Without one there is no early
+//! binding: VBA cannot declare `As NamedPipeClient` and offers no
+//! IntelliSense. Every host named above binds late by default, so this costs
+//! tooling rather than reach.
 //!
 //! # Why `DllCanUnloadNow` always refuses
 //!
