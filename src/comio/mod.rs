@@ -10,6 +10,7 @@
 
 pub mod asyncop;
 pub mod buffer;
+pub mod connector;
 pub mod hvsock;
 pub mod listener;
 pub mod pipe;
@@ -29,8 +30,15 @@ pub use pipe::{NamedPipeClient, NamedPipeListener};
 // the bind its addressing supports.
 #[allow(unused_imports)]
 pub use listener::{
-    HyperVConnectionListener, IConnectionListener, IConnectionReceivedArgs,
-    NamedPipeConnectionListener, UnixConnectionListener,
+    HyperVConnectionListener, IConnectionListener, IConnectionReceivedArgs, IHyperVListenerBind,
+    INamedPipeListenerBind, IUnixListenerBind, NamedPipeConnectionListener, UnixConnectionListener,
+};
+// The client half: one connector per transport, so a COM caller can make a
+// connection as well as accept one.
+#[allow(unused_imports)]
+pub use connector::{
+    HyperVConnector, IHyperVConnector, INamedPipeConnector, IUnixConnector, NamedPipeConnector,
+    UnixConnector,
 };
 // `stream::from_reg` takes/returns crate-private types (`Arc<tpio::IoReg>`),
 // so it stays `pub(crate)` here rather than `pub` (the latter would be a hard

@@ -42,17 +42,17 @@ const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
 /// factory, not by `RoActivateInstance`.
 #[interface("1f4c7d6a-9b2e-4a85-8d13-6c0f5a2b7e94")]
 pub unsafe trait IConnectionListener: IUnknown {
-    fn ConnectionReceived(&self, handler: *mut c_void, result: *mut i64) -> HRESULT;
-    fn RemoveConnectionReceived(&self, token: i64) -> HRESULT;
-    fn Information(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT;
+    pub fn ConnectionReceived(&self, handler: *mut c_void, result: *mut i64) -> HRESULT;
+    pub fn RemoveConnectionReceived(&self, token: i64) -> HRESULT;
+    pub fn Information(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT;
 }
 
 /// Custom fixed-IID interface exposing the stream/endpoint pair delivered by
 /// a `ConnectionReceived` event. GUID frozen here — do not change or reuse.
 #[interface("9d359f23-57af-4770-b11a-e223be76adc3")]
 pub unsafe trait IConnectionReceivedArgs: IUnknown {
-    fn Stream(&self, result: *mut *mut c_void) -> HRESULT;
-    fn RemoteEndpoint(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT;
+    pub fn Stream(&self, result: *mut *mut c_void) -> HRESULT;
+    pub fn RemoteEndpoint(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT;
 }
 
 #[implement(IConnectionReceivedArgs)]
@@ -386,7 +386,7 @@ impl Drop for ListenerCore {
 /// GUID frozen — do not change or reuse.
 #[interface("c0a5e7b1-3d94-4f26-8b57-2e1a906c4df3")]
 pub unsafe trait INamedPipeListenerBind: IUnknown {
-    fn BindAsync(
+    pub fn BindAsync(
         &self,
         name: core::mem::ManuallyDrop<HSTRING>,
         result: *mut *mut c_void,
@@ -396,7 +396,7 @@ pub unsafe trait INamedPipeListenerBind: IUnknown {
 /// The AF_UNIX listener's own bind. GUID frozen.
 #[interface("4e8d12fa-6b30-4c71-a9e5-8f0b37d62a1c")]
 pub unsafe trait IUnixListenerBind: IUnknown {
-    fn BindAsync(
+    pub fn BindAsync(
         &self,
         path: core::mem::ManuallyDrop<HSTRING>,
         result: *mut *mut c_void,
@@ -406,13 +406,13 @@ pub unsafe trait IUnixListenerBind: IUnknown {
 /// The Hyper-V listener's own binds. GUID frozen.
 #[interface("7a26c9e4-1f85-4b03-bd68-50c9a4e7138b")]
 pub unsafe trait IHyperVListenerBind: IUnknown {
-    fn BindEndpointAsync(
+    pub fn BindEndpointAsync(
         &self,
         vm_id: *const windows_core::GUID,
         service_id: *const windows_core::GUID,
         result: *mut *mut c_void,
     ) -> HRESULT;
-    fn BindServiceNameAsync(
+    pub fn BindServiceNameAsync(
         &self,
         service_id: *const windows_core::GUID,
         result: *mut *mut c_void,
