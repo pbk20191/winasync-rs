@@ -9,6 +9,7 @@
 
 pub mod async_rw;
 pub mod file;
+pub mod hvsock;
 pub mod net;
 pub mod pipe;
 pub mod unix;
