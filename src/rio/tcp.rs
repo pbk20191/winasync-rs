@@ -16,8 +16,8 @@
 
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    closesocket, connect, listen, IPPROTO_TCP, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM,
-    SOMAXCONN,
+    closesocket, connect, listen, IPPROTO_TCP, RIO_MSG_DEFER, SOCKADDR, SOCKADDR_STORAGE,
+    SOCKET, SOCK_STREAM, SOMAXCONN,
 };
 
 use super::buffer::RioSlice;
@@ -154,6 +154,31 @@ impl RioTcpStream {
         self.rq.post(slice, true, 0)
     }
 
+    /// Queues a send without dispatching it (`RIO_MSG_DEFER`), to be released
+    /// by [`commit_sends`](Self::commit_sends).
+    ///
+    /// Worth more on TCP than anywhere else in this engine. The published TCP
+    /// comparisons have RIO at or below plain IOCP by default — one
+    /// game-server benchmark measured RIO *behind* IOCP until sends were
+    /// batched and deferred, at which point it moved ahead by a few percent.
+    /// Deferring is what amortises RIO's per-operation floor across a batch,
+    /// and on a stream protocol there is usually something to batch.
+    pub fn send_deferred(
+        &self,
+        slice: RioSlice,
+    ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
+    {
+        self.rq.post(slice, true, RIO_MSG_DEFER)
+    }
+
+    /// Dispatches everything queued by
+    /// [`send_deferred`](Self::send_deferred), in one crossing
+    /// (`RIO_MSG_COMMIT_ONLY`). Each deferred send still completes
+    /// individually.
+    pub fn commit_sends(&self) -> windows_core::Result<()> {
+        self.rq.commit_sends()
+    }
+
 }
 
 impl Drop for RioTcpStream {
@@ -170,6 +195,65 @@ mod tests {
     use crate::tp::{timeout, Runtime};
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::time::Duration;
+
+    /// Several sends queued with RIO_MSG_DEFER and released by one commit.
+    ///
+    /// TCP has no message boundaries, so the receiver may see the batch as
+    /// one read or several — the test accepts either and only insists the
+    /// bytes arrive, in order, after the commit.
+    #[test]
+    fn rio_tcp_deferred_sends_commit_as_a_batch() {
+        let rt = Runtime::new();
+        let cq = RioCq::new(&rt, 256).expect("completion queue");
+        let pool = RioBufferPool::new(512, 8).expect("buffer pool");
+
+        let listener = RioTcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .expect("listen");
+        let addr = listener.local_addr().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cq2 = cq.clone();
+        rt.submit(move || {
+            let r = listener.accept_blocking(&cq2, RqConfig::default());
+            let _ = tx.send(r.map(Box::new));
+        });
+
+        let client =
+            RioTcpStream::connect_blocking(&cq, addr, RqConfig::default()).expect("connect");
+        let server = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("accept")
+            .expect("accepted stream");
+
+        let result = block_on(timeout(&rt, Duration::from_secs(5), async {
+            let srv_rx = server.recv(pool.acquire().unwrap()).expect("post recv");
+
+            let mut futures = Vec::new();
+            for chunk in [b"aaa", b"bbb", b"ccc"] {
+                let mut s = pool.acquire().unwrap();
+                s[..3].copy_from_slice(chunk);
+                s.set_len(3);
+                futures.push(client.send_deferred(s).expect("defer"));
+            }
+            // Nothing has gone out yet; one crossing releases all three.
+            client.commit_sends().expect("commit");
+
+            for f in futures {
+                assert_eq!(f.await.0.unwrap(), 3);
+            }
+
+            let (n, got) = srv_rx.await;
+            let n = n.unwrap();
+            assert!(n > 0 && n <= 9, "got {n} bytes");
+            // Whatever the segmentation, the stream starts with the batch in
+            // submission order.
+            assert_eq!(&got[..n], &b"aaabbbccc"[..n]);
+        }));
+        result.expect("deferred TCP sends timed out");
+    }
 
     #[test]
     fn rio_tcp_echo() {
