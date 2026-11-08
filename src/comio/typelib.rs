@@ -11,6 +11,15 @@
 //! - **Early binding.** VBA can only write `Dim x As NamedPipeClient`, and
 //!   offer IntelliSense for it, if a library describes the members.
 //!
+//! # Frozen, as of 2026-11-09
+//!
+//! Like [`super::dispatch`], this is kept but no longer developed. A `.tlb`
+//! describes the blocking dispinterfaces; the `.winmd` that comio is heading
+//! for describes the async vtables instead, and the two have no consumer in
+//! common. `docs/comio-com-winrt-status.md` has the reasoning — including why
+//! the one thing this library proved useful for beyond its own hosts, feeding
+//! `tlbimp`, is not worth a test.
+//!
 //! # Why not IDL and `midl`
 //!
 //! The usual way to get a `.tlb` is to write the whole surface a second time

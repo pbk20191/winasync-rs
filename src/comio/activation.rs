@@ -14,6 +14,18 @@
 //! call `CoCreateInstance` can open a named pipe, an AF_UNIX socket or a
 //! Hyper-V socket through the same WinRT stream interfaces.
 //!
+//! # Where this is going, as of 2026-11-09
+//!
+//! CLSID activation is the COM half, and comio is heading for the WinRT one:
+//! a `.winmd`, `DllGetActivationFactory` beside `DllGetClassObject`, and
+//! `ActivatableClassId` registration beside the keys written here. That path
+//! is additive — this module keeps working for the frozen `IDispatch` layer
+//! ([`super::dispatch`]) — but it is not per-user. Third-party WinRT
+//! activation outside a package means `HKEY_LOCAL_MACHINE`, or a manifest on
+//! the *consuming* executable, which is not an option for a shared
+//! interpreter. The elevation-free `regsvr32` below does not carry over.
+//! `docs/comio-com-winrt-status.md` has the reasoning.
+//!
 //! # What the registration does and does not claim
 //!
 //! `DllRegisterServer` writes under **`HKEY_CURRENT_USER\Software\Classes`**,

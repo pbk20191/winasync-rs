@@ -40,11 +40,18 @@
 //! type library ([`typelib`]). A runtime class name is a promise that the
 //! name resolves through WinRT metadata, and nothing here publishes any — so
 //! inventing a non-empty name would make the claim more *credible* without
-//! making it true, which is worse than the empty string. Answering these
-//! honestly is part of shipping a `.winmd`, not a step that can usefully come
-//! before it. `tests::iinspectable_is_shaped_but_hollow` pins the current
-//! answers, so a `windows-rs` upgrade that changes any of them shows up as a
-//! failure rather than a silent shift.
+//! making it true, which is worse than the empty string.
+//!
+//! Publishing a `.winmd` is what would give these objects a name worth
+//! reporting — but note that it does **not** on its own make them report it.
+//! Metadata settles what the name means; `#[implement]` still decides what
+//! the vtable says, and it says nothing. The two are separate problems, and
+//! a conforming runtime class needs both solved. `docs/comio-com-winrt-status.md`
+//! tracks that as the open blocker on the WinRT direction.
+//!
+//! `tests::iinspectable_is_shaped_but_hollow` pins the current answers, so a
+//! `windows-rs` upgrade that changes any of them shows up as a failure rather
+//! than a silent shift.
 #![allow(dead_code)]
 
 pub mod activation;

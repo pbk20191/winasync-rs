@@ -14,6 +14,13 @@
 //! something else while waiting advises a sink, and one that just wants the
 //! next connection calls `Accept`.
 //!
+//! # Frozen, as of 2026-11-09
+//!
+//! Like [`super::dispatch`], this is kept but no longer developed. A WinRT
+//! consumer gets `IAsyncOperation` and an event it can await directly, and
+//! needs none of this; connection points exist for the hosts that only speak
+//! `IDispatch`. `docs/comio-com-winrt-status.md` has the reasoning.
+//!
 //! # What a host does
 //!
 //! `QueryInterface` for `IConnectionPointContainer`, `FindConnectionPoint`

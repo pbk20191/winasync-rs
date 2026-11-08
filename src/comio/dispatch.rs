@@ -18,6 +18,17 @@
 //! and late binding cannot describe a member differently, and the build
 //! still needs no IDL and no `midl.exe`.
 //!
+//! # Frozen, as of 2026-11-09
+//!
+//! This layer is kept but no longer developed. comio's target consumers are
+//! WinRT projections — Python, Node, .NET scripting — which read a `.winmd`
+//! and never ask an object for `IDispatch`. What this reaches instead is the
+//! classic script hosts, and those cannot consume WinRT at any price: they
+//! predate it and only speak `IDispatch`. So it stays for them; it just stops
+//! growing. `docs/comio-com-winrt-status.md` carries the reasoning and lists
+//! what the decision dropped — including an operation object that would have
+//! gone here.
+//!
 //! # A synchronous surface, deliberately
 //!
 //! The vtables hand back `IAsyncOperation` and `IAsyncAction`. A script has
