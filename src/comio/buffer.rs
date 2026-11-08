@@ -2,16 +2,27 @@ use windows::Storage::Streams::{Buffer, IBuffer};
 use windows::Win32::System::WinRT::IBufferByteAccess;
 use windows_core::Interface;
 
-pub(crate) fn new_buffer(capacity: u32) -> windows_core::Result<Buffer> {
+/// Allocates a WinRT `IBuffer` of `capacity` bytes.
+///
+/// Public because the streams in this module speak `IBuffer`: a caller of
+/// `ReadAsync`/`WriteAsync` has to be able to make one.
+pub fn new_buffer(capacity: u32) -> windows_core::Result<Buffer> {
     Buffer::Create(capacity)
 }
 
-pub(crate) fn buffer_ptr(buf: &IBuffer) -> windows_core::Result<*mut u8> {
+/// The raw bytes behind an `IBuffer`, via `IBufferByteAccess`.
+///
+/// # Safety
+/// Safe to call, but the returned pointer is only valid while `buf` lives,
+/// and only `Capacity()` bytes are addressable — `Length()` says how many
+/// currently hold data.
+pub fn buffer_ptr(buf: &IBuffer) -> windows_core::Result<*mut u8> {
     let access: IBufferByteAccess = buf.cast()?;
     unsafe { access.Buffer() }
 }
 
-pub(crate) fn buffer_capacity(buf: &IBuffer) -> windows_core::Result<u32> {
+/// How many bytes the buffer can hold (not how many it currently holds).
+pub fn buffer_capacity(buf: &IBuffer) -> windows_core::Result<u32> {
     buf.Capacity()
 }
 

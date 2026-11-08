@@ -1,12 +1,11 @@
-mod common;
-#[cfg(feature = "tp")]
-mod tp;
-#[cfg(feature = "rio")]
-mod rio;
+//! Demo binary for the engines in this crate's library.
+
 #[cfg(feature = "comio")]
-mod comio;
+use rustwinui3loop::comio;
 #[cfg(feature = "dq")]
-mod dq;
+use rustwinui3loop::dq;
+#[cfg(feature = "tp")]
+use rustwinui3loop::tp;
 
 // All of these feed the `dq`-only WinUI demo tail in `main`.
 #[cfg(feature = "dq")]
