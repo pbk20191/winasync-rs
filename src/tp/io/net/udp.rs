@@ -325,35 +325,11 @@ type WsaRecvMsgFn = unsafe extern "system" fn(
     lpcompletionroutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
 ) -> i32;
 
-/// `WSARecvMsg` is a provider extension (no direct export): fetch + cache its
-/// pointer via `WSAIoctl`, like [`get_connectex`]. (`WSASendMsg` *is* a direct
-/// export, so it needs no such fetch.)
+/// `WSARecvMsg` for the TCP/IP provider. (`WSASendMsg` *is* a direct export,
+/// so it needs no lookup.)
 fn get_wsarecvmsg(sock: SOCKET) -> windows_core::Result<WsaRecvMsgFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
-    if let Some(&p) = PTR.get() {
-        return Ok(unsafe { mem::transmute::<usize, WsaRecvMsgFn>(p) });
-    }
-    let mut fptr: Option<WsaRecvMsgFn> = None;
-    let mut bytes = 0u32;
-    let r = unsafe {
-        WSAIoctl(
-            sock,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            Some(&WSAID_WSARECVMSG as *const _ as *const c_void),
-            size_of::<windows_core::GUID>() as u32,
-            Some(&mut fptr as *mut _ as *mut c_void),
-            size_of::<Option<WsaRecvMsgFn>>() as u32,
-            &mut bytes,
-            None,
-            None,
-        )
-    };
-    if r != 0 {
-        return Err(wsa_last_err());
-    }
-    let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null WSARecvMsg");
-    let _ = PTR.set(f as usize);
-    Ok(f)
+    unsafe { extension_fn(sock, &WSAID_WSARECVMSG, &PTR) }
 }
 
 /// Op-block payload for `recv_msg`: the data buffer, the control (ancillary)

@@ -13,15 +13,17 @@
 //! `WSARecv` / `WSASend` for data.
 
 use super::net::{
-    classify_wsa_overlapped, get_connectex, new_socket, sock_check, VectoredPayload, ADDR_SLOT,
+    classify_wsa_overlapped, new_socket, sock_check, VectoredPayload, ADDR_SLOT,
 };
 use super::{submit, IoRes};
 use crate::tp::{Runtime, RuntimeInner};
+use crate::common::winsock::extension_fn;
 use core::ffi::c_void;
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
+    WSAID_CONNECTEX,
     bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_HYPERV, INVALID_SOCKET,
     IPPROTO, SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT,
     SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
@@ -36,6 +38,30 @@ pub use crate::common::hvaddr::{
     HVSOCKET_CONTAINER_PASSTHRU, HV_GUID_BROADCAST, HV_GUID_CHILDREN, HV_GUID_LOOPBACK,
     HV_GUID_PARENT, HV_GUID_SILOHOST, HV_GUID_WILDCARD, HV_GUID_ZERO, HV_PROTOCOL_RAW,
 };
+
+/// `ConnectEx` for the **HvSocket** provider.
+///
+/// Deliberately *not* `net::get_connectex`: that one caches the TCP/IP
+/// provider's pointer, and an extension pointer belongs to the provider
+/// (see [`crate::common::winsock::extension_fn`]). They are the same address
+/// on stock Windows — every Microsoft base provider is served by one
+/// `mswsock.dll` — but a layered provider under one protocol and not another
+/// can make them differ.
+fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    unsafe { extension_fn(sock, &WSAID_CONNECTEX, &PTR) }
+}
+
+/// `ConnectEx`'s signature; see [`get_connectex`].
+type ConnectExFn = unsafe extern "system" fn(
+    s: SOCKET,
+    name: *const SOCKADDR,
+    namelen: i32,
+    lpsendbuffer: *const core::ffi::c_void,
+    dwsenddatalength: u32,
+    lpdwbytessent: *mut u32,
+    lpoverlapped: *mut windows::Win32::System::IO::OVERLAPPED,
+) -> windows_core::BOOL;
 
 /// Creates an AF_HYPERV stream socket. Fails with `WSAEAFNOSUPPORT` (10047)
 /// where the Hyper-V socket provider is not present.

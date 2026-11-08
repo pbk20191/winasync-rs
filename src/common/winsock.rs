@@ -8,10 +8,14 @@
 //! hang, not a cosmetic difference. One copy now.
 
 use super::overlapped::Issue;
+use core::ffi::c_void;
+use std::sync::OnceLock;
 use windows::Win32::Foundation::WIN32_ERROR;
 use windows::Win32::Networking::WinSock::{
-    WSADATA, WSAGetLastError, WSAStartup, WSA_IO_PENDING,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKET, WSADATA, WSAGetLastError, WSAIoctl, WSAStartup,
+    WSA_IO_PENDING,
 };
+use windows_core::GUID;
 
 /// Process-wide Winsock initialization, deliberately never torn down
 /// (`WSACleanup` is not called — a library has no way to know it is the last
@@ -64,4 +68,75 @@ pub fn classify_wsa_overlapped(succeeded: bool) -> Issue {
 /// `SOCKET_ERROR` otherwise (`WSARecv`, `WSASend`, ...).
 pub fn classify_wsa_ret(r: i32) -> Issue {
     classify_wsa_overlapped(r == 0)
+}
+
+/// Fetches a Winsock extension function pointer — `ConnectEx`, `AcceptEx`,
+/// `DisconnectEx`, `TransmitPackets`, `WSARecvMsg` — which are reachable only
+/// through `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)`, never as exports.
+///
+/// # Why `cache` belongs to the caller
+///
+/// One GUID per call; there is deliberately no batched variant here.
+/// `SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER` looks like one but is not:
+/// its input is a single GUID naming a function *table*, and the only table
+/// GUID Windows providers accept is `WSAID_MULTIPLE_RIO` (Registered I/O).
+/// Measured on Windows 11: asking it for `WSAID_CONNECTEX` — alone or
+/// alongside the RIO GUID — fails with `WSAEOPNOTSUPP`, and a second GUID in
+/// the input buffer is ignored.
+///
+/// The pointer is a property of the socket's **service provider**, not of the
+/// process: Winsock forwards this ioctl to the provider's `WSPIoctl`, so
+/// nothing promises one process-wide value. In practice every Microsoft base
+/// provider (TCP/IP, AFUNIX, HvSocket) is served by the same `mswsock.dll` and
+/// returns the same address — but a layered provider (LSP) inserted under some
+/// protocols and not others can break that. Giving each transport its own
+/// `OnceLock` keeps the cache per provider at the cost of one extra ioctl per
+/// family per process, which is the conservative reading of the contract.
+///
+/// # Safety
+/// `F` must be the exact `extern "system"` signature the extension `id`
+/// names, and must be pointer-sized. `cache` must be dedicated to this one
+/// `id` *and* to sockets of one provider.
+pub unsafe fn extension_fn<F: Copy>(
+    sock: SOCKET,
+    id: &GUID,
+    cache: &OnceLock<usize>,
+) -> windows_core::Result<F> {
+    debug_assert_eq!(
+        size_of::<F>(),
+        size_of::<*mut c_void>(),
+        "extension_fn::<F> requires a bare function pointer"
+    );
+    if let Some(&p) = cache.get() {
+        return Ok(unsafe { core::mem::transmute_copy::<usize, F>(&p) });
+    }
+    let mut raw: *mut c_void = core::ptr::null_mut();
+    let mut bytes = 0u32;
+    let r = unsafe {
+        WSAIoctl(
+            sock,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            Some(id as *const GUID as *const c_void),
+            size_of::<GUID>() as u32,
+            Some(&mut raw as *mut _ as *mut c_void),
+            size_of::<*mut c_void>() as u32,
+            &mut bytes,
+            None,
+            None,
+        )
+    };
+    if r != 0 {
+        return Err(wsa_last_err());
+    }
+    if raw.is_null() {
+        // A provider reporting success with a null pointer is broken. Return
+        // an error rather than panic: this crate keeps panics away from the
+        // FFI paths.
+        return Err(windows_core::Error::from_hresult(windows_core::HRESULT(
+            0x8000_4003u32 as i32, // E_POINTER
+        )));
+    }
+    let p = raw as usize;
+    let _ = cache.set(p);
+    Ok(unsafe { core::mem::transmute_copy::<usize, F>(&p) })
 }

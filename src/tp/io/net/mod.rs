@@ -15,7 +15,7 @@ use super::file::File;
 use super::{submit, IoRes, OpFuture};
 use crate::tp::{Runtime, RuntimeInner};
 pub(crate) use crate::common::winsock::{
-    classify_wsa_overlapped, sock_check, wsa_init, wsa_last_err,
+    classify_wsa_overlapped, extension_fn, sock_check, wsa_init,
 };
 use core::ffi::c_void;
 use std::mem;
@@ -23,10 +23,9 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, connect, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW,
+    bind, closesocket, connect, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW,
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
-    IPPROTO, IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER,
-    SOCKADDR,
+    IPPROTO, IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, SD_SEND, SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
     SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TF_DISCONNECT,
     TF_REUSE_SOCKET, TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT,
@@ -170,35 +169,12 @@ type ConnectExFn = unsafe extern "system" fn(
     lpoverlapped: *mut windows::Win32::System::IO::OVERLAPPED,
 ) -> windows_core::BOOL;
 
-/// `ConnectEx` is not a direct export: fetch its provider function pointer via
-/// `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` once and cache it (the base
-/// TCP provider's pointer is process-stable).
+/// `ConnectEx` for the **TCP/IP** provider. Its own cache: the AF_UNIX and
+/// AF_HYPERV transports fetch theirs separately, since the pointer belongs to
+/// the provider (see [`extension_fn`]).
 pub(super) fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
-    if let Some(&p) = PTR.get() {
-        return Ok(unsafe { mem::transmute::<usize, ConnectExFn>(p) });
-    }
-    let mut fptr: Option<ConnectExFn> = None;
-    let mut bytes = 0u32;
-    let r = unsafe {
-        WSAIoctl(
-            sock,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            Some(&WSAID_CONNECTEX as *const _ as *const c_void),
-            size_of::<windows_core::GUID>() as u32,
-            Some(&mut fptr as *mut _ as *mut c_void),
-            size_of::<Option<ConnectExFn>>() as u32,
-            &mut bytes,
-            None,
-            None,
-        )
-    };
-    if r != 0 {
-        return Err(wsa_last_err());
-    }
-    let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null ConnectEx");
-    let _ = PTR.set(f as usize);
-    Ok(f)
+    unsafe { extension_fn(sock, &WSAID_CONNECTEX, &PTR) }
 }
 
 type TransmitPacketsFn = unsafe extern "system" fn(
@@ -210,35 +186,10 @@ type TransmitPacketsFn = unsafe extern "system" fn(
     dwflags: u32,
 ) -> windows_core::BOOL;
 
-/// `TransmitPackets` is a provider extension (no direct export): fetch its
-/// function pointer via `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` once and
-/// cache it, like [`get_connectex`].
+/// `TransmitPackets` for the TCP/IP provider.
 fn get_transmitpackets(sock: SOCKET) -> windows_core::Result<TransmitPacketsFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
-    if let Some(&p) = PTR.get() {
-        return Ok(unsafe { mem::transmute::<usize, TransmitPacketsFn>(p) });
-    }
-    let mut fptr: Option<TransmitPacketsFn> = None;
-    let mut bytes = 0u32;
-    let r = unsafe {
-        WSAIoctl(
-            sock,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            Some(&WSAID_TRANSMITPACKETS as *const _ as *const c_void),
-            size_of::<windows_core::GUID>() as u32,
-            Some(&mut fptr as *mut _ as *mut c_void),
-            size_of::<Option<TransmitPacketsFn>>() as u32,
-            &mut bytes,
-            None,
-            None,
-        )
-    };
-    if r != 0 {
-        return Err(wsa_last_err());
-    }
-    let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null TransmitPackets");
-    let _ = PTR.set(f as usize);
-    Ok(f)
+    unsafe { extension_fn(sock, &WSAID_TRANSMITPACKETS, &PTR) }
 }
 
 /// Post-transfer disposition for [`TcpStream::transmit_file`] /
@@ -274,34 +225,10 @@ type DisconnectExFn = unsafe extern "system" fn(
     dwreserved: u32,
 ) -> windows_core::BOOL;
 
-/// `DisconnectEx` is a provider extension (no direct export): fetch and cache
-/// its function pointer via `WSAIoctl`, like [`get_connectex`].
+/// `DisconnectEx` for the TCP/IP provider.
 fn get_disconnectex(sock: SOCKET) -> windows_core::Result<DisconnectExFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
-    if let Some(&p) = PTR.get() {
-        return Ok(unsafe { mem::transmute::<usize, DisconnectExFn>(p) });
-    }
-    let mut fptr: Option<DisconnectExFn> = None;
-    let mut bytes = 0u32;
-    let r = unsafe {
-        WSAIoctl(
-            sock,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            Some(&WSAID_DISCONNECTEX as *const _ as *const c_void),
-            size_of::<windows_core::GUID>() as u32,
-            Some(&mut fptr as *mut _ as *mut c_void),
-            size_of::<Option<DisconnectExFn>>() as u32,
-            &mut bytes,
-            None,
-            None,
-        )
-    };
-    if r != 0 {
-        return Err(wsa_last_err());
-    }
-    let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null DisconnectEx");
-    let _ = PTR.set(f as usize);
-    Ok(f)
+    unsafe { extension_fn(sock, &WSAID_DISCONNECTEX, &PTR) }
 }
 
 

@@ -12,7 +12,9 @@
 //! memory alive until the op's real completion, not merely until the
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
-use crate::common::winsock::{classify_wsa_overlapped, sock_check, wsa_init, wsa_last_err};
+use crate::common::winsock::{
+    classify_wsa_overlapped, extension_fn, sock_check, wsa_init,
+};
 use super::listener::Accepted;
 use super::stream;
 use super::tpio::{self, IoReg, OpHandle};
@@ -23,9 +25,9 @@ use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
-    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
+    SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
     SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
-    WSAID_CONNECTEX, WSAIoctl, WSASocketW, WSA_FLAG_OVERLAPPED,
+    WSAID_CONNECTEX, WSASocketW, WSA_FLAG_OVERLAPPED,
 };
 use windows::Win32::System::IO::OVERLAPPED;
 use windows_core::{Error, IInspectable, Result, HRESULT};
@@ -79,36 +81,11 @@ type ConnectExFn = unsafe extern "system" fn(
     lpoverlapped: *mut OVERLAPPED,
 ) -> windows_core::BOOL;
 
-/// `ConnectEx` is not a direct export: fetch its provider function pointer via
-/// `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` once and cache it. Separate
-/// cache from `tp::io::net`'s (that one is private, and per-provider pointers
-/// are process-stable regardless of which socket fetched them).
-fn get_connectex(sock: SOCKET) -> Result<ConnectExFn> {
+/// `ConnectEx` for the **AFUNIX** provider; cached apart from every other
+/// family's (see [`extension_fn`]).
+fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
-    if let Some(&p) = PTR.get() {
-        return Ok(unsafe { mem::transmute::<usize, ConnectExFn>(p) });
-    }
-    let mut fptr: Option<ConnectExFn> = None;
-    let mut bytes = 0u32;
-    let r = unsafe {
-        WSAIoctl(
-            sock,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            Some(&WSAID_CONNECTEX as *const _ as *const c_void),
-            size_of::<windows_core::GUID>() as u32,
-            Some(&mut fptr as *mut _ as *mut c_void),
-            size_of::<Option<ConnectExFn>>() as u32,
-            &mut bytes,
-            None,
-            None,
-        )
-    };
-    if r != 0 {
-        return Err(wsa_last_err());
-    }
-    let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null ConnectEx");
-    let _ = PTR.set(f as usize);
-    Ok(f)
+    unsafe { extension_fn(sock, &WSAID_CONNECTEX, &PTR) }
 }
 
 /// AcceptEx address slot: sockaddr size + 16 bytes, per the API contract.
