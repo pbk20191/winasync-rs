@@ -273,7 +273,7 @@ mod tests {
     use super::*;
     use crate::comio::buffer::{buffer_ptr, new_buffer};
     use crate::comio::tpio::{IoReg, Issue};
-    use crate::tp::block_on;
+    use crate::common::block_on;
     use std::future::IntoFuture;
     use windows::Storage::Streams::IBuffer;
     use windows::Win32::Foundation::ERROR_IO_PENDING;

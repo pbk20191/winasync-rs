@@ -118,7 +118,7 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-#[cfg(all(test, feature = "tp"))]
+#[cfg(all(test, any(feature = "tp", feature = "comio")))]
 mod tests {
     use super::*;
     use crate::common::block_on;

@@ -222,7 +222,7 @@ impl NamedPipeClient {
 mod tests {
     use super::*;
     use crate::comio::buffer::{buffer_ptr, new_buffer};
-    use crate::tp::block_on;
+    use crate::common::block_on;
     use std::future::IntoFuture;
     use windows::Storage::Streams::{IBuffer, IInputStream, IOutputStream, InputStreamOptions};
     use windows_core::Interface;

@@ -1,16 +1,23 @@
 mod common;
+#[cfg(feature = "tp")]
 mod tp;
+#[cfg(feature = "comio")]
 mod comio;
+#[cfg(feature = "dq")]
 mod dq;
 
+// All of these feed the `dq`-only WinUI demo tail in `main`.
+#[cfg(feature = "dq")]
 use windows::System::Threading::{ThreadPool, WorkItemHandler};
-use windows::Win32::System::WinRT::ICoreWindowInterop;
-use windows_future::IAsyncAction;
+#[cfg(feature = "dq")]
 use windows_threading::Pool;
+#[cfg(feature = "dq")]
 use winui3::bootstrap::{PackageDependency, WindowsAppSDKVersion};
+#[cfg(feature = "dq")]
 use winui3::Microsoft::UI::Dispatching::{DispatcherQueue, DispatcherQueueHandler};
 
 /// Demo of the TP_* based async runtime in `src/tp/`.
+#[cfg(feature = "tp")]
 fn tp_demo() {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
@@ -83,6 +90,7 @@ fn tp_demo() {
 /// `DispatcherRuntime::run` creates a real WinRT `DispatcherQueue`, which
 /// requires that bootstrap to be in place first (see the ordering note on
 /// `main`).
+#[cfg(all(feature = "tp", feature = "comio", feature = "dq"))]
 fn dq_demo() {
     use dq::DispatcherRuntime;
     use std::time::Duration;
@@ -164,18 +172,19 @@ fn dq_demo() {
 }
 
 fn main() {
-    // `DispatcherRuntime::run` (used by `dq_demo`, and by the existing WinUI
-    // section below) creates a real WinRT `DispatcherQueue`, which requires
-    // the Windows App SDK bootstrap to already be initialized. Moved to the
-    // very top of `main` (it used to run between `tp_demo()` and the WinUI
-    // section) so both `tp_demo()` and `dq_demo()` — the latter needs it, the
-    // former doesn't but is unaffected — run under it uniformly, and the
-    // existing WinUI code path below keeps working exactly as before.
+    // The Windows App SDK bootstrap must be initialized before any
+    // `DispatcherQueue` is created (dq_demo + the WinUI tail). Gated with the
+    // `dq` feature, which owns all the WinUI demo code below.
+    #[cfg(feature = "dq")]
     let sdk = PackageDependency::initialize_version(WindowsAppSDKVersion::V2).unwrap();
 
+    #[cfg(feature = "tp")]
     tp_demo();
+    #[cfg(all(feature = "tp", feature = "comio", feature = "dq"))]
     dq_demo();
 
+    #[cfg(feature = "dq")]
+    {
   //  initialize().unwrap();
     //
     // IAsyncAction
@@ -243,5 +252,5 @@ windows::Networking::Sockets::StreamSocketListener::new;
     dispatch_queue.RunEventLoop().unwrap();
     drop(sdk);
     println!("Hello2, world!");
-
+    }
 }

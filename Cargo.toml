@@ -5,53 +5,92 @@ edition = "2024"
 
 [dependencies]
 windows-core = "0.62.2"
-#windows = "0.62.2"
 
 [dependencies.windows-link]
 version = "0.2"
 
+# `windows` is a base dep, but its feature surface is activated per crate-feature
+# (tp / comio / dq) below — so e.g. a `tp`-only build pulls only the Win32 bits.
 [dependencies.windows]
 version = "0.62.2"
-features = ["System", "Foundation", "System_Threading", "System_Threading_Core",
-    "Networking_Sockets", "Storage_Streams", "Security_Credentials",
-    "Security_Cryptography_Certificates",
-    "ApplicationModel_Background", "Networking_Connectivity", "Web_Http", "Web_UI_Interop", "Web_UI",
-    "Win32_Foundation", "Win32_System_Threading", "Win32_System_IO",
-    "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_Security",
-    "Win32_System_ApplicationInstallationAndServicing",
-    "Win32_System_Pipes", "Win32_System_WinRT",
-    "Win32_System_Memory", "Win32_System_SystemInformation",
-]
+default-features = false
+features = []
 
 [dependencies.windows-future]
 version = "0.3.2"
-
-#[build-dependencies.windows-app]
-#git = "https://github.com/microsoft/windows-app-rs"
-#features = [
-#    "WindowsAppSdk_Foundation"
-#]
-
-#[build-dependencies.windows-bindgen]
-#version = "0.66.0"
+optional = true
 
 [dependencies.winio-winui3]
 version = "0.4.0"
 features = ["UI_Dispatching", "UI_Composition", "UI_Xaml"]
-
+optional = true
 
 [dependencies.windows-threading]
 version = "0.2.1"
-#[target.'cfg(windows)'.build-dependencies]
-#embed-resource = "3.0.9"
+optional = true
 
 [dependencies.futures-io]
 version = "0.3"
 optional = true
 
 [features]
-# Bridge tp's AsyncRead/AsyncWrite to the futures-io ecosystem traits.
-futures-io = ["dep:futures-io"]
+default = ["tp", "dq", "comio"]
+
+# Win32 thread-pool async runtime. Standalone: no winui3 / windows-future.
+tp = [
+    "windows/Win32_Foundation",
+    "windows/Win32_Security",
+    "windows/Win32_System_Threading",
+    "windows/Win32_System_IO",
+    "windows/Win32_Storage_FileSystem",
+    "windows/Win32_Networking_WinSock",
+    "windows/Win32_System_Pipes",
+    "windows/Win32_System_Memory",
+    "windows/Win32_System_SystemInformation",
+    "windows/Win32_System_ApplicationInstallationAndServicing",
+]
+
+# WinRT-shaped COM streams over overlapped IO.
+comio = [
+    "dep:windows-future",
+    "dep:windows-threading",
+    "windows/Foundation",
+    "windows/Storage_Streams",
+    "windows/Win32_Foundation",
+    "windows/Win32_System_Threading",
+    "windows/Win32_System_IO",
+    "windows/Win32_Storage_FileSystem",
+    "windows/Win32_Networking_WinSock",
+    "windows/Win32_System_Pipes",
+    "windows/Win32_System_WinRT",
+    "windows/Win32_Security",
+]
+
+# DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.
+dq = [
+    "dep:winio-winui3",
+    "dep:windows-threading",
+    "dep:windows-future",
+    "windows/Foundation",
+    "windows/System",
+    "windows/System_Threading",
+    "windows/System_Threading_Core",
+    "windows/Networking_Sockets",
+    "windows/Storage_Streams",
+    "windows/Security_Credentials",
+    "windows/Security_Cryptography_Certificates",
+    "windows/ApplicationModel_Background",
+    "windows/Networking_Connectivity",
+    "windows/Web_Http",
+    "windows/Web_UI_Interop",
+    "windows/Web_UI",
+    "windows/Win32_Foundation",
+    "windows/Win32_System_WinRT",
+    "windows/Win32_System_ApplicationInstallationAndServicing",
+]
+
+# tp's optional futures-io interop (AsyncRead/AsyncWrite <-> futures_io).
+futures-io = ["tp", "dep:futures-io"]
 
 [build-dependencies]
 embed-resource = "3.0.9"

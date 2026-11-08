@@ -40,7 +40,7 @@ pub(crate) use crate::common::check::check;
 mod tests {
     use super::pipe::{NamedPipeClient, NamedPipeListener};
     use crate::comio::buffer::new_buffer;
-    use crate::tp::block_on;
+    use crate::common::block_on;
     use std::future::IntoFuture;
     use std::time::Duration;
     use windows::Storage::Streams::{

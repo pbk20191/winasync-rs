@@ -655,7 +655,7 @@ mod tests {
 mod listener_tests {
     use super::*;
     use crate::comio::buffer::{buffer_ptr, new_buffer};
-    use crate::tp::block_on;
+    use crate::common::block_on;
     use std::future::IntoFuture;
     use std::sync::mpsc;
     use windows::Foundation::IClosable;
@@ -821,7 +821,7 @@ mod listener_tests {
 
     #[test]
     fn close_cancels_inflight_accept_no_leak() {
-        use crate::tp::block_on;
+        use crate::common::block_on;
         use windows::Foundation::IClosable;
         let name = format!(r"\\.\pipe\comio_listener_leak_{}", std::process::id());
         let listener = ConnectionListener::named_pipe();
@@ -853,7 +853,7 @@ mod listener_tests {
 
     #[test]
     fn drop_without_close_no_leak() {
-        use crate::tp::block_on;
+        use crate::common::block_on;
         let name = format!(r"\\.\pipe\comio_listener_dropleak_{}", std::process::id());
         let listener = ConnectionListener::named_pipe();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(|_, _| Ok(()));

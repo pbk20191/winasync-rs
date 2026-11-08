@@ -688,7 +688,8 @@ mod run_tests {
 /// function call does not. The client-side `run` future uses plain `.await`
 /// throughout (as `run_tests::cross_thread_wake_resumes_on_dq_thread`
 /// already does), so no `.into_future()` is needed there.
-#[cfg(test)]
+// Cross-runtime integration tests: dq driving comio over a tp-backed server.
+#[cfg(all(test, feature = "comio", feature = "tp"))]
 mod integration {
     use super::*;
 
