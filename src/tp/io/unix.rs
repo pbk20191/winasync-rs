@@ -3,7 +3,9 @@
 //! `tp`'s `TcpListener`/`TcpStream` (AcceptEx / ConnectEx), with `SOCKADDR_UN`
 //! addressing; shares the socket helpers in `super::net`.
 
-use super::net::{classify_wsa_overlapped, get_connectex, new_socket, sock_check, ADDR_SLOT};
+use super::net::{
+    classify_wsa_overlapped, get_connectex, new_socket, sock_check, VectoredPayload, ADDR_SLOT,
+};
 use super::{submit, IoRes, Issue};
 use crate::tp::{Runtime, RuntimeInner};
 use core::ffi::c_void;
@@ -142,6 +144,44 @@ impl UnixStream {
         async move {
             let (result, payload) = fut.await;
             (result, payload.buf)
+        }
+    }
+
+    /// Scatter-reads into `bufs` with one vectored `WSARecv`.
+    pub fn read_vectored(
+        &self,
+        bufs: Vec<Vec<u8>>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
+                p.fill();
+                let r = WSARecv(sock, &p.wsabufs, None, &mut p.flags, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.bufs)
+        }
+    }
+
+    /// Gather-writes `bufs` with one vectored `WSASend`.
+    pub fn write_vectored(
+        &self,
+        bufs: Vec<Vec<u8>>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
+                p.fill();
+                let r = WSASend(sock, &p.wsabufs, None, 0, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.bufs)
         }
     }
 

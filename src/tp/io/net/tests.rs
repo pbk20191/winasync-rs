@@ -407,6 +407,71 @@
     }
 
     #[test]
+    fn tcp_peek_does_not_consume() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = rt.spawn(async move {
+                let s = listener.accept().await.unwrap();
+                // Peek first, then read: both must see the same bytes.
+                let (n1, b1) = s.peek(vec![0u8; 8]).await;
+                let peeked = b1[..n1.unwrap()].to_vec();
+                let (n2, b2) = s.read(vec![0u8; 8]).await;
+                let read = b2[..n2.unwrap()].to_vec();
+                (peeked, read)
+            });
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            client.write(b"peekme".to_vec()).await.0.unwrap();
+            let (peeked, read) = server.await.unwrap();
+            assert_eq!(peeked, b"peekme");
+            assert_eq!(read, b"peekme", "peek must not consume");
+        }));
+        result.expect("peek test timed out");
+    }
+
+    #[test]
+    fn tcp_vectored_roundtrip() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Server scatter-reads one stream into two differently-sized buffers.
+            let server = rt.spawn(async move {
+                let s = listener.accept().await.unwrap();
+                let (n, bufs) = s.read_vectored(vec![vec![0u8; 4], vec![0u8; 5]]).await;
+                let n = n.unwrap();
+                let mut got = Vec::new();
+                for b in &bufs {
+                    got.extend_from_slice(b);
+                }
+                got.truncate(n);
+                got
+            });
+
+            // Client gather-writes three buffers as one contiguous send.
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let (w, bufs) = client
+                .write_vectored(vec![b"abc".to_vec(), b"def".to_vec(), b"ghi".to_vec()])
+                .await;
+            assert_eq!(w.unwrap(), 9);
+            assert_eq!(bufs.len(), 3, "buffers are handed back");
+
+            assert_eq!(server.await.unwrap(), b"abcdefghi");
+        }));
+        result.expect("vectored roundtrip timed out");
+    }
+
+    #[test]
     fn cancel_storm_accept_and_read() {
         let rt = Runtime::new();
         block_on(timeout(&rt, Duration::from_secs(30), async {

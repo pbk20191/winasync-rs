@@ -241,6 +241,79 @@ impl TcpStream {
         }
     }
 
+    /// Like [`read`](Self::read), but leaves the data queued (`MSG_PEEK`), so a
+    /// subsequent read returns the same bytes. Useful for inspecting a protocol
+    /// header before deciding how much to consume.
+    pub fn peek(
+        &self,
+        buf: Vec<u8>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(
+                &self.res,
+                RecvPayload {
+                    buf,
+                    flags: MSG_PEEK.0 as u32,
+                },
+                move |ovl, p| {
+                    let wsabuf = WSABUF {
+                        len: p.buf.len() as u32,
+                        buf: windows_core::PSTR(p.buf.as_mut_ptr()),
+                    };
+                    let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
+                    classify_wsa_overlapped(r == 0)
+                },
+            )
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.buf)
+        }
+    }
+
+    /// Scatter-reads into `bufs` with a single vectored `WSARecv` — the socket
+    /// counterpart to `File::read_scatter`. Resolves to the total byte count
+    /// (0 = peer closed) and hands the buffers back; they are filled in order.
+    pub fn read_vectored(
+        &self,
+        bufs: Vec<Vec<u8>>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
+                p.fill();
+                let r = WSARecv(sock, &p.wsabufs, None, &mut p.flags, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.bufs)
+        }
+    }
+
+    /// Gather-writes `bufs` with a single vectored `WSASend` — the socket
+    /// counterpart to `File::write_gather`. Resolves to the total byte count and
+    /// hands the buffers back; they are sent in order as one contiguous stream.
+    pub fn write_vectored(
+        &self,
+        bufs: Vec<Vec<u8>>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
+                p.fill();
+                let r = WSASend(sock, &p.wsabufs, None, 0, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.bufs)
+        }
+    }
+
     /// Half-closes the send direction; the peer's next read returns 0.
     pub fn shutdown_send(&self) -> windows_core::Result<()> {
         sock_check(unsafe { shutdown(self.res.socket(), SD_SEND) })

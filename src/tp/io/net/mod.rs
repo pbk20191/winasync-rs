@@ -23,7 +23,8 @@ use windows::Win32::Networking::WinSock::{
     bind, closesocket, connect, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx,
     WSAGetLastError, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW, WSAStartup,
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
-    IPPROTO, IPPROTO_TCP, IPPROTO_UDP, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
+    IPPROTO, IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER,
+    SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
     SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TF_DISCONNECT,
     TF_REUSE_SOCKET, TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT,
@@ -374,6 +375,42 @@ struct AcceptIntoPayload {
 struct RecvPayload {
     buf: Vec<u8>,
     flags: u32,
+}
+
+/// Payload of a **vectored** WSARecv/WSASend: the caller's buffers plus the
+/// `WSABUF` array the provider reads. Both live in the op block for the op's
+/// duration; the array is built once in `issue` with exact capacity so it never
+/// reallocates out from under the kernel's pointer.
+pub(in crate::tp::io) struct VectoredPayload {
+    pub(in crate::tp::io) bufs: Vec<Vec<u8>>,
+    pub(in crate::tp::io) wsabufs: Vec<WSABUF>,
+    pub(in crate::tp::io) flags: u32,
+}
+
+// WSABUF holds a raw pointer; the whole payload is owned by one op at a time.
+unsafe impl Send for VectoredPayload {}
+
+impl VectoredPayload {
+    pub(in crate::tp::io) fn new(bufs: Vec<Vec<u8>>) -> Self {
+        let n = bufs.len();
+        Self {
+            bufs,
+            wsabufs: Vec::with_capacity(n),
+            flags: 0,
+        }
+    }
+
+    /// (Re)builds the `WSABUF` array to point at the owned buffers. Called from
+    /// `issue`, i.e. once, after the payload is parked in the op block.
+    pub(in crate::tp::io) fn fill(&mut self) {
+        self.wsabufs.clear();
+        for b in self.bufs.iter_mut() {
+            self.wsabufs.push(WSABUF {
+                len: b.len() as u32,
+                buf: windows_core::PSTR(b.as_mut_ptr()),
+            });
+        }
+    }
 }
 
 mod tcp;
