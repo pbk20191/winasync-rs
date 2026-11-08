@@ -29,7 +29,8 @@ use windows::Win32::Networking::WinSock::{
     TF_REUSE_SOCKET, TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT,
     TRANSMIT_PACKETS_ELEMENT_0, TRANSMIT_PACKETS_ELEMENT_0_0, TransmitFile, WINSOCK_SOCKET_TYPE,
     WSABUF, WSADATA, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAID_TRANSMITPACKETS,
-    WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
+    WSAID_WSARECVMSG, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, CMSGHDR, IN_PKTINFO, IPPROTO_IP,
+    IP_PKTINFO, LPWSAOVERLAPPED_COMPLETION_ROUTINE, WSAMSG, WSASendMsg,
 };
 
 /// Process-wide Winsock initialization; never torn down (`WSACleanup` is
@@ -1079,6 +1080,234 @@ impl UdpSocket {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UDP control messages (WSARecvMsg / WSASendMsg) — ancillary data (IP_PKTINFO…)
+// ---------------------------------------------------------------------------
+
+type WsaRecvMsgFn = unsafe extern "system" fn(
+    s: SOCKET,
+    lpmsg: *mut WSAMSG,
+    lpdwnumberofbytesrecvd: *mut u32,
+    lpoverlapped: *mut windows::Win32::System::IO::OVERLAPPED,
+    lpcompletionroutine: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
+) -> i32;
+
+/// `WSARecvMsg` is a provider extension (no direct export): fetch + cache its
+/// pointer via `WSAIoctl`, like [`get_connectex`]. (`WSASendMsg` *is* a direct
+/// export, so it needs no such fetch.)
+fn get_wsarecvmsg(sock: SOCKET) -> windows_core::Result<WsaRecvMsgFn> {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    if let Some(&p) = PTR.get() {
+        return Ok(unsafe { mem::transmute::<usize, WsaRecvMsgFn>(p) });
+    }
+    let mut fptr: Option<WsaRecvMsgFn> = None;
+    let mut bytes = 0u32;
+    let r = unsafe {
+        WSAIoctl(
+            sock,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            Some(&WSAID_WSARECVMSG as *const _ as *const c_void),
+            size_of::<windows_core::GUID>() as u32,
+            Some(&mut fptr as *mut _ as *mut c_void),
+            size_of::<Option<WsaRecvMsgFn>>() as u32,
+            &mut bytes,
+            None,
+            None,
+        )
+    };
+    if r != 0 {
+        return Err(wsa_last_err());
+    }
+    let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null WSARecvMsg");
+    let _ = PTR.set(f as usize);
+    Ok(f)
+}
+
+/// Op-block payload for `recv_msg`: the data buffer, the control (ancillary)
+/// buffer, the source address, and the `WSABUF`/`WSAMSG` the kernel reads
+/// (self-referential pointers into this same payload, valid for the op).
+struct RecvMsgPayload {
+    data: Vec<u8>,
+    control: Vec<u8>,
+    source: SOCKADDR_STORAGE,
+    wsabuf: WSABUF,
+    msg: WSAMSG,
+}
+unsafe impl Send for RecvMsgPayload {}
+
+/// Op-block payload for `send_msg` (dest address + control, same discipline).
+struct SendMsgPayload {
+    data: Vec<u8>,
+    control: Vec<u8>,
+    dest: SOCKADDR_STORAGE,
+    wsabuf: WSABUF,
+    msg: WSAMSG,
+}
+unsafe impl Send for SendMsgPayload {}
+
+/// Outcome of [`UdpSocket::recv_msg`]: the datagram size, its source, and the
+/// raw ancillary-data (control) bytes (parse with [`parse_ip_pktinfo`]).
+pub struct ReceivedMsg {
+    pub bytes: usize,
+    pub source: SocketAddr,
+    pub control: Vec<u8>,
+}
+
+impl UdpSocket {
+    /// Enables `IP_PKTINFO` so `recv_msg` receives the local interface/address a
+    /// datagram arrived on as an `IN_PKTINFO` control message (IPv4).
+    pub fn set_recv_pktinfo(&self, on: bool) -> windows_core::Result<()> {
+        let v: i32 = on as i32;
+        sock_check(unsafe {
+            setsockopt(self.res.socket(), IPPROTO_IP.0, IP_PKTINFO, Some(&v.to_ne_bytes()))
+        })
+    }
+
+    /// Receives one datagram with ancillary data via `WSARecvMsg`. `control_cap`
+    /// sizes the control buffer. Resolves to [`ReceivedMsg`] plus the data buffer.
+    pub fn recv_msg(
+        &self,
+        buf: Vec<u8>,
+        control_cap: usize,
+    ) -> impl Future<Output = (windows_core::Result<ReceivedMsg>, Vec<u8>)> + Send + use<> {
+        let sock = self.res.socket();
+        let started: windows_core::Result<OpFuture<RecvMsgPayload>> = (|| {
+            let recvmsg = get_wsarecvmsg(sock)?;
+            let payload = RecvMsgPayload {
+                data: buf,
+                control: vec![0u8; control_cap],
+                source: unsafe { mem::zeroed() },
+                wsabuf: unsafe { mem::zeroed() },
+                msg: unsafe { mem::zeroed() },
+            };
+            Ok(unsafe {
+                submit(&self.res, payload, move |ovl, p| {
+                    let data_ptr = p.data.as_mut_ptr();
+                    let data_len = p.data.len() as u32;
+                    let ctrl_ptr = p.control.as_mut_ptr();
+                    let ctrl_len = p.control.len() as u32;
+                    let src_ptr = &mut p.source as *mut SOCKADDR_STORAGE as *mut SOCKADDR;
+                    p.wsabuf = WSABUF {
+                        len: data_len,
+                        buf: windows_core::PSTR(data_ptr),
+                    };
+                    let buf_ptr = &mut p.wsabuf as *mut WSABUF;
+                    p.msg = WSAMSG {
+                        name: src_ptr,
+                        namelen: size_of::<SOCKADDR_STORAGE>() as i32,
+                        lpBuffers: buf_ptr,
+                        dwBufferCount: 1,
+                        Control: WSABUF {
+                            len: ctrl_len,
+                            buf: windows_core::PSTR(ctrl_ptr),
+                        },
+                        dwFlags: 0,
+                    };
+                    let r = recvmsg(sock, &mut p.msg, core::ptr::null_mut(), ovl, None);
+                    classify_wsa_overlapped(r == 0)
+                })
+            })
+        })();
+        async move {
+            match started {
+                Ok(fut) => {
+                    let (result, mut payload) = fut.await;
+                    let out = match result {
+                        Ok(n) => read_sockaddr(&payload.source).map(|source| {
+                            let clen = payload.msg.Control.len as usize;
+                            payload.control.truncate(clen);
+                            ReceivedMsg {
+                                bytes: n,
+                                source,
+                                control: std::mem::take(&mut payload.control),
+                            }
+                        }),
+                        Err(e) => Err(e),
+                    };
+                    (out, payload.data)
+                }
+                Err(e) => (Err(e), Vec::new()),
+            }
+        }
+    }
+
+    /// Sends one datagram to `dest` with the given raw ancillary-data (control)
+    /// bytes via `WSASendMsg` (empty `control` = an ordinary datagram). Resolves
+    /// to the byte count and hands the data buffer back.
+    pub fn send_msg(
+        &self,
+        buf: Vec<u8>,
+        dest: SocketAddr,
+        control: Vec<u8>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        let sock = self.res.socket();
+        let mut dest_storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let dest_len = write_sockaddr(&dest, &mut dest_storage);
+        let payload = SendMsgPayload {
+            data: buf,
+            control,
+            dest: dest_storage,
+            wsabuf: unsafe { mem::zeroed() },
+            msg: unsafe { mem::zeroed() },
+        };
+        let fut = unsafe {
+            submit(&self.res, payload, move |ovl, p| {
+                let data_ptr = p.data.as_mut_ptr();
+                let data_len = p.data.len() as u32;
+                let ctrl_len = p.control.len() as u32;
+                // An empty control buffer must present a NULL pointer, not Vec's
+                // dangling one (WSASendMsg rejects the latter with WSAEFAULT).
+                let ctrl_ptr = if p.control.is_empty() {
+                    core::ptr::null_mut()
+                } else {
+                    p.control.as_mut_ptr()
+                };
+                let dst_ptr = &mut p.dest as *mut SOCKADDR_STORAGE as *mut SOCKADDR;
+                p.wsabuf = WSABUF {
+                    len: data_len,
+                    buf: windows_core::PSTR(data_ptr),
+                };
+                let buf_ptr = &mut p.wsabuf as *mut WSABUF;
+                p.msg = WSAMSG {
+                    name: dst_ptr,
+                    namelen: dest_len,
+                    lpBuffers: buf_ptr,
+                    dwBufferCount: 1,
+                    Control: WSABUF {
+                        len: ctrl_len,
+                        buf: windows_core::PSTR(ctrl_ptr),
+                    },
+                    dwFlags: 0,
+                };
+                let r = WSASendMsg(sock, &p.msg, 0, None, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.data)
+        }
+    }
+}
+
+/// Parses the first `IP_PKTINFO` control message out of a `recv_msg` control
+/// buffer, returning the local address the datagram arrived on (IPv4).
+pub fn parse_ip_pktinfo(control: &[u8]) -> Option<Ipv4Addr> {
+    let hdr_size = size_of::<CMSGHDR>();
+    // WSA_CMSG_ALIGN to pointer size; data follows the aligned header.
+    let data_off = hdr_size.next_multiple_of(size_of::<usize>());
+    if control.len() < data_off + size_of::<IN_PKTINFO>() {
+        return None;
+    }
+    let hdr = unsafe { &*(control.as_ptr() as *const CMSGHDR) };
+    if hdr.cmsg_level != IPPROTO_IP.0 || hdr.cmsg_type != IP_PKTINFO {
+        return None;
+    }
+    let pktinfo = unsafe { &*(control[data_off..].as_ptr() as *const IN_PKTINFO) };
+    let addr = unsafe { pktinfo.ipi_addr.S_un.S_addr };
+    Some(Ipv4Addr::from(u32::from_be(addr)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::{block_on, timeout, Runtime};
@@ -1459,6 +1688,34 @@ mod tests {
             assert_eq!(&b[..n.unwrap()], b"b");
         }));
         result.expect("accept_into reuse timed out");
+    }
+
+    #[test]
+    fn udp_recv_msg_pktinfo() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            server.set_recv_pktinfo(true).unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+
+            client.send_msg(b"msg!".to_vec(), server_addr, Vec::new()).await.0.unwrap();
+            let (r, b) = server.recv_msg(vec![0u8; 64], 128).await;
+            let rm = r.unwrap();
+            assert_eq!(&b[..rm.bytes], b"msg!");
+            assert!(matches!(rm.source, SocketAddr::V4(_)));
+            // IP_PKTINFO reports the local (loopback) address the datagram hit.
+            assert_eq!(parse_ip_pktinfo(&rm.control), Some(Ipv4Addr::LOCALHOST));
+        }));
+        result.expect("recv_msg pktinfo timed out");
     }
 
     #[test]
