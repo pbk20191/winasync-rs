@@ -8,6 +8,7 @@
 //! boundary; cancellation is `CancelIoEx` + a ref release.
 
 pub mod async_rw;
+pub mod device;
 pub mod file;
 pub mod hvsock;
 pub mod net;
