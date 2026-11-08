@@ -270,4 +270,73 @@ impl HvStreamSocket {
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None) })?;
         Ok(stream::from_reg(reg))
     }
+
+    /// Callback-based counterpart to [`connect`](Self::connect), for the COM
+    /// connector: the result is delivered from the `ConnectEx` completion
+    /// instead of being awaited, so nothing blocks a thread while the
+    /// connect is outstanding.
+    ///
+    /// Same ownership argument as `arm_accept`: the remote `SockaddrHv` is
+    /// memory the provider may read until the operation really completes, so
+    /// it is moved into the completion closure rather than left on a frame
+    /// that could be dropped first.
+    pub(crate) fn arm_connect(
+        addr: HvSocketAddr,
+        on_result: Box<dyn FnOnce(Result<IInspectable>) + Send>,
+    ) -> Result<OpHandle> {
+        let sock = new_socket()?;
+        let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
+            // ConnectEx fails with WSAEINVAL on an unbound socket.
+            let (local, local_len) = HvSocketAddr::new(HV_GUID_ZERO, HV_GUID_ZERO).to_raw();
+            sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
+            let connect_ex = get_connectex(sock)?;
+            let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
+            Ok((connect_ex, reg))
+        })();
+        let (connect_ex, reg) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                return Err(e);
+            }
+        };
+
+        // `reg`'s Drop closes the socket if this fails.
+        let (remote, remote_len) = addr.to_raw();
+        let remote_box = Box::new(remote);
+        let remote_ptr = remote_box.as_ref() as *const SockaddrHv as usize;
+
+        let reg_for_stream = reg.clone();
+        let op = unsafe {
+            tpio::submit(
+                &reg,
+                Box::new(move |ioresult: u32, _bytes: usize| {
+                    // Hold the address until the real completion.
+                    drop(remote_box);
+                    let res = if ioresult == 0 {
+                        sock_check(setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None))
+                            .map(|()| stream::from_reg(reg_for_stream))
+                    } else {
+                        Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
+                    };
+                    on_result(res);
+                }),
+                move |ovl| {
+                    let mut sent = 0u32;
+                    let ok = connect_ex(
+                        sock,
+                        remote_ptr as *const SOCKADDR,
+                        remote_len,
+                        core::ptr::null(),
+                        0,
+                        &mut sent,
+                        ovl,
+                    );
+                    classify_wsa_overlapped(ok.as_bool())
+                },
+            )
+        };
+        Ok(op)
+    }
+
 }

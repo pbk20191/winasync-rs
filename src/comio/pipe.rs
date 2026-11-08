@@ -201,6 +201,21 @@ impl NamedPipeClient {
         Ok(stream::from_reg(reg))
     }
 
+    /// One synchronous open attempt, with no `ERROR_PIPE_BUSY` wait: the
+    /// caller decides whether to wait and on whose thread.
+    pub(crate) fn try_open(wname: &HSTRING) -> Result<windows_core::IInspectable> {
+        let handle = Self::open(wname)?;
+        match IoReg::register(handle, false) {
+            Ok(reg) => Ok(stream::from_reg(reg)),
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Opening the client end is a plain synchronous `CreateFileW` — only
     /// the server's `accept` needs an overlapped `ConnectNamedPipe`.
     fn open(wname: &HSTRING) -> Result<HANDLE> {
