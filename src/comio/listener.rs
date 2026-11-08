@@ -243,12 +243,17 @@ pub(crate) struct ListenerCore {
     /// caller that uses the event directly, which is all of them except a
     /// script — see [`super::dispatch`].
     accept_queue: Mutex<Option<super::dispatch::AcceptQueue>>,
+    /// The connection point's sinks. Created with the listener so
+    /// `FindConnectionPoint` never has to decide whether one exists yet.
+    events: Arc<EventSource>,
 }
 
 impl ListenerCore {
     fn new() -> Self {
+        let state = Arc::new(ListenerState::new());
         Self {
-            state: Arc::new(ListenerState::new()),
+            events: Arc::new(EventSource::new(state.clone())),
+            state,
             accept_queue: Mutex::new(None),
         }
     }
@@ -327,23 +332,13 @@ impl ListenerCore {
         &self,
         handler: &TypedEventHandler<IInspectable, IInspectable>,
     ) -> Result<i64> {
-        if self.state.closed.load(Ordering::Acquire) {
-            return Err(Error::from_hresult(RO_E_CLOSED));
-        }
-        let token = self.state.event.add(handler)?;
-        let first = {
-            let mut h = self.state.handlers.lock().unwrap();
-            h.insert(token);
-            h.len() == 1
-        };
-        if first {
-            if let Err(e) = ensure_running(self.state.clone()) {
-                self.state.handlers.lock().unwrap().remove(&token);
-                self.state.event.remove(token);
-                return Err(e);
-            }
-        }
-        Ok(token)
+        add_handler(&self.state, handler)
+    }
+
+    /// The connection point's view of this listener, for
+    /// `IConnectionPointContainer::FindConnectionPoint`.
+    pub(crate) fn advise_target(&self) -> Arc<dyn super::connpt::AdviseTarget> {
+        self.events.clone()
     }
 
     /// Removes a handler. Removing the last one pauses the chain and cancels
@@ -658,7 +653,10 @@ macro_rules! listener_impls {
     IConnectionListener,
     INamedPipeListenerBind,
     windows::Foundation::IClosable,
-    windows::Win32::System::Com::IDispatch
+    windows::Win32::System::Com::IDispatch,
+    windows::Win32::System::Com::IConnectionPointContainer,
+    windows::Win32::System::Ole::IProvideClassInfo,
+    windows::Win32::System::Ole::IProvideClassInfo2
 )]
 pub struct NamedPipeConnectionListener {
     core: ListenerCore,
@@ -672,7 +670,10 @@ pub struct NamedPipeConnectionListener {
     IConnectionListener,
     IUnixListenerBind,
     windows::Foundation::IClosable,
-    windows::Win32::System::Com::IDispatch
+    windows::Win32::System::Com::IDispatch,
+    windows::Win32::System::Com::IConnectionPointContainer,
+    windows::Win32::System::Ole::IProvideClassInfo,
+    windows::Win32::System::Ole::IProvideClassInfo2
 )]
 pub struct UnixConnectionListener {
     core: ListenerCore,
@@ -685,7 +686,10 @@ pub struct UnixConnectionListener {
     IConnectionListener,
     IHyperVListenerBind,
     windows::Foundation::IClosable,
-    windows::Win32::System::Com::IDispatch
+    windows::Win32::System::Com::IDispatch,
+    windows::Win32::System::Com::IConnectionPointContainer,
+    windows::Win32::System::Ole::IProvideClassInfo,
+    windows::Win32::System::Ole::IProvideClassInfo2
 )]
 pub struct HyperVConnectionListener {
     core: ListenerCore,
@@ -787,16 +791,13 @@ const CLOSE: i32 = 4;
 fn shared_member(core: &ListenerCore, dispid: i32, args: &[VARIANT]) -> Result<VARIANT> {
     match dispid {
         ACCEPT => {
-            dispatch::expect_args(args, 1)?;
             let timeout_ms = dispatch::as_u32(&args[0])?;
             dispatch::object(&core.accept_queued(timeout_ms)?)
         }
         INFORMATION => {
-            dispatch::expect_args(args, 0)?;
             Ok(dispatch::bstr(&core.information()?.to_string()))
         }
         CLOSE => {
-            dispatch::expect_args(args, 0)?;
             core.close()?;
             Ok(dispatch::empty())
         }
@@ -813,22 +814,24 @@ fn shared_member(core: &ListenerCore, dispid: i32, args: &[VARIANT]) -> Result<V
 /// entries alone, because a `macro_rules!` call in expression position
 /// cannot expand to a comma-separated list.
 macro_rules! members {
-    ($(($name:literal, $id:expr)),* $(,)?) => {
+    ($($bind:expr),* $(,)?) => {
         &[
-            $(dispatch::Member { name: $name, dispid: $id },)*
-            dispatch::Member { name: "Accept", dispid: ACCEPT },
-            dispatch::Member { name: "Information", dispid: INFORMATION },
-            dispatch::Member { name: "Close", dispid: CLOSE },
+            $($bind,)*
+            dispatch::member!("Accept", ACCEPT, ("TimeoutMs": Count) -> Object),
+            dispatch::member!("Information", INFORMATION, () -> Text),
+            dispatch::member!("Close", CLOSE, () -> None),
         ]
     };
 }
 
 impl Dispatchable for NamedPipeConnectionListener {
-    const MEMBERS: &'static [dispatch::Member] = members![("Bind", 1)];
+    const DISPINTERFACE: windows_core::GUID = super::typelib::IID_DNAMED_PIPE_LISTENER;
+
+    const MEMBERS: &'static [dispatch::Member] =
+        members![dispatch::member!("Bind", 1, ("Name": Text) -> None)];
 
     fn invoke_member(&self, dispid: i32, args: &[VARIANT]) -> Result<VARIANT> {
         if dispid == 1 {
-            dispatch::expect_args(args, 1)?;
             let name = HSTRING::from(dispatch::as_string(&args[0])?);
             // Waited on rather than returned: a script cannot await, and the
             // bind error it would otherwise never see is the whole point.
@@ -841,11 +844,13 @@ impl Dispatchable for NamedPipeConnectionListener {
 }
 
 impl Dispatchable for UnixConnectionListener {
-    const MEMBERS: &'static [dispatch::Member] = members![("Bind", 1)];
+    const DISPINTERFACE: windows_core::GUID = super::typelib::IID_DUNIX_LISTENER;
+
+    const MEMBERS: &'static [dispatch::Member] =
+        members![dispatch::member!("Bind", 1, ("Path": Text) -> None)];
 
     fn invoke_member(&self, dispid: i32, args: &[VARIANT]) -> Result<VARIANT> {
         if dispid == 1 {
-            dispatch::expect_args(args, 1)?;
             let path = HSTRING::from(dispatch::as_string(&args[0])?);
             self.bind(&path)?.join()?;
             self.core.start_queue()?;
@@ -856,13 +861,16 @@ impl Dispatchable for UnixConnectionListener {
 }
 
 impl Dispatchable for HyperVConnectionListener {
-    const MEMBERS: &'static [dispatch::Member] =
-        members![("BindEndpoint", 1), ("BindServiceName", 5)];
+    const DISPINTERFACE: windows_core::GUID = super::typelib::IID_DHYPERV_LISTENER;
+
+    const MEMBERS: &'static [dispatch::Member] = members![
+        dispatch::member!("BindEndpoint", 1, ("VmId": Guid, "ServiceId": Guid) -> None),
+        dispatch::member!("BindServiceName", 5, ("ServiceId": Guid) -> None),
+    ];
 
     fn invoke_member(&self, dispid: i32, args: &[VARIANT]) -> Result<VARIANT> {
         match dispid {
             1 => {
-                dispatch::expect_args(args, 2)?;
                 let vm = dispatch::as_guid(&args[0])?;
                 let service = dispatch::as_guid(&args[1])?;
                 self.bind_endpoint(&vm, &service)?.join()?;
@@ -870,7 +878,6 @@ impl Dispatchable for HyperVConnectionListener {
                 Ok(dispatch::empty())
             }
             5 => {
-                dispatch::expect_args(args, 1)?;
                 let service = dispatch::as_guid(&args[0])?;
                 self.bind_service_name(&service)?.join()?;
                 self.core.start_queue()?;
@@ -885,7 +892,154 @@ dispatch::impl_dispatch!(NamedPipeConnectionListener, NamedPipeConnectionListene
 dispatch::impl_dispatch!(UnixConnectionListener, UnixConnectionListener_Impl);
 dispatch::impl_dispatch!(HyperVConnectionListener, HyperVConnectionListener_Impl);
 
+// The event half: a host that would rather be called than call `Accept`.
+// All three raise the same `DListenerEvents`, so only the CLSID — which
+// `IProvideClassInfo::GetClassInfo` answers with — differs.
+use super::activation;
+use super::connpt::impl_connection_points;
 
+impl_connection_points!(
+    NamedPipeConnectionListener_Impl,
+    activation::CLSID_NAMED_PIPE_CONNECTION_LISTENER
+);
+impl_connection_points!(
+    UnixConnectionListener_Impl,
+    activation::CLSID_UNIX_CONNECTION_LISTENER
+);
+impl_connection_points!(
+    HyperVConnectionListener_Impl,
+    activation::CLSID_HYPER_V_CONNECTION_LISTENER
+);
+
+
+
+/// Registers one `ConnectionReceived` handler and, if it is the first
+/// consumer, starts the accept chain.
+///
+/// Free rather than a `ListenerCore` method because two callers need it:
+/// the public `ConnectionReceived`, and the event source behind the
+/// connection point, which has the state but not the core.
+///
+/// If starting the chain fails synchronously — a malformed endpoint bound
+/// before any handler existed, or a stale AF_UNIX socket file — that error
+/// surfaces here and the registration is rolled back, leaving the listener
+/// exactly as it was.
+fn add_handler(
+    state: &Arc<ListenerState>,
+    handler: &TypedEventHandler<IInspectable, IInspectable>,
+) -> Result<i64> {
+    if state.closed.load(Ordering::Acquire) {
+        return Err(Error::from_hresult(RO_E_CLOSED));
+    }
+    let token = state.event.add(handler)?;
+    let first = {
+        let mut h = state.handlers.lock().unwrap();
+        h.insert(token);
+        h.len() == 1
+    };
+    if first
+        && let Err(e) = ensure_running(state.clone())
+    {
+        state.handlers.lock().unwrap().remove(&token);
+        state.event.remove(token);
+        return Err(e);
+    }
+    Ok(token)
+}
+
+/// Removes a handler. Removing the last one pauses the chain and cancels
+/// the in-flight accept.
+fn remove_handler(state: &Arc<ListenerState>, token: i64) -> Result<()> {
+    if state.closed.load(Ordering::Acquire) {
+        return Err(Error::from_hresult(RO_E_CLOSED));
+    }
+    state.event.remove(token);
+    let last = {
+        let mut h = state.handlers.lock().unwrap();
+        h.remove(&token);
+        h.is_empty()
+    };
+    if last
+        && let Some(op) = state.current_op.lock().unwrap().take()
+    {
+        op.cancel();
+    }
+    Ok(())
+}
+
+/// Backs a listener's connection point: the advised sinks, plus the single
+/// `ConnectionReceived` registration that fans out to them.
+///
+/// One registration however many sinks there are, so the accept chain still
+/// sees exactly one consumer and the handler-gating rules are unchanged.
+pub(crate) struct EventSource {
+    state: Arc<ListenerState>,
+    /// Shared with the fan-out handler. No cycle: the handler is owned by
+    /// `state.event`, and a `SinkSet` points at nothing.
+    sinks: Arc<super::connpt::SinkSet>,
+    /// Token of the fan-out handler: registered on the first `Advise` and
+    /// removed when the last sink goes, which pauses the chain for a
+    /// listener nobody subscribes to any more.
+    token: Mutex<Option<i64>>,
+}
+
+impl EventSource {
+    fn new(state: Arc<ListenerState>) -> Self {
+        Self {
+            state,
+            sinks: Arc::new(super::connpt::SinkSet::new()),
+            token: Mutex::new(None),
+        }
+    }
+}
+
+impl super::connpt::AdviseTarget for EventSource {
+    fn advise(&self, sink: windows_core::Ref<windows_core::IUnknown>) -> Result<u32> {
+        // The token lock serializes advise against unadvise, so the fan-out
+        // handler cannot be registered twice, nor removed between a sink
+        // being added and the chain being started.
+        let mut token = self.token.lock().unwrap();
+        let cookie = self.sinks.advise(sink)?;
+        if token.is_none() {
+            let sinks = self.sinks.clone();
+            let handler =
+                TypedEventHandler::<IInspectable, IInspectable>::new(move |_sender, args| {
+                    let Some(args) = args.as_ref() else {
+                        return Ok(());
+                    };
+                    let args: IConnectionReceivedArgs = args.cast()?;
+                    let stream = unsafe {
+                        let mut raw = core::ptr::null_mut();
+                        args.Stream(&mut raw).ok()?;
+                        IInspectable::from_raw(raw)
+                    };
+                    sinks.fire(&stream);
+                    Ok(())
+                });
+            match add_handler(&self.state, &handler) {
+                Ok(t) => *token = Some(t),
+                Err(e) => {
+                    // Roll the sink back: a caller should get the bind error
+                    // rather than a cookie for an event that can never fire.
+                    let _ = self.sinks.unadvise(cookie);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(cookie)
+    }
+
+    fn unadvise(&self, cookie: u32) -> Result<()> {
+        let mut token = self.token.lock().unwrap();
+        self.sinks.unadvise(cookie)?;
+        if self.sinks.is_empty()
+            && let Some(t) = token.take()
+        {
+            let _ = remove_handler(&self.state, t);
+        }
+        Ok(())
+    }
+}
 
 fn want_running(state: &ListenerState) -> bool {
     if state.closed.load(Ordering::Acquire) {

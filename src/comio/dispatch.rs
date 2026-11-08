@@ -9,18 +9,14 @@
 //! `New-Object -ComObject Rustwinui3loop.NamedPipeClient` succeeds and then
 //! every method call fails.
 //!
-//! # No type library
+//! # Names, and where the type library comes from
 //!
-//! `GetTypeInfoCount` returns 0 and `GetTypeInfo` returns `E_NOTIMPL`: the
-//! names are resolved from a table in this module rather than from a
-//! compiled `.tlb`. That is the whole reason this is self-contained — no
-//! IDL, no `midl.exe` in the build, nothing extra to register, and the
-//! member list cannot drift away from the code that implements it.
-//!
-//! What it costs is early binding. VBA will not offer IntelliSense and
-//! cannot declare `As NamedPipeClient`; everything must go through `Object`
-//! / late binding. Every host listed above does that by default, so the cost
-//! lands only on tooling, not on reach.
+//! `GetIDsOfNames` resolves against a table in this module rather than a
+//! compiled `.tlb`, so late binding works whether or not anything has been
+//! registered. [`super::typelib`] then *generates* the library from these
+//! same tables, which is what `GetTypeInfo` hands back — so early binding
+//! and late binding cannot describe a member differently, and the build
+//! still needs no IDL and no `midl.exe`.
 //!
 //! # A synchronous surface, deliberately
 //!
@@ -41,6 +37,12 @@
 //! `TypedEventHandler`, which no script can construct. The dispatch `Bind`
 //! therefore registers a handler of this module's own and pushes each
 //! accepted stream onto a queue that `Accept(timeoutMs)` pops.
+//!
+//! [`super::connpt`] later made the event reachable properly, through a
+//! connection point a host advises a sink on. `Accept` stays, and not only
+//! for compatibility: a script that simply wants the next connection says
+//! so in one line, and PowerShell cannot use the sink path at all for
+//! reasons that module documents.
 //!
 //! This also fixes an ordering problem that would otherwise make the whole
 //! thing unusable from a single-threaded script. Accepting is gated on a
@@ -72,6 +74,48 @@ use windows_core::{AgileReference, BSTR, GUID, HRESULT, IInspectable, Interface,
 pub(crate) struct Member {
     pub name: &'static str,
     pub dispid: i32,
+    /// In source order, as a caller writes them.
+    pub params: &'static [Param],
+    pub returns: Vt,
+}
+
+/// One declared parameter. The name is what a host shows in a signature and
+/// what named-argument binding would resolve against.
+pub(crate) struct Param {
+    pub name: &'static str,
+    pub vt: Vt,
+}
+
+/// The parameter and return types this surface uses, which is all a type
+/// library needs to describe it.
+///
+/// Narrow on purpose: a wider set would be types no member here returns,
+/// and every entry has to be something [`super::typelib`] can emit and the
+/// VARIANT helpers above can produce.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Vt {
+    /// No return value.
+    None,
+    Text,
+    Count,
+    /// Another dispatchable object.
+    Object,
+    /// A GUID, which a script writes as text and [`as_guid`] parses — so it
+    /// is a `BSTR` on the wire and only the name says more.
+    Guid,
+}
+
+impl Vt {
+    /// The `VARENUM` a type library records for this.
+    pub(crate) fn varenum(self) -> windows::Win32::System::Variant::VARENUM {
+        use windows::Win32::System::Variant::{VT_BSTR, VT_DISPATCH, VT_I4, VT_VOID};
+        match self {
+            Vt::None => VT_VOID,
+            Vt::Text | Vt::Guid => VT_BSTR,
+            Vt::Count => VT_I4,
+            Vt::Object => VT_DISPATCH,
+        }
+    }
 }
 
 /// Declares a class's dispatch surface.
@@ -82,6 +126,12 @@ pub(crate) trait Dispatchable {
     /// What `GetIDsOfNames` resolves against. Searched case-insensitively:
     /// VBScript and PowerShell do not preserve the case a user typed.
     const MEMBERS: &'static [Member];
+
+    /// The dispinterface in [`super::typelib`] that describes [`MEMBERS`],
+    /// and what `GetTypeInfo` hands back.
+    ///
+    /// [`MEMBERS`]: Dispatchable::MEMBERS
+    const DISPINTERFACE: GUID;
 
     /// Runs one member. `args` is in source order — see [`invoke`], which
     /// has already undone `DISPPARAMS`' reversal.
@@ -154,9 +204,9 @@ pub(crate) unsafe fn invoke<T: Dispatchable>(
     params: *const DISPPARAMS,
     result: *mut VARIANT,
 ) -> Result<()> {
-    if !T::MEMBERS.iter().any(|m| m.dispid == dispid) {
+    let Some(member) = T::MEMBERS.iter().find(|m| m.dispid == dispid) else {
         return Err(windows_core::Error::from_hresult(DISP_E_MEMBERNOTFOUND));
-    }
+    };
 
     // `DISPPARAMS` holds arguments in reverse: rgvarg[0] is the *last* one.
     // Undoing that here keeps every member body reading left to right.
@@ -178,6 +228,13 @@ pub(crate) unsafe fn invoke<T: Dispatchable>(
         }
     };
 
+    // Arity is checked here, against the same declaration the type library
+    // is generated from, rather than in each member body — so a signature
+    // cannot be advertised in one place and enforced differently in another.
+    if args.len() != member.params.len() {
+        return Err(windows_core::Error::from_hresult(DISP_E_BADPARAMCOUNT));
+    }
+
     let value = this.invoke_member(dispid, &args)?;
     // A caller that does not want the result passes null; the value is then
     // dropped here rather than leaked.
@@ -186,6 +243,29 @@ pub(crate) unsafe fn invoke<T: Dispatchable>(
     }
     Ok(())
 }
+
+/// One [`Member`], written the way a signature reads.
+///
+/// `member!("Connect", 2, ("Name": Text) -> Object)` — the name a script
+/// calls, the frozen DISPID, the parameters, and what comes back. The same
+/// line feeds `Invoke`'s arity check and the type library's `FUNCDESC`.
+macro_rules! member {
+    ($name:literal, $id:expr, ($($pn:literal : $pv:ident),* $(,)?) -> $ret:ident) => {
+        $crate::comio::dispatch::Member {
+            name: $name,
+            dispid: $id,
+            params: &[$(
+                $crate::comio::dispatch::Param {
+                    name: $pn,
+                    vt: $crate::comio::dispatch::Vt::$pv,
+                },
+            )*],
+            returns: $crate::comio::dispatch::Vt::$ret,
+        }
+    };
+}
+
+pub(crate) use member;
 
 /// Generates the `IDispatch` vtable bodies for a `#[implement]`ed type.
 ///
@@ -210,6 +290,9 @@ macro_rules! impl_dispatch {
             const MEMBERS: &'static [$crate::comio::dispatch::Member] =
                 <$ty as $crate::comio::dispatch::Dispatchable>::MEMBERS;
 
+            const DISPINTERFACE: windows_core::GUID =
+                <$ty as $crate::comio::dispatch::Dispatchable>::DISPINTERFACE;
+
             fn invoke_member(
                 &self,
                 dispid: i32,
@@ -231,19 +314,30 @@ macro_rules! impl_dispatch {
         // pointers are validated before use in `ids_of_names` / `invoke`.
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         impl windows::Win32::System::Com::IDispatch_Impl for $impl_ty {
-            /// Zero: there is no type library. See the module docs.
+            /// One: the library `super::typelib` generates and registers.
             fn GetTypeInfoCount(&self) -> windows_core::Result<u32> {
-                Ok(0)
+                Ok(1)
             }
 
+            /// The dispinterface describing this class.
+            ///
+            /// Fails with `TYPE_E_LIBNOTREGISTERED` when the library has not
+            /// been registered — which a host treats as "no type info" and
+            /// falls back to pure late binding, exactly as before this
+            /// existed.
             fn GetTypeInfo(
                 &self,
-                _index: u32,
+                index: u32,
                 _lcid: u32,
             ) -> windows_core::Result<windows::Win32::System::Com::ITypeInfo> {
-                Err(windows_core::Error::from_hresult(
-                    windows::Win32::Foundation::E_NOTIMPL,
-                ))
+                if index != 0 {
+                    return Err(windows_core::Error::from_hresult(
+                        windows::Win32::Foundation::DISP_E_BADINDEX,
+                    ));
+                }
+                $crate::comio::typelib::type_info(
+                    &<$impl_ty as $crate::comio::dispatch::Dispatchable>::DISPINTERFACE,
+                )
             }
 
             fn GetIDsOfNames(
@@ -378,14 +472,6 @@ pub(crate) fn as_guid(value: &VARIANT) -> Result<GUID> {
     let text = as_string(value)?;
     let trimmed = text.trim().trim_start_matches('{').trim_end_matches('}');
     GUID::try_from(trimmed).map_err(|_| windows_core::Error::from_hresult(DISP_E_TYPEMISMATCH))
-}
-
-/// Checks arity before a member body indexes into its arguments.
-pub(crate) fn expect_args(args: &[VARIANT], want: usize) -> Result<()> {
-    if args.len() != want {
-        return Err(windows_core::Error::from_hresult(DISP_E_BADPARAMCOUNT));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

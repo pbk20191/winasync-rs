@@ -212,19 +212,12 @@ impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
 /// Implemented on the generated wrapper, not on `OverlappedDuplexStream`:
 /// `ReadAsync`/`WriteAsync`/`Close` are trait impls that live there.
 impl crate::comio::dispatch::Dispatchable for OverlappedDuplexStream_Impl {
+    const DISPINTERFACE: windows_core::GUID = crate::comio::typelib::IID_DSTREAM;
+
     const MEMBERS: &'static [crate::comio::dispatch::Member] = &[
-        crate::comio::dispatch::Member {
-            name: "WriteText",
-            dispid: 1,
-        },
-        crate::comio::dispatch::Member {
-            name: "ReadText",
-            dispid: 2,
-        },
-        crate::comio::dispatch::Member {
-            name: "Close",
-            dispid: 3,
-        },
+        crate::comio::dispatch::member!("WriteText", 1, ("Text": Text) -> Count),
+        crate::comio::dispatch::member!("ReadText", 2, ("MaxBytes": Count) -> Text),
+        crate::comio::dispatch::member!("Close", 3, () -> None),
     ];
 
     fn invoke_member(
@@ -240,7 +233,6 @@ impl crate::comio::dispatch::Dispatchable for OverlappedDuplexStream_Impl {
         match dispid {
             // WriteText(text) -> bytes written
             1 => {
-                dispatch::expect_args(args, 1)?;
                 let bytes = dispatch::as_string(&args[0])?.into_bytes();
                 let len = u32::try_from(bytes.len()).map_err(|_| {
                     windows_core::Error::from_hresult(
@@ -258,7 +250,6 @@ impl crate::comio::dispatch::Dispatchable for OverlappedDuplexStream_Impl {
             }
             // ReadText(maxBytes) -> what arrived, possibly fewer bytes
             2 => {
-                dispatch::expect_args(args, 1)?;
                 let max = dispatch::as_u32(&args[0])?.max(1);
                 let buf = new_buffer(max)?;
                 let ib: IBuffer = buf.cast()?;
@@ -277,7 +268,6 @@ impl crate::comio::dispatch::Dispatchable for OverlappedDuplexStream_Impl {
                 Ok(dispatch::bstr(&text))
             }
             3 => {
-                dispatch::expect_args(args, 0)?;
                 IClosable_Impl::Close(self)?;
                 Ok(dispatch::empty())
             }

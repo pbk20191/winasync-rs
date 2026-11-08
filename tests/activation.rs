@@ -245,8 +245,9 @@ fn com_activation_round_trip_through_the_registered_dll() {
     let closable: windows::Foundation::IClosable = events.cast().unwrap();
     closable.Close().unwrap();
 
-    // --- And the same thing from a language that has no vtables -----------
+    // --- And the same thing from languages that have no vtables -----------
     powershell_round_trip();
+    wsh_event_round_trip();
 
     // The module stays loaded on purpose: `DllCanUnloadNow` returns S_FALSE,
     // and objects created above are still alive in this scope. Dropping the
@@ -316,6 +317,76 @@ Write-Output 'ROUND-TRIP-OK'
     assert!(
         out.status.success() && stdout.contains("ROUND-TRIP-OK"),
         "PowerShell could not drive the objects.\nstatus: {:?}\nstdout: {}\nstderr: {}",
+        out.status,
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Runs the listener's *event* from Windows Script Host, in its own process.
+///
+/// This is what the type library and the connection points are for, and the
+/// only check that reaches all of it. `WScript.ConnectObject` asks the
+/// object for its class info, reads the coclass's `[default, source]`
+/// interface out of the registered library, finds the matching connection
+/// point and advises a sink — none of which this crate performs, and any of
+/// which would silently leave the event undelivered if the library were
+/// wrong.
+///
+/// It is also the only test where the sink is in a different apartment from
+/// the thread that raises the event: `cscript` is single-threaded STA, the
+/// accept completes on a thread-pool thread, and the call has to marshal.
+/// That is what the `CoIncrementMTAUsage` in `SinkSet::advise` exists for —
+/// without it this fails with `CO_E_NOTINITIALIZED` while every in-process
+/// test still passes.
+fn wsh_event_round_trip() {
+    let pipe = format!(r"\\.\pipe\comio_wsh_{}", std::process::id());
+    let script = format!(
+        r#"Dim gotEvent, gotText
+gotEvent = False
+gotText = ""
+PipeName = "{pipe}"
+
+Set listener = CreateObject("Rustwinui3loop.NamedPipeConnectionListener")
+WScript.ConnectObject listener, "L_"
+listener.Bind PipeName
+
+Set client = CreateObject("Rustwinui3loop.NamedPipeClient")
+Set cs = client.Connect(PipeName)
+cs.WriteText "from vbscript"
+
+For i = 1 To 50
+  If gotEvent Then Exit For
+  WScript.Sleep 100
+Next
+
+If gotEvent Then
+  WScript.Echo "EVENT-OK:" & gotText
+Else
+  WScript.Echo "NO-EVENT"
+End If
+listener.Close
+
+Sub L_ConnectionReceived(stream)
+  gotText = stream.ReadText(64)
+  gotEvent = True
+End Sub
+"#
+    );
+
+    let path = std::env::temp_dir().join(format!("comio_event_{}.vbs", std::process::id()));
+    std::fs::write(&path, script).expect("write script");
+    let out = std::process::Command::new("cscript.exe")
+        .args(["//nologo", "//E:vbscript"])
+        .arg(&path)
+        .output()
+        .expect("spawn cscript");
+    let _ = std::fs::remove_file(&path);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("EVENT-OK:from vbscript"),
+        "the sink was never called, or got the wrong stream.\nstatus: {:?}\nstdout: {}\nstderr: {}",
         out.status,
         stdout,
         String::from_utf8_lossy(&out.stderr)

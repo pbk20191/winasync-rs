@@ -302,15 +302,11 @@ impl INamedPipeConnector_Impl for NamedPipeClient_Impl {
 /// as the blocking shape of `ConnectAsync` — see `dispatch`'s module docs
 /// for why a script gets the second rather than the first.
 impl dispatch::Dispatchable for NamedPipeClient {
+    const DISPINTERFACE: windows_core::GUID = super::typelib::IID_DNAMED_PIPE_CLIENT;
+
     const MEMBERS: &'static [dispatch::Member] = &[
-        dispatch::Member {
-            name: "Transport",
-            dispid: 1,
-        },
-        dispatch::Member {
-            name: "Connect",
-            dispid: 2,
-        },
+        dispatch::member!("Transport", 1, () -> Text),
+        dispatch::member!("Connect", 2, ("Name": Text) -> Object),
     ];
 
     fn invoke_member(
@@ -319,12 +315,8 @@ impl dispatch::Dispatchable for NamedPipeClient {
         args: &[windows::Win32::System::Variant::VARIANT],
     ) -> windows_core::Result<windows::Win32::System::Variant::VARIANT> {
         match dispid {
-            1 => {
-                dispatch::expect_args(args, 0)?;
-                Ok(dispatch::bstr(TRANSPORT))
-            }
+            1 => Ok(dispatch::bstr(TRANSPORT)),
             2 => {
-                dispatch::expect_args(args, 1)?;
                 let name = windows_core::HSTRING::from(dispatch::as_string(&args[0])?);
                 dispatch::object(&self.connect_async(&name).join()?)
             }

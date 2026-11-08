@@ -408,15 +408,11 @@ impl IHyperVConnector_Impl for HvStreamSocket_Impl {
 /// as the blocking shape of `ConnectAsync` — see `dispatch`'s module docs
 /// for why a script gets the second rather than the first.
 impl dispatch::Dispatchable for HvStreamSocket {
+    const DISPINTERFACE: windows_core::GUID = super::typelib::IID_DHV_SOCKET;
+
     const MEMBERS: &'static [dispatch::Member] = &[
-        dispatch::Member {
-            name: "Transport",
-            dispid: 1,
-        },
-        dispatch::Member {
-            name: "Connect",
-            dispid: 2,
-        },
+        dispatch::member!("Transport", 1, () -> Text),
+        dispatch::member!("Connect", 2, ("VmId": Guid, "ServiceId": Guid) -> Object),
     ];
 
     fn invoke_member(
@@ -425,14 +421,10 @@ impl dispatch::Dispatchable for HvStreamSocket {
         args: &[windows::Win32::System::Variant::VARIANT],
     ) -> windows_core::Result<windows::Win32::System::Variant::VARIANT> {
         match dispid {
-            1 => {
-                dispatch::expect_args(args, 0)?;
-                Ok(dispatch::bstr(TRANSPORT))
-            }
+            1 => Ok(dispatch::bstr(TRANSPORT)),
             2 => {
                 // Two GUIDs, which a script writes as strings — braced
                 // or bare, both accepted.
-                dispatch::expect_args(args, 2)?;
                 let vm = dispatch::as_guid(&args[0])?;
                 let service = dispatch::as_guid(&args[1])?;
                 dispatch::object(&self.connect_async(&vm, &service).join()?)

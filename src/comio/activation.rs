@@ -261,7 +261,9 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 /// rebuild at a new path is picked up.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllRegisterServer() -> HRESULT {
-    match unsafe { register_under(HKEY_CURRENT_USER, CLASSES_ROOT) } {
+    match unsafe { register_under(HKEY_CURRENT_USER, CLASSES_ROOT) }
+        .and_then(|()| super::typelib::register())
+    {
         Ok(()) => S_OK,
         Err(e) => e.code(),
     }
@@ -270,7 +272,10 @@ pub extern "system" fn DllRegisterServer() -> HRESULT {
 /// Removes everything [`DllRegisterServer`] wrote. What `regsvr32 /u` calls.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllUnregisterServer() -> HRESULT {
-    match unsafe { unregister_under(HKEY_CURRENT_USER, CLASSES_ROOT) } {
+    // The library goes first: it is registered under its own LIBID rather
+    // than under the class keys, so losing those first would strand it.
+    let lib = super::typelib::unregister();
+    match unsafe { unregister_under(HKEY_CURRENT_USER, CLASSES_ROOT) }.and(lib) {
         Ok(()) => S_OK,
         Err(e) => e.code(),
     }
@@ -305,6 +310,17 @@ pub(crate) unsafe fn register_under(root: HKEY, base: &str) -> Result<()> {
             let progid = create_key(key, "ProgID")?;
             let r = set_default(progid, class.progid);
             close(progid);
+            r?;
+            // Points a host at the library that describes this class, which
+            // is how it finds the default and source interfaces without
+            // asking the object. See `super::typelib`.
+            let tl = create_key(key, "TypeLib")?;
+            let r = set_default(tl, &clsid_key(&super::typelib::LIBID));
+            close(tl);
+            r?;
+            let ver = create_key(key, "Version")?;
+            let r = set_default(ver, &version_string());
+            close(ver);
             r
         })();
         close(key);
@@ -319,6 +335,53 @@ pub(crate) unsafe fn register_under(root: HKEY, base: &str) -> Result<()> {
             r
         })();
         close(named);
+        r?;
+    }
+
+    // The dispinterfaces, so a host can resolve one by IID — which is what
+    // `FindConnectionPoint` callers and cross-apartment marshalling of the
+    // event sink both do.
+    unsafe { register_interfaces(root, base) }
+}
+
+/// `1.0`, the one place the library version is spelled for the registry.
+fn version_string() -> String {
+    let (major, minor) = super::typelib::VERSION;
+    format!("{major}.{minor}")
+}
+
+/// Registers the dispinterfaces this library declares.
+///
+/// `ProxyStubClsid32` is oleaut32's own dispatch proxy
+/// (`{00020420-…}`): a dispinterface has no vtable to marshal, so the
+/// standard IDispatch proxy is exactly right, and naming it is what lets an
+/// event sink be called from the thread-pool thread an accept completes on
+/// when the sink lives in a different apartment.
+///
+/// # Safety
+///
+/// `root` must be a live registry key the caller may write to.
+unsafe fn register_interfaces(root: HKEY, base: &str) -> Result<()> {
+    const PS_DISPATCH: &str = "{00020420-0000-0000-c000-000000000046}";
+    let libid = clsid_key(&super::typelib::LIBID);
+    for (name, iid) in super::typelib::DISPINTERFACE_IDS {
+        let iid = clsid_key(iid);
+        let key = unsafe { create_key(root, &format!("{base}\\Interface\\{iid}"))? };
+        let r = (|| unsafe {
+            set_default(key, name)?;
+            let ps = create_key(key, "ProxyStubClsid32")?;
+            let r = set_default(ps, PS_DISPATCH);
+            close(ps);
+            r?;
+            let tl = create_key(key, "TypeLib")?;
+            let r = (|| {
+                set_default(tl, &libid)?;
+                set_value(tl, "Version", &version_string())
+            })();
+            close(tl);
+            r
+        })();
+        close(key);
         r?;
     }
     Ok(())
