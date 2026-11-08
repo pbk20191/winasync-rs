@@ -13,6 +13,7 @@
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
 use crate::common::winsock::{classify_wsa_overlapped, sock_check, wsa_init, wsa_last_err};
+use super::listener::Accepted;
 use super::stream;
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
@@ -247,7 +248,7 @@ impl UnixStreamListener {
     /// `Err` directly, without ever invoking `on_result`.
     pub(crate) fn arm_accept(
         &self,
-        on_result: Box<dyn FnOnce(Result<IInspectable>) + Send>,
+        on_result: Box<dyn FnOnce(Result<Accepted>) + Send>,
     ) -> Result<OpHandle> {
         let accept_sock = new_socket()?;
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
@@ -289,7 +290,7 @@ impl UnixStreamListener {
                         closesocket(accept_sock);
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };
-                    on_result(res);
+                    on_result(res.map(Accepted::unnamed));
                 }),
                 move |ovl| {
                     let mut bytes = 0u32;

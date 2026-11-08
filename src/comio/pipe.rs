@@ -120,7 +120,7 @@ impl NamedPipeListener {
 /// callback.
 pub(crate) fn arm_accept(
     name: &str,
-    on_result: Box<dyn FnOnce(Result<windows_core::IInspectable>) + Send>,
+    on_result: Box<dyn FnOnce(Result<super::listener::Accepted>) + Send>,
 ) -> Result<OpHandle> {
     let wname = HSTRING::from(name);
     let handle = unsafe {
@@ -157,7 +157,7 @@ pub(crate) fn arm_accept(
                 } else {
                     Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                 };
-                on_result(res);
+                on_result(res.map(super::listener::Accepted::unnamed));
             }),
             move |ovl| match ConnectNamedPipe(handle, Some(ovl)) {
                 Ok(()) => Issue::SyncSuccess,

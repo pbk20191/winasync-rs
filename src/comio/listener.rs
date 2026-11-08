@@ -56,6 +56,25 @@ impl IConnectionReceivedArgs_Impl for ConnectionReceivedArgs_Impl {
     }
 }
 
+/// One accepted connection, as a transport hands it back.
+///
+/// `remote` is the *peer's* endpoint when the transport can name one. Only
+/// AF_HYPERV can today: a Hyper-V peer carries the partition it came from,
+/// which is the thing a host service authorizes on. A named pipe or an
+/// AF_UNIX client has no address to report, so those pass `None` and the
+/// event falls back to the listener's own bound endpoint, as before.
+pub(crate) struct Accepted {
+    pub(crate) stream: IInspectable,
+    pub(crate) remote: Option<HSTRING>,
+}
+
+impl Accepted {
+    /// A connection from a transport with no peer name.
+    pub(crate) fn unnamed(stream: IInspectable) -> Self {
+        Self { stream, remote: None }
+    }
+}
+
 /// Constructs a new `IConnectionReceivedArgs` wrapping `stream`/`endpoint`.
 pub(crate) fn new_args(stream: IInspectable, endpoint: HSTRING) -> IConnectionReceivedArgs {
     ConnectionReceivedArgs { stream, endpoint }.into()
@@ -113,7 +132,7 @@ impl AcceptSource {
     /// AF_UNIX, lazily binds the persistent listen socket on first use (so its
     /// bind/listen error surfaces here as an `Err`, and so gating prevents the
     /// socket from existing at all until there is a handler).
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<IInspectable>) + Send>) -> Result<OpHandle> {
+    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
         match self {
             AcceptSource::NamedPipe(name) => super::pipe::arm_accept(name, on_result),
             AcceptSource::Unix { path, listener } => {
@@ -638,21 +657,27 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
     };
 
     let state_cb = state.clone();
-    let on_result: Box<dyn FnOnce(Result<IInspectable>) + Send> = Box::new(move |res| {
+    let on_result: Box<dyn FnOnce(Result<Accepted>) + Send> = Box::new(move |res| {
         if state_cb.closed.load(Ordering::Acquire) {
             // Closed: just release (`want_running` is false, so no restart).
             let _ = release_running(&state_cb);
             return;
         }
         match res {
-            Ok(stream) => {
-                let endpoint = state_cb
-                    .endpoint
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_default();
-                fire_event(&state_cb, stream, endpoint);
+            Ok(accepted) => {
+                // The peer's endpoint when the transport could name one
+                // (AF_HYPERV: which partition connected), else this
+                // listener's own bound endpoint — which is all the other
+                // transports can say.
+                let endpoint = accepted.remote.unwrap_or_else(|| {
+                    state_cb
+                        .endpoint
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_default()
+                });
+                fire_event(&state_cb, accepted.stream, endpoint);
                 // Re-arm on a *fresh* pool stack, continuing to own `running`
                 // (`drive(.., true)`). Handing the re-arm to the pool bounds
                 // chain depth to O(1) even when completions arrive synchronously
@@ -948,7 +973,7 @@ mod listener_tests {
         let service = windows_core::GUID::from_u128(0x5a83_c7e1_9b04_4d26_8f17_63ca0e2b95d8);
 
         let listener = ConnectionListener::hyper_v();
-        let (tx, rx) = mpsc::channel::<usize>();
+        let (tx, rx) = mpsc::channel::<(usize, HSTRING)>();
         let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
             let a = args.as_ref().unwrap();
             let cra: IConnectionReceivedArgs = a.cast().unwrap();
@@ -957,7 +982,12 @@ mod listener_tests {
                 cra.Stream(&mut raw).ok()?;
                 raw as usize
             };
-            let _ = tx.send(raw);
+            let remote = unsafe {
+                let mut s = core::mem::ManuallyDrop::new(HSTRING::new());
+                cra.RemoteEndpoint(&mut s).ok()?;
+                core::mem::ManuallyDrop::into_inner(s)
+            };
+            let _ = tx.send((raw, remote));
             Ok(())
         });
         listener.ConnectionReceived(&handler).unwrap();
@@ -977,10 +1007,19 @@ mod listener_tests {
                 return;
             }
         };
-        let server_raw = rx
+        let (server_raw, remote) = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("no ConnectionReceived");
         let server = unsafe { IInspectable::from_raw(server_raw as *mut core::ffi::c_void) };
+
+        // RemoteEndpoint names the *peer* here, not the listener's own bound
+        // address: a wildcard-bound service accepts from every partition, so
+        // this is how a host service learns which one it is talking to.
+        let remote = remote.to_string();
+        assert!(
+            remote.starts_with("hv://loopback/"),
+            "RemoteEndpoint should name the connecting partition, got {remote:?}"
+        );
 
         // The accepted connection is an ordinary WinRT duplex stream — the
         // whole point of routing hvsock through this listener.

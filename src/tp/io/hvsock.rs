@@ -31,7 +31,8 @@ use windows::Win32::Networking::WinSock::{
 // `tp::io::hvsock::*` rather than through `common`.
 #[allow(unused_imports)]
 pub use crate::common::hvaddr::{
-    vsock_service_id, HvSocketAddr, HVSOCKET_CONNECTED_SUSPEND, HVSOCKET_CONNECT_TIMEOUT,
+    local_addr_of, peer_addr_of, vsock_port_of, vsock_service_id, HvSocketAddr,
+    HVSOCKET_CONNECTED_SUSPEND, HVSOCKET_CONNECT_TIMEOUT,
     HVSOCKET_CONTAINER_PASSTHRU, HV_GUID_BROADCAST, HV_GUID_CHILDREN, HV_GUID_LOOPBACK,
     HV_GUID_PARENT, HV_GUID_SILOHOST, HV_GUID_WILDCARD, HV_GUID_ZERO, HV_PROTOCOL_RAW,
 };
@@ -134,6 +135,20 @@ impl HvStream {
         fut.await.0?;
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None) })?;
         Ok(stream)
+    }
+
+    /// Which partition is on the other end, and which service it reached.
+    ///
+    /// For a host service this is the authorization primitive: a listener on
+    /// the wildcard VM id accepts from every partition, so this is the only
+    /// way to tell *which guest* a connection came from.
+    pub fn peer_addr(&self) -> windows_core::Result<HvSocketAddr> {
+        peer_addr_of(self.res.socket())
+    }
+
+    /// This socket's own AF_HYPERV name.
+    pub fn local_addr(&self) -> windows_core::Result<HvSocketAddr> {
+        local_addr_of(self.res.socket())
     }
 
     /// Receives into `buf`; resolves to the byte count (0 = peer closed).
@@ -318,6 +333,74 @@ mod tests {
             }
             Err(e) => panic!("unexpected AF_HYPERV socket error: {e:?}"),
         }
+    }
+
+    #[test]
+    fn hv_peer_addr_identifies_the_partition() {
+        let rt = Runtime::new();
+        let service = GUID::from_u128(0x41c7_9e03_6b52_4a18_bd74_2e1f05a63c90);
+        let listener = match HvListener::bind(&rt, HvSocketAddr::wildcard(service)) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("skipped: AF_HYPERV bind unavailable ({e:?})");
+                return;
+            }
+        };
+        let result = block_on(timeout(&rt, Duration::from_secs(5), async {
+            let server = rt.spawn(async move {
+                let s = listener.accept().await?;
+                // The listener bound the *wildcard* VM id, so this is the only
+                // way to learn who actually connected.
+                Ok::<_, windows_core::Error>((s.peer_addr()?, s.local_addr()?))
+            });
+            let client =
+                match HvStream::connect(&rt, HvSocketAddr::loopback(service), Some(2000)).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("skipped: AF_HYPERV loopback connect refused ({e:?})");
+                        return;
+                    }
+                };
+            let (peer, _local) = server.await.unwrap().unwrap();
+
+            // The part worth authorizing on: which partition connected. The
+            // listener bound the *wildcard* VM id, so nothing else tells us.
+            assert_eq!(peer.vm_id, HV_GUID_LOOPBACK, "peer should be this partition");
+            assert_eq!(peer.vm_name(), Some("loopback"));
+
+            // The peer's service id is the client's own ephemeral endpoint —
+            // it matches what the client reports as its local address, and is
+            // emphatically not the service that was dialled.
+            assert_eq!(peer.service_id, client.local_addr().unwrap().service_id);
+            assert_ne!(
+                peer.service_id, service,
+                "a peer service id must never be mistaken for the dialled service"
+            );
+
+            // From the client's side, the peer is exactly what it dialled.
+            assert_eq!(client.peer_addr().unwrap(), HvSocketAddr::loopback(service));
+        }));
+        if result.is_err() {
+            eprintln!("skipped: AF_HYPERV loopback timed out (service not registered)");
+        }
+    }
+
+    #[test]
+    fn hv_addr_display_and_vsock_roundtrip() {
+        assert_eq!(vsock_port_of(vsock_service_id(5000)), Some(5000));
+        assert_eq!(vsock_port_of(GUID::from_u128(0x1234_0000_0000_0000_0000_000000000000)), None);
+        assert_eq!(
+            HvSocketAddr::loopback(vsock_service_id(5000)).to_string(),
+            "hv://loopback/vsock:5000"
+        );
+        assert_eq!(
+            HvSocketAddr::new(
+                GUID::from_u128(0x2fd10ba4_7e2f_4a3c_9d31_0f5a8c7b4e21),
+                GUID::from_u128(0x11112222_3333_4444_5555_666677778888),
+            )
+            .to_string(),
+            "hv://2fd10ba4-7e2f-4a3c-9d31-0f5a8c7b4e21/11112222-3333-4444-5555-666677778888"
+        );
     }
 
     #[test]

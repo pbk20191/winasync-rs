@@ -17,10 +17,13 @@
 //! `tp`'s Hyper-V transport.
 
 use crate::common::winsock::{classify_wsa_overlapped, sock_check, wsa_init, wsa_last_err};
+use super::listener::Accepted;
 use super::stream;
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
-use crate::common::hvaddr::{HvSocketAddr, SockaddrHv, HV_GUID_ZERO, HV_PROTOCOL_RAW};
+use crate::common::hvaddr::{
+    peer_addr_of, HvSocketAddr, SockaddrHv, HV_GUID_ZERO, HV_PROTOCOL_RAW,
+};
 use core::ffi::c_void;
 use std::mem;
 use std::sync::{Arc, OnceLock};
@@ -32,7 +35,7 @@ use windows::Win32::Networking::WinSock::{
     WSAIoctl, WSASocketW, WSA_FLAG_OVERLAPPED,
 };
 use windows::Win32::System::IO::OVERLAPPED;
-use windows_core::{Error, IInspectable, Result, HRESULT};
+use windows_core::{Error, HSTRING, IInspectable, Result, HRESULT};
 
 /// Creates an AF_HYPERV stream socket. Fails with `WSAEAFNOSUPPORT` (10047)
 /// where the Hyper-V socket provider is not present.
@@ -198,7 +201,7 @@ impl HvStreamListener {
     /// completion closure so both live until the real kernel completion.
     pub(crate) fn arm_accept(
         &self,
-        on_result: Box<dyn FnOnce(Result<IInspectable>) + Send>,
+        on_result: Box<dyn FnOnce(Result<Accepted>) + Send>,
     ) -> Result<OpHandle> {
         let accept_sock = new_socket()?;
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
@@ -214,15 +217,25 @@ impl HvStreamListener {
                     drop(addr_buf);
                     let res = if ioresult == 0 {
                         let listen_val = listen_sock.0.to_ne_bytes();
-                        let finish = || -> Result<IInspectable> {
+                        let finish = || -> Result<Accepted> {
                             sock_check(setsockopt(
                                 accept_sock,
                                 SOL_SOCKET,
                                 SO_UPDATE_ACCEPT_CONTEXT,
                                 Some(&listen_val),
                             ))?;
+                            // Read the peer *before* the socket is handed to
+                            // the stream: this is the one chance to learn
+                            // which partition connected, and the listener is
+                            // typically bound to the wildcard VM id, so
+                            // nothing else carries that. Valid only after
+                            // SO_UPDATE_ACCEPT_CONTEXT above.
+                            let remote = peer_addr_of(accept_sock).ok();
                             let reg = IoReg::register(HANDLE(accept_sock.0 as *mut c_void), true)?;
-                            Ok(stream::from_reg(reg))
+                            Ok(Accepted {
+                                stream: stream::from_reg(reg),
+                                remote: remote.map(|a| HSTRING::from(a.to_string())),
+                            })
                         };
                         match finish() {
                             Ok(s) => Ok(s),
