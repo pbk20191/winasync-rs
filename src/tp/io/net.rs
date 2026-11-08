@@ -25,10 +25,11 @@ use windows::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
     IPPROTO, IPPROTO_TCP, IPPROTO_UDP, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
-    SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TransmitFile,
-    TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT, TRANSMIT_PACKETS_ELEMENT_0,
-    TRANSMIT_PACKETS_ELEMENT_0_0, WINSOCK_SOCKET_TYPE, WSABUF, WSADATA, WSAID_CONNECTEX,
-    WSAID_TRANSMITPACKETS, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
+    SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TF_DISCONNECT,
+    TF_REUSE_SOCKET, TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT,
+    TRANSMIT_PACKETS_ELEMENT_0, TRANSMIT_PACKETS_ELEMENT_0_0, TransmitFile, WINSOCK_SOCKET_TYPE,
+    WSABUF, WSADATA, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAID_TRANSMITPACKETS,
+    WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
 };
 
 /// Process-wide Winsock initialization; never torn down (`WSACleanup` is
@@ -260,6 +261,69 @@ fn get_transmitpackets(sock: SOCKET) -> windows_core::Result<TransmitPacketsFn> 
     Ok(f)
 }
 
+/// Post-transfer disposition for [`TcpStream::transmit_file`] /
+/// [`TcpStream::transmit_packets`]: optionally disconnect after sending, and
+/// prepare the handle for reuse (see [`TcpStream::reconnect`] /
+/// [`TcpStream::into_reusable`]).
+#[derive(Clone, Copy, Default)]
+pub struct TransmitFlags {
+    /// Issue a transport disconnect after the transfer (`TF_DISCONNECT`).
+    pub disconnect: bool,
+    /// Prepare the handle to be reused by a later `AcceptEx`/`ConnectEx`
+    /// (`TF_REUSE_SOCKET`). Implies `disconnect`.
+    pub reuse_socket: bool,
+}
+
+impl TransmitFlags {
+    fn to_bits(self) -> u32 {
+        let mut f = 0;
+        if self.disconnect || self.reuse_socket {
+            f |= TF_DISCONNECT;
+        }
+        if self.reuse_socket {
+            f |= TF_REUSE_SOCKET;
+        }
+        f
+    }
+}
+
+type DisconnectExFn = unsafe extern "system" fn(
+    s: SOCKET,
+    lpoverlapped: *mut windows::Win32::System::IO::OVERLAPPED,
+    dwflags: u32,
+    dwreserved: u32,
+) -> windows_core::BOOL;
+
+/// `DisconnectEx` is a provider extension (no direct export): fetch and cache
+/// its function pointer via `WSAIoctl`, like [`get_connectex`].
+fn get_disconnectex(sock: SOCKET) -> windows_core::Result<DisconnectExFn> {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    if let Some(&p) = PTR.get() {
+        return Ok(unsafe { mem::transmute::<usize, DisconnectExFn>(p) });
+    }
+    let mut fptr: Option<DisconnectExFn> = None;
+    let mut bytes = 0u32;
+    let r = unsafe {
+        WSAIoctl(
+            sock,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            Some(&WSAID_DISCONNECTEX as *const _ as *const c_void),
+            size_of::<windows_core::GUID>() as u32,
+            Some(&mut fptr as *mut _ as *mut c_void),
+            size_of::<Option<DisconnectExFn>>() as u32,
+            &mut bytes,
+            None,
+            None,
+        )
+    };
+    if r != 0 {
+        return Err(wsa_last_err());
+    }
+    let f = fptr.expect("SIO_GET_EXTENSION_FUNCTION_POINTER returned null DisconnectEx");
+    let _ = PTR.set(f as usize);
+    Ok(f)
+}
+
 fn classify_wsa_overlapped(succeeded: bool) -> Issue {
     if succeeded {
         // Synchronous success still queues a completion (we never set
@@ -293,6 +357,16 @@ impl Drop for AcceptPayload {
 
 // SOCKET is a plain kernel handle value.
 unsafe impl Send for AcceptPayload {}
+
+/// Payload for [`TcpListener::accept_into`]: the recycled socket's `IoRes` (kept
+/// alive for the op — its socket is the AcceptEx target, and its TP_IO is reused
+/// by the returned stream) plus the AcceptEx address buffer. `Arc<IoRes>` is
+/// `Send`, so this needs no manual `unsafe impl` (unlike the raw-`SOCKET`
+/// [`AcceptPayload`]).
+struct AcceptIntoPayload {
+    res: Arc<IoRes>,
+    addr_buf: Box<[u8; 2 * ADDR_SLOT]>,
+}
 
 /// A listening TCP socket bound to a [`Runtime`]'s pool.
 pub struct TcpListener {
@@ -375,6 +449,53 @@ impl TcpListener {
                 Err(e)
             }
         }
+    }
+
+    /// Accepts the next connection into a socket recycled from
+    /// [`TcpStream::into_reusable`], skipping the per-connection `socket()` and —
+    /// crucially — the completion-port re-association, which Windows forbids (a
+    /// socket is bound to one IOCP for life). The reused socket keeps its original
+    /// `IoRes`/TP_IO; only `AcceptEx` is re-run on it, driven by this listener,
+    /// and the returned stream reuses that same `IoRes`. The reused socket must
+    /// match this listener's address family.
+    pub async fn accept_into(&self, reusable: ReusableSocket) -> windows_core::Result<TcpStream> {
+        let accept_sock = reusable.res.socket();
+        let listen_sock = self.res.socket();
+        let fut = unsafe {
+            submit(
+                &self.res,
+                AcceptIntoPayload {
+                    // Keep the recycled socket's IoRes alive for the op (its
+                    // socket is the AcceptEx target); the IoRes owns the socket,
+                    // so the payload never closes it.
+                    res: reusable.res,
+                    addr_buf: Box::new([0; 2 * ADDR_SLOT]),
+                },
+                |ovl, p| {
+                    let mut bytes = 0u32;
+                    let ok = AcceptEx(
+                        listen_sock,
+                        p.res.socket(),
+                        p.addr_buf.as_mut_ptr() as *mut c_void,
+                        0,
+                        ADDR_SLOT as u32,
+                        ADDR_SLOT as u32,
+                        &mut bytes,
+                        ovl,
+                    );
+                    classify_wsa_overlapped(ok.as_bool())
+                },
+            )
+        };
+        let (result, payload) = fut.await;
+        result?;
+        let listen_val = listen_sock.0.to_ne_bytes();
+        sock_check(unsafe {
+            setsockopt(accept_sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
+        })?;
+        // Reuse the recycled socket's existing TP_IO registration directly — no
+        // re-register (one IOCP per socket for life).
+        Ok(TcpStream { res: payload.res })
     }
 }
 
@@ -528,16 +649,18 @@ impl TcpStream {
         file: &File,
         offset: u64,
         count: u32,
+        flags: TransmitFlags,
     ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
         let sock = self.res.socket();
         let file_handle = file.handle();
+        let tf = flags.to_bits();
         // Keep the file's IoRes (hence its HANDLE) alive for the op's lifetime.
         let keepalive = file.res_arc();
         let fut = unsafe {
             submit(&self.res, keepalive, move |ovl, _keepalive| {
                 (*ovl).Anonymous.Anonymous.Offset = offset as u32;
                 (*ovl).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-                let ok = TransmitFile(sock, file_handle, count, 0, Some(ovl), None, 0);
+                let ok = TransmitFile(sock, file_handle, count, 0, Some(ovl), None, tf);
                 classify_wsa_overlapped(ok.as_bool())
             })
         };
@@ -554,8 +677,10 @@ impl TcpStream {
     pub fn transmit_packets(
         &self,
         packets: TransmitPackets,
+        flags: TransmitFlags,
     ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
         let sock = self.res.socket();
+        let tf = flags.to_bits();
         // Fetch the extension pointer and issue the op *synchronously*, so the
         // returned async block captures only the (Send) OpFuture — never the
         // non-Send HANDLEs, which are consumed here into the op block.
@@ -606,7 +731,7 @@ impl TcpStream {
                         p.array.len() as u32,
                         0,
                         ovl,
-                        0,
+                        tf,
                     );
                     classify_wsa_overlapped(ok.as_bool())
                 })
@@ -619,6 +744,85 @@ impl TcpStream {
             }
         }
     }
+
+    /// Transport-level disconnect via `DisconnectEx`. With `reuse = true`
+    /// (`TF_REUSE_SOCKET`) the handle is left ready for reuse without a fresh
+    /// `socket()` — by [`reconnect`](Self::reconnect) (client) or
+    /// [`into_reusable`](Self::into_reusable) + [`TcpListener::accept_into`]
+    /// (server).
+    ///
+    /// This is a **graceful** disconnect: the returned future resolves once the
+    /// close handshake completes — i.e. after the peer has also closed its side.
+    /// Use it on a *finished* connection (both ends done); if the peer keeps its
+    /// side open it will not complete promptly.
+    pub fn disconnect(
+        &self,
+        reuse: bool,
+    ) -> impl Future<Output = windows_core::Result<()>> + Send + use<> {
+        let sock = self.res.socket();
+        let started: windows_core::Result<OpFuture<()>> =
+            get_disconnectex(sock).map(|disconnect_ex| {
+                let flags = if reuse { TF_REUSE_SOCKET } else { 0 };
+                unsafe {
+                    submit(&self.res, (), move |ovl, _| {
+                        let ok = disconnect_ex(sock, ovl, flags, 0);
+                        classify_wsa_overlapped(ok.as_bool())
+                    })
+                }
+            });
+        async move {
+            match started {
+                Ok(fut) => fut.await.0.map(|_| ()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// Reuses this (disconnected, `TF_REUSE_SOCKET`-prepared) socket for a new
+    /// outbound connection to `addr` — a `ConnectEx` on the *same handle*, with
+    /// no fresh `socket()`/`bind()`/pool registration. Call after
+    /// `disconnect(true).await`.
+    pub async fn reconnect(&self, addr: SocketAddr) -> windows_core::Result<()> {
+        let sock = self.res.socket();
+        let connect_ex = get_connectex(sock)?;
+        let mut remote = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let remote_len = write_sockaddr(&addr, &mut remote);
+        let fut = unsafe {
+            submit(&self.res, (remote, remote_len), move |ovl, p| {
+                let mut sent = 0u32;
+                let ok = connect_ex(
+                    sock,
+                    &p.0 as *const _ as *const SOCKADDR,
+                    p.1,
+                    core::ptr::null(),
+                    0,
+                    &mut sent,
+                    ovl,
+                );
+                classify_wsa_overlapped(ok.as_bool())
+            })
+        };
+        fut.await.0?;
+        sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None) })?;
+        Ok(())
+    }
+
+    /// Consumes this stream, handing its socket (with its existing `IoRes`/TP_IO
+    /// retained) to [`TcpListener::accept_into`] for reuse. Call after
+    /// `disconnect(true).await` on a finished connection. Keeping the `IoRes`
+    /// avoids a completion-port re-association, which Windows forbids.
+    pub fn into_reusable(self) -> ReusableSocket {
+        ReusableSocket { res: self.res }
+    }
+}
+
+/// A finished TCP socket (disconnected with reuse via `DisconnectEx` +
+/// `TF_REUSE_SOCKET`) retaining its `IoRes`/TP_IO, ready to be recycled by
+/// [`TcpListener::accept_into`] without a new `socket()` or completion-port
+/// re-association. Dropped without reuse, it closes the socket normally (the
+/// `IoRes`'s own `Drop`).
+pub struct ReusableSocket {
+    res: Arc<IoRes>,
 }
 
 /// One element of a [`TransmitPackets`] sequence: an owned memory buffer, or a
@@ -1096,7 +1300,7 @@ mod tests {
             // Server streams the whole file over the socket, then half-closes.
             let server = rt.spawn(async move {
                 let stream = listener.accept().await.unwrap();
-                let n = stream.transmit_file(&file, 0, 0).await.unwrap();
+                let n = stream.transmit_file(&file, 0, 0, TransmitFlags::default()).await.unwrap();
                 stream.shutdown_send().unwrap();
                 n
             });
@@ -1146,7 +1350,7 @@ mod tests {
             let server = rt.spawn(async move {
                 let stream = listener.accept().await.unwrap();
                 let pk = TransmitPackets::new().bytes(hdr).file(&file, 0, 0);
-                let n = stream.transmit_packets(pk).await.unwrap();
+                let n = stream.transmit_packets(pk, TransmitFlags::default()).await.unwrap();
                 stream.shutdown_send().unwrap();
                 n
             });
@@ -1170,6 +1374,91 @@ mod tests {
         assert_eq!(got, expected, "scattered header+file bytes mismatch");
         assert_eq!(sent, expected.len());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disconnect_only_completes() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(5), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let s1 = listener.accept().await.unwrap();
+            // DisconnectEx is graceful: it completes once the peer has closed too,
+            // so close the server side first (the connection is finished).
+            drop(s1);
+            client.disconnect(true).await.unwrap();
+        }));
+        result.expect("disconnect alone timed out");
+    }
+
+    #[test]
+    fn disconnect_reconnect_client() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // First connection on a fresh client socket.
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let s1 = listener.accept().await.unwrap();
+            client.write(b"one".to_vec()).await.0.unwrap();
+            let (n, b) = s1.read(vec![0u8; 8]).await;
+            assert_eq!(&b[..n.unwrap()], b"one");
+
+            // Finish the connection (close the peer), then disconnect + reuse the
+            // SAME client handle and reconnect — no new socket()/bind()/register.
+            drop(s1);
+            client.disconnect(true).await.unwrap();
+            client.reconnect(addr).await.unwrap();
+
+            let s2 = listener.accept().await.unwrap();
+            client.write(b"two".to_vec()).await.0.unwrap();
+            let (n, b) = s2.read(vec![0u8; 8]).await;
+            assert_eq!(&b[..n.unwrap()], b"two");
+        }));
+        result.expect("disconnect/reconnect timed out");
+    }
+
+    #[test]
+    fn accept_into_server_reuse() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let c1 = TcpStream::connect(&rt, addr).await.unwrap();
+            let s1 = listener.accept().await.unwrap();
+            c1.write(b"a".to_vec()).await.0.unwrap();
+            let (n, b) = s1.read(vec![0u8; 4]).await;
+            assert_eq!(&b[..n.unwrap()], b"a");
+
+            // Finish the connection (close the client), then the server disconnects
+            // its accepted socket for reuse and hands it to the next accept instead
+            // of creating a new one.
+            drop(c1);
+            s1.disconnect(true).await.unwrap();
+            let reusable = s1.into_reusable();
+
+            let c2 = TcpStream::connect(&rt, addr).await.unwrap();
+            let s2 = listener.accept_into(reusable).await.unwrap();
+            c2.write(b"b".to_vec()).await.0.unwrap();
+            let (n, b) = s2.read(vec![0u8; 4]).await;
+            assert_eq!(&b[..n.unwrap()], b"b");
+        }));
+        result.expect("accept_into reuse timed out");
     }
 
     #[test]

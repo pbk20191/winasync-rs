@@ -55,7 +55,9 @@ pub use io::async_rw::{
 #[allow(unused_imports)]
 pub use io::file::{File, PageBuffers};
 #[allow(unused_imports)]
-pub use io::net::{TcpListener, TcpStream, TransmitPackets, UdpSocket};
+pub use io::net::{
+    ReusableSocket, TcpListener, TcpStream, TransmitFlags, TransmitPackets, UdpSocket,
+};
 #[allow(unused_imports)]
 pub use pool::{Pool, PoolBuilder, Priority, Scope};
 #[allow(unused_imports)]
