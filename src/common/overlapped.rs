@@ -35,6 +35,13 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 #[cfg(debug_assertions)]
 pub static LIVE_OPS: AtomicUsize = AtomicUsize::new(0);
 
+/// Ops finished inline because their handle had opted out of the completion
+/// packet (debug builds). Without this a skip-mode handle whose flag silently
+/// failed to take effect would behave identically — correct, just not faster —
+/// so tests assert this actually moves.
+#[cfg(debug_assertions)]
+pub static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+
 /// A handle registered with a pool's TP_IO; owns the kernel handle + TP_IO.
 pub struct IoReg {
     pub handle: HANDLE,
@@ -86,12 +93,12 @@ impl IoReg {
     /// thread hand-off, and the context switch all disappear; the issuing
     /// thread finishes the op itself.
     ///
-    /// The cost is a contract: from here on, *every* issue closure on this
-    /// handle must return [`Issue::DoneSync`] when its call reports immediate
-    /// success, or that op never completes. Enable it only on a handle whose
-    /// op set is entirely skip-aware, and only before any op is in flight —
-    /// an op issued before the mode is set and completing after it is still
-    /// delivered normally, but the race is not worth running.
+    /// Safe to enable on any handle registered here: issue closures report
+    /// [`Issue::SyncSuccess`] as a fact and [`submit`] applies this mode, so
+    /// there is no per-op contract to get wrong. Still enable it before
+    /// issuing ops rather than racing one in flight — an op issued before the
+    /// mode is set and completing after it is delivered normally, but there is
+    /// nothing to gain from the race.
     ///
     /// Also sets `FILE_SKIP_SET_EVENT_ON_HANDLE`, which is free here: this
     /// engine never waits on the handle's event.
@@ -128,22 +135,24 @@ impl Drop for IoReg {
     }
 }
 
-/// Outcome of issuing the overlapped call, as classified by the caller.
+/// What the overlapped call did, as observed by the issuer.
+///
+/// These are **facts about the call**, not decisions about what happens next.
+/// In particular an issuer never decides whether a completion packet is coming:
+/// that depends on whether the handle opted into
+/// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, which [`submit`] knows and the issue
+/// closure does not need to. Keeping the policy in one place is what makes the
+/// skip-completion mode safe to enable on any handle — an issuer that reports
+/// truthfully cannot get it wrong.
 pub enum Issue {
-    /// A completion callback will arrive (ERROR_IO_PENDING, or a synchronous
-    /// success on a handle that did **not** opt into
-    /// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` — such a success still queues a
-    /// packet).
+    /// The call completed **synchronously and successfully**. A completion
+    /// packet still follows unless the handle opted out of one.
+    SyncSuccess,
+    /// The call is in flight (`ERROR_IO_PENDING` / `WSA_IO_PENDING`); a
+    /// completion packet will arrive.
     Pending,
     /// Hard synchronous failure — no completion will arrive.
     Failed(windows_core::HRESULT),
-    /// Synchronous **success** on a handle that opted into
-    /// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` via
-    /// [`IoReg::set_skip_completion_on_success`]: the data is already
-    /// transferred and no packet is coming, so [`submit`] finishes the op
-    /// inline (reading the byte count back from the OVERLAPPED). Returning this
-    /// on a handle that did not opt in loses the real completion.
-    DoneSync,
 }
 
 /// How an op finished, handed to its completion callback.
@@ -299,14 +308,17 @@ pub unsafe fn submit<P>(
         let p = (*(*op).payload.get()).as_mut().unwrap();
         issue(&raw mut (*op).overlapped, p)
     };
-    // Both non-`Pending` outcomes mean "no completion packet is coming": the
-    // TP_IO must be unarmed and the op finished right here.
+    // Decide here — not in the issue closure — whether a completion packet is
+    // still coming. When none is, the TP_IO must be unarmed and the op
+    // finished inline.
     let inline = match outcome {
         Issue::Pending => None,
-        // Hand the exact HRESULT to the callback (no lossy win32 downgrade
-        // here; callers that want one do it themselves).
-        Issue::Failed(hr) => Some(Completion::SyncFail(hr)),
-        Issue::DoneSync => {
+        // A sync success on an ordinary handle still queues a packet; only a
+        // handle that opted out needs finishing here.
+        Issue::SyncSuccess if !reg.skips_completion_on_success() => None,
+        Issue::SyncSuccess => {
+            #[cfg(debug_assertions)]
+            INLINE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
             // The kernel wrote Internal/InternalHigh before returning, so the
             // transferred count is readable without waiting.
             let mut bytes = 0u32;
@@ -315,6 +327,9 @@ pub unsafe fn submit<P>(
             };
             Some(Completion::Done(0, if ok.is_ok() { bytes as usize } else { 0 }))
         }
+        // Hand the exact HRESULT to the callback (no lossy win32 downgrade
+        // here; callers that want one do it themselves).
+        Issue::Failed(hr) => Some(Completion::SyncFail(hr)),
     };
     if let Some(completion) = inline {
         unsafe {

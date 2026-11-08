@@ -408,8 +408,10 @@
 
     #[test]
     fn skip_completion_on_success_echoes_and_leaks_nothing() {
+        use crate::common::overlapped::INLINE_COMPLETIONS;
         let rt = Runtime::new();
         let before = super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed);
+        let inline_before = INLINE_COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed);
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
             let listener = TcpListener::bind(
                 &rt,
@@ -457,6 +459,13 @@
             assert_eq!(server.await.unwrap(), 16 * 8 + 4);
         }));
         result.expect("skip-completion echo timed out");
+        // Without this the test would pass just as well with the mode inert:
+        // waiting for a packet produces the same bytes, only slower.
+        let inlined = INLINE_COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed) - inline_before;
+        assert!(
+            inlined > 0,
+            "skip-completion mode never took the inline path — the flag is not in effect"
+        );
         drop(rt);
         for _ in 0..200 {
             if super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == before {

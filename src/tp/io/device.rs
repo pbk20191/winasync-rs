@@ -120,7 +120,7 @@ impl Device {
                     None,
                     Some(ovl),
                 ) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }

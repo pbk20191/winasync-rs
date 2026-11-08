@@ -330,7 +330,7 @@ mod tests {
         let sh = sreg.handle;
         let write_op = IoAsyncOp::<u32>::start_write(&sreg, wib.clone(), 2, move |ovl| {
             match unsafe { WriteFile(sh, Some(std::slice::from_raw_parts(wp, 2)), None, Some(ovl)) } {
-                Ok(()) => Issue::Pending,
+                Ok(()) => Issue::SyncSuccess,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                 Err(e) => Issue::Failed(e.code()),
             }
@@ -343,7 +343,7 @@ mod tests {
         let ch = creg.handle;
         let read_op = IoAsyncOp::start_read(&creg, rib.clone(), (), move |ovl| {
             match unsafe { ReadFile(ch, Some(std::slice::from_raw_parts_mut(rp, 2)), None, Some(ovl)) } {
-                Ok(()) => Issue::Pending,
+                Ok(()) => Issue::SyncSuccess,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                 Err(e) => Issue::Failed(e.code()),
             }

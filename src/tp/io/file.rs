@@ -227,7 +227,7 @@ impl File {
                 (*ovl).Anonymous.Anonymous.Offset = pos as u32;
                 (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
                 match ReadFile(handle, Some(&mut buf[..]), None, Some(ovl)) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -265,7 +265,7 @@ impl File {
                 (*ovl).Anonymous.Anonymous.Offset = pos as u32;
                 (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
                 match WriteFile(handle, Some(&buf[..]), None, Some(ovl)) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -301,7 +301,7 @@ impl File {
                     (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
                     p.build_segments();
                     match ReadFileScatter(handle, p.segments.as_ptr(), count, None, ovl) {
-                        Ok(()) => Issue::Pending,
+                        Ok(()) => Issue::SyncSuccess,
                         Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                         Err(e) => Issue::Failed(e.code()),
                     }
@@ -342,7 +342,7 @@ impl File {
                     (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
                     p.build_segments();
                     match WriteFileGather(handle, p.segments.as_ptr(), count, None, ovl) {
-                        Ok(()) => Issue::Pending,
+                        Ok(()) => Issue::SyncSuccess,
                         Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                         Err(e) => Issue::Failed(e.code()),
                     }

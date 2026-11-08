@@ -21,11 +21,12 @@ use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_core::{implement, ComObject, Ref, Result};
 use windows_future::{IAsyncOperation, IAsyncOperationWithProgress};
 
-/// Classifies a WinSock overlapped call's return the way `src/tp/io/net.rs`
-/// does: `r == 0` or `WSA_IO_PENDING` both mean "a completion is coming".
+/// Classifies a WinSock overlapped call's return: `r == 0` is a synchronous
+/// success, `WSA_IO_PENDING` means the op is in flight. Whether either one
+/// yields a completion packet is `submit`'s call, not this one's.
 fn classify_wsa(r: i32) -> Issue {
     if r == 0 {
-        return Issue::Pending;
+        return Issue::SyncSuccess;
     }
     let err = unsafe { WSAGetLastError() };
     if err == WSA_IO_PENDING {
@@ -121,7 +122,7 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
                     None,
                     Some(ovl),
                 ) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -159,7 +160,7 @@ impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
                     None,
                     Some(ovl),
                 ) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }

@@ -33,7 +33,7 @@ impl NamedPipeStream {
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 match ReadFile(handle, Some(&mut buf[..]), None, Some(ovl)) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -51,7 +51,7 @@ impl NamedPipeStream {
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 match WriteFile(handle, Some(&buf[..]), None, Some(ovl)) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -113,7 +113,7 @@ impl NamedPipeListener {
                 // the StartThreadpoolIo and delivers it synchronously; accept
                 // treats it as "connected" below.
                 match ConnectNamedPipe(h, Some(ovl)) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }

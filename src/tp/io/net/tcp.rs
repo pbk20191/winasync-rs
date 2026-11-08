@@ -242,7 +242,6 @@ impl TcpStream {
 
         let mut remote = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let remote_len = write_sockaddr(&addr, &mut remote);
-        let skip = stream.res.skips_completion_on_success();
         let fut = unsafe {
             submit(&stream.res, (remote, remote_len), move |ovl, p| {
                 let mut sent = 0u32;
@@ -255,7 +254,7 @@ impl TcpStream {
                     &mut sent,
                     ovl,
                 );
-                classify_wsa_skip(ok.as_bool(), skip)
+                classify_wsa_overlapped(ok.as_bool())
             })
         };
         let (result, _) = fut.await;
@@ -271,7 +270,6 @@ impl TcpStream {
         buf: Vec<u8>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
         let sock = self.res.socket();
-        let skip = self.res.skips_completion_on_success();
         let fut = unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
                 let wsabuf = WSABUF {
@@ -279,7 +277,7 @@ impl TcpStream {
                     buf: windows_core::PSTR(p.buf.as_mut_ptr()),
                 };
                 let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
-                classify_wsa_skip(r == 0, skip)
+                classify_wsa_overlapped(r == 0)
             })
         };
         async move {
@@ -294,7 +292,6 @@ impl TcpStream {
         buf: Vec<u8>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
         let sock = self.res.socket();
-        let skip = self.res.skips_completion_on_success();
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let wsabuf = WSABUF {
@@ -302,7 +299,7 @@ impl TcpStream {
                     buf: windows_core::PSTR(buf.as_mut_ptr()),
                 };
                 let r = WSASend(sock, &[wsabuf], None, 0, Some(ovl), None);
-                classify_wsa_skip(r == 0, skip)
+                classify_wsa_overlapped(r == 0)
             })
         };
         async move {
@@ -319,7 +316,6 @@ impl TcpStream {
         buf: Vec<u8>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
         let sock = self.res.socket();
-        let skip = self.res.skips_completion_on_success();
         let fut = unsafe {
             submit(
                 &self.res,
@@ -333,7 +329,7 @@ impl TcpStream {
                         buf: windows_core::PSTR(p.buf.as_mut_ptr()),
                     };
                     let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
-                    classify_wsa_skip(r == 0, skip)
+                    classify_wsa_overlapped(r == 0)
                 },
             )
         };
@@ -351,12 +347,11 @@ impl TcpStream {
         bufs: Vec<Vec<u8>>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
         let sock = self.res.socket();
-        let skip = self.res.skips_completion_on_success();
         let fut = unsafe {
             submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
                 p.fill();
                 let r = WSARecv(sock, &p.wsabufs, None, &mut p.flags, Some(ovl), None);
-                classify_wsa_skip(r == 0, skip)
+                classify_wsa_overlapped(r == 0)
             })
         };
         async move {
@@ -373,12 +368,11 @@ impl TcpStream {
         bufs: Vec<Vec<u8>>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
         let sock = self.res.socket();
-        let skip = self.res.skips_completion_on_success();
         let fut = unsafe {
             submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
                 p.fill();
                 let r = WSASend(sock, &p.wsabufs, None, 0, Some(ovl), None);
-                classify_wsa_skip(r == 0, skip)
+                classify_wsa_overlapped(r == 0)
             })
         };
         async move {
@@ -394,12 +388,8 @@ impl TcpStream {
     /// switch, which is where most of the per-op cost of a chatty connection
     /// sits.
     ///
-    /// Every `TcpStream` op (read, write, peek, the vectored pair,
-    /// `transmit_file`, `transmit_packets`, `disconnect`, `reconnect`) handles
-    /// the skipped packet, so the mode is safe to enable on a stream as a
-    /// whole. Enable it *before* issuing ops, and note that the mode belongs to
-    /// the socket handle: a stream recycled through `into_reusable` /
-    /// `accept_into` keeps it.
+    /// Enable it *before* issuing ops. The mode belongs to the socket handle,
+    /// so a stream recycled through `into_reusable` / `accept_into` keeps it.
     ///
     /// Semantics do not change — an op still resolves through its future, only
     /// sooner and possibly before the await yields.
@@ -449,7 +439,6 @@ impl TcpStream {
         let sock = self.res.socket();
         let file_handle = file.handle();
         let tf = flags.to_bits();
-        let skip = self.res.skips_completion_on_success();
         // Keep the file's IoRes (hence its HANDLE) alive for the op's lifetime.
         let keepalive = file.res_arc();
         let fut = unsafe {
@@ -457,7 +446,7 @@ impl TcpStream {
                 (*ovl).Anonymous.Anonymous.Offset = offset as u32;
                 (*ovl).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
                 let ok = TransmitFile(sock, file_handle, count, 0, Some(ovl), None, tf);
-                classify_wsa_skip(ok.as_bool(), skip)
+                classify_wsa_overlapped(ok.as_bool())
             })
         };
         async move {
@@ -477,7 +466,6 @@ impl TcpStream {
     ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
         let sock = self.res.socket();
         let tf = flags.to_bits();
-        let skip = self.res.skips_completion_on_success();
         // Fetch the extension pointer and issue the op *synchronously*, so the
         // returned async block captures only the (Send) OpFuture — never the
         // non-Send HANDLEs, which are consumed here into the op block.
@@ -530,7 +518,7 @@ impl TcpStream {
                         ovl,
                         tf,
                     );
-                    classify_wsa_skip(ok.as_bool(), skip)
+                    classify_wsa_overlapped(ok.as_bool())
                 })
             })
         })();
@@ -557,14 +545,13 @@ impl TcpStream {
         reuse: bool,
     ) -> impl Future<Output = windows_core::Result<()>> + Send + use<> {
         let sock = self.res.socket();
-        let skip = self.res.skips_completion_on_success();
         let started: windows_core::Result<OpFuture<()>> =
             get_disconnectex(sock).map(|disconnect_ex| {
                 let flags = if reuse { TF_REUSE_SOCKET } else { 0 };
                 unsafe {
                     submit(&self.res, (), move |ovl, _| {
                         let ok = disconnect_ex(sock, ovl, flags, 0);
-                        classify_wsa_skip(ok.as_bool(), skip)
+                        classify_wsa_overlapped(ok.as_bool())
                     })
                 }
             });
@@ -585,7 +572,6 @@ impl TcpStream {
         let connect_ex = get_connectex(sock)?;
         let mut remote = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let remote_len = write_sockaddr(&addr, &mut remote);
-        let skip = self.res.skips_completion_on_success();
         let fut = unsafe {
             submit(&self.res, (remote, remote_len), move |ovl, p| {
                 let mut sent = 0u32;
@@ -598,7 +584,7 @@ impl TcpStream {
                     &mut sent,
                     ovl,
                 );
-                classify_wsa_skip(ok.as_bool(), skip)
+                classify_wsa_overlapped(ok.as_bool())
             })
         };
         fut.await.0?;

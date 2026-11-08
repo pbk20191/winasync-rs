@@ -86,7 +86,7 @@ impl NamedPipeListener {
             // callers of `accept` see a single, ordinary "connected" outcome
             // regardless of which path produced it.
             match ConnectNamedPipe(handle, Some(ovl)) {
-                Ok(()) => Issue::Pending,
+                Ok(()) => Issue::SyncSuccess,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                 Err(e) => Issue::Failed(e.code()),
             }
@@ -160,7 +160,7 @@ pub(crate) fn arm_accept(
                 on_result(res);
             }),
             move |ovl| match ConnectNamedPipe(handle, Some(ovl)) {
-                Ok(()) => Issue::Pending,
+                Ok(()) => Issue::SyncSuccess,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                 Err(e) => Issue::Failed(e.code()),
             },
@@ -319,7 +319,7 @@ mod tests {
         let reg = IoReg::register(handle, false).unwrap();
         let server_stream = block_on(await_io(&reg, |ovl| unsafe {
             match ConnectNamedPipe(handle, Some(ovl)) {
-                Ok(()) => Issue::Pending,
+                Ok(()) => Issue::SyncSuccess,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                 Err(e) => Issue::Failed(e.code()),
             }

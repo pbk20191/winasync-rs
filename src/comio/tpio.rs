@@ -11,7 +11,8 @@ use std::sync::Arc;
 use windows::Win32::System::IO::OVERLAPPED;
 
 pub(crate) use crate::common::overlapped::Issue;
-#[cfg(debug_assertions)]
+// Leak counter reached by comio's tests as `tpio::LIVE_OPS`.
+#[allow(unused_imports)]
 pub(crate) use crate::common::overlapped::LIVE_OPS;
 
 /// A handle registered on the **default process pool** (`pcbe = NULL`). Newtype
@@ -105,7 +106,7 @@ mod tests {
         let _wop = unsafe {
             submit(&sreg, Box::new(move |ioresult, bytes| { let _ = &wbuf; tx.send((ioresult, bytes)).unwrap(); }), |ovl| {
                 match WriteFile(sreg.handle, Some(std::slice::from_raw_parts(wptr, 1)), None, Some(ovl)) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -121,7 +122,7 @@ mod tests {
         let _rop = unsafe {
             submit(&creg, Box::new(move |ioresult, bytes| { let _ = &rbuf2; tx2.send((ioresult, bytes)).unwrap(); }), |ovl| {
                 match ReadFile(creg.handle, Some(std::slice::from_raw_parts_mut(rptr, 1)), None, Some(ovl)) {
-                    Ok(()) => Issue::Pending,
+                    Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
@@ -156,7 +157,7 @@ mod tests {
             let rop = unsafe {
                 submit(&creg, Box::new(move |_ioresult, _bytes| { let _ = &rbuf; }), |ovl| {
                     match ReadFile(creg.handle, Some(std::slice::from_raw_parts_mut(rptr, 1)), None, Some(ovl)) {
-                        Ok(()) => Issue::Pending,
+                        Ok(()) => Issue::SyncSuccess,
                         Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                         Err(e) => Issue::Failed(e.code()),
                     }
