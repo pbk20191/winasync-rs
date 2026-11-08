@@ -471,6 +471,7 @@ mod tests {
     #[test]
     fn default_pool_pump_drives_a_roundtrip() {
         use super::super::cq::RioCq;
+        use std::time::Duration;
         let cq = RioCq::with_default_pool(64).expect("default-pool cq");
         let pool = RioBufferPool::new(512, 4).expect("pool");
         let rq = RqConfig {
@@ -487,12 +488,28 @@ mod tests {
         out.set_len(4);
         let tx = client.send(out).expect("post send");
 
-        assert_eq!(crate::common::block_on(tx).0.unwrap(), 4);
-        let (n, slice) = crate::common::block_on(rx);
-        assert_eq!(&slice[..n.unwrap()], b"dflt");
+        // `tp::timeout` is unavailable in an rio-only build and `block_on`
+        // parks on INFINITE, so a dead pump would hang the whole test binary
+        // with no named failure. Watchdog thread instead.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let sent = crate::common::block_on(tx).0;
+            let (n, slice) = crate::common::block_on(rx);
+            let bytes = n.as_ref().map(|&n| slice[..n].to_vec()).unwrap_or_default();
+            let _ = done_tx.send((sent, n, bytes));
+        });
+        let (sent, n, bytes) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("default-pool pump never dispatched");
+        assert_eq!(sent.unwrap(), 4);
+        assert_eq!(n.unwrap(), 4);
+        assert_eq!(bytes, b"dflt");
 
+        assert!(cq.pump_error().is_none(), "pump died: {:?}", cq.pump_error());
         drop(server);
         drop(client);
+        // Buffers come back only if the completions were dispatched.
+        assert_eq!(pool.available(), 4, "every slice returned to the pool");
         drop(cq);
     }
 

@@ -2,7 +2,7 @@
 //!
 //! RIO does not deliver completions; it accumulates them in a queue the
 //! application drains. The pump here turns that into the push model the rest
-//! of this crate uses, over the thread pool `tp` already owns:
+//! of this crate uses, over a Win32 thread pool — `tp`'s if it is enabled, the process default one otherwise:
 //!
 //! ```text
 //!   RIONotify(cq)                 arm one notification
@@ -31,7 +31,7 @@
 //! reads as four billion results.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Networking::WinSock::{
@@ -40,8 +40,8 @@ use windows::Win32::Networking::WinSock::{
     RIO_NOTIFICATION_COMPLETION_0_0, RIO_NOTIFICATION_COMPLETION_0_1,
 };
 use windows::Win32::System::Threading::{
-    CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait, SetThreadpoolWait,
-    WaitForThreadpoolWaitCallbacks, PTP_CALLBACK_INSTANCE, PTP_WAIT,
+    CallbackMayRunLong, CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait,
+    SetThreadpoolWait, WaitForThreadpoolWaitCallbacks, PTP_CALLBACK_INSTANCE, PTP_WAIT,
 };
 
 use super::buffer::RioSlice;
@@ -94,10 +94,10 @@ impl Request {
     }
 }
 
-/// The pool's callback environment installs a `FinalizationCallback` that
 /// The queue itself. Nothing here is specific to how it gets drained — the
-/// pool-driven pump's own state lives in [`PoolPump`], which is the only part
-/// that knows `tp` exists.
+/// pool-driven pump's own state lives in [`PoolPump`]. Only that struct's
+/// optional `RuntimeInner` anchor is `tp`-specific; the pump itself runs on
+/// either pool.
 struct CqState {
     cq: RIO_CQ,
     /// Whether a `RIONotify` is outstanding; `RIONotify` answers
@@ -108,6 +108,13 @@ struct CqState {
     /// Which mechanism delivers notifications; decides whether `RIONotify`
     /// applies at all and whether this crate owns a pump.
     mode: Mode,
+    /// Win32 error from whatever stopped the pump, or 0 while healthy.
+    ///
+    /// A pool-driven queue has no caller loop to return an error to, so a
+    /// failed re-arm or a corrupt queue would otherwise be invisible: every
+    /// outstanding and future operation just never completes. Recording it
+    /// gives [`RioCq::pump_error`] something to report.
+    pump_error: AtomicU32,
 }
 
 /// How a completion queue announces that it has results.
@@ -172,8 +179,10 @@ unsafe fn release_pump(ctx: *mut core::ffi::c_void) {
 /// Windows offers, because a RIO queue is rarely the only engine in a
 /// process:
 ///
-/// * [`new`](Self::new) — an event and a TP_WAIT on this crate's pool. The
-///   pump is ours; nothing else is required of the caller.
+/// * [`new`](Self::new) — an event and a TP_WAIT on `tp`'s configurable
+///   pool. The pump is ours; nothing else is required of the caller.
+/// * [`with_default_pool`](Self::with_default_pool) — the same pump on the
+///   process default pool, so no runtime from this crate is needed.
 /// * [`with_iocp`](Self::with_iocp) — **a completion port the caller owns**,
 ///   which may well belong to another library's runtime. RIO posts one packet
 ///   per notification carrying the caller's key and OVERLAPPED pointer; on
@@ -186,8 +195,10 @@ unsafe fn release_pump(ctx: *mut core::ffi::c_void) {
 /// * [`polling`](Self::polling) — no notification at all. The caller drains
 ///   on its own schedule, which is the lowest-latency and highest-CPU option.
 ///
-/// Only the first needs `tp`; the other three are plain Winsock and work with
-/// the `rio` feature alone.
+/// Only [`new`](Self::new) needs `tp`; the rest are plain Winsock and work
+/// with the `rio` feature alone. The two pool-driven modes own their
+/// consumer, so [`drain`](Self::drain), [`notify`](Self::notify) and
+/// [`resize`](Self::resize) are refused on them.
 pub struct RioCq {
     state: Arc<CqState>,
     /// The pump this queue owns, if any. Created and torn down as a unit.
@@ -246,6 +257,7 @@ impl RioCq {
             cq,
             armed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            pump_error: AtomicU32::new(0),
             mode: Mode::Pool,
         });
         let pump = Arc::new(PoolPump {
@@ -303,11 +315,13 @@ impl RioCq {
     /// # The cost of a shared pool
     ///
     /// That pool is shared with the CRT and with every other library in the
-    /// process, and a null callback environment cannot carry the
-    /// `LongFunction` flag that would warn the pool a callback may run long.
-    /// Each notification drains the queue until it is empty, so a sustained
-    /// flood of completions holds one default-pool thread for as long as it
-    /// lasts, and other users of that pool wait.
+    /// process. Each notification drains the queue until it is empty, so a
+    /// sustained flood of completions can hold a default-pool thread for as
+    /// long as it lasts. The pump calls `CallbackMayRunLong` on entry, which
+    /// asks the pool for a replacement thread immediately rather than after
+    /// its starvation detector fires, so other users of the pool are not
+    /// stalled behind a long drain — but the threads are still shared, and
+    /// this crate cannot size or prioritise them.
     ///
     /// With `tp` enabled, [`new`](Self::new) puts the same pump on a private
     /// pool whose environment can be configured. Under heavy load prefer that,
@@ -338,6 +352,7 @@ impl RioCq {
             cq,
             armed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            pump_error: AtomicU32::new(0),
             mode: Mode::DefaultPool,
         });
         let pump = Arc::new(PoolPump {
@@ -494,6 +509,7 @@ impl RioCq {
                 cq,
                 armed: AtomicBool::new(false),
                 closing: AtomicBool::new(false),
+                pump_error: AtomicU32::new(0),
                 mode,
             }),
             pump: Mutex::new(None),
@@ -507,11 +523,31 @@ impl RioCq {
     /// queue drains itself, and a second consumer would break RIO's
     /// single-consumer rule for `RIODequeueCompletion`.
     pub fn drain(&self) -> Option<usize> {
-        debug_assert!(
-            !matches!(self.state.mode, Mode::Pool | Mode::DefaultPool),
-            "a pool-driven queue already has a consumer"
-        );
+        if self.state.is_self_pumping() {
+            // Not a debug_assert: in release this would put two threads in
+            // RIODequeueCompletion on an unsynchronized queue, hand the same
+            // RequestContext to Box::from_raw twice, and double-free a
+            // Request along with the RioSlice it holds. Refuse instead.
+            return Some(0);
+        }
         drain(&self.state)
+    }
+
+    /// The error that stopped this queue's pump, if one did.
+    ///
+    /// Only a pool-driven queue can need this: the externally driven modes
+    /// return their errors from [`drain`](Self::drain) and
+    /// [`notify`](Self::notify) directly. A non-`None` result here means no
+    /// further completion will ever be dispatched, so every outstanding
+    /// future is dead — a condition that is otherwise indistinguishable from
+    /// a quiet network.
+    pub fn pump_error(&self) -> Option<windows_core::Error> {
+        match self.state.pump_error.load(Ordering::Acquire) {
+            0 => None,
+            code => Some(windows_core::Error::from_hresult(
+                windows::Win32::Foundation::WIN32_ERROR(code).to_hresult(),
+            )),
+        }
     }
 
     /// Arms the next notification (`RIONotify`).
@@ -519,7 +555,10 @@ impl RioCq {
     /// Call it after each [`drain`](Self::drain); RIO notifies once per arm.
     /// A no-op in polling mode, where there is nothing to arm.
     pub fn notify(&self) -> windows_core::Result<()> {
-        if self.state.mode == Mode::Polling {
+        // Nothing to arm when polling, and nothing for a caller to arm on a
+        // queue this crate pumps — re-arming under the pump would race its
+        // own RIONotify.
+        if self.state.mode == Mode::Polling || self.state.is_self_pumping() {
             return Ok(());
         }
         notify_state(&self.state)
@@ -532,6 +571,15 @@ impl RioCq {
     /// overflow — so grow this before growing a request queue, and shrink it
     /// only after.
     pub fn resize(&self, size: u32) -> windows_core::Result<()> {
+        if self.state.is_self_pumping() {
+            // Resizing reindexes the queue under whoever is dequeuing, and
+            // the pump may be mid-drain on another thread right now. Neither
+            // queue kind is internally synchronized, so refuse rather than
+            // corrupt.
+            return Err(windows_core::Error::from_hresult(
+                windows::Win32::Foundation::WIN32_ERROR(WSAEINVAL).to_hresult(),
+            ));
+        }
         let table = rio_table()?;
         let ok = unsafe { (table.raw().RIOResizeCompletionQueue.unwrap())(self.state.cq, size) };
         if ok.as_bool() {
@@ -543,6 +591,21 @@ impl RioCq {
 
     pub(crate) fn raw(&self) -> RIO_CQ {
         self.state.cq
+    }
+}
+
+impl CqState {
+    /// Whether this crate owns the pump, i.e. whether a caller touching the
+    /// queue directly would be a second consumer.
+    fn is_self_pumping(&self) -> bool {
+        matches!(self.mode, Mode::Pool | Mode::DefaultPool)
+    }
+
+    /// First error wins: later failures are consequences of the first.
+    fn record_pump_error(&self, code: u32) {
+        let _ = self
+            .pump_error
+            .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
@@ -562,6 +625,36 @@ fn create_cq(
         return Err(wsa_last_err());
     }
     Ok(cq)
+}
+
+/// Dispatches whatever is still in the queue before it is destroyed.
+///
+/// Sockets hold an `Arc<RioCq>`, so they close first and this runs moments
+/// later — while the `WSAECONNABORTED` completions their `closesocket` just
+/// produced are still arriving. Throwing the queue away without dequeuing
+/// them leaks every outstanding `Request`: its `RioSlice`, and through that
+/// the `Arc<RioBufferPool>`, so `RIODeregisterBuffer` never runs and the
+/// slab stays page-locked for the life of the process. The waiting
+/// `oneshot::Sender`s would never drop either, leaving any still-held
+/// receiver pending forever instead of resolving.
+///
+/// Bounded: the kernel queues those completions promptly, and a teardown is
+/// not a place to wait indefinitely for a peer.
+fn drain_before_close(state: &CqState) {
+    const MAX_IDLE_ROUNDS: u32 = 50;
+    let mut idle = 0;
+    while idle < MAX_IDLE_ROUNDS {
+        match drain(state) {
+            Some(0) => {
+                idle += 1;
+                std::thread::yield_now();
+            }
+            // Progress: keep going without counting against the budget.
+            Some(_) => idle = 0,
+            // Corrupt queue — nothing more can be dequeued from it.
+            None => return,
+        }
+    }
 }
 
 fn close_cq(cq: RIO_CQ) {
@@ -643,12 +736,28 @@ fn drain(state: &CqState) -> Option<usize> {
 
 /// TP_WAIT callback: one at a time, which is what keeps the single-consumer
 /// rule for `RIODequeueCompletion`.
+/// Clears [`IN_PUMP`] however the callback leaves, including by unwind.
+struct RestoreInPump;
+impl Drop for RestoreInPump {
+    fn drop(&mut self) {
+        IN_PUMP.with(|f| f.set(false));
+    }
+}
+
 unsafe extern "system" fn pump_callback(
-    _: PTP_CALLBACK_INSTANCE,
+    instance: PTP_CALLBACK_INSTANCE,
     ctx: *mut core::ffi::c_void,
     wait: PTP_WAIT,
     _wait_result: u32,
 ) {
+    // The drain runs until the queue is empty, which under a sustained
+    // producer is unbounded. Tell the pool so it can add a thread rather than
+    // waiting out its ~500ms starvation detector — this is per-callback and
+    // needs no callback environment, so it works on the default pool too.
+    // FALSE only means the pool already has a replacement thread ready.
+    let _ = unsafe { CallbackMayRunLong(instance) };
+    IN_PUMP.with(|f| f.set(true));
+    let _restore = RestoreInPump;
     // Borrow the context without consuming the reference the TP_WAIT holds.
     let pump = unsafe { Arc::from_raw(ctx as *const PoolPump) };
     let pump = core::mem::ManuallyDrop::new(pump);
@@ -660,12 +769,65 @@ unsafe extern "system" fn pump_callback(
     let drained = catch_unwind(AssertUnwindSafe(|| drain(state)));
     match drained {
         Ok(Some(_)) => {
-            let _ = arm(state, pump.event, wait);
+            // A failed re-arm is terminal for a pool-driven queue: nothing
+            // will notify again. Record it so the owner can see why its
+            // futures stopped resolving.
+            if let Err(e) = arm(state, pump.event, wait) {
+                state.record_pump_error(e.code().0 as u32);
+            }
         }
-        // Corrupt queue or a panic in the drain: stop pumping rather than
-        // spin. Outstanding requests will never complete, which is the
-        // honest outcome of a queue the provider says is unusable.
-        _ => {}
+        // The queue reported RIO_CORRUPT_CQ, the function table went away, or
+        // the drain panicked. Stop pumping rather than spin; outstanding
+        // requests will never complete, so say so rather than going quiet.
+        Ok(None) => state.record_pump_error(WSAECONNRESET),
+        Err(_) => state.record_pump_error(WSAECONNRESET),
+    }
+}
+
+/// Stand-in win32 code for "this queue is finished"; RIO reports corruption
+/// as a sentinel rather than an error code.
+const WSAECONNRESET: u32 = 10054;
+const WSAEINVAL: u32 = 10022;
+
+thread_local! {
+    /// Set while this thread is inside [`pump_callback`].
+    ///
+    /// A completion dispatched by the drain runs its waiter's waker inline,
+    /// and that waker may poll a task that drops the last socket — and with
+    /// it the last `Arc<RioCq>`. `Drop` would then wait for the very callback
+    /// it is running inside, which is the deadlock
+    /// `crate::tp` invariant 6 forbids. This flag lets teardown notice and
+    /// step aside instead.
+    static IN_PUMP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Teardown moved off the pump thread; see the `IN_PUMP` check in
+/// [`RioCq::drop`].
+struct Teardown {
+    pump: Pump,
+    cq: RIO_CQ,
+}
+
+// Every field is a kernel handle or a raw pointer this value now owns
+// exclusively.
+unsafe impl Send for Teardown {}
+
+impl Teardown {
+    fn run(self) {
+        unsafe {
+            SetThreadpoolWait(self.pump.wait, None, None);
+            WaitForThreadpoolWaitCallbacks(self.pump.wait, true);
+            SetThreadpoolWait(self.pump.wait, None, None);
+            WaitForThreadpoolWaitCallbacks(self.pump.wait, true);
+            CloseThreadpoolWait(self.pump.wait);
+        }
+        if let Some(ctx) = self.pump.ctx_to_release {
+            unsafe { drop(Arc::from_raw(ctx)) };
+        }
+        close_cq(self.cq);
+        unsafe {
+            let _ = CloseHandle(self.pump.event);
+        }
     }
 }
 
@@ -677,9 +839,24 @@ impl Drop for RioCq {
         let Some(pump) = pump else {
             // Externally driven: no pump of ours, and no context was handed
             // to a callback object.
+            drain_before_close(&self.state);
             close_cq(self.state.cq);
             return;
         };
+
+        if IN_PUMP.with(|f| f.get()) {
+            // We are *inside* this queue's own pump callback: a completion we
+            // just dispatched dropped the last owner. Waiting for the callback
+            // to finish would be waiting for ourselves, so hand the teardown
+            // to a thread that is not this one. The callback returns moments
+            // later and the wait there completes immediately.
+            let salvage = Teardown {
+                pump,
+                cq: self.state.cq,
+            };
+            std::thread::spawn(move || salvage.run());
+            return;
+        }
 
         unsafe {
             // Cancel the pending wait, then let any running callback finish.
@@ -700,6 +877,8 @@ impl Drop for RioCq {
         if let Some(ctx) = pump.ctx_to_release {
             unsafe { drop(Arc::from_raw(ctx)) };
         }
+
+        drain_before_close(&self.state);
 
         // Close the queue before the event it notifies through.
         close_cq(self.state.cq);
@@ -741,7 +920,7 @@ mod tests {
         // unique address for the queue's whole life.
         let tag: Box<OVERLAPPED> = Box::new(unsafe { core::mem::zeroed() });
         let tag_ptr = Box::into_raw(tag);
-        const RIO_KEY: usize = 0x5249_4F00; // 'RIO ' — any value the caller picks
+        const RIO_KEY: usize = 0x5249_4F00; // 'RIO' + 0 — any value the caller picks
 
         let cq = unsafe {
             RioCq::with_iocp(iocp, RIO_KEY, tag_ptr as *mut core::ffi::c_void, 64)

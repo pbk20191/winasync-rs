@@ -90,9 +90,10 @@ dq = [
 ]
 
 # Registered I/O (RIO) sub-engine: a separate completion engine beside the
-# overlapped/TP_IO core. Standalone — the queue can be driven by a caller's
-# own IOCP, event, or poll loop, none of which need a runtime from here.
-# Enabling `tp` as well adds the pool-driven pump and async accept/connect.
+# overlapped/TP_IO core. Standalone — it pumps itself on the process default
+# thread pool, or the queue can be driven by a caller's own IOCP, event or
+# poll loop. Enabling `tp` as well adds a pump on tp's configurable pool and
+# async accept/connect.
 rio = [
     "windows/Win32_Foundation",
     "windows/Win32_Security",

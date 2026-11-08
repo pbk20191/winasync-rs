@@ -42,15 +42,16 @@
 //!
 //! RIO is a submission engine, not a runtime: something else must notice the
 //! completion queue has results, and something else must perform the
-//! handshake. This module therefore depends on nothing but Winsock, and
-//! takes whichever of those two jobs the caller already has covered.
+//! handshake. This module therefore needs no runtime from this crate — only
+//! Winsock and the Win32 thread pool — and takes whichever of those two jobs
+//! the caller already has covered.
 //!
 //! With the `rio` feature alone:
 //!   * [`RioCq::with_default_pool`](cq::RioCq::with_default_pool) gives a
 //!     working pump out of the box, on the thread pool Windows gives every
 //!     process — no runtime from here, no drain loop to write. Its caveat is
-//!     that the pool is shared with everything else in the process and a null
-//!     callback environment cannot be marked `LongFunction`;
+//!     that those threads are shared with everything else in the process and
+//!     cannot be sized or prioritised from here;
 //!   * or the queue is driven by **the caller's** IOCP
 //!     ([`with_iocp`](cq::RioCq::with_iocp)), event
 //!     ([`with_event`](cq::RioCq::with_event)), or poll loop

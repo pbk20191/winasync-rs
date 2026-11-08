@@ -133,8 +133,16 @@ impl RequestQueue {
         })
     }
 
-    pub(crate) fn raw(&self) -> RIO_RQ {
-        *self.rq.lock().unwrap()
+    /// Locks the queue for the duration of one RIO call.
+    ///
+    /// The guard must be **held across** the call, not just across reading
+    /// the handle: `RIO_RQ` has no internal synchronization, so two threads
+    /// inside `RIOSend` on one queue corrupt its slot bookkeeping. Returning
+    /// a bare `RIO_RQ` here would drop the guard at the end of the caller's
+    /// `let`, leaving every operation unlocked while the docs promised
+    /// otherwise.
+    fn locked(&self) -> std::sync::MutexGuard<'_, RIO_RQ> {
+        self.rq.lock().unwrap()
     }
 
     /// Posts a plain send or receive.
@@ -166,12 +174,14 @@ impl RequestQueue {
         }
         .into_context();
 
-        let rq = self.raw();
-        let ok = unsafe {
-            if is_send {
-                (table.raw().RIOSend.unwrap())(rq, &buf, 1, flags, ctx)
-            } else {
-                (table.raw().RIOReceive.unwrap())(rq, &buf, 1, flags, ctx)
+        let ok = {
+            let rq = self.locked();
+            unsafe {
+                if is_send {
+                    (table.raw().RIOSend.unwrap())(*rq, &buf, 1, flags, ctx)
+                } else {
+                    (table.raw().RIOReceive.unwrap())(*rq, &buf, 1, flags, ctx)
+                }
             }
         };
         if !ok.as_bool() {
@@ -188,8 +198,10 @@ impl RequestQueue {
     /// first if it will not.
     pub(crate) fn resize(&self, max_recv: u32, max_send: u32) -> windows_core::Result<()> {
         let table = rio_table()?;
-        let rq = self.raw();
-        let ok = unsafe { (table.raw().RIOResizeRequestQueue.unwrap())(rq, max_recv, max_send) };
+        let ok = {
+            let rq = self.locked();
+            unsafe { (table.raw().RIOResizeRequestQueue.unwrap())(*rq, max_recv, max_send) }
+        };
         if ok.as_bool() {
             Ok(())
         } else {
@@ -200,15 +212,17 @@ impl RequestQueue {
     /// Dispatches everything queued with `RIO_MSG_DEFER`.
     pub(crate) fn commit_sends(&self) -> windows_core::Result<()> {
         let table = rio_table()?;
-        let rq = self.raw();
-        let ok = unsafe {
-            (table.raw().RIOSend.unwrap())(
-                rq,
-                core::ptr::null(),
-                0,
-                windows::Win32::Networking::WinSock::RIO_MSG_COMMIT_ONLY,
-                core::ptr::null(),
-            )
+        let ok = {
+            let rq = self.locked();
+            unsafe {
+                (table.raw().RIOSend.unwrap())(
+                    *rq,
+                    core::ptr::null(),
+                    0,
+                    windows::Win32::Networking::WinSock::RIO_MSG_COMMIT_ONLY,
+                    core::ptr::null(),
+                )
+            }
         };
         if ok.as_bool() {
             Ok(())
@@ -236,11 +250,12 @@ impl RequestQueue {
         }
         .into_context();
 
-        let rq = self.raw();
-        let ok = unsafe {
+        let ok = {
+            let rq = self.locked();
+            unsafe {
             if is_send {
                 (table.raw().RIOSendEx.unwrap())(
-                    rq,
+                    *rq,
                     data_buf,
                     1,
                     core::ptr::null(),
@@ -255,7 +270,7 @@ impl RequestQueue {
                 // RIOReceiveEx reports success as a non-zero INT rather than
                 // a BOOL, unlike its send counterpart.
                 (table.raw().RIOReceiveEx.unwrap())(
-                    rq,
+                    *rq,
                     data_buf,
                     1,
                     core::ptr::null(),
@@ -265,6 +280,7 @@ impl RequestQueue {
                     0,
                     ctx,
                 ) != 0
+            }
             }
         };
         if !ok {
