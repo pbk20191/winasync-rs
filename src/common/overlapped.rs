@@ -20,15 +20,16 @@ use std::any::Any;
 use std::cell::UnsafeCell;
 use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Networking::WinSock::{closesocket, SOCKET};
+use windows::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows::Win32::System::Threading::{
     CancelThreadpoolIo, CloseThreadpoolIo, CreateThreadpoolIo, StartThreadpoolIo,
     PTP_CALLBACK_INSTANCE, PTP_IO, TP_CALLBACK_ENVIRON_V3,
 };
-use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 /// Number of live op blocks (debug builds) — leak tests assert this settles to 0.
 #[cfg(debug_assertions)]
@@ -39,6 +40,10 @@ pub struct IoReg {
     pub handle: HANDLE,
     io: PTP_IO,
     is_socket: bool,
+    /// Set once [`set_skip_completion_on_success`](Self::set_skip_completion_on_success)
+    /// succeeds; read by issue closures to decide whether a synchronous success
+    /// still queues a completion packet.
+    skip_on_success: AtomicBool,
     /// Kept alive for the registration's lifetime (e.g. `tp`'s `RuntimeInner`
     /// so the pool outlives in-flight ops). `None` for the default pool.
     _keepalive: Option<Arc<dyn Any + Send + Sync>>,
@@ -62,6 +67,7 @@ impl IoReg {
             handle,
             io,
             is_socket,
+            skip_on_success: AtomicBool::new(false),
             _keepalive: keepalive,
         }))
     }
@@ -72,6 +78,36 @@ impl IoReg {
 
     pub fn is_socket(&self) -> bool {
         self.is_socket
+    }
+
+    /// Stops the kernel from queuing a completion packet when an op on this
+    /// handle completes **synchronously** — the hot path for a socket whose
+    /// data is already buffered, or a cached file read. The packet, its pool
+    /// thread hand-off, and the context switch all disappear; the issuing
+    /// thread finishes the op itself.
+    ///
+    /// The cost is a contract: from here on, *every* issue closure on this
+    /// handle must return [`Issue::DoneSync`] when its call reports immediate
+    /// success, or that op never completes. Enable it only on a handle whose
+    /// op set is entirely skip-aware, and only before any op is in flight —
+    /// an op issued before the mode is set and completing after it is still
+    /// delivered normally, but the race is not worth running.
+    ///
+    /// Also sets `FILE_SKIP_SET_EVENT_ON_HANDLE`, which is free here: this
+    /// engine never waits on the handle's event.
+    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
+        /// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE`
+        /// from winbase.h — not exposed by the `windows` crate.
+        const SKIP_FLAGS: u8 = 0x1 | 0x2;
+        unsafe { SetFileCompletionNotificationModes(self.handle, SKIP_FLAGS)? };
+        self.skip_on_success.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether [`set_skip_completion_on_success`](Self::set_skip_completion_on_success)
+    /// is in effect — issue closures branch on this.
+    pub fn skips_completion_on_success(&self) -> bool {
+        self.skip_on_success.load(Ordering::Acquire)
     }
 }
 
@@ -94,11 +130,20 @@ impl Drop for IoReg {
 
 /// Outcome of issuing the overlapped call, as classified by the caller.
 pub enum Issue {
-    /// A completion callback will arrive (sync success still queues one — we
-    /// never set FILE_SKIP_COMPLETION_PORT_ON_SUCCESS — or ERROR_IO_PENDING).
+    /// A completion callback will arrive (ERROR_IO_PENDING, or a synchronous
+    /// success on a handle that did **not** opt into
+    /// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` — such a success still queues a
+    /// packet).
     Pending,
     /// Hard synchronous failure — no completion will arrive.
     Failed(windows_core::HRESULT),
+    /// Synchronous **success** on a handle that opted into
+    /// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` via
+    /// [`IoReg::set_skip_completion_on_success`]: the data is already
+    /// transferred and no packet is coming, so [`submit`] finishes the op
+    /// inline (reading the byte count back from the OVERLAPPED). Returning this
+    /// on a handle that did not opt in loses the real completion.
+    DoneSync,
 }
 
 /// How an op finished, handed to its completion callback.
@@ -254,7 +299,24 @@ pub unsafe fn submit<P>(
         let p = (*(*op).payload.get()).as_mut().unwrap();
         issue(&raw mut (*op).overlapped, p)
     };
-    if let Issue::Failed(hr) = outcome {
+    // Both non-`Pending` outcomes mean "no completion packet is coming": the
+    // TP_IO must be unarmed and the op finished right here.
+    let inline = match outcome {
+        Issue::Pending => None,
+        // Hand the exact HRESULT to the callback (no lossy win32 downgrade
+        // here; callers that want one do it themselves).
+        Issue::Failed(hr) => Some(Completion::SyncFail(hr)),
+        Issue::DoneSync => {
+            // The kernel wrote Internal/InternalHigh before returning, so the
+            // transferred count is readable without waiting.
+            let mut bytes = 0u32;
+            let ok = unsafe {
+                GetOverlappedResult(reg.handle, &raw const (*op).overlapped, &mut bytes, false)
+            };
+            Some(Completion::Done(0, if ok.is_ok() { bytes as usize } else { 0 }))
+        }
+    };
+    if let Some(completion) = inline {
         unsafe {
             CancelThreadpoolIo(reg.io);
             let cb = {
@@ -263,9 +325,7 @@ pub unsafe fn submit<P>(
                 s.on_complete.take()
             };
             if let Some(cb) = cb {
-                // Hand the exact HRESULT to the callback (no lossy win32
-                // downgrade here; callers that want one do it themselves).
-                let _ = catch_unwind(AssertUnwindSafe(move || cb(Completion::SyncFail(hr))));
+                let _ = catch_unwind(AssertUnwindSafe(move || cb(completion)));
             }
             release_ref(op as *mut c_void);
         }

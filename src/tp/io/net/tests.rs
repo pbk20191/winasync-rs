@@ -407,6 +407,71 @@
     }
 
     #[test]
+    fn skip_completion_on_success_echoes_and_leaks_nothing() {
+        let rt = Runtime::new();
+        let before = super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed);
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = rt.spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                stream.set_skip_completion_on_success().unwrap();
+                let mut echoed = 0usize;
+                // Echo until the peer half-closes; several round trips, so the
+                // sync-success path (data already buffered) is the one
+                // actually taken most times.
+                loop {
+                    let (n, b) = stream.read(vec![0u8; 64]).await;
+                    let n = n.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    stream.write(b[..n].to_vec()).await.0.unwrap();
+                    echoed += n;
+                }
+                echoed
+            });
+
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            client.set_skip_completion_on_success().unwrap();
+            for i in 0..16u8 {
+                let msg = vec![i; 8];
+                client.write(msg.clone()).await.0.unwrap();
+                let (n, b) = client.read(vec![0u8; 64]).await;
+                assert_eq!(&b[..n.unwrap()], &msg[..]);
+            }
+            // Vectored and peek go through the same classifier.
+            client
+                .write_vectored(vec![b"ab".to_vec(), b"cd".to_vec()])
+                .await
+                .0
+                .unwrap();
+            let (n, b) = client.read(vec![0u8; 8]).await;
+            assert_eq!(&b[..n.unwrap()], b"abcd");
+
+            client.shutdown_send().unwrap();
+            assert_eq!(server.await.unwrap(), 16 * 8 + 4);
+        }));
+        result.expect("skip-completion echo timed out");
+        drop(rt);
+        for _ in 0..200 {
+            if super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "op blocks leaked on the skip-completion path"
+        );
+    }
+
+    #[test]
     fn accept_with_data_gets_first_segment() {
         let rt = Runtime::new();
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {

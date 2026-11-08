@@ -328,13 +328,27 @@ fn get_disconnectex(sock: SOCKET) -> windows_core::Result<DisconnectExFn> {
 
 pub(super) fn classify_wsa_overlapped(succeeded: bool) -> Issue {
     if succeeded {
-        // Synchronous success still queues a completion (we never set
-        // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS).
+        // Synchronous success still queues a completion on a handle that has
+        // not opted into FILE_SKIP_COMPLETION_PORT_ON_SUCCESS.
         Issue::Pending
     } else if unsafe { WSAGetLastError() } == WSA_IO_PENDING {
         Issue::Pending
     } else {
         Issue::Failed(wsa_last_hr())
+    }
+}
+
+/// [`classify_wsa_overlapped`] for a handle that may have opted into
+/// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`: there, a synchronous success queues
+/// no packet, so the op must be finished inline instead of awaited.
+///
+/// Every issue closure on such a handle must route through here — one that
+/// still reports `Pending` on a sync success hangs its op forever.
+pub(in crate::tp::io) fn classify_wsa_skip(succeeded: bool, skip: bool) -> Issue {
+    if succeeded && skip {
+        Issue::DoneSync
+    } else {
+        classify_wsa_overlapped(succeeded)
     }
 }
 
