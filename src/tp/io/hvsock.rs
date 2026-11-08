@@ -27,6 +27,9 @@ use windows::Win32::Networking::WinSock::{
     SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
 };
 
+// The whole addressing surface, re-exported so callers reach it as
+// `tp::io::hvsock::*` rather than through `common`.
+#[allow(unused_imports)]
 pub use crate::common::hvaddr::{
     vsock_service_id, HvSocketAddr, HVSOCKET_CONNECTED_SUSPEND, HVSOCKET_CONNECT_TIMEOUT,
     HVSOCKET_CONTAINER_PASSTHRU, HV_GUID_BROADCAST, HV_GUID_CHILDREN, HV_GUID_LOOPBACK,

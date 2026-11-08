@@ -7,6 +7,9 @@ pub mod task;
 pub mod timer;
 pub mod waker;
 
+// Re-exported as this runtime's public timer surface. Nothing in this bin
+// crate consumes them yet, hence the allow — they are API, not dead code.
+#[allow(unused_imports)]
 pub use timer::{interval, sleep, timeout, Elapsed, Interval, Sleep, Tick, Timeout};
 
 use std::cell::{Cell, RefCell};

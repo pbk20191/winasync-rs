@@ -1,5 +1,9 @@
 //! WinRT-native StreamSocketListener-shaped listener over comio transports.
 #![allow(dead_code)]
+// This whole file is a COM/WinRT surface: PascalCase members are the ABI
+// convention it is shaped to, not Rust naming slips. The `#[interface]` macro
+// rejects an attribute of its own, so the allow lives here.
+#![allow(non_snake_case)]
 
 use core::ffi::c_void;
 use std::collections::HashSet;
@@ -545,6 +549,13 @@ fn release_running(state: &Arc<ListenerState>) -> bool {
 /// Returns the first accept's synchronous error on a cold start so `BindAsync`
 /// can surface it (a malformed pipe name, an AF_UNIX bind/listen error, …); a
 /// re-arm continuation has nowhere to surface it and ignores it.
+// `acquired = true` below is dead *today* only because every path out of the
+// `try_arm` match either returns or resets it first. It stays because the
+// variable's meaning is "we own `running`", and a future `continue` added
+// after the acquisition would otherwise re-enter the CAS while already
+// holding it — a silent double-acquire. Keeping the invariant honest is worth
+// more than the warning.
+#[allow(unused_assignments)]
 fn drive(state: Arc<ListenerState>, mut acquired: bool) -> Result<()> {
     loop {
         if !acquired {

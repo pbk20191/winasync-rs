@@ -214,14 +214,15 @@ fn main() {
         // server.BindServiceNameWithProtectionLevelAndAdapterAsync()
         server.Close().unwrap();
     }
-    windows::Networking::Sockets::DatagramSocket::new;
+    // API-existence scratch (kept as notes, like the line below):
+    // windows::Networking::Sockets::DatagramSocket::new;
    // windows::Storage::FileIO::AppendLinesAsync;
-windows::Networking::Sockets::StreamSocketListener::new;
-    ThreadPool::RunAsync(&WorkItemHandler::new(move |x| {
+// windows::Networking::Sockets::StreamSocketListener::new;
+    ThreadPool::RunAsync(&WorkItemHandler::new(move |_x| {
 
         return Ok(());
     })).unwrap();
-    Pool::new().scope(|pool| {
+    Pool::new().scope(|_pool| {
    //   pool.0;
 
           ()

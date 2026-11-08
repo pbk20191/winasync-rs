@@ -6,7 +6,7 @@
 use super::net::{
     classify_wsa_overlapped, get_connectex, new_socket, sock_check, VectoredPayload, ADDR_SLOT,
 };
-use super::{submit, IoRes, Issue};
+use super::{submit, IoRes};
 use crate::tp::{Runtime, RuntimeInner};
 use core::ffi::c_void;
 use std::mem;

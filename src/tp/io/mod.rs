@@ -25,7 +25,8 @@ use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::System::IO::OVERLAPPED;
 
 pub(crate) use crate::common::overlapped::Issue;
-#[cfg(debug_assertions)]
+// Leak counter reached by tests as `super::super::LIVE_OPS`.
+#[allow(unused_imports)]
 pub(crate) use crate::common::overlapped::LIVE_OPS;
 
 /// A handle registered with the runtime's pool, plus the typed runtime so
