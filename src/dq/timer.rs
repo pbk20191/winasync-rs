@@ -205,6 +205,43 @@ impl Drop for Sleep {
     }
 }
 
+/// Error returned by [`timeout`] when the deadline passes first.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Elapsed;
+
+/// Future returned by [`timeout`].
+pub struct Timeout<F> {
+    fut: F,
+    sleep: Sleep,
+}
+
+impl<F: Future> Future for Timeout<F> {
+    type Output = Result<F::Output, Elapsed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Structural pinning of `fut`; `sleep` is Unpin (no self-references).
+        let this = unsafe { self.get_unchecked_mut() };
+        if let Poll::Ready(v) = unsafe { Pin::new_unchecked(&mut this.fut) }.poll(cx) {
+            return Poll::Ready(Ok(v));
+        }
+        match Pin::new(&mut this.sleep).poll(cx) {
+            // Dropping `Timeout` afterwards drops `fut`, cancelling any pending
+            // work it owns.
+            Poll::Ready(()) => Poll::Ready(Err(Elapsed)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Awaits `fut` for at most `dur`; on expiry resolves to `Err(Elapsed)`. Must
+/// be called (and awaited) on a thread running a `DispatcherRuntime`.
+pub fn timeout<F: Future>(dur: Duration, fut: F) -> Timeout<F> {
+    Timeout {
+        fut,
+        sleep: sleep(dur),
+    }
+}
+
 /// A periodic timer. Each [`tick`][Interval::tick] resolves on the next
 /// firing; missed firings are not lost (they accumulate as pending ticks).
 pub struct Interval {
@@ -295,6 +332,20 @@ mod tests {
         });
         assert!(elapsed >= Duration::from_millis(50), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn timeout_both_arms() {
+        crate::dq::ensure_sdk();
+        let _g = crate::dq::dq_test_guard();
+        DispatcherRuntime::run(async {
+            // Slow future loses to a short deadline.
+            let slow = sleep(Duration::from_millis(200));
+            assert_eq!(timeout(Duration::from_millis(50), slow).await, Err(Elapsed));
+            // Fast future beats a long deadline.
+            let fast = sleep(Duration::from_millis(20));
+            assert_eq!(timeout(Duration::from_millis(500), fast).await, Ok(()));
+        });
     }
 
     /// Dropping a `Sleep` before it ever fires must not panic or hang a

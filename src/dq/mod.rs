@@ -7,7 +7,7 @@ pub mod task;
 pub mod timer;
 pub mod waker;
 
-pub use timer::{interval, sleep, Interval, Sleep, Tick};
+pub use timer::{interval, sleep, timeout, Elapsed, Interval, Sleep, Tick, Timeout};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
