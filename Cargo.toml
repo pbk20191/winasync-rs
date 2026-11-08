@@ -100,6 +100,7 @@ rio = [
     "windows/Win32_Networking_WinSock",
     "windows/Win32_System_IO",
     "windows/Win32_System_Memory",
+    "windows/Win32_System_SystemInformation",
 ]
 
 # tp's optional futures-io interop (AsyncRead/AsyncWrite <-> futures_io).

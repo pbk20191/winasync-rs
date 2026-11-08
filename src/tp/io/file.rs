@@ -3,10 +3,10 @@
 //! the op block so cancellation can hand it to the completion callback).
 
 use super::{submit, IoRes, Issue, OpFuture};
-use crate::common::buffer::{IoBuf, IoBufMut};
+use crate::common::buffer::{page_size, IoBuf, IoBufMut, Region};
 use crate::tp::Runtime;
 use core::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use windows::Win32::Foundation::{
     ERROR_HANDLE_EOF, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE,
 };
@@ -15,48 +15,25 @@ use windows::Win32::Storage::FileSystem::{
     FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_NO_BUFFERING,
     FILE_FLAG_OVERLAPPED, FILE_SEGMENT_ELEMENT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-};
-use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
-/// The system memory page size (cached), as required for the page-aligned
-/// buffers of `ReadFileScatter`/`WriteFileGather`.
-fn page_size() -> usize {
-    static PS: OnceLock<usize> = OnceLock::new();
-    *PS.get_or_init(|| {
-        let mut si = SYSTEM_INFO::default();
-        unsafe { GetSystemInfo(&mut si) };
-        si.dwPageSize as usize
-    })
-}
 
 /// A set of `pages` page-sized, page-aligned buffers (one `VirtualAlloc`
 /// region), for the scatter/gather file IO. Each page becomes one
 /// `FILE_SEGMENT_ELEMENT`. The whole region is addressable as one contiguous
 /// byte slice for filling/inspecting.
 pub struct PageBuffers {
-    ptr: *mut u8,
+    region: Region,
     pages: usize,
     page_size: usize,
 }
-
-// The pointer is a private, owned VirtualAlloc region; moving it is sound.
-unsafe impl Send for PageBuffers {}
 
 impl PageBuffers {
     /// Allocates `pages` page-aligned pages (must be >= 1).
     pub fn new(pages: usize) -> windows_core::Result<Self> {
         let pages = pages.max(1);
         let page_size = page_size();
-        let ptr = unsafe {
-            VirtualAlloc(None, pages * page_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-        };
-        if ptr.is_null() {
-            return Err(windows_core::Error::from_thread());
-        }
         Ok(Self {
-            ptr: ptr as *mut u8,
+            region: Region::new(pages * page_size)?,
             pages,
             page_size,
         })
@@ -84,20 +61,36 @@ impl PageBuffers {
 
     /// The region as one contiguous byte slice.
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len()) }
+        unsafe { std::slice::from_raw_parts(self.region.base(), self.len()) }
     }
 
     /// The region as one contiguous mutable byte slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len()) }
+        unsafe { std::slice::from_raw_parts_mut(self.region.base(), self.len()) }
     }
 }
 
-impl Drop for PageBuffers {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = VirtualFree(self.ptr as *mut c_void, 0, MEM_RELEASE);
-        }
+// The region is contiguous and its address never moves, so these buffers are
+// an ordinary owned IO buffer as well — usable with `read_at`/`write_at`, not
+// only with scatter/gather.
+//
+// Scatter/gather deliberately keeps taking `PageBuffers` rather than any
+// `IoBufMut`: it needs each segment to be exactly one page, and this type
+// *proves* that where a generic buffer could only be checked at run time.
+// Unbuffered IO answers a misaligned buffer with ERROR_INVALID_PARAMETER, so
+// the guarantee is worth more than the uniformity.
+unsafe impl IoBuf for PageBuffers {
+    fn stable_ptr(&self) -> *const u8 {
+        self.region.base()
+    }
+    fn len(&self) -> usize {
+        PageBuffers::len(self)
+    }
+}
+
+unsafe impl IoBufMut for PageBuffers {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.region.base()
     }
 }
 
@@ -116,7 +109,7 @@ impl VectorPayload {
         self.segments.clear();
         for i in 0..self.buffers.pages {
             self.segments.push(FILE_SEGMENT_ELEMENT {
-                Buffer: unsafe { self.buffers.ptr.add(i * self.buffers.page_size) } as *mut c_void,
+                Buffer: unsafe { self.buffers.region.base().add(i * self.buffers.page_size) } as *mut c_void,
             });
         }
         // NULL-terminator element.
@@ -387,6 +380,34 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("tp_io_test_{}_{name}", std::process::id()));
         p.to_string_lossy().into_owned()
+    }
+
+    /// `PageBuffers` is now an ordinary owned IO buffer as well, so the same
+    /// pages serve a buffered `read_at`/`write_at` and an unbuffered
+    /// scatter/gather — one allocation, either path.
+    #[test]
+    fn page_buffers_work_as_a_plain_io_buffer() {
+        let path = temp_path("pagebuf_plain.bin");
+        let rt = Runtime::new();
+        block_on(async {
+            let f = File::create(&rt, &path).unwrap();
+            let mut out = PageBuffers::new(1).unwrap();
+            let n = out.len();
+            out.as_mut_slice()[..5].copy_from_slice(b"pages");
+
+            // Straight through the generic write path, no Vec involved.
+            let (written, out) = f.write_at(out, 0).await;
+            assert_eq!(written.unwrap(), n);
+
+            let back = PageBuffers::new(1).unwrap();
+            let (read, back) = f.read_at(back, 0).await;
+            assert_eq!(read.unwrap(), n);
+            assert_eq!(&back.as_slice()[..5], b"pages");
+            // And it is still the scatter/gather type it always was.
+            assert_eq!(back.pages(), 1);
+            assert_eq!(out.pages(), 1);
+        });
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The socket side of skip-completion is covered in `net::tests`; this is
