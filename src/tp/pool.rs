@@ -54,7 +54,9 @@ unsafe extern "system" fn finalize_ctx(_: PTP_CALLBACK_INSTANCE, ctx: *mut c_voi
     if ctx.is_null() {
         return;
     }
-    unsafe { ((*(ctx as *const CtxHeader)).release)(ctx) }
+    // Sound only because every context handed to one of our TP objects is
+    // repr(C) with a CtxHeader first — the contract CtxHeader::new states.
+    unsafe { (*(ctx as *const CtxHeader)).release(ctx) }
 }
 
 #[cfg(debug_assertions)]
@@ -203,9 +205,7 @@ pub(crate) unsafe fn try_submit<F: FnOnce() + Send>(
     f: F,
 ) {
     let ctx = Box::into_raw(Box::new(SimpleCtx {
-        header: CtxHeader {
-            release: release_simple::<F>,
-        },
+        header: unsafe { CtxHeader::new(release_simple::<F>) },
         f: Some(f),
     }));
     unsafe {

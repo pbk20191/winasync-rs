@@ -31,7 +31,7 @@
 //! reads as four billion results.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Networking::WinSock::{
@@ -166,8 +166,18 @@ unsafe impl Sync for PoolPump {}
 /// The single release path for a pump context, run by the environment's
 /// finalization callback when the TP_WAIT is closed.
 unsafe fn release_pump(ctx: *mut core::ffi::c_void) {
+    #[cfg(debug_assertions)]
+    PUMP_RELEASES.fetch_add(1, Ordering::Relaxed);
     unsafe { drop(Arc::from_raw(ctx as *const PoolPump)) }
 }
+
+/// Pump contexts released, by either path (debug builds).
+///
+/// Exists to pin down *when* the environment's finalization callback runs:
+/// `Drop`'s correctness argument assumes `CloseThreadpoolWait` has already
+/// released the context by the time it returns.
+#[cfg(debug_assertions)]
+pub(crate) static PUMP_RELEASES: AtomicUsize = AtomicUsize::new(0);
 
 /// A RIO completion queue.
 ///
@@ -320,9 +330,7 @@ impl RioCq {
             mode: Mode::Pump,
         });
         let pump = Arc::new(PoolPump {
-            header: CtxHeader {
-                release: release_pump,
-            },
+            header: unsafe { CtxHeader::new(release_pump) },
             state: state.clone(),
             event,
             _keepalive: keepalive,
@@ -834,10 +842,12 @@ impl Drop for RioCq {
             CloseThreadpoolWait(pump.wait);
         }
 
-        // On `tp`'s pool the close above ran the environment's finalization
-        // callback, which released the context. The default pool has no such
-        // callback, so the reference is ours to drop — and only now, with
-        // every callback provably finished.
+        // On an environment with a finalization callback the close above
+        // already released the context — measured, not assumed: see
+        // `finalization_timing::close_threadpool_wait_releases_the_context_before_returning`,
+        // which fails loudly if that ever becomes deferred. A null
+        // environment has no such callback, so the reference is ours to drop,
+        // and only now, with every callback provably finished.
         if let Some(ctx) = pump.ctx_to_release {
             unsafe { drop(Arc::from_raw(ctx)) };
         }
@@ -953,5 +963,46 @@ mod tests {
     /// dispatched by the drain above, so no executor is involved.
     fn block_on_ready<F: Future>(fut: F) -> F::Output {
         crate::common::block_on(fut)
+    }
+}
+
+#[cfg(all(test, feature = "tp", debug_assertions))]
+mod finalization_timing {
+    use super::*;
+    use crate::tp::Runtime;
+
+    /// Is the context released by the time `CloseThreadpoolWait` returns?
+    ///
+    /// `Drop` assumes so. If it were deferred, the `tp`-environment path
+    /// would release the pump — and whatever keepalive it holds — later, on a
+    /// pool thread, which is how a pool ends up being torn down from inside
+    /// itself.
+    #[test]
+    fn close_threadpool_wait_releases_the_context_before_returning() {
+        let rt = Runtime::new();
+        let before = PUMP_RELEASES.load(Ordering::Relaxed);
+        let cq = RioCq::new(&rt, 64).expect("cq");
+        drop(cq);
+        let immediately = PUMP_RELEASES.load(Ordering::Relaxed);
+
+        // Give a deferred release every chance, so a failure here says
+        // "deferred", not "slow".
+        let mut eventually = immediately;
+        for _ in 0..200 {
+            if eventually > before {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            eventually = PUMP_RELEASES.load(Ordering::Relaxed);
+        }
+
+        assert!(
+            eventually > before,
+            "the pump context was never released at all"
+        );
+        assert_eq!(
+            immediately, eventually,
+            "finalization is DEFERRED: the context outlived CloseThreadpoolWait,              so Drop must not assume the keepalive is already gone"
+        );
     }
 }

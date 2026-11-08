@@ -262,9 +262,7 @@ where
     F::Output: Send + 'static,
 {
     let core = Arc::new(TaskCore {
-        header: CtxHeader {
-            release: release_task::<F>,
-        },
+        header: unsafe { CtxHeader::new(release_task::<F>) },
         // Starting in SCHEDULED matches the initial submission below and
         // keeps every waker transition uniform.
         state: AtomicU8::new(SCHEDULED),

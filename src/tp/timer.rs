@@ -75,9 +75,7 @@ unsafe impl Sync for RawTimer {}
 impl RawTimer {
     fn new(rt: &Runtime, due: Duration, period_ms: u32) -> Self {
         let shared = Arc::new(TimerShared {
-            header: CtxHeader {
-                release: release_timer,
-            },
+            header: unsafe { CtxHeader::new(release_timer) },
             state: Mutex::new(TimerState {
                 ticks: 0,
                 waker: None,

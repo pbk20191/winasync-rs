@@ -92,9 +92,7 @@ impl Drop for HandleWait {
 /// returned future completes or is dropped.
 pub unsafe fn wait_for_handle(rt: &Runtime, handle: HANDLE) -> HandleWait {
     let shared = Arc::new(WaitShared {
-        header: CtxHeader {
-            release: release_wait,
-        },
+        header: unsafe { CtxHeader::new(release_wait) },
         state: Mutex::new(WaitState {
             result: None,
             waker: None,
