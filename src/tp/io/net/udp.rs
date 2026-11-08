@@ -26,6 +26,23 @@ struct SendToPayload {
 
 unsafe impl Send for SendToPayload {}
 
+/// Vectored counterpart of [`RecvFromPayload`]: the shared buffer/`WSABUF` pair
+/// plus the source-address slot the provider fills.
+struct VectoredFromPayload {
+    v: VectoredPayload,
+    from: SOCKADDR_STORAGE,
+    from_len: i32,
+}
+unsafe impl Send for VectoredFromPayload {}
+
+/// Vectored counterpart of [`SendToPayload`].
+struct VectoredToPayload {
+    v: VectoredPayload,
+    to: SOCKADDR_STORAGE,
+    to_len: i32,
+}
+unsafe impl Send for VectoredToPayload {}
+
 /// A bound UDP socket on a [`Runtime`]'s pool. Supports connectionless
 /// `send_to`/`recv_from` over IPv4 or IPv6.
 pub struct UdpSocket {
@@ -138,6 +155,89 @@ impl UdpSocket {
                 Err(e) => Err(e),
             };
             (out, payload.buf)
+        }
+    }
+
+    /// Scatter-receives one datagram into `bufs` with a vectored `WSARecvFrom`;
+    /// resolves to the byte count plus the source address, and hands the buffers
+    /// back. Truncation still fails with `WSAEMSGSIZE`.
+    pub fn recv_from_vectored(
+        &self,
+        bufs: Vec<Vec<u8>>,
+    ) -> impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, Vec<Vec<u8>>)> + Send + use<>
+    {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(
+                &self.res,
+                VectoredFromPayload {
+                    v: VectoredPayload::new(bufs),
+                    from: mem::zeroed::<SOCKADDR_STORAGE>(),
+                    from_len: size_of::<SOCKADDR_STORAGE>() as i32,
+                },
+                move |ovl, p| {
+                    p.v.fill();
+                    let r = WSARecvFrom(
+                        sock,
+                        &p.v.wsabufs,
+                        None,
+                        &mut p.v.flags,
+                        Some(&mut p.from as *mut _ as *mut SOCKADDR),
+                        Some(&mut p.from_len),
+                        Some(ovl),
+                        None,
+                    );
+                    classify_wsa_overlapped(r == 0)
+                },
+            )
+        };
+        async move {
+            let (result, payload) = fut.await;
+            let out = match result {
+                Ok(n) => read_sockaddr(&payload.from).map(|addr| (n, addr)),
+                Err(e) => Err(e),
+            };
+            (out, payload.v.bufs)
+        }
+    }
+
+    /// Gather-sends `bufs` as **one** datagram to `addr` with a vectored
+    /// `WSASendTo`; resolves to the byte count and hands the buffers back.
+    pub fn send_to_vectored(
+        &self,
+        bufs: Vec<Vec<u8>>,
+        addr: SocketAddr,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        let sock = self.res.socket();
+        let mut to = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let to_len = write_sockaddr(&addr, &mut to);
+        let fut = unsafe {
+            submit(
+                &self.res,
+                VectoredToPayload {
+                    v: VectoredPayload::new(bufs),
+                    to,
+                    to_len,
+                },
+                move |ovl, p| {
+                    p.v.fill();
+                    let r = WSASendTo(
+                        sock,
+                        &p.v.wsabufs,
+                        None,
+                        0,
+                        Some(&p.to as *const _ as *const SOCKADDR),
+                        p.to_len,
+                        Some(ovl),
+                        None,
+                    );
+                    classify_wsa_overlapped(r == 0)
+                },
+            )
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.v.bufs)
         }
     }
 

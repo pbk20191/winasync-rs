@@ -407,6 +407,46 @@
     }
 
     #[test]
+    fn udp_vectored_roundtrip() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client_port = client.local_addr().unwrap().port();
+
+            // Three buffers gather into ONE datagram...
+            let (w, _) = client
+                .send_to_vectored(
+                    vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()],
+                    server_addr,
+                )
+                .await;
+            assert_eq!(w.unwrap(), 6);
+
+            // ...and scatter into two on receive.
+            let (r, bufs) = server.recv_from_vectored(vec![vec![0u8; 3], vec![0u8; 8]]).await;
+            let (n, from) = r.unwrap();
+            let mut got = Vec::new();
+            for b in &bufs {
+                got.extend_from_slice(b);
+            }
+            got.truncate(n);
+            assert_eq!(got, b"abcdef");
+            assert_eq!(from.port(), client_port);
+        }));
+        result.expect("udp vectored roundtrip timed out");
+    }
+
+    #[test]
     fn tcp_peek_does_not_consume() {
         let rt = Runtime::new();
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
