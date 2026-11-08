@@ -12,16 +12,18 @@
 //! non-zero flow labels crossing to a differing stack would be affected.
 
 use super::file::File;
-use super::{submit, IoRes, Issue, OpFuture};
+use super::{submit, IoRes, OpFuture};
 use crate::tp::{Runtime, RuntimeInner};
+pub(crate) use crate::common::winsock::{
+    classify_wsa_overlapped, sock_check, wsa_init, wsa_last_err,
+};
 use core::ffi::c_void;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, OnceLock};
 use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, connect, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx,
-    WSAGetLastError, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW, WSAStartup,
+    bind, closesocket, connect, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW,
     ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
     IPPROTO, IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, SD_SEND, SIO_GET_EXTENSION_FUNCTION_POINTER,
     SOCKADDR,
@@ -29,37 +31,13 @@ use windows::Win32::Networking::WinSock::{
     SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TF_DISCONNECT,
     TF_REUSE_SOCKET, TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT,
     TRANSMIT_PACKETS_ELEMENT_0, TRANSMIT_PACKETS_ELEMENT_0_0, TransmitFile, WINSOCK_SOCKET_TYPE,
-    WSABUF, WSADATA, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAID_TRANSMITPACKETS,
-    WSAID_WSARECVMSG, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING, CMSGHDR, IN_PKTINFO, IPPROTO_IP,
+    WSABUF, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAID_TRANSMITPACKETS,
+    WSAID_WSARECVMSG, WSA_FLAG_OVERLAPPED, CMSGHDR, IN_PKTINFO, IPPROTO_IP,
     IP_PKTINFO, LPWSAOVERLAPPED_COMPLETION_ROUTINE, WSAMSG, WSASendMsg,
 };
 
 /// Process-wide Winsock initialization; never torn down (`WSACleanup` is
 /// deliberately not called).
-pub fn wsa_init() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| unsafe {
-        let mut data = WSADATA::default();
-        let r = WSAStartup(0x0202, &mut data);
-        assert_eq!(r, 0, "WSAStartup failed: {r}");
-    });
-}
-
-fn wsa_last_hr() -> windows_core::HRESULT {
-    WIN32_ERROR(unsafe { WSAGetLastError() }.0 as u32).to_hresult()
-}
-
-fn wsa_last_err() -> windows_core::Error {
-    windows_core::Error::from_hresult(wsa_last_hr())
-}
-
-pub(super) fn sock_check(r: i32) -> windows_core::Result<()> {
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(wsa_last_err())
-    }
-}
 
 /// Creates an overlapped socket of the given family/type/protocol. `WSASocketW`
 /// is wrapped by the `windows` crate to map `INVALID_SOCKET` to an `Err`.
@@ -326,31 +304,6 @@ fn get_disconnectex(sock: SOCKET) -> windows_core::Result<DisconnectExFn> {
     Ok(f)
 }
 
-pub(super) fn classify_wsa_overlapped(succeeded: bool) -> Issue {
-    if succeeded {
-        // Synchronous success still queues a completion on a handle that has
-        // not opted into FILE_SKIP_COMPLETION_PORT_ON_SUCCESS.
-        Issue::Pending
-    } else if unsafe { WSAGetLastError() } == WSA_IO_PENDING {
-        Issue::Pending
-    } else {
-        Issue::Failed(wsa_last_hr())
-    }
-}
-
-/// [`classify_wsa_overlapped`] for a handle that may have opted into
-/// `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`: there, a synchronous success queues
-/// no packet, so the op must be finished inline instead of awaited.
-///
-/// Every issue closure on such a handle must route through here — one that
-/// still reports `Pending` on a sync success hangs its op forever.
-pub(in crate::tp::io) fn classify_wsa_skip(succeeded: bool, skip: bool) -> Issue {
-    if succeeded && skip {
-        Issue::DoneSync
-    } else {
-        classify_wsa_overlapped(succeeded)
-    }
-}
 
 /// AcceptEx address slot: sockaddr size + 16 bytes, per the API contract.
 pub(super) const ADDR_SLOT: usize = size_of::<SOCKADDR_STORAGE>() + 16;

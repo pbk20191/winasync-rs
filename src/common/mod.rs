@@ -16,8 +16,17 @@ pub mod check;
 pub mod hvaddr;
 #[cfg(any(feature = "tp", feature = "comio"))]
 pub mod overlapped;
-
+// Winsock error mapping + the overlapped-issue classifier, shared by every
+// socket transport in both overlapped runtimes.
 #[cfg(any(feature = "tp", feature = "comio"))]
+pub mod winsock;
+
+// Short paths for the two most-used items. Same note as elsewhere: unused
+// *here* only because this is a bin crate with no external consumer.
+#[cfg(any(feature = "tp", feature = "comio"))]
+#[allow(unused_imports)]
 pub use block_on::block_on;
 #[cfg(any(feature = "tp", feature = "comio"))]
+#[allow(unused_imports)]
 pub use check::check;
+

@@ -12,51 +12,22 @@
 //! memory alive until the op's real completion, not merely until the
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
+use crate::common::winsock::{classify_wsa_overlapped, sock_check, wsa_init, wsa_last_err};
 use super::stream;
-use super::tpio::{self, IoReg, Issue, OpHandle};
+use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use core::ffi::c_void;
 use std::mem;
-use std::sync::{Arc, Once, OnceLock};
-use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
+use std::sync::{Arc, OnceLock};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
-    SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSADATA, WSAGetLastError,
-    WSAID_CONNECTEX, WSAIoctl, WSASocketW, WSAStartup, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
+    SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
+    WSAID_CONNECTEX, WSAIoctl, WSASocketW, WSA_FLAG_OVERLAPPED,
 };
 use windows::Win32::System::IO::OVERLAPPED;
 use windows_core::{Error, IInspectable, Result, HRESULT};
-
-/// Process-wide Winsock initialization; deliberately never torn down
-/// (`WSACleanup` is not called). Duplicated from `tp::io::net::wsa_init`
-/// (that one is private to `tp`) per the task brief — small, acceptable
-/// duplication rather than threading a shared init through crate-visibility
-/// changes.
-fn wsa_init() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| unsafe {
-        let mut data = WSADATA::default();
-        let r = WSAStartup(0x0202, &mut data);
-        assert_eq!(r, 0, "WSAStartup failed: {r}");
-    });
-}
-
-fn wsa_last_hr() -> HRESULT {
-    WIN32_ERROR(unsafe { WSAGetLastError() }.0 as u32).to_hresult()
-}
-
-fn wsa_last_err() -> Error {
-    Error::from_hresult(wsa_last_hr())
-}
-
-fn sock_check(r: i32) -> Result<()> {
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(wsa_last_err())
-    }
-}
 
 fn new_socket() -> Result<SOCKET> {
     wsa_init();
@@ -95,18 +66,6 @@ fn sockaddr_un_autobind() -> (SOCKADDR_UN, i32) {
         sun_path: [0i8; 108],
     };
     (sa, size_of::<ADDRESS_FAMILY>() as i32)
-}
-
-fn classify_wsa_overlapped(succeeded: bool) -> Issue {
-    if succeeded {
-        // Synchronous success still queues a completion (we never set
-        // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS).
-        Issue::Pending
-    } else if unsafe { WSAGetLastError() } == WSA_IO_PENDING {
-        Issue::Pending
-    } else {
-        Issue::Failed(wsa_last_hr())
-    }
 }
 
 type ConnectExFn = unsafe extern "system" fn(

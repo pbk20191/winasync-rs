@@ -16,51 +16,23 @@
 //! differ; see [`crate::common::hvaddr`] for the addressing, shared with
 //! `tp`'s Hyper-V transport.
 
+use crate::common::winsock::{classify_wsa_overlapped, sock_check, wsa_init, wsa_last_err};
 use super::stream;
-use super::tpio::{self, IoReg, Issue, OpHandle};
+use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use crate::common::hvaddr::{HvSocketAddr, SockaddrHv, HV_GUID_ZERO, HV_PROTOCOL_RAW};
 use core::ffi::c_void;
 use std::mem;
-use std::sync::{Arc, Once, OnceLock};
-use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
+use std::sync::{Arc, OnceLock};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, AF_HYPERV, INVALID_SOCKET,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
-    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSADATA, WSAGetLastError, WSAID_CONNECTEX,
-    WSAIoctl, WSASocketW, WSAStartup, WSA_FLAG_OVERLAPPED, WSA_IO_PENDING,
+    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSAID_CONNECTEX,
+    WSAIoctl, WSASocketW, WSA_FLAG_OVERLAPPED,
 };
 use windows::Win32::System::IO::OVERLAPPED;
 use windows_core::{Error, IInspectable, Result, HRESULT};
-
-/// Process-wide Winsock initialization; deliberately never torn down. Same
-/// rationale as `super::unix::wsa_init` — `Once` is per-item, but `WSAStartup`
-/// is refcounted by Winsock, so a second call from the other transport is
-/// harmless.
-fn wsa_init() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| unsafe {
-        let mut data = WSADATA::default();
-        let r = WSAStartup(0x0202, &mut data);
-        assert_eq!(r, 0, "WSAStartup failed: {r}");
-    });
-}
-
-fn wsa_last_hr() -> HRESULT {
-    WIN32_ERROR(unsafe { WSAGetLastError() }.0 as u32).to_hresult()
-}
-
-fn wsa_last_err() -> Error {
-    Error::from_hresult(wsa_last_hr())
-}
-
-fn sock_check(r: i32) -> Result<()> {
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(wsa_last_err())
-    }
-}
 
 /// Creates an AF_HYPERV stream socket. Fails with `WSAEAFNOSUPPORT` (10047)
 /// where the Hyper-V socket provider is not present.
@@ -75,18 +47,6 @@ fn new_socket() -> Result<SOCKET> {
             0,
             WSA_FLAG_OVERLAPPED,
         )
-    }
-}
-
-fn classify_wsa_overlapped(succeeded: bool) -> Issue {
-    if succeeded {
-        // Synchronous success still queues a completion (we never set
-        // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS on these handles).
-        Issue::Pending
-    } else if unsafe { WSAGetLastError() } == WSA_IO_PENDING {
-        Issue::Pending
-    } else {
-        Issue::Failed(wsa_last_hr())
     }
 }
 
