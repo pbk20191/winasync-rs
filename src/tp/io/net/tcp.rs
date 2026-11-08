@@ -9,13 +9,32 @@ pub struct TcpListener {
     /// The address family the listen socket was created with; accepted sockets
     /// must be created with the same family for `AcceptEx`.
     family: ADDRESS_FAMILY,
+    /// Extra `WSASocketW` flags carried onto every accepted socket, so a
+    /// listener created for another engine's needs keeps producing sockets
+    /// that engine can use. `AcceptEx` takes a socket the caller made, so
+    /// unlike plain `accept()` nothing is inherited automatically.
+    socket_flags: u32,
 }
 
 impl TcpListener {
     /// Binds and listens on `addr` (IPv4 or IPv6).
     pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpListener> {
+        Self::bind_with_flags(rt, addr, 0)
+    }
+
+    /// [`bind`](Self::bind) with extra `WSASocketW` flags on the listen
+    /// socket *and* on every socket `accept` creates.
+    ///
+    /// For composing with another completion engine: create the sockets the
+    /// way that engine needs, do the handshake here, hand the connected
+    /// socket over. This module never interprets `extra_flags`.
+    pub fn bind_with_flags(
+        rt: &Runtime,
+        addr: SocketAddr,
+        extra_flags: u32,
+    ) -> windows_core::Result<TcpListener> {
         let family = family_of(&addr);
-        let sock = new_socket(family, SOCK_STREAM, IPPROTO_TCP)?;
+        let sock = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
         let register = || -> windows_core::Result<Arc<IoRes>> {
             let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
             let len = write_sockaddr(&addr, &mut storage);
@@ -24,7 +43,11 @@ impl TcpListener {
             IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
         };
         match register() {
-            Ok(res) => Ok(TcpListener { res, family }),
+            Ok(res) => Ok(TcpListener {
+                res,
+                family,
+                socket_flags: extra_flags,
+            }),
             Err(e) => {
                 unsafe { closesocket(sock) };
                 Err(e)
@@ -39,7 +62,8 @@ impl TcpListener {
 
     /// Accepts one connection.
     pub async fn accept(&self) -> windows_core::Result<TcpStream> {
-        let accept_sock = new_socket(self.family, SOCK_STREAM, IPPROTO_TCP)?;
+        let accept_sock =
+            new_socket_with(self.family, SOCK_STREAM, IPPROTO_TCP, self.socket_flags)?;
         let listen_sock = self.res.socket();
         let fut = unsafe {
             submit(
@@ -104,7 +128,8 @@ impl TcpListener {
         &self,
         recv_len: usize,
     ) -> windows_core::Result<(TcpStream, Vec<u8>)> {
-        let accept_sock = new_socket(self.family, SOCK_STREAM, IPPROTO_TCP)?;
+        let accept_sock =
+            new_socket_with(self.family, SOCK_STREAM, IPPROTO_TCP, self.socket_flags)?;
         let listen_sock = self.res.socket();
         let fut = unsafe {
             submit(
@@ -220,8 +245,19 @@ impl TcpStream {
 
     /// Connects to `addr` (IPv4 or IPv6).
     pub async fn connect(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpStream> {
+        Self::connect_with_flags(rt, addr, 0).await
+    }
+
+    /// [`connect`](Self::connect) with extra `WSASocketW` flags on the
+    /// socket — the connect-side counterpart of
+    /// [`TcpListener::bind_with_flags`].
+    pub async fn connect_with_flags(
+        rt: &Runtime,
+        addr: SocketAddr,
+        extra_flags: u32,
+    ) -> windows_core::Result<TcpStream> {
         let family = family_of(&addr);
-        let sock = new_socket(family, SOCK_STREAM, IPPROTO_TCP)?;
+        let sock = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
         let prepared = (|| -> windows_core::Result<(ConnectExFn, TcpStream)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
             let mut local = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
@@ -410,6 +446,14 @@ impl TcpStream {
         TcpStream {
             res: self.res.clone(),
         }
+    }
+
+    /// The underlying socket, for another engine in this crate to attach to.
+    ///
+    /// Borrowed, never surrendered: this stream keeps ownership and closes it
+    /// on drop, so the borrower must not outlive the stream.
+    pub(crate) fn raw_socket(&self) -> SOCKET {
+        self.res.socket()
     }
 
     /// The locally bound address of this connected socket.

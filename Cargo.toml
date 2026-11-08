@@ -90,9 +90,17 @@ dq = [
 ]
 
 # Registered I/O (RIO) sub-engine: a separate completion engine beside the
-# overlapped/TP_IO core, for high-rate socket workloads. Builds on tp for the
-# pool and TP_WAIT.
-rio = ["tp"]
+# overlapped/TP_IO core. Standalone — the queue can be driven by a caller's
+# own IOCP, event, or poll loop, none of which need a runtime from here.
+# Enabling `tp` as well adds the pool-driven pump and async accept/connect.
+rio = [
+    "windows/Win32_Foundation",
+    "windows/Win32_Security",
+    "windows/Win32_System_Threading",
+    "windows/Win32_Networking_WinSock",
+    "windows/Win32_System_IO",
+    "windows/Win32_System_Memory",
+]
 
 # tp's optional futures-io interop (AsyncRead/AsyncWrite <-> futures_io).
 futures-io = ["tp", "dep:futures-io"]

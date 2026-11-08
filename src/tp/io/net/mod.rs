@@ -14,14 +14,18 @@
 use super::file::File;
 use super::{submit, IoRes, OpFuture};
 use crate::tp::{Runtime, RuntimeInner};
+pub(crate) use crate::common::sockaddr::{
+    addr_of_socket, family_of, peer_of_socket, read_sockaddr, wildcard, write_sockaddr,
+};
 pub(crate) use crate::common::winsock::{
     classify_wsa_overlapped, connectex, extension_fn, sock_check, wsa_init, ConnectExFn,
 };
 use core::ffi::c_void;
 use std::mem;
+#[allow(unused_imports)]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, OnceLock};
-use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, IPV6_DROP_MEMBERSHIP, IPV6_MREQ,
     IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF, IPV6_MULTICAST_LOOP,
@@ -30,10 +34,10 @@ use windows::Win32::Networking::WinSock::{
     IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_UNBLOCK_SOURCE, SO_REUSEADDR,
     getsockopt,
     UDP_COALESCED_INFO, UDP_RECV_MAX_COALESCED_SIZE, UDP_SEND_MSG_SIZE,
-    bind, closesocket, connect, getpeername, getsockname, listen, setsockopt, shutdown, AcceptEx, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW,
-    ADDRESS_FAMILY, AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
+    bind, closesocket, connect, listen, setsockopt, shutdown, AcceptEx, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW,
+    ADDRESS_FAMILY, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
     IPPROTO, IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, SD_SEND, SOCKADDR,
-    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
+    SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
     SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TF_DISCONNECT,
     TF_REUSE_SOCKET, TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT,
     TRANSMIT_PACKETS_ELEMENT_0, TRANSMIT_PACKETS_ELEMENT_0_0, TransmitFile, WINSOCK_SOCKET_TYPE,
@@ -52,6 +56,23 @@ pub(super) fn new_socket(
     socktype: WINSOCK_SOCKET_TYPE,
     proto: IPPROTO,
 ) -> windows_core::Result<SOCKET> {
+    new_socket_with(family, socktype, proto, 0)
+}
+
+/// [`new_socket`] plus `extra_flags`, OR-ed into the `WSASocketW` flags
+/// beside `WSA_FLAG_OVERLAPPED`.
+///
+/// The seam another engine needs: a socket may have to be created with flags
+/// this module knows nothing about — `WSA_FLAG_REGISTERED_IO`, say — and
+/// still be driven through this one's overlapped accept and connect. Keeping
+/// the parameter opaque means `tp` does not grow a dependency on whatever
+/// wants the flag.
+pub(crate) fn new_socket_with(
+    family: ADDRESS_FAMILY,
+    socktype: WINSOCK_SOCKET_TYPE,
+    proto: IPPROTO,
+    extra_flags: u32,
+) -> windows_core::Result<SOCKET> {
     wsa_init();
     unsafe {
         WSASocketW(
@@ -60,111 +81,11 @@ pub(super) fn new_socket(
             proto.0,
             None,
             0,
-            WSA_FLAG_OVERLAPPED,
+            WSA_FLAG_OVERLAPPED | extra_flags,
         )
     }
 }
 
-/// The address family a `SocketAddr` needs its socket created with.
-fn family_of(addr: &SocketAddr) -> ADDRESS_FAMILY {
-    match addr {
-        SocketAddr::V4(_) => AF_INET,
-        SocketAddr::V6(_) => AF_INET6,
-    }
-}
-
-/// The `0.0.0.0:0` / `[::]:0` wildcard of a family, for the implicit local bind
-/// `ConnectEx` requires.
-fn wildcard(family: ADDRESS_FAMILY) -> SocketAddr {
-    if family == AF_INET6 {
-        SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
-    } else {
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-    }
-}
-
-/// Marshals a `SocketAddr` into a zeroed `SOCKADDR_STORAGE`, returning the
-/// valid length (`sizeof(sockaddr_in|sockaddr_in6)`). Port is written in
-/// network byte order; the IPv4 address follows the existing `to_be` idiom so
-/// its in-memory bytes are the octets in order.
-pub(crate) fn write_sockaddr(addr: &SocketAddr, storage: &mut SOCKADDR_STORAGE) -> i32 {
-    unsafe {
-        match addr {
-            SocketAddr::V4(v4) => {
-                *(storage as *mut _ as *mut SOCKADDR_IN) = SOCKADDR_IN {
-                    sin_family: AF_INET,
-                    sin_port: v4.port().to_be(),
-                    sin_addr: IN_ADDR {
-                        S_un: IN_ADDR_0 {
-                            S_addr: u32::from(*v4.ip()).to_be(),
-                        },
-                    },
-                    sin_zero: [0; 8],
-                };
-                size_of::<SOCKADDR_IN>() as i32
-            }
-            SocketAddr::V6(v6) => {
-                *(storage as *mut _ as *mut SOCKADDR_IN6) = SOCKADDR_IN6 {
-                    sin6_family: AF_INET6,
-                    sin6_port: v6.port().to_be(),
-                    sin6_flowinfo: v6.flowinfo(),
-                    sin6_addr: IN6_ADDR {
-                        u: IN6_ADDR_0 {
-                            Byte: v6.ip().octets(),
-                        },
-                    },
-                    Anonymous: SOCKADDR_IN6_0 {
-                        sin6_scope_id: v6.scope_id(),
-                    },
-                };
-                size_of::<SOCKADDR_IN6>() as i32
-            }
-        }
-    }
-}
-
-/// Parses a `SOCKADDR_STORAGE` (as filled by `getsockname`/`getpeername`/a
-/// datagram source) back into a `SocketAddr`, dispatching on `ss_family`.
-pub(crate) fn read_sockaddr(storage: &SOCKADDR_STORAGE) -> windows_core::Result<SocketAddr> {
-    unsafe {
-        if storage.ss_family == AF_INET {
-            let sa = &*(storage as *const _ as *const SOCKADDR_IN);
-            Ok(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(u32::from_be(sa.sin_addr.S_un.S_addr)),
-                u16::from_be(sa.sin_port),
-            )))
-        } else if storage.ss_family == AF_INET6 {
-            let sa = &*(storage as *const _ as *const SOCKADDR_IN6);
-            Ok(SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(sa.sin6_addr.u.Byte),
-                u16::from_be(sa.sin6_port),
-                sa.sin6_flowinfo,
-                sa.Anonymous.sin6_scope_id,
-            )))
-        } else {
-            // Neither AF_INET nor AF_INET6 — WSAEAFNOSUPPORT.
-            Err(windows_core::Error::from_hresult(
-                WIN32_ERROR(10047).to_hresult(),
-            ))
-        }
-    }
-}
-
-/// `getsockname` for a socket, as a `SocketAddr` (useful after binding port 0).
-pub(crate) fn addr_of_socket(sock: SOCKET) -> windows_core::Result<SocketAddr> {
-    let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
-    let mut len = size_of::<SOCKADDR_STORAGE>() as i32;
-    sock_check(unsafe { getsockname(sock, &mut storage as *mut _ as *mut SOCKADDR, &mut len) })?;
-    read_sockaddr(&storage)
-}
-
-/// `getpeername` for a connected socket, as a `SocketAddr`.
-fn peer_of_socket(sock: SOCKET) -> windows_core::Result<SocketAddr> {
-    let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
-    let mut len = size_of::<SOCKADDR_STORAGE>() as i32;
-    sock_check(unsafe { getpeername(sock, &mut storage as *mut _ as *mut SOCKADDR, &mut len) })?;
-    read_sockaddr(&storage)
-}
 
 /// `ConnectEx` for the **TCP/IP** provider. The signature lives in
 /// `common::winsock`; only this cache is local, because the pointer belongs

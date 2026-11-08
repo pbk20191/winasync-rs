@@ -38,6 +38,32 @@
 //! at socket creation for AF_UNIX, AF_HYPERV and raw sockets, so the
 //! non-IP transports in `tp` cannot use it.
 //!
+//! # Standalone, or composed
+//!
+//! RIO is a submission engine, not a runtime: something else must notice the
+//! completion queue has results, and something else must perform the
+//! handshake. This module therefore depends on nothing but Winsock, and
+//! takes whichever of those two jobs the caller already has covered.
+//!
+//! With the `rio` feature alone:
+//!   * the queue is driven by **the caller's** IOCP
+//!     ([`RioCq::with_iocp`](cq::RioCq::with_iocp)), event
+//!     ([`with_event`](cq::RioCq::with_event)), or poll loop
+//!     ([`polling`](cq::RioCq::polling)) — including one belonging to an
+//!     entirely different library;
+//!   * TCP connects and accepts block, because there is no async engine here
+//!     to borrow one from.
+//!
+//! With `tp` enabled as well:
+//!   * [`RioCq::new`](cq::RioCq::new) adds a pump of our own, an event
+//!     watched by a TP_WAIT on `tp`'s pool;
+//!   * [`RioTcpAcceptor`] and [`RioTcpStream::connect`] do the handshake with
+//!     `tp`'s overlapped `AcceptEx`/`ConnectEx` and hand the connected socket
+//!     to RIO — one socket, two engines, each doing the part it has.
+//!
+//! Nothing in `tp` learns about RIO in return: it gained only the ability to
+//! carry opaque extra `WSASocketW` flags through its own constructors.
+//!
 //! # Experimental
 //!
 //! This engine exists to cover a *concept* — registered buffers plus a drained
@@ -68,6 +94,8 @@
 // other runtime modules.
 #![allow(dead_code)]
 
+// The comparison needs the other engine to compare against.
+#[cfg(feature = "tp")]
 mod bench;
 pub mod buffer;
 pub mod cq;
@@ -86,3 +114,6 @@ pub use rq::RqConfig;
 pub use socket::RioUdpSocket;
 #[allow(unused_imports)]
 pub use tcp::{RioTcpListener, RioTcpStream};
+#[cfg(feature = "tp")]
+#[allow(unused_imports)]
+pub use tcp::RioTcpAcceptor;

@@ -24,7 +24,7 @@ use super::buffer::RioSlice;
 use super::cq::RioCq;
 use super::rq::{bind_socket, new_rio_socket, RequestQueue, RqConfig};
 use crate::common::winsock::sock_check;
-use crate::tp::io::net::{addr_of_socket, write_sockaddr};
+use crate::common::sockaddr::{addr_of_socket, write_sockaddr};
 use std::net::SocketAddr;
 
 /// A listening socket whose accepted connections can take RIO request queues.
@@ -61,9 +61,9 @@ impl RioTcpListener {
 
     /// Accepts one connection and attaches a request queue to it.
     ///
-    /// Blocking, because RIO offers no accept of its own and wrapping the
-    /// overlapped `AcceptEx` here would mean pulling in the other engine.
-    /// Call it from a pool thread (`Runtime::submit`) if that matters.
+    /// Blocking: RIO has no accept, and with `rio` alone there is no
+    /// overlapped engine here to borrow one from. Enable `tp` as well and use
+    /// `RioTcpAcceptor::accept`, which awaits an `AcceptEx` instead.
     pub fn accept_blocking(
         &self,
         cq: &Arc<RioCq>,
@@ -91,6 +91,11 @@ impl Drop for RioTcpListener {
 pub struct RioTcpStream {
     sock: SOCKET,
     rq: RequestQueue,
+    /// Set when the socket came from the overlapped engine's handshake. That
+    /// stream owns the socket and its TP_IO registration, so this one must
+    /// not close it — exactly one owner, whichever path created it.
+    #[cfg(feature = "tp")]
+    owner: Option<crate::tp::io::net::TcpStream>,
 }
 
 unsafe impl Send for RioTcpStream {}
@@ -124,7 +129,12 @@ impl RioTcpStream {
         config: RqConfig,
     ) -> windows_core::Result<Self> {
         match RequestQueue::attach(sock, cq, config) {
-            Ok(rq) => Ok(Self { sock, rq }),
+            Ok(rq) => Ok(Self {
+                sock,
+                rq,
+                #[cfg(feature = "tp")]
+                owner: None,
+            }),
             Err(e) => {
                 unsafe { closesocket(sock) };
                 Err(e)
@@ -209,15 +219,24 @@ impl RioTcpStream {
 
 impl Drop for RioTcpStream {
     fn drop(&mut self) {
+        // A stream built on a `tp` handshake does not own its socket; the
+        // overlapped stream it kept does, and closes it on its own drop.
+        #[cfg(feature = "tp")]
+        if self.owner.is_some() {
+            return;
+        }
         unsafe { closesocket(self.sock) };
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // Several of these are tp-only; their imports are shared.
+    #![allow(unused_imports)]
     use super::super::buffer::RioBufferPool;
     use super::*;
     use crate::common::block_on;
+    #[cfg(feature = "tp")]
     use crate::tp::{timeout, Runtime};
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::time::Duration;
@@ -227,6 +246,7 @@ mod tests {
     /// TCP has no message boundaries, so the receiver may see the batch as
     /// one read or several — the test accepts either and only insists the
     /// bytes arrive, in order, after the commit.
+    #[cfg(feature = "tp")]
     #[test]
     fn rio_tcp_deferred_sends_commit_as_a_batch() {
         let rt = Runtime::new();
@@ -281,6 +301,78 @@ mod tests {
         result.expect("deferred TCP sends timed out");
     }
 
+    /// One socket, two engines: `tp` awaits the handshake, RIO carries the
+    /// data. No blocking accept, no second thread.
+    #[cfg(feature = "tp")]
+    #[test]
+    fn composed_handshake_then_rio_data_path() {
+        use super::RioTcpAcceptor;
+        let rt = Runtime::new();
+        let cq = RioCq::new(&rt, 256).expect("cq");
+        let pool = RioBufferPool::new(512, 8).expect("pool");
+
+        let listener = RioTcpAcceptor::bind(
+            &rt,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        )
+        .expect("bind");
+        let addr = listener.local_addr().unwrap();
+
+        let result = block_on(timeout(&rt, Duration::from_secs(5), async {
+            let rq = RqConfig::default();
+            // Both sides of the handshake are awaited; AcceptEx and ConnectEx
+            // are in flight at once.
+            let (server, client) = futures_join(
+                listener.accept(&cq, rq),
+                RioTcpStream::connect(&rt, &cq, addr, rq),
+            )
+            .await;
+            let server = server.expect("accept");
+            let client = client.expect("connect");
+
+            let srv_rx = server.recv(pool.acquire().unwrap()).expect("recv");
+            let mut out = pool.acquire().unwrap();
+            out[..7].copy_from_slice(b"composed"[..7].try_into().unwrap());
+            out.set_len(7);
+            client.send(out).expect("send").await.0.unwrap();
+
+            let (n, got) = srv_rx.await;
+            assert_eq!(&got[..n.unwrap()], b"compose");
+        }));
+        result.expect("composed handshake timed out");
+    }
+
+    /// Minimal join: poll both to completion on this thread.
+    #[cfg(feature = "tp")]
+    async fn futures_join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+        // The accept cannot finish before the connect is issued, so issue the
+        // connect first and then await both in turn.
+        let mut a = Box::pin(a);
+        let mut b = Box::pin(b);
+        use std::task::Poll;
+        let mut ra = None;
+        let mut rb = None;
+        std::future::poll_fn(move |cx| {
+            if ra.is_none() {
+                if let Poll::Ready(v) = a.as_mut().poll(cx) {
+                    ra = Some(v);
+                }
+            }
+            if rb.is_none() {
+                if let Poll::Ready(v) = b.as_mut().poll(cx) {
+                    rb = Some(v);
+                }
+            }
+            if ra.is_some() && rb.is_some() {
+                Poll::Ready((ra.take().unwrap(), rb.take().unwrap()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    #[cfg(feature = "tp")]
     #[test]
     fn rio_tcp_echo() {
         let rt = Runtime::new();
@@ -336,3 +428,102 @@ mod tests {
         result.expect("RIO TCP echo timed out");
     }
 }
+
+/// Composition with the overlapped engine.
+///
+/// RIO has no accept and no connect, so with `tp` also enabled the handshake
+/// is simply done by *that* engine and the connected socket handed over: one
+/// socket, two engines, each doing the part it has. The socket is created
+/// with `WSA_FLAG_REGISTERED_IO` through `tp`'s flag-carrying constructors,
+/// which is why those exist — `tp` never learns what the flag means.
+///
+/// The `tp` stream is kept alive for the RIO stream's whole life rather than
+/// being unwrapped: it owns the socket and its TP_IO registration, so keeping
+/// it means exactly one owner closes the socket, and the overlapped side
+/// stays usable alongside RIO if a caller wants both.
+#[cfg(feature = "tp")]
+mod compose {
+    use super::*;
+    use crate::tp::io::net::{TcpListener as TpListener, TcpStream as TpStream};
+    use crate::tp::Runtime;
+    use windows::Win32::Networking::WinSock::WSA_FLAG_REGISTERED_IO;
+
+    /// A listener whose accepted sockets can take RIO request queues, with an
+    /// `async` accept driven by `AcceptEx`.
+    pub struct RioTcpAcceptor {
+        inner: TpListener,
+    }
+
+    impl RioTcpAcceptor {
+        /// Binds, creating sockets RIO can use.
+        pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<Self> {
+            Ok(Self {
+                inner: TpListener::bind_with_flags(rt, addr, WSA_FLAG_REGISTERED_IO)?,
+            })
+        }
+
+        pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        /// Awaits one connection and attaches a RIO request queue to it.
+        pub async fn accept(
+            &self,
+            cq: &Arc<RioCq>,
+            config: RqConfig,
+        ) -> windows_core::Result<RioTcpStream> {
+            let stream = self.inner.accept().await?;
+            RioTcpStream::from_tp(stream, cq, config)
+        }
+
+        /// Awaits a connection *and* its first segment, then attaches a queue
+        /// — `AcceptEx` with a receive length, so a client that speaks first
+        /// costs one op instead of two.
+        pub async fn accept_with_data(
+            &self,
+            cq: &Arc<RioCq>,
+            config: RqConfig,
+            recv_len: usize,
+        ) -> windows_core::Result<(RioTcpStream, Vec<u8>)> {
+            let (stream, data) = self.inner.accept_with_data(recv_len).await?;
+            Ok((RioTcpStream::from_tp(stream, cq, config)?, data))
+        }
+    }
+
+    impl RioTcpStream {
+        /// Connects with `ConnectEx` and attaches a RIO request queue.
+        pub async fn connect(
+            rt: &Runtime,
+            cq: &Arc<RioCq>,
+            addr: SocketAddr,
+            config: RqConfig,
+        ) -> windows_core::Result<Self> {
+            let stream =
+                TpStream::connect_with_flags(rt, addr, WSA_FLAG_REGISTERED_IO).await?;
+            Self::from_tp(stream, cq, config)
+        }
+
+        /// Adopts a connected `tp` stream, adding a RIO request queue.
+        ///
+        /// The socket must have been created with `WSA_FLAG_REGISTERED_IO`,
+        /// which the constructors above arrange; without it
+        /// `RIOCreateRequestQueue` fails with `WSAEOPNOTSUPP`. The stream is
+        /// kept, not consumed, so it keeps owning the socket.
+        pub fn from_tp(
+            stream: TpStream,
+            cq: &Arc<RioCq>,
+            config: RqConfig,
+        ) -> windows_core::Result<Self> {
+            let rq = RequestQueue::attach(stream.raw_socket(), cq, config)?;
+            Ok(Self {
+                sock: stream.raw_socket(),
+                owner: Some(stream),
+                rq,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "tp")]
+#[allow(unused_imports)]
+pub use compose::RioTcpAcceptor;

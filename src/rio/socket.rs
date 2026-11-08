@@ -25,7 +25,7 @@ use windows::Win32::Networking::WinSock::{
 };
 
 use super::buffer::RioSlice;
-use crate::tp::io::net::read_sockaddr;
+use crate::common::sockaddr::read_sockaddr;
 use super::cq::{CompleteFn, RioCq};
 use super::rq::{
     bind_socket, new_rio_socket, resolve, status_to_result, RequestQueue, RqConfig,
@@ -310,19 +310,22 @@ impl Drop for RioUdpSocket {
 }
 
 fn write_sockaddr(addr: &SocketAddr, storage: &mut SOCKADDR_STORAGE) -> i32 {
-    crate::tp::io::net::write_sockaddr(addr, storage)
+    crate::common::sockaddr::write_sockaddr(addr, storage)
 }
 
 fn local_addr_of(sock: SOCKET) -> windows_core::Result<SocketAddr> {
-    crate::tp::io::net::addr_of_socket(sock)
+    crate::common::sockaddr::addr_of_socket(sock)
 }
 
 #[cfg(test)]
 mod tests {
+    // Several of these are tp-only; their imports are shared.
+    #![allow(unused_imports)]
     use super::super::buffer::RioBufferPool;
     use super::super::rq::{WSAENOBUFS, WSAENOBUFS_HRESULT};
     use super::*;
     use crate::common::block_on;
+    #[cfg(feature = "tp")]
     use crate::tp::{timeout, Runtime};
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::time::Duration;
@@ -333,6 +336,7 @@ mod tests {
 
     /// The whole engine end to end: registered buffers, a request queue, the
     /// RIONotify/TP_WAIT pump, and a real datagram.
+    #[cfg(feature = "tp")]
     #[test]
     fn rio_udp_roundtrip() {
         let rt = Runtime::new();
@@ -381,6 +385,7 @@ mod tests {
 
     /// Unconnected send/receive over RIOSendEx/RIOReceiveEx, where RIO names
     /// the peer address with a RIO_BUF of its own.
+    #[cfg(feature = "tp")]
     #[test]
     fn rio_udp_addressed_roundtrip() {
         let rt = Runtime::new();
@@ -421,6 +426,7 @@ mod tests {
     }
 
     /// Deferred sends are queued and only dispatched by the commit.
+    #[cfg(feature = "tp")]
     #[test]
     fn deferred_sends_dispatch_on_commit() {
         let rt = Runtime::new();
@@ -504,6 +510,7 @@ mod tests {
 
     /// Request queues grow live; shrinking below what is outstanding is
     /// refused rather than silently dropping work.
+    #[cfg(feature = "tp")]
     #[test]
     fn request_queue_resizes() {
         let rt = Runtime::new();
@@ -536,8 +543,9 @@ mod tests {
     /// backpressure signal, not a failure.
     #[test]
     fn request_queue_full_is_synchronous_backpressure() {
-        let rt = Runtime::new();
-        let cq = RioCq::new(&rt, 64).expect("completion queue");
+        // Polling mode, so this exercises RIO's own backpressure without
+        // needing a runtime from elsewhere.
+        let cq = RioCq::polling(64).expect("completion queue");
         let pool = RioBufferPool::new(512, 8).expect("buffer pool");
         let sock = RioUdpSocket::bind(
             &cq,

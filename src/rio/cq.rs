@@ -32,13 +32,18 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use std::sync::Arc;
+#[cfg(feature = "tp")]
+use std::sync::Mutex;
+use windows::Win32::Foundation::HANDLE;
+#[cfg(feature = "tp")]
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Networking::WinSock::{
     RIORESULT, RIO_CORRUPT_CQ, RIO_CQ, RIO_EVENT_COMPLETION, RIO_IOCP_COMPLETION,
     RIO_NOTIFICATION_COMPLETION, RIO_NOTIFICATION_COMPLETION_0,
     RIO_NOTIFICATION_COMPLETION_0_0, RIO_NOTIFICATION_COMPLETION_0_1,
 };
+#[cfg(feature = "tp")]
 use windows::Win32::System::Threading::{
     CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait, SetThreadpoolWait,
     WaitForThreadpoolWaitCallbacks, PTP_CALLBACK_INSTANCE, PTP_WAIT,
@@ -48,7 +53,9 @@ use super::buffer::RioSlice;
 use super::rq::RIO_INVALID_CQ;
 use super::table::rio_table;
 use crate::common::winsock::wsa_last_err;
+#[cfg(feature = "tp")]
 use crate::tp::pool::CtxHeader;
+#[cfg(feature = "tp")]
 use crate::tp::{Runtime, RuntimeInner};
 
 /// How many completions one dequeue call collects. Batching is the point of a
@@ -94,15 +101,11 @@ impl Request {
 }
 
 /// The pool's callback environment installs a `FinalizationCallback` that
-/// treats every context as beginning with a [`CtxHeader`] and calls its
-/// `release`. Honouring that layout is mandatory: a context without the
-/// header has its first field invoked as a function pointer when the callback
-/// object is closed.
-#[repr(C)]
+/// The queue itself. Nothing here is specific to how it gets drained — the
+/// pool-driven pump's own state lives in [`PoolPump`], which is the only part
+/// that knows `tp` exists.
 struct CqState {
-    header: CtxHeader,
     cq: RIO_CQ,
-    event: HANDLE,
     /// Whether a `RIONotify` is outstanding; `RIONotify` answers
     /// `WSAEALREADY` if one already is.
     armed: AtomicBool,
@@ -111,8 +114,6 @@ struct CqState {
     /// Which mechanism delivers notifications; decides whether `RIONotify`
     /// applies at all and whether this crate owns a pump.
     mode: Mode,
-    /// Held only in [`Mode::Pool`], so the pool outlives its own callbacks.
-    _rt: Option<Arc<RuntimeInner>>,
 }
 
 /// How a completion queue announces that it has results.
@@ -120,6 +121,8 @@ struct CqState {
 enum Mode {
     /// An event plus a TP_WAIT on this crate's pool; the pump is ours.
     Pool,
+    /// An event the caller waits on with its own mechanism.
+    Event,
     /// An IOCP the caller owns. The caller recognises the packet and calls
     /// [`RioCq::drain`] then [`RioCq::notify`] itself.
     Iocp,
@@ -131,10 +134,35 @@ enum Mode {
 unsafe impl Send for CqState {}
 unsafe impl Sync for CqState {}
 
-/// The single release path for a `CqState` context, run by the environment's
+/// State belonging to the thread-pool pump, and only to it: the event
+/// `RIONotify` signals, the TP_WAIT watching it, and the pool that must
+/// outlive its own callbacks.
+///
+/// This is also where the pool's layout contract lives. Its callback
+/// environment installs a `FinalizationCallback` that treats every context as
+/// beginning with a [`CtxHeader`] and calls that header's `release`, so a
+/// context without the header has its first field invoked as a function
+/// pointer when the callback object is closed. Keeping the header on *this*
+/// struct rather than on the queue is what lets the queue exist without `tp`.
+#[cfg(feature = "tp")]
+#[repr(C)]
+struct PoolPump {
+    header: CtxHeader,
+    state: Arc<CqState>,
+    event: HANDLE,
+    _rt: Arc<RuntimeInner>,
+}
+
+#[cfg(feature = "tp")]
+unsafe impl Send for PoolPump {}
+#[cfg(feature = "tp")]
+unsafe impl Sync for PoolPump {}
+
+/// The single release path for a pump context, run by the environment's
 /// finalization callback when the TP_WAIT is closed.
-unsafe fn release_cq_state(ctx: *mut core::ffi::c_void) {
-    unsafe { drop(Arc::from_raw(ctx as *const CqState)) }
+#[cfg(feature = "tp")]
+unsafe fn release_pump(ctx: *mut core::ffi::c_void) {
+    unsafe { drop(Arc::from_raw(ctx as *const PoolPump)) }
 }
 
 /// A RIO completion queue.
@@ -154,12 +182,20 @@ unsafe fn release_cq_state(ctx: *mut core::ffi::c_void) {
 ///   seeing it the caller calls [`drain`](Self::drain) and then
 ///   [`notify`](Self::notify). This is the interop path: an existing IOCP
 ///   loop gains RIO sockets without a second set of threads.
+/// * [`with_event`](Self::with_event) — **an event the caller waits on**,
+///   with whatever it already uses: `WaitForMultipleObjects`, another thread
+///   pool, a foreign reactor. Only the queue is ours.
 /// * [`polling`](Self::polling) — no notification at all. The caller drains
 ///   on its own schedule, which is the lowest-latency and highest-CPU option.
+///
+/// Only the first needs `tp`; the other three are plain Winsock and work with
+/// the `rio` feature alone.
 pub struct RioCq {
     state: Arc<CqState>,
-    /// Present only in [`Mode::Pool`].
-    wait: Mutex<Option<PTP_WAIT>>,
+    /// The pool-driven pump's own handles, present only in [`Mode::Pool`].
+    /// They are created and torn down together, so they travel as a pair.
+    #[cfg(feature = "tp")]
+    pump: Mutex<Option<(PTP_WAIT, HANDLE)>>,
 }
 
 unsafe impl Send for RioCq {}
@@ -172,6 +208,7 @@ impl RioCq {
     /// socket attached to this queue: RIO requires
     /// `sum(max_outstanding) <= size`, and honouring that is what makes
     /// overflow structurally impossible rather than something to handle.
+    #[cfg(feature = "tp")]
     pub fn new(rt: &Runtime, size: u32) -> windows_core::Result<Arc<Self>> {
         // Manual-reset: with NotifyReset the event is cleared by the next
         // RIONotify, not by the signal.
@@ -196,18 +233,21 @@ impl RioCq {
         };
 
         let state = Arc::new(CqState {
-            header: CtxHeader {
-                release: release_cq_state,
-            },
             cq,
-            event,
             armed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             mode: Mode::Pool,
-            _rt: Some(rt.inner.clone()),
+        });
+        let pump = Arc::new(PoolPump {
+            header: CtxHeader {
+                release: release_pump,
+            },
+            state: state.clone(),
+            event,
+            _rt: rt.inner.clone(),
         });
 
-        let ctx = Arc::into_raw(state.clone());
+        let ctx = Arc::into_raw(pump);
         let wait = unsafe {
             CreateThreadpoolWait(
                 Some(pump_callback),
@@ -230,10 +270,10 @@ impl RioCq {
 
         let this = Arc::new(RioCq {
             state: state.clone(),
-            wait: Mutex::new(Some(wait)),
+            pump: Mutex::new(Some((wait, event))),
         });
         // Arm for the first time: notify, then wait, in that order.
-        arm(&state, wait)?;
+        arm(&state, event, wait)?;
         Ok(this)
     }
 
@@ -289,6 +329,52 @@ impl RioCq {
         Ok(this)
     }
 
+    /// Creates a queue that signals **an event the caller waits on**.
+    ///
+    /// For a process that already has a waiting mechanism — its own thread
+    /// pool, a `WaitForMultipleObjects` loop, a foreign reactor. On being
+    /// signalled the caller drains and re-arms, exactly as in
+    /// [`with_iocp`](Self::with_iocp).
+    ///
+    /// `notify_reset` is RIO's `NotifyReset`, and it does **not** mean what
+    /// its name suggests:
+    ///
+    /// * `true` — RIO clears the event on the **next `RIONotify`**, not when
+    ///   it signals. So the event stays signalled after a notification until
+    ///   the caller re-arms, and any wait armed before that `RIONotify` can
+    ///   fire spuriously. This is why Microsoft's thread-pool recipe puts
+    ///   `SetThreadpoolWait` *after* `RIONotify`; the same ordering applies
+    ///   to any wait the caller arms.
+    /// * `false` — RIO never touches the event; resetting it is the caller's
+    ///   job. Correct for an auto-reset event, which clears itself on the
+    ///   wait that observes it.
+    ///
+    /// # Safety
+    /// `event` must be a valid event handle that outlives this queue, and
+    /// must not be used for anything else while the queue holds it.
+    pub unsafe fn with_event(
+        event: HANDLE,
+        notify_reset: bool,
+        size: u32,
+    ) -> windows_core::Result<Arc<Self>> {
+        let notify = RIO_NOTIFICATION_COMPLETION {
+            Type: RIO_EVENT_COMPLETION,
+            Anonymous: RIO_NOTIFICATION_COMPLETION_0 {
+                Event: RIO_NOTIFICATION_COMPLETION_0_0 {
+                    EventHandle: event,
+                    NotifyReset: notify_reset.into(),
+                },
+            },
+        };
+        let cq = create_cq(size, Some(&notify))?;
+        let this = Self::externally_driven(cq, Mode::Event);
+        // Armed here for the same reason as the IOCP mode: an unarmed queue
+        // is silent, which reads as a delivery failure rather than a missing
+        // call.
+        notify_state(&this.state)?;
+        Ok(this)
+    }
+
     /// Creates a queue with no notification: the caller polls
     /// [`drain`](Self::drain).
     ///
@@ -303,17 +389,13 @@ impl RioCq {
     fn externally_driven(cq: RIO_CQ, mode: Mode) -> Arc<Self> {
         Arc::new(RioCq {
             state: Arc::new(CqState {
-                header: CtxHeader {
-                    release: release_cq_state,
-                },
                 cq,
-                event: HANDLE(core::ptr::null_mut()),
                 armed: AtomicBool::new(false),
                 closing: AtomicBool::new(false),
                 mode,
-                _rt: None,
             }),
-            wait: Mutex::new(None),
+            #[cfg(feature = "tp")]
+            pump: Mutex::new(None),
         })
     }
 
@@ -409,14 +491,15 @@ fn notify_state(state: &CqState) -> windows_core::Result<()> {
 
 /// `RIONotify` followed immediately by `SetThreadpoolWait`, per Microsoft's
 /// documented pattern — pool mode only.
-fn arm(state: &Arc<CqState>, wait: PTP_WAIT) -> windows_core::Result<()> {
+#[cfg(feature = "tp")]
+fn arm(state: &Arc<CqState>, event: HANDLE, wait: PTP_WAIT) -> windows_core::Result<()> {
     if state.closing.load(Ordering::Acquire) {
         return Ok(());
     }
     notify_state(state)?;
     // Must follow RIONotify: with NotifyReset the event is cleared by that
     // call, so arming first could latch a stale signal.
-    unsafe { SetThreadpoolWait(wait, Some(state.event), None) };
+    unsafe { SetThreadpoolWait(wait, Some(event), None) };
     Ok(())
 }
 
@@ -461,6 +544,7 @@ fn drain(state: &CqState) -> Option<usize> {
 
 /// TP_WAIT callback: one at a time, which is what keeps the single-consumer
 /// rule for `RIODequeueCompletion`.
+#[cfg(feature = "tp")]
 unsafe extern "system" fn pump_callback(
     _: PTP_CALLBACK_INSTANCE,
     ctx: *mut core::ffi::c_void,
@@ -468,16 +552,17 @@ unsafe extern "system" fn pump_callback(
     _wait_result: u32,
 ) {
     // Borrow the context without consuming the reference the TP_WAIT holds.
-    let state = unsafe { Arc::from_raw(ctx as *const CqState) };
-    let state = core::mem::ManuallyDrop::new(state);
+    let pump = unsafe { Arc::from_raw(ctx as *const PoolPump) };
+    let pump = core::mem::ManuallyDrop::new(pump);
+    let state = &pump.state;
 
     // The notification has fired; the next RIONotify will clear the event.
     state.armed.store(false, Ordering::Release);
 
-    let drained = catch_unwind(AssertUnwindSafe(|| drain(&state)));
+    let drained = catch_unwind(AssertUnwindSafe(|| drain(state)));
     match drained {
         Ok(Some(_)) => {
-            let _ = arm(&state, wait);
+            let _ = arm(state, pump.event, wait);
         }
         // Corrupt queue or a panic in the drain: stop pumping rather than
         // spin. Outstanding requests will never complete, which is the
@@ -489,33 +574,34 @@ unsafe extern "system" fn pump_callback(
 impl Drop for RioCq {
     fn drop(&mut self) {
         self.state.closing.store(true, Ordering::Release);
-        let wait = match *self.wait.lock().unwrap() {
-            Some(w) => w,
-            None => {
-                // Externally driven: no pump of ours to stop, and no context
-                // reference was handed to a callback object.
-                close_cq(self.state.cq);
-                return;
+
+        #[cfg(feature = "tp")]
+        if let Some((wait, event)) = *self.pump.lock().unwrap() {
+            unsafe {
+                // Cancel the pending wait, then let any running callback
+                // finish.
+                SetThreadpoolWait(wait, None, None);
+                WaitForThreadpoolWaitCallbacks(wait, true);
+                // A callback that started before `closing` was set may have
+                // re-armed on its way out; cancel that too before closing the
+                // wait object, which must not be pending.
+                SetThreadpoolWait(wait, None, None);
+                WaitForThreadpoolWaitCallbacks(wait, true);
+                // Finalization runs here, releasing the pump context — the
+                // environment's single release path.
+                CloseThreadpoolWait(wait);
             }
-        };
-        unsafe {
-            // Cancel the pending wait, then let any running callback finish.
-            SetThreadpoolWait(wait, None, None);
-            WaitForThreadpoolWaitCallbacks(wait, true);
-            // A callback that started before `closing` was set may have
-            // re-armed on its way out; cancel that too before closing the
-            // wait object, which must not be pending.
-            SetThreadpoolWait(wait, None, None);
-            WaitForThreadpoolWaitCallbacks(wait, true);
-            CloseThreadpoolWait(wait);
+            // Close the queue before the event it notifies through.
+            close_cq(self.state.cq);
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            return;
         }
-        // CloseThreadpoolWait above finalized the callback object, which
-        // ran `release_cq_state` and dropped the context reference — the
-        // environment's single release path. Nothing to release here.
+
+        // Externally driven: no pump of ours, and no context was handed to a
+        // callback object.
         close_cq(self.state.cq);
-        unsafe {
-            let _ = CloseHandle(self.state.event);
-        }
     }
 }
 

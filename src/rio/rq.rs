@@ -88,7 +88,7 @@ pub(crate) fn new_rio_socket(
 /// Binds `sock` to `addr`.
 pub(crate) fn bind_socket(sock: SOCKET, addr: &SocketAddr) -> windows_core::Result<()> {
     let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
-    let len = crate::tp::io::net::write_sockaddr(addr, &mut storage);
+    let len = crate::common::sockaddr::write_sockaddr(addr, &mut storage);
     crate::common::winsock::sock_check(unsafe {
         windows::Win32::Networking::WinSock::bind(sock, &storage as *const _ as *const SOCKADDR, len)
     })

@@ -7,14 +7,19 @@
 //! the overlapped-issue contract, and a divergent copy of *that* is a silent
 //! hang, not a cosmetic difference. One copy now.
 
+#[cfg(any(feature = "tp", feature = "comio"))]
 use super::overlapped::Issue;
+#[cfg(any(feature = "tp", feature = "comio"))]
 use core::ffi::c_void;
+#[cfg(any(feature = "tp", feature = "comio"))]
 use std::sync::OnceLock;
 use windows::Win32::Foundation::WIN32_ERROR;
+use windows::Win32::Networking::WinSock::{WSADATA, WSAGetLastError, WSAStartup};
+#[cfg(any(feature = "tp", feature = "comio"))]
 use windows::Win32::Networking::WinSock::{
-    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKET, WSADATA, WSAGetLastError, WSAIoctl, WSAStartup,
-    WSA_IO_PENDING,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKET, WSAIoctl, WSA_IO_PENDING,
 };
+#[cfg(any(feature = "tp", feature = "comio"))]
 use windows_core::GUID;
 
 /// Process-wide Winsock initialization, deliberately never torn down
@@ -54,6 +59,7 @@ pub fn sock_check(r: i32) -> windows_core::Result<()> {
 ///
 /// Reports only what the call did; whether a completion packet follows is
 /// decided by `submit` from the handle's notification mode (see [`Issue`]).
+#[cfg(any(feature = "tp", feature = "comio"))]
 pub fn classify_wsa_overlapped(succeeded: bool) -> Issue {
     if succeeded {
         Issue::SyncSuccess
@@ -66,6 +72,7 @@ pub fn classify_wsa_overlapped(succeeded: bool) -> Issue {
 
 /// [`classify_wsa_overlapped`] for the APIs that return `0` on success and
 /// `SOCKET_ERROR` otherwise (`WSARecv`, `WSASend`, ...).
+#[cfg(any(feature = "tp", feature = "comio"))]
 pub fn classify_wsa_ret(r: i32) -> Issue {
     classify_wsa_overlapped(r == 0)
 }
@@ -76,6 +83,7 @@ pub fn classify_wsa_ret(r: i32) -> Issue {
 /// [`connectex`]), but the signature does not vary, and a second hand-written
 /// copy of it is a silent ABI mismatch waiting to happen rather than a
 /// stylistic duplication.
+#[cfg(any(feature = "tp", feature = "comio"))]
 pub type ConnectExFn = unsafe extern "system" fn(
     s: SOCKET,
     name: *const windows::Win32::Networking::WinSock::SOCKADDR,
@@ -93,6 +101,7 @@ pub type ConnectExFn = unsafe extern "system" fn(
 /// service provider, and AF_INET, AF_UNIX and AF_HYPERV are different
 /// providers even though stock Windows serves them all from one
 /// `mswsock.dll`.
+#[cfg(any(feature = "tp", feature = "comio"))]
 pub fn connectex(sock: SOCKET, cache: &OnceLock<usize>) -> windows_core::Result<ConnectExFn> {
     unsafe {
         extension_fn(
@@ -130,6 +139,7 @@ pub fn connectex(sock: SOCKET, cache: &OnceLock<usize>) -> windows_core::Result<
 /// `F` must be the exact `extern "system"` signature the extension `id`
 /// names, and must be pointer-sized. `cache` must be dedicated to this one
 /// `id` *and* to sockets of one provider.
+#[cfg(any(feature = "tp", feature = "comio"))]
 pub unsafe fn extension_fn<F: Copy>(
     sock: SOCKET,
     id: &GUID,
