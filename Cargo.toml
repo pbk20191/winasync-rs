@@ -89,6 +89,11 @@ dq = [
     "windows/Win32_System_ApplicationInstallationAndServicing",
 ]
 
+# Registered I/O (RIO) sub-engine: a separate completion engine beside the
+# overlapped/TP_IO core, for high-rate socket workloads. Builds on tp for the
+# pool and TP_WAIT.
+rio = ["tp"]
+
 # tp's optional futures-io interop (AsyncRead/AsyncWrite <-> futures_io).
 futures-io = ["tp", "dep:futures-io"]
 

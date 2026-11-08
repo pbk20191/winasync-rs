@@ -1,6 +1,8 @@
 mod common;
 #[cfg(feature = "tp")]
 mod tp;
+#[cfg(feature = "rio")]
+mod rio;
 #[cfg(feature = "comio")]
 mod comio;
 #[cfg(feature = "dq")]
