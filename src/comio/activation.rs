@@ -28,12 +28,23 @@
 //!
 //! `ThreadingModel = Both` says the objects are safe to use from an STA or
 //! the MTA. They are: every one of them is `Send + Sync` and already
-//! delivers completions on thread-pool threads. It does **not** promise they
-//! can cross apartments — these are custom interfaces with no registered
-//! proxy/stub and no type library, so COM has nothing to marshal them with.
-//! Create and use each object inside one apartment. `Both` is what keeps
-//! that the normal case: the object is created directly in the caller's
-//! apartment rather than in a host STA it would then have to marshal out of.
+//! delivers completions on thread-pool threads. Whether a given *interface*
+//! on them can leave the apartment it was created in is a separate question,
+//! and the answer differs by family:
+//!
+//! * The dispinterfaces marshal. [`super::typelib`] describes them and
+//!   `register_interfaces` points their `Interface` keys at the oleaut32
+//!   dispatch proxy, so COM can build a proxy from the library. The event
+//!   path depends on this: `cscript` is a single-threaded STA, the accept
+//!   completes on a thread-pool thread, and the sink call has to cross.
+//! * The interfaces this crate declares itself — `IConnectionListener`, the
+//!   `*ListenerBind` pair — do not. They are custom interfaces with no
+//!   registered proxy/stub, and the library does not describe them, so COM
+//!   has nothing to marshal them with. Use those inside one apartment.
+//!
+//! `Both` is what keeps that the normal case: the object is created directly
+//! in the caller's apartment rather than in a host STA it would then have to
+//! marshal out of.
 //!
 //! # What a caller can do with an activated object
 //!
@@ -49,10 +60,15 @@
 //! differently from the vtable's — blocking where the vtable is async — and
 //! that module explains why.
 //!
-//! What is still missing is a type library. Without one there is no early
-//! binding: VBA cannot declare `As NamedPipeClient` and offers no
-//! IntelliSense. Every host named above binds late by default, so this costs
-//! tooling rather than reach.
+//! The type library ([`super::typelib`]) adds early binding on top of that,
+//! but only over what the dispinterfaces describe — the blocking members.
+//! VBA can declare `As NamedPipeClient` and gets IntelliSense over `Connect`,
+//! `Accept` and `WriteText`; nothing in the library mentions the vtable's
+//! `IAsyncOperation` returns. A type library has no notion of a parameterized
+//! interface, and an automation client would have no way to await one even if
+//! handed it. Reaching the async model from another language means reading
+//! WinRT metadata, which this crate does not ship — so that is Rust today, or
+//! a caller that redeclares the interfaces itself.
 //!
 //! # Why `DllCanUnloadNow` always refuses
 //!

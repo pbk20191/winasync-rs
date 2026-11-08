@@ -43,17 +43,35 @@
 //! reads from, across the apartment boundary. VBA's `WithEvents` and an ATL
 //! sink take that same path.
 //!
-//! PowerShell is the exception, and not for a reason this code can fix.
-//! `Register-ObjectEvent` resolves an event by name through
-//! `Type.GetEvent`, which a `System.__ComObject` has nothing to answer with
-//! unless an interop assembly was imported from the library first — COM
-//! discovery is not consulted at all. Going under it with
-//! `ComEventsHelper.Combine` and an explicit IID and DISPID does find the
-//! connection point and advise successfully, but the sink it builds then
-//! calls a PowerShell script block on the thread the event is raised on,
-//! where no runspace exists. Both are host limitations above COM; the
-//! blocking `Accept` in [`super::dispatch`] is what PowerShell should use,
-//! which is one reason it is still there.
+//! PowerShell needs one extra step, which the type library supplies.
+//! `Register-ObjectEvent` resolves an event by name through `Type.GetEvent`,
+//! and a `System.__ComObject` has nothing to answer with — COM discovery is
+//! not consulted at all. The answer is an interop assembly:
+//!
+//! ```text
+//! TlbImp.exe "%LOCALAPPDATA%\rustwinui3loop\rustwinui3loop.tlb" ^
+//!     /out:Rustwinui3loop.Interop.dll /namespace:Rustwinui3loop
+//! ```
+//!
+//! `tlbimp` reads the `[default, source]` flags this library sets and emits
+//! the glue .NET wants — a `DListenerEvents_EventProvider`, a sink helper,
+//! and `ConnectionReceived` as a real .NET event on each coclass. The object
+//! must then be created from the interop coclass, not by ProgID: `New-Object
+//! -ComObject` yields a `System.__ComObject` again, while `New-Object
+//! Rustwinui3loop.NamedPipeConnectionListenerClass` yields a typed RCW that
+//! `Type.GetEvent` can answer for. Measured on PowerShell 7.6.9 / .NET 10,
+//! with both `Wait-Event` and an `-Action` block.
+//!
+//! Two things are worth knowing before relying on it. `Register-ObjectEvent`
+//! is what makes this work, not .NET COM events generally: going under it
+//! with `ComEventsHelper.Combine` and an explicit IID and DISPID does advise
+//! successfully, but the sink it builds calls the script block on the thread
+//! the event is raised on, where no runspace exists. And the delivery is
+//! cooperative — PowerShell marshals the event into its own queue and runs
+//! the action on the pipeline thread between statements, so a main thread
+//! blocked inside one long call delays its own handlers. Where that matters,
+//! the blocking `Accept` in [`super::dispatch`] inside `Start-ThreadJob` is
+//! the better shape, which is one reason `Accept` is still there.
 //!
 //! # Enumerators
 //!

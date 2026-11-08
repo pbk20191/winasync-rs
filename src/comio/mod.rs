@@ -6,6 +6,45 @@
 //! All three are transports WinRT itself does not expose: `StreamSocket` has no
 //! named-pipe, AF_UNIX or AF_HYPERV support, and `HostName` cannot even name
 //! those endpoints.
+//!
+//! # What `IInspectable` answers here, and what it does not
+//!
+//! Every object in this module is reachable as an `IInspectable`: the WinRT
+//! interfaces they implement — `IClosable`, `IInputStream`, `IOutputStream`,
+//! `IAsyncOperationWithProgress` — all derive from it, so `QueryInterface`
+//! succeeds. The ABI really is the WinRT one. What the three `IInspectable`
+//! methods *say*, though, is fixed by `windows-rs` and is not the truth about
+//! these objects:
+//!
+//! * `GetIids` reports an empty set. `IInspectable_Vtbl::new` installs a free
+//!   function that writes `count = 0`, `values = null` and returns `S_OK`. It
+//!   takes no type parameter at all, so there is no point at which an object's
+//!   real interface chains could reach it.
+//! * `GetRuntimeClassName` reports the empty string. It returns
+//!   `RuntimeName::NAME` of the **first** interface named in `#[implement]`,
+//!   and `#[interface]` generates `impl RuntimeName for X {}` — taking the
+//!   default, `""` — for every interface this crate declares.
+//! * `GetTrustLevel` is the one that reaches our code, and the macro hardcodes
+//!   it to `0`, `BaseTrust`.
+//!
+//! All three return `S_OK`, so a consumer doing WinRT type discovery is told
+//! "no interfaces, no name, base trust" rather than "I cannot say" — a
+//! confident wrong answer instead of an honest refusal. None of it is
+//! reachable from here: `#[implement]` parses only a list of interfaces, and
+//! the identity vtable it builds is an associated constant on the generated
+//! `_Impl` type.
+//!
+//! That is a gap in what these objects *are*, not a defect to paper over.
+//! They are not WinRT runtime classes; they are COM classes that implement
+//! WinRT interfaces, activated by CLSID ([`activation`]) and described by a
+//! type library ([`typelib`]). A runtime class name is a promise that the
+//! name resolves through WinRT metadata, and nothing here publishes any — so
+//! inventing a non-empty name would make the claim more *credible* without
+//! making it true, which is worse than the empty string. Answering these
+//! honestly is part of shipping a `.winmd`, not a step that can usefully come
+//! before it. `tests::iinspectable_is_shaped_but_hollow` pins the current
+//! answers, so a `windows-rs` upgrade that changes any of them shows up as a
+//! failure rather than a silent shift.
 #![allow(dead_code)]
 
 pub mod activation;
@@ -181,5 +220,79 @@ mod tests {
                 "op blocks leaked after read cancel storm"
             );
         }
+    }
+
+    /// Pins what `IInspectable` actually answers on our objects, for the
+    /// reasons the module docs give.
+    ///
+    /// This is a characterisation test: it asserts what is, not what should
+    /// be, so that the day a `windows-rs` upgrade makes any of it honest —
+    /// or changes it some other way — that is a failure to read rather than
+    /// a silent shift under a design decision which cited it.
+    ///
+    /// A real WinRT class goes through the same calls as a control. Without
+    /// it, "empty" could just as well mean the test is calling the vtable
+    /// wrong; with it, the empty answers are demonstrably the object's.
+    #[test]
+    fn iinspectable_is_shaped_but_hollow() {
+        use windows_core::{IInspectable, IInspectable_Vtbl};
+
+        /// `GetIids` has no safe wrapper in `windows-core`, so go through the
+        /// vtable. Returns the count, and whether the array came back null.
+        fn get_iids(what: &str, object: &IInspectable) -> (u32, bool) {
+            // Seeded with values the callee must overwrite, so a vtable entry
+            // that ignored its out-params could not pass for "empty".
+            let mut count = 0xDEADu32;
+            let mut values = core::ptr::dangling_mut::<windows_core::GUID>();
+            let hr = unsafe {
+                let raw = object.as_raw();
+                let vtbl = *(raw as *const *const IInspectable_Vtbl);
+                ((*vtbl).GetIids)(raw, &mut count, &mut values)
+            };
+            assert!(hr.is_ok(), "{what}: GetIids failed with {hr:?}");
+            let null = values.is_null();
+            if !null {
+                // The array is the caller's to release.
+                unsafe {
+                    windows::Win32::System::Com::CoTaskMemFree(Some(
+                        values as *const core::ffi::c_void,
+                    ))
+                };
+            }
+            (count, null)
+        }
+
+        let ours: IInspectable = crate::comio::NamedPipeConnectionListener::new()
+            .cast()
+            .expect("listener QI IInspectable");
+
+        let (count, values_null) = get_iids("listener", &ours);
+        assert_eq!(count, 0, "GetIids reported interfaces");
+        assert!(values_null, "GetIids returned a non-null array");
+        let name = ours.GetRuntimeClassName().expect("GetRuntimeClassName");
+        assert!(name.is_empty(), "GetRuntimeClassName said {name:?}");
+        assert_eq!(
+            ours.GetTrustLevel().expect("GetTrustLevel"),
+            0,
+            "GetTrustLevel was not BaseTrust"
+        );
+
+        // The control: a class the Windows Runtime itself publishes, reached
+        // through the identical code path.
+        let theirs: IInspectable = crate::comio::buffer::new_buffer(1)
+            .expect("Buffer::Create")
+            .cast()
+            .expect("Buffer QI IInspectable");
+
+        let (count, values_null) = get_iids("control", &theirs);
+        assert_ne!(count, 0, "control: a real WinRT class reported no IIDs");
+        assert!(!values_null, "control: a real WinRT class returned no array");
+        assert!(
+            !theirs
+                .GetRuntimeClassName()
+                .expect("control: GetRuntimeClassName")
+                .is_empty(),
+            "control: a real WinRT class reported no name"
+        );
     }
 }
