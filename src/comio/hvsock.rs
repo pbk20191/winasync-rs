@@ -17,10 +17,10 @@
 //! `tp`'s Hyper-V transport.
 
 use crate::common::winsock::{
-    classify_wsa_overlapped, extension_fn, sock_check, wsa_init,
+    classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
 use super::listener::Accepted;
-use super::stream;
+use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use crate::common::hvaddr::{
@@ -33,10 +33,9 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, AF_HYPERV, INVALID_SOCKET,
     SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
-    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSAID_CONNECTEX,
+    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
     WSASocketW, WSA_FLAG_OVERLAPPED,
 };
-use windows::Win32::System::IO::OVERLAPPED;
 use windows_core::{Error, HSTRING, IInspectable, Result, HRESULT};
 
 /// Creates an AF_HYPERV stream socket. Fails with `WSAEAFNOSUPPORT` (10047)
@@ -55,42 +54,17 @@ fn new_socket() -> Result<SOCKET> {
     }
 }
 
-type ConnectExFn = unsafe extern "system" fn(
-    s: SOCKET,
-    name: *const SOCKADDR,
-    namelen: i32,
-    lpsendbuffer: *const c_void,
-    dwsenddatalength: u32,
-    lpdwbytessent: *mut u32,
-    lpoverlapped: *mut OVERLAPPED,
-) -> windows_core::BOOL;
-
-/// `ConnectEx` for the **HvSocket** provider; cached apart from every other
-/// family's (see [`extension_fn`]).
+/// `ConnectEx` for the **HvSocket** provider. The signature lives in
+/// `common::winsock`; only this cache is local, because the pointer belongs
+/// to the provider.
 fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
-    unsafe { extension_fn(sock, &WSAID_CONNECTEX, &PTR) }
+    connectex(sock, &PTR)
 }
 
 /// AcceptEx address slot: sockaddr size + 16 bytes, per the API contract.
 const ADDR_SLOT: usize = size_of::<SockaddrHv>() + 16;
 
-/// Owns the pre-created accept socket while `AcceptEx` is in flight, closing it
-/// if the `accept()` future is dropped before the op resolves. Same reasoning
-/// as `super::unix::AcceptSockGuard`: closing a socket with a pending op just
-/// aborts the op, with no kernel-owned memory left behind.
-struct AcceptSockGuard(SOCKET);
-
-impl Drop for AcceptSockGuard {
-    fn drop(&mut self) {
-        if self.0 != INVALID_SOCKET {
-            unsafe { closesocket(self.0) };
-        }
-    }
-}
-
-// SOCKET is a plain kernel handle value.
-unsafe impl Send for AcceptSockGuard {}
 
 /// A listening Hyper-V socket, registered with the thread pool's TP_IO so
 /// `AcceptEx` can be driven through [`await_io_owning`].

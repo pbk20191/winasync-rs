@@ -70,6 +70,39 @@ pub fn classify_wsa_ret(r: i32) -> Issue {
     classify_wsa_overlapped(r == 0)
 }
 
+/// `ConnectEx`'s ABI.
+///
+/// One declaration for every transport. The *cache* stays per provider (see
+/// [`connectex`]), but the signature does not vary, and a second hand-written
+/// copy of it is a silent ABI mismatch waiting to happen rather than a
+/// stylistic duplication.
+pub type ConnectExFn = unsafe extern "system" fn(
+    s: SOCKET,
+    name: *const windows::Win32::Networking::WinSock::SOCKADDR,
+    namelen: i32,
+    lpsendbuffer: *const c_void,
+    dwsenddatalength: u32,
+    lpdwbytessent: *mut u32,
+    lpoverlapped: *mut windows::Win32::System::IO::OVERLAPPED,
+) -> windows_core::BOOL;
+
+/// Fetches `ConnectEx` for `sock`'s provider, caching into the caller's
+/// `OnceLock`.
+///
+/// Each transport passes its own cache: the pointer belongs to the socket's
+/// service provider, and AF_INET, AF_UNIX and AF_HYPERV are different
+/// providers even though stock Windows serves them all from one
+/// `mswsock.dll`.
+pub fn connectex(sock: SOCKET, cache: &OnceLock<usize>) -> windows_core::Result<ConnectExFn> {
+    unsafe {
+        extension_fn(
+            sock,
+            &windows::Win32::Networking::WinSock::WSAID_CONNECTEX,
+            cache,
+        )
+    }
+}
+
 /// Fetches a Winsock extension function pointer — `ConnectEx`, `AcceptEx`,
 /// `DisconnectEx`, `TransmitPackets`, `WSARecvMsg` — which are reachable only
 /// through `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)`, never as exports.

@@ -60,6 +60,7 @@
 
 pub mod buffer;
 pub mod cq;
+pub mod rq;
 pub mod socket;
 pub mod tcp;
 pub(crate) mod table;
@@ -69,6 +70,8 @@ pub use buffer::{RioBufferPool, RioSlice};
 #[allow(unused_imports)]
 pub use cq::RioCq;
 #[allow(unused_imports)]
-pub use socket::{RioUdpSocket, RqConfig};
+pub use rq::RqConfig;
+#[allow(unused_imports)]
+pub use socket::RioUdpSocket;
 #[allow(unused_imports)]
 pub use tcp::{RioTcpListener, RioTcpStream};

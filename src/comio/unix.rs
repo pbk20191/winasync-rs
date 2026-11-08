@@ -13,10 +13,10 @@
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
 use crate::common::winsock::{
-    classify_wsa_overlapped, extension_fn, sock_check, wsa_init,
+    classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
 use super::listener::Accepted;
-use super::stream;
+use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use core::ffi::c_void;
@@ -26,10 +26,8 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
     SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
-    SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
-    WSAID_CONNECTEX, WSASocketW, WSA_FLAG_OVERLAPPED,
+    SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSASocketW, WSA_FLAG_OVERLAPPED,
 };
-use windows::Win32::System::IO::OVERLAPPED;
 use windows_core::{Error, IInspectable, Result, HRESULT};
 
 fn new_socket() -> Result<SOCKET> {
@@ -71,44 +69,17 @@ fn sockaddr_un_autobind() -> (SOCKADDR_UN, i32) {
     (sa, size_of::<ADDRESS_FAMILY>() as i32)
 }
 
-type ConnectExFn = unsafe extern "system" fn(
-    s: SOCKET,
-    name: *const SOCKADDR,
-    namelen: i32,
-    lpsendbuffer: *const c_void,
-    dwsenddatalength: u32,
-    lpdwbytessent: *mut u32,
-    lpoverlapped: *mut OVERLAPPED,
-) -> windows_core::BOOL;
-
-/// `ConnectEx` for the **AFUNIX** provider; cached apart from every other
-/// family's (see [`extension_fn`]).
+/// `ConnectEx` for the **AFUNIX** provider. The signature lives in
+/// `common::winsock`; only this cache is local, because the pointer belongs
+/// to the provider.
 fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
-    unsafe { extension_fn(sock, &WSAID_CONNECTEX, &PTR) }
+    connectex(sock, &PTR)
 }
 
 /// AcceptEx address slot: sockaddr size + 16 bytes, per the API contract.
 const ADDR_SLOT: usize = size_of::<SOCKADDR_UN>() + 16;
 
-/// Owns the pre-created accept socket while `AcceptEx` is in flight, closing
-/// it if `accept()`'s own future is dropped before the op resolves. This is
-/// safe as a plain frame-local guard (unlike the address buffer, below):
-/// closing a socket with a pending overlapped op on it just aborts the op
-/// and releases the handle — there is no kernel-owned *memory* backing the
-/// socket value itself that a delayed completion could still write into.
-struct AcceptSockGuard(SOCKET);
-
-impl Drop for AcceptSockGuard {
-    fn drop(&mut self) {
-        if self.0 != INVALID_SOCKET {
-            unsafe { closesocket(self.0) };
-        }
-    }
-}
-
-// SOCKET is a plain kernel handle value.
-unsafe impl Send for AcceptSockGuard {}
 
 /// A listening AF_UNIX socket, registered with the thread pool's TP_IO so
 /// `AcceptEx` can be driven through [`super::waitop::await_io`].

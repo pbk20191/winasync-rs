@@ -14,41 +14,18 @@
 //! `WSA_FLAG_OVERLAPPED`: a socket accepted from a RIO-flagged listener can
 //! take a request queue without the flag being set again.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, listen, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOMAXCONN,
-    WSASocketW, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
+    closesocket, connect, listen, IPPROTO_TCP, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM,
+    SOMAXCONN,
 };
 
 use super::buffer::RioSlice;
-use super::cq::{CompleteFn, Request, RioCq};
-use super::socket::RqConfig;
-use super::table::rio_table;
-use crate::common::oneshot;
-use crate::common::winsock::{sock_check, wsa_init, wsa_last_err};
+use super::cq::RioCq;
+use super::rq::{bind_socket, new_rio_socket, RequestQueue, RqConfig};
+use crate::common::winsock::sock_check;
 use crate::tp::io::net::{addr_of_socket, write_sockaddr};
 use std::net::SocketAddr;
-
-const RIO_INVALID_RQ: windows::Win32::Networking::WinSock::RIO_RQ =
-    windows::Win32::Networking::WinSock::RIO_RQ(0);
-
-fn new_rio_socket(addr: &SocketAddr) -> windows_core::Result<SOCKET> {
-    wsa_init();
-    let family = match addr {
-        SocketAddr::V4(_) => windows::Win32::Networking::WinSock::AF_INET,
-        SocketAddr::V6(_) => windows::Win32::Networking::WinSock::AF_INET6,
-    };
-    unsafe {
-        WSASocketW(
-            family.0 as i32,
-            SOCK_STREAM.0,
-            windows::Win32::Networking::WinSock::IPPROTO_TCP.0,
-            None,
-            0,
-            WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
-        )
-    }
-}
 
 /// A listening socket whose accepted connections can take RIO request queues.
 ///
@@ -64,11 +41,9 @@ unsafe impl Sync for RioTcpListener {}
 
 impl RioTcpListener {
     pub fn bind(addr: SocketAddr) -> windows_core::Result<Self> {
-        let sock = new_rio_socket(&addr)?;
+        let sock = new_rio_socket(&addr, SOCK_STREAM.0, IPPROTO_TCP.0)?;
         let setup = || -> windows_core::Result<()> {
-            let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
-            let len = write_sockaddr(&addr, &mut storage);
-            sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
+            bind_socket(sock, &addr)?;
             sock_check(unsafe { listen(sock, SOMAXCONN as i32) })
         };
         match setup() {
@@ -115,8 +90,7 @@ impl Drop for RioTcpListener {
 /// cancel, and operations on one stream are serialized.
 pub struct RioTcpStream {
     sock: SOCKET,
-    rq: Mutex<windows::Win32::Networking::WinSock::RIO_RQ>,
-    _cq: Arc<RioCq>,
+    rq: RequestQueue,
 }
 
 unsafe impl Send for RioTcpStream {}
@@ -129,16 +103,12 @@ impl RioTcpStream {
         addr: SocketAddr,
         config: RqConfig,
     ) -> windows_core::Result<Self> {
-        let sock = new_rio_socket(&addr)?;
+        let sock = new_rio_socket(&addr, SOCK_STREAM.0, IPPROTO_TCP.0)?;
         let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
         let len = write_sockaddr(&addr, &mut storage);
-        if let Err(e) = sock_check(unsafe {
-            windows::Win32::Networking::WinSock::connect(
-                sock,
-                &storage as *const _ as *const SOCKADDR,
-                len,
-            )
-        }) {
+        if let Err(e) =
+            sock_check(unsafe { connect(sock, &storage as *const _ as *const SOCKADDR, len) })
+        {
             unsafe { closesocket(sock) };
             return Err(e);
         }
@@ -153,29 +123,13 @@ impl RioTcpStream {
         cq: &Arc<RioCq>,
         config: RqConfig,
     ) -> windows_core::Result<Self> {
-        let table = rio_table()?;
-        let rq = unsafe {
-            (table.raw().RIOCreateRequestQueue.unwrap())(
-                sock,
-                config.max_outstanding_recv,
-                1,
-                config.max_outstanding_send,
-                1,
-                cq.raw(),
-                cq.raw(),
-                core::ptr::null(),
-            )
-        };
-        if rq == RIO_INVALID_RQ {
-            let e = wsa_last_err();
-            unsafe { closesocket(sock) };
-            return Err(e);
+        match RequestQueue::attach(sock, cq, config) {
+            Ok(rq) => Ok(Self { sock, rq }),
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                Err(e)
+            }
         }
-        Ok(Self {
-            sock,
-            rq: Mutex::new(rq),
-            _cq: cq.clone(),
-        })
     }
 
     pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
@@ -188,7 +142,7 @@ impl RioTcpStream {
         slice: RioSlice,
     ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
     {
-        self.post(slice, false)
+        self.rq.post(slice, false, 0)
     }
 
     /// Posts a send of `slice`'s current length.
@@ -197,57 +151,9 @@ impl RioTcpStream {
         slice: RioSlice,
     ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
     {
-        self.post(slice, true)
+        self.rq.post(slice, true, 0)
     }
 
-    fn post(
-        &self,
-        slice: RioSlice,
-        is_send: bool,
-    ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
-    {
-        let table = rio_table()?;
-        let (tx, rx) = oneshot::channel::<(windows_core::Result<usize>, Option<RioSlice>)>();
-        let buf = slice.rio_buf();
-
-        let complete: CompleteFn = Box::new(move |status, bytes, returned| {
-            let result = if status == 0 {
-                Ok(bytes as usize)
-            } else {
-                Err(windows_core::Error::from_hresult(
-                    windows::Win32::Foundation::WIN32_ERROR(status as u32).to_hresult(),
-                ))
-            };
-            let _ = tx.send((result, returned));
-        });
-
-        let ctx = Request {
-            complete,
-            slice: Some(slice),
-        }
-        .into_context();
-
-        let rq = *self.rq.lock().unwrap();
-        let ok = unsafe {
-            if is_send {
-                (table.raw().RIOSend.unwrap())(rq, &buf, 1, 0, ctx)
-            } else {
-                (table.raw().RIOReceive.unwrap())(rq, &buf, 1, 0, ctx)
-            }
-        };
-        if !ok.as_bool() {
-            let err = wsa_last_err();
-            let _ = unsafe { Box::from_raw(ctx as *mut Request) };
-            return Err(err);
-        }
-
-        Ok(async move {
-            match rx.await {
-                Ok((result, slice)) => (result, slice.expect("pump returns the slice")),
-                Err(_) => unreachable!("the pump always completes a posted request"),
-            }
-        })
-    }
 }
 
 impl Drop for RioTcpStream {

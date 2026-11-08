@@ -15,7 +15,7 @@ use super::file::File;
 use super::{submit, IoRes, OpFuture};
 use crate::tp::{Runtime, RuntimeInner};
 pub(crate) use crate::common::winsock::{
-    classify_wsa_overlapped, extension_fn, sock_check, wsa_init,
+    classify_wsa_overlapped, connectex, extension_fn, sock_check, wsa_init, ConnectExFn,
 };
 use core::ffi::c_void;
 use std::mem;
@@ -37,7 +37,7 @@ use windows::Win32::Networking::WinSock::{
     SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TF_DISCONNECT,
     TF_REUSE_SOCKET, TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT,
     TRANSMIT_PACKETS_ELEMENT_0, TRANSMIT_PACKETS_ELEMENT_0_0, TransmitFile, WINSOCK_SOCKET_TYPE,
-    WSABUF, WSAID_CONNECTEX, WSAID_DISCONNECTEX, WSAID_TRANSMITPACKETS,
+    WSABUF, WSAID_DISCONNECTEX, WSAID_TRANSMITPACKETS,
     WSAID_WSARECVMSG, WSA_FLAG_OVERLAPPED, CMSGHDR, IN_PKTINFO, IPPROTO_IP,
     IP_PKTINFO, LPWSAOVERLAPPED_COMPLETION_ROUTINE, WSAMSG, WSASendMsg,
 };
@@ -166,22 +166,12 @@ fn peer_of_socket(sock: SOCKET) -> windows_core::Result<SocketAddr> {
     read_sockaddr(&storage)
 }
 
-type ConnectExFn = unsafe extern "system" fn(
-    s: SOCKET,
-    name: *const SOCKADDR,
-    namelen: i32,
-    lpsendbuffer: *const c_void,
-    dwsenddatalength: u32,
-    lpdwbytessent: *mut u32,
-    lpoverlapped: *mut windows::Win32::System::IO::OVERLAPPED,
-) -> windows_core::BOOL;
-
-/// `ConnectEx` for the **TCP/IP** provider. Its own cache: the AF_UNIX and
-/// AF_HYPERV transports fetch theirs separately, since the pointer belongs to
-/// the provider (see [`extension_fn`]).
+/// `ConnectEx` for the **TCP/IP** provider. The signature lives in
+/// `common::winsock`; only this cache is local, because the pointer belongs
+/// to the provider.
 pub(super) fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
     static PTR: OnceLock<usize> = OnceLock::new();
-    unsafe { extension_fn(sock, &WSAID_CONNECTEX, &PTR) }
+    connectex(sock, &PTR)
 }
 
 type TransmitPacketsFn = unsafe extern "system" fn(
@@ -245,9 +235,9 @@ pub(super) const ADDR_SLOT: usize = size_of::<SOCKADDR_STORAGE>() + 16;
 /// Owns the pre-created accept socket and address buffer while AcceptEx is in
 /// flight. If the op is cancelled the completion callback frees the block and
 /// this Drop closes the socket.
-struct AcceptPayload {
-    accept_sock: SOCKET,
-    addr_buf: Box<[u8; 2 * ADDR_SLOT]>,
+pub(in crate::tp::io) struct AcceptPayload {
+    pub(in crate::tp::io) accept_sock: SOCKET,
+    pub(in crate::tp::io) addr_buf: Box<[u8; 2 * ADDR_SLOT]>,
 }
 
 impl Drop for AcceptPayload {
@@ -294,9 +284,9 @@ unsafe impl Send for AcceptDataPayload {}
 
 /// Payload of a WSARecv: the buffer plus the flags word, which the provider
 /// may write at completion time and therefore must live in the op block.
-struct RecvPayload {
-    buf: Vec<u8>,
-    flags: u32,
+pub(in crate::tp::io) struct RecvPayload {
+    pub(in crate::tp::io) buf: Vec<u8>,
+    pub(in crate::tp::io) flags: u32,
 }
 
 /// Payload of a **vectored** WSARecv/WSASend: the caller's buffers plus the
