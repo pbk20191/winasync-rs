@@ -34,11 +34,7 @@ pub(crate) use stream::from_reg;
 #[allow(unused_imports)]
 pub use unix::{UnixStreamListener, UnixStreamSocket};
 
-/// Thread pool / overlapped calls only fail on resource exhaustion; map those
-/// to a panic, matching `tp`'s policy.
-pub(crate) fn check<T>(r: windows_core::Result<T>) -> T {
-    r.expect("comio overlapped allocation failed")
-}
+pub(crate) use crate::common::check::check;
 
 #[cfg(test)]
 mod tests {

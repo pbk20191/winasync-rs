@@ -39,7 +39,6 @@
 // only by the unit tests and the demo.
 #![allow(dead_code)]
 
-pub mod block_on;
 pub mod io;
 pub mod pool;
 pub mod task;
@@ -47,7 +46,7 @@ pub mod timer;
 pub mod wait;
 
 #[allow(unused_imports)]
-pub use block_on::block_on;
+pub use crate::common::block_on::block_on;
 #[allow(unused_imports)]
 pub use io::async_rw::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, TcpStreamIo, WriteHalf,
@@ -70,11 +69,7 @@ pub use wait::{wait_for_handle, HandleWait};
 use pool::PoolInner;
 use std::sync::Arc;
 
-/// When used correctly the thread pool APIs only fail on memory exhaustion;
-/// map such failures to a panic (same policy as `windows-threading`).
-pub(crate) fn check<T>(result: windows_core::Result<T>) -> T {
-    result.expect("threadpool allocation failed")
-}
+pub(crate) use crate::common::check::check;
 
 /// A handle to an async runtime backed by a private Win32 thread pool.
 ///
@@ -136,7 +131,9 @@ impl Runtime {
         F::Output: Send + 'static,
     {
         let handle = self.spawn(fut);
-        block_on::block_on(async move { handle.await.expect("block_on: spawned task failed") })
+        crate::common::block_on::block_on(async move {
+            handle.await.expect("block_on: spawned task failed")
+        })
     }
 }
 

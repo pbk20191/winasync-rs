@@ -1,7 +1,8 @@
 //! Drive a future to completion on the calling thread, parking on a Win32
-//! auto-reset event between polls.
+//! auto-reset event between polls. Runtime-neutral: no dependency on any
+//! executor's pool — usable to drive any future.
 
-use super::check;
+use crate::common::check::check;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -26,13 +27,10 @@ impl Parker {
 
     fn unpark(&self) {
         // Called from `Waker::wake`, which may run inside a thread-pool
-        // completion callback (an IO/timer/task completion waking the top-level
-        // future). A waker must not panic across that FFI boundary (module
-        // invariant #7), so this must stay panic-free — hence not `check`,
-        // whose panic policy is only sound for the OOM-only pool-alloc calls.
-        // `SetEvent` on this live, owned auto-reset handle cannot realistically
-        // fail; a spurious failure would at worst drop one wake, which the
-        // poll loop's recheck tolerates. Asserted in debug for visibility.
+        // completion callback. A waker must not panic across that FFI boundary,
+        // so this stays panic-free (not `check`). `SetEvent` on this live, owned
+        // auto-reset handle cannot realistically fail; a spurious failure drops
+        // at most one wake, which the poll loop's recheck tolerates.
         let r = unsafe { SetEvent(self.event) };
         debug_assert!(r.is_ok(), "SetEvent failed in waker: {r:?}");
     }
@@ -53,6 +51,7 @@ impl Drop for Parker {
         }
     }
 }
+
 static VTABLE: RawWakerVTable = RawWakerVTable::new(
     |p| {
         unsafe { Arc::increment_strong_count(p as *const Parker) };
@@ -70,8 +69,7 @@ fn raw_waker(parker: *const Parker) -> RawWaker {
     RawWaker::new(parker as *const (), &VTABLE)
 }
 
-/// Runs the future to completion on the calling thread. Spawned tasks keep
-/// running on their pool threads; only the top-level future is driven here.
+/// Runs the future to completion on the calling thread, parking between polls.
 pub fn block_on<F: Future>(f: F) -> F::Output {
     let parker = Parker::new();
     let waker = parker.waker();

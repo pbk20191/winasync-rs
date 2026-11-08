@@ -1,12 +1,10 @@
 //! A runtime-neutral single-shot channel: one `Sender` hands exactly one value
 //! to one `Receiver` (a `Future`).
 //!
-//! It depends only on `std::sync` + `core::task::Waker` — it knows nothing about
-//! `tp`, `dq`, or any executor, so it works as the handoff between *any* two
-//! contexts (pool task -> UI task, world thread -> render thread, …). The
-//! receiver resolves on whatever executor polls it, woken by whatever thread
-//! sends — the "hop" is pure composition, with no coupling baked into either
-//! runtime.
+//! Depends only on `std::sync` + `core::task::Waker` — it knows nothing about
+//! `tp`, `dq`, or any executor, so it is the handoff between *any* two contexts
+//! (pool task -> UI task, world thread -> render thread, …). The receiver
+//! resolves on whatever executor polls it, woken by whatever thread sends.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -70,8 +68,6 @@ impl<T> Sender<T> {
             inner.completed = true;
             inner.waker.take()
         };
-        // `self`'s `Drop` runs after this returns; it sees `completed` and so
-        // does not mark `sender_dropped`.
         if let Some(w) = waker {
             w.wake();
         }
@@ -89,7 +85,7 @@ impl<T> Drop for Sender<T> {
         let waker = {
             let mut inner = self.inner.lock().unwrap();
             if inner.completed {
-                return; // value was sent; nothing to signal.
+                return;
             }
             inner.sender_dropped = true;
             inner.waker.take()
@@ -122,10 +118,10 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tp"))]
 mod tests {
     use super::*;
-    use crate::tp::block_on;
+    use crate::common::block_on;
 
     #[test]
     fn send_then_receive() {
