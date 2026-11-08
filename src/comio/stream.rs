@@ -105,7 +105,7 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
             // the op's real completion regardless of cancellation.
             let mut flags = Box::new(0u32);
             let flags_ptr: *mut u32 = &mut *flags;
-            Ok(IoAsyncOp::start_read(&reg, ib, flags, |_| {}, move |ovl| unsafe {
+            Ok(IoAsyncOp::start_read(&reg, ib, flags, move |ovl| unsafe {
                 let wsabuf = WSABUF {
                     len: n,
                     buf: windows_core::PSTR(ptr),
@@ -114,7 +114,7 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
                 classify_wsa(r)
             }))
         } else {
-            Ok(IoAsyncOp::start_read(&reg, ib, (), |_| {}, move |ovl| unsafe {
+            Ok(IoAsyncOp::start_read(&reg, ib, (), move |ovl| unsafe {
                 match ReadFile(
                     handle,
                     Some(std::slice::from_raw_parts_mut(ptr, n as usize)),
@@ -144,7 +144,7 @@ impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
         let is_socket = reg.is_socket();
         let handle = reg.handle;
         let sock = SOCKET(handle.0 as usize);
-        Ok(IoAsyncOp::start_write(&reg, ib, len, |_| {}, move |ovl| unsafe {
+        Ok(IoAsyncOp::start_write(&reg, ib, len, move |ovl| unsafe {
             if is_socket {
                 let wsabuf = WSABUF {
                     len,
