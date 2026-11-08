@@ -1,0 +1,511 @@
+//! TCP over TP_IO: `TcpListener` (AcceptEx), `TcpStream` (ConnectEx /
+//! WSARecv / WSASend), zero-copy sends (TransmitFile / TransmitPackets), and
+//! socket-handle reuse (DisconnectEx + TF_REUSE_SOCKET).
+
+use super::*;
+/// A listening TCP socket bound to a [`Runtime`]'s pool.
+pub struct TcpListener {
+    res: Arc<IoRes>,
+    /// The address family the listen socket was created with; accepted sockets
+    /// must be created with the same family for `AcceptEx`.
+    family: ADDRESS_FAMILY,
+}
+
+impl TcpListener {
+    /// Binds and listens on `addr` (IPv4 or IPv6).
+    pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpListener> {
+        let family = family_of(&addr);
+        let sock = new_socket(family, SOCK_STREAM, IPPROTO_TCP)?;
+        let register = || -> windows_core::Result<Arc<IoRes>> {
+            let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+            let len = write_sockaddr(&addr, &mut storage);
+            sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
+            sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
+            IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
+        };
+        match register() {
+            Ok(res) => Ok(TcpListener { res, family }),
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                Err(e)
+            }
+        }
+    }
+
+    /// The locally bound address (useful after binding port 0).
+    pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
+        addr_of_socket(self.res.socket())
+    }
+
+    /// Accepts one connection.
+    pub async fn accept(&self) -> windows_core::Result<TcpStream> {
+        let accept_sock = new_socket(self.family, SOCK_STREAM, IPPROTO_TCP)?;
+        let listen_sock = self.res.socket();
+        let fut = unsafe {
+            submit(
+                &self.res,
+                AcceptPayload {
+                    accept_sock,
+                    addr_buf: Box::new([0; 2 * ADDR_SLOT]),
+                },
+                |ovl, p| {
+                    let mut bytes = 0u32;
+                    let ok = AcceptEx(
+                        listen_sock,
+                        p.accept_sock,
+                        p.addr_buf.as_mut_ptr() as *mut c_void,
+                        0, // complete on connect; do not wait for first data
+                        ADDR_SLOT as u32,
+                        ADDR_SLOT as u32,
+                        &mut bytes,
+                        ovl,
+                    );
+                    classify_wsa_overlapped(ok.as_bool())
+                },
+            )
+        };
+        let (result, mut payload) = fut.await;
+        result?;
+        let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
+        let finish = || -> windows_core::Result<TcpStream> {
+            // Until SO_UPDATE_ACCEPT_CONTEXT (value = the listen socket) the
+            // accepted socket is half-configured (shutdown/getsockname/
+            // getpeername fail).
+            let listen_val = listen_sock.0.to_ne_bytes();
+            sock_check(unsafe {
+                setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
+            })?;
+            TcpStream::from_socket(&self.res.rt, sock)
+        };
+        match finish() {
+            Ok(stream) => Ok(stream),
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                Err(e)
+            }
+        }
+    }
+
+    /// Accepts the next connection into a socket recycled from
+    /// [`TcpStream::into_reusable`], skipping the per-connection `socket()` and —
+    /// crucially — the completion-port re-association, which Windows forbids (a
+    /// socket is bound to one IOCP for life). The reused socket keeps its original
+    /// `IoRes`/TP_IO; only `AcceptEx` is re-run on it, driven by this listener,
+    /// and the returned stream reuses that same `IoRes`. The reused socket must
+    /// match this listener's address family.
+    pub async fn accept_into(&self, reusable: ReusableSocket) -> windows_core::Result<TcpStream> {
+        let accept_sock = reusable.res.socket();
+        let listen_sock = self.res.socket();
+        let fut = unsafe {
+            submit(
+                &self.res,
+                AcceptIntoPayload {
+                    // Keep the recycled socket's IoRes alive for the op (its
+                    // socket is the AcceptEx target); the IoRes owns the socket,
+                    // so the payload never closes it.
+                    res: reusable.res,
+                    addr_buf: Box::new([0; 2 * ADDR_SLOT]),
+                },
+                |ovl, p| {
+                    let mut bytes = 0u32;
+                    let ok = AcceptEx(
+                        listen_sock,
+                        p.res.socket(),
+                        p.addr_buf.as_mut_ptr() as *mut c_void,
+                        0,
+                        ADDR_SLOT as u32,
+                        ADDR_SLOT as u32,
+                        &mut bytes,
+                        ovl,
+                    );
+                    classify_wsa_overlapped(ok.as_bool())
+                },
+            )
+        };
+        let (result, payload) = fut.await;
+        result?;
+        let listen_val = listen_sock.0.to_ne_bytes();
+        sock_check(unsafe {
+            setsockopt(accept_sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
+        })?;
+        // Reuse the recycled socket's existing TP_IO registration directly — no
+        // re-register (one IOCP per socket for life).
+        Ok(TcpStream { res: payload.res })
+    }
+}
+
+
+/// A connected TCP socket bound to a [`Runtime`]'s pool.
+pub struct TcpStream {
+    res: Arc<IoRes>,
+}
+
+impl TcpStream {
+    fn from_socket(rt: &Arc<RuntimeInner>, sock: SOCKET) -> windows_core::Result<TcpStream> {
+        match IoRes::register(rt, HANDLE(sock.0 as *mut c_void), true) {
+            Ok(res) => Ok(TcpStream { res }),
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                Err(e)
+            }
+        }
+    }
+
+    /// Connects to `addr` (IPv4 or IPv6).
+    pub async fn connect(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpStream> {
+        let family = family_of(&addr);
+        let sock = new_socket(family, SOCK_STREAM, IPPROTO_TCP)?;
+        let prepared = (|| -> windows_core::Result<(ConnectExFn, TcpStream)> {
+            // ConnectEx fails with WSAEINVAL on an unbound socket.
+            let mut local = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+            let local_len = write_sockaddr(&wildcard(family), &mut local);
+            sock_check(unsafe {
+                bind(sock, &local as *const _ as *const SOCKADDR, local_len)
+            })?;
+            let connect_ex = get_connectex(sock)?;
+            Ok((connect_ex, TcpStream::from_socket(&rt.inner, sock)?))
+        })();
+        let (connect_ex, stream) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe { closesocket(sock) };
+                return Err(e);
+            }
+        };
+
+        let mut remote = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let remote_len = write_sockaddr(&addr, &mut remote);
+        let fut = unsafe {
+            submit(&stream.res, (remote, remote_len), move |ovl, p| {
+                let mut sent = 0u32;
+                let ok = connect_ex(
+                    sock,
+                    &p.0 as *const _ as *const SOCKADDR,
+                    p.1,
+                    core::ptr::null(),
+                    0,
+                    &mut sent,
+                    ovl,
+                );
+                classify_wsa_overlapped(ok.as_bool())
+            })
+        };
+        let (result, _) = fut.await;
+        result?;
+        sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None) })?;
+        Ok(stream)
+    }
+
+    /// Receives into `buf`; resolves to the byte count (0 = peer closed) and
+    /// hands the buffer back.
+    pub fn read(
+        &self,
+        buf: Vec<u8>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
+                let wsabuf = WSABUF {
+                    len: p.buf.len() as u32,
+                    buf: windows_core::PSTR(p.buf.as_mut_ptr()),
+                };
+                let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, payload) = fut.await;
+            (result, payload.buf)
+        }
+    }
+
+    /// Sends `buf`; resolves to the byte count and hands the buffer back.
+    pub fn write(
+        &self,
+        buf: Vec<u8>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send + use<> {
+        let sock = self.res.socket();
+        let fut = unsafe {
+            submit(&self.res, buf, move |ovl, buf| {
+                let wsabuf = WSABUF {
+                    len: buf.len() as u32,
+                    buf: windows_core::PSTR(buf.as_mut_ptr()),
+                };
+                let r = WSASend(sock, &[wsabuf], None, 0, Some(ovl), None);
+                classify_wsa_overlapped(r == 0)
+            })
+        };
+        async move {
+            let (result, buf) = fut.await;
+            (result, buf)
+        }
+    }
+
+    /// Half-closes the send direction; the peer's next read returns 0.
+    pub fn shutdown_send(&self) -> windows_core::Result<()> {
+        sock_check(unsafe { shutdown(self.res.socket(), SD_SEND) })
+    }
+
+    /// A second handle onto the same socket (shared via the refcounted
+    /// `IoRes`); the socket closes only once all handles drop. Used by
+    /// `TcpStreamIo::split` to drive the read and write halves independently —
+    /// concurrent WSARecv (read) and WSASend (write) on one socket is supported.
+    pub(in crate::tp::io) fn share(&self) -> TcpStream {
+        TcpStream {
+            res: self.res.clone(),
+        }
+    }
+
+    /// The locally bound address of this connected socket.
+    pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
+        addr_of_socket(self.res.socket())
+    }
+
+    /// The remote peer's address.
+    pub fn peer_addr(&self) -> windows_core::Result<SocketAddr> {
+        peer_of_socket(self.res.socket())
+    }
+
+    /// Sends (part of) an open overlapped `file`'s contents over the socket
+    /// using the kernel's `TransmitFile` — a zero-copy path straight from the
+    /// file-system cache, without staging the bytes through user space.
+    ///
+    /// `offset` is the starting position in the file; `count == 0` sends from
+    /// `offset` to end of file. Resolves to the number of bytes transmitted.
+    /// The op completes on this socket's TP_IO like any other overlapped send.
+    pub fn transmit_file(
+        &self,
+        file: &File,
+        offset: u64,
+        count: u32,
+        flags: TransmitFlags,
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+        let sock = self.res.socket();
+        let file_handle = file.handle();
+        let tf = flags.to_bits();
+        // Keep the file's IoRes (hence its HANDLE) alive for the op's lifetime.
+        let keepalive = file.res_arc();
+        let fut = unsafe {
+            submit(&self.res, keepalive, move |ovl, _keepalive| {
+                (*ovl).Anonymous.Anonymous.Offset = offset as u32;
+                (*ovl).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+                let ok = TransmitFile(sock, file_handle, count, 0, Some(ovl), None, tf);
+                classify_wsa_overlapped(ok.as_bool())
+            })
+        };
+        async move {
+            let (result, _keepalive) = fut.await;
+            result
+        }
+    }
+
+    /// Sends a sequence of in-memory buffers and/or file ranges as one
+    /// `TransmitPackets` call — a single-syscall scatter of mixed memory and
+    /// file sources, transmitted in insertion order. Resolves to the total
+    /// number of bytes sent. See [`TransmitPackets`] for building the sequence.
+    pub fn transmit_packets(
+        &self,
+        packets: TransmitPackets,
+        flags: TransmitFlags,
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+        let sock = self.res.socket();
+        let tf = flags.to_bits();
+        // Fetch the extension pointer and issue the op *synchronously*, so the
+        // returned async block captures only the (Send) OpFuture — never the
+        // non-Send HANDLEs, which are consumed here into the op block.
+        let started: windows_core::Result<OpFuture<TransmitPacketsPayload>> = (|| {
+            let transmit = get_transmitpackets(sock)?;
+            let TransmitPackets { elems } = packets;
+            let count = elems.len();
+            let payload = TransmitPacketsPayload {
+                elems,
+                array: Vec::with_capacity(count),
+            };
+            Ok(unsafe {
+                submit(&self.res, payload, move |ovl, p| {
+                    // Build the element array in place (it and the memory
+                    // buffers it points at all live in the op block for the
+                    // op's duration). Pre-reserved, so no realloc moves it.
+                    p.array.clear();
+                    for e in p.elems.iter_mut() {
+                        let el = match e {
+                            Elem::Mem(buf) => TRANSMIT_PACKETS_ELEMENT {
+                                dwElFlags: TP_ELEMENT_MEMORY,
+                                cLength: buf.len() as u32,
+                                Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
+                                    pBuffer: buf.as_mut_ptr() as *mut c_void,
+                                },
+                            },
+                            Elem::File {
+                                handle,
+                                offset,
+                                length,
+                                ..
+                            } => TRANSMIT_PACKETS_ELEMENT {
+                                dwElFlags: TP_ELEMENT_FILE,
+                                cLength: *length,
+                                Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
+                                    Anonymous: TRANSMIT_PACKETS_ELEMENT_0_0 {
+                                        nFileOffset: *offset,
+                                        hFile: *handle,
+                                    },
+                                },
+                            },
+                        };
+                        p.array.push(el);
+                    }
+                    let ok = transmit(
+                        sock,
+                        p.array.as_mut_ptr(),
+                        p.array.len() as u32,
+                        0,
+                        ovl,
+                        tf,
+                    );
+                    classify_wsa_overlapped(ok.as_bool())
+                })
+            })
+        })();
+        async move {
+            match started {
+                Ok(fut) => fut.await.0,
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// Transport-level disconnect via `DisconnectEx`. With `reuse = true`
+    /// (`TF_REUSE_SOCKET`) the handle is left ready for reuse without a fresh
+    /// `socket()` — by [`reconnect`](Self::reconnect) (client) or
+    /// [`into_reusable`](Self::into_reusable) + [`TcpListener::accept_into`]
+    /// (server).
+    ///
+    /// This is a **graceful** disconnect: the returned future resolves once the
+    /// close handshake completes — i.e. after the peer has also closed its side.
+    /// Use it on a *finished* connection (both ends done); if the peer keeps its
+    /// side open it will not complete promptly.
+    pub fn disconnect(
+        &self,
+        reuse: bool,
+    ) -> impl Future<Output = windows_core::Result<()>> + Send + use<> {
+        let sock = self.res.socket();
+        let started: windows_core::Result<OpFuture<()>> =
+            get_disconnectex(sock).map(|disconnect_ex| {
+                let flags = if reuse { TF_REUSE_SOCKET } else { 0 };
+                unsafe {
+                    submit(&self.res, (), move |ovl, _| {
+                        let ok = disconnect_ex(sock, ovl, flags, 0);
+                        classify_wsa_overlapped(ok.as_bool())
+                    })
+                }
+            });
+        async move {
+            match started {
+                Ok(fut) => fut.await.0.map(|_| ()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// Reuses this (disconnected, `TF_REUSE_SOCKET`-prepared) socket for a new
+    /// outbound connection to `addr` — a `ConnectEx` on the *same handle*, with
+    /// no fresh `socket()`/`bind()`/pool registration. Call after
+    /// `disconnect(true).await`.
+    pub async fn reconnect(&self, addr: SocketAddr) -> windows_core::Result<()> {
+        let sock = self.res.socket();
+        let connect_ex = get_connectex(sock)?;
+        let mut remote = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let remote_len = write_sockaddr(&addr, &mut remote);
+        let fut = unsafe {
+            submit(&self.res, (remote, remote_len), move |ovl, p| {
+                let mut sent = 0u32;
+                let ok = connect_ex(
+                    sock,
+                    &p.0 as *const _ as *const SOCKADDR,
+                    p.1,
+                    core::ptr::null(),
+                    0,
+                    &mut sent,
+                    ovl,
+                );
+                classify_wsa_overlapped(ok.as_bool())
+            })
+        };
+        fut.await.0?;
+        sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None) })?;
+        Ok(())
+    }
+
+    /// Consumes this stream, handing its socket (with its existing `IoRes`/TP_IO
+    /// retained) to [`TcpListener::accept_into`] for reuse. Call after
+    /// `disconnect(true).await` on a finished connection. Keeping the `IoRes`
+    /// avoids a completion-port re-association, which Windows forbids.
+    pub fn into_reusable(self) -> ReusableSocket {
+        ReusableSocket { res: self.res }
+    }
+}
+
+/// A finished TCP socket (disconnected with reuse via `DisconnectEx` +
+/// `TF_REUSE_SOCKET`) retaining its `IoRes`/TP_IO, ready to be recycled by
+/// [`TcpListener::accept_into`] without a new `socket()` or completion-port
+/// re-association. Dropped without reuse, it closes the socket normally (the
+/// `IoRes`'s own `Drop`).
+pub struct ReusableSocket {
+    res: Arc<IoRes>,
+}
+
+/// One element of a [`TransmitPackets`] sequence: an owned memory buffer, or a
+/// range of an open file (kept alive via its `IoRes`).
+enum Elem {
+    Mem(Vec<u8>),
+    File {
+        /// Keeps the file handle valid for the op's lifetime.
+        _keep: Arc<IoRes>,
+        handle: HANDLE,
+        offset: i64,
+        length: u32,
+    },
+}
+
+/// A builder for [`TcpStream::transmit_packets`]: an ordered mix of in-memory
+/// buffers and open-file ranges, sent in one `TransmitPackets` syscall.
+#[derive(Default)]
+pub struct TransmitPackets {
+    elems: Vec<Elem>,
+}
+
+impl TransmitPackets {
+    /// A new, empty sequence.
+    pub fn new() -> Self {
+        Self { elems: Vec::new() }
+    }
+
+    /// Appends an in-memory buffer (sent inline).
+    pub fn bytes(mut self, buf: Vec<u8>) -> Self {
+        self.elems.push(Elem::Mem(buf));
+        self
+    }
+
+    /// Appends a byte range of an open overlapped `file` (`length == 0` sends to
+    /// end of file). The file is kept alive until the transmit completes.
+    pub fn file(mut self, file: &File, offset: i64, length: u32) -> Self {
+        self.elems.push(Elem::File {
+            _keep: file.res_arc(),
+            handle: file.handle(),
+            offset,
+            length,
+        });
+        self
+    }
+}
+
+/// Op-block payload for `TransmitPackets`: owns every memory buffer and file
+/// keepalive, plus the element array the kernel reads.
+struct TransmitPacketsPayload {
+    elems: Vec<Elem>,
+    array: Vec<TRANSMIT_PACKETS_ELEMENT>,
+}
+
+// All raw handles/pointers held here are plain kernel values / stable heap
+// pointers into this same payload; moving the payload is sound.
+unsafe impl Send for TransmitPacketsPayload {}
