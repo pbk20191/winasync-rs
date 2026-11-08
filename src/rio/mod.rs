@@ -46,8 +46,13 @@
 //! takes whichever of those two jobs the caller already has covered.
 //!
 //! With the `rio` feature alone:
-//!   * the queue is driven by **the caller's** IOCP
-//!     ([`RioCq::with_iocp`](cq::RioCq::with_iocp)), event
+//!   * [`RioCq::with_default_pool`](cq::RioCq::with_default_pool) gives a
+//!     working pump out of the box, on the thread pool Windows gives every
+//!     process — no runtime from here, no drain loop to write. Its caveat is
+//!     that the pool is shared with everything else in the process and a null
+//!     callback environment cannot be marked `LongFunction`;
+//!   * or the queue is driven by **the caller's** IOCP
+//!     ([`with_iocp`](cq::RioCq::with_iocp)), event
 //!     ([`with_event`](cq::RioCq::with_event)), or poll loop
 //!     ([`polling`](cq::RioCq::polling)) — including one belonging to an
 //!     entirely different library;

@@ -44,14 +44,11 @@ impl Priority {
     }
 }
 
-/// Common header of every context pointer handed to a TP object created with
-/// our callback environments. The environment's `FinalizationCallback` calls
-/// `release` exactly once when the object is finalized, making it the single
-/// context release path regardless of how the object was closed.
-#[repr(C)]
-pub(crate) struct CtxHeader {
-    pub(crate) release: unsafe fn(*mut c_void),
-}
+/// Re-exported so `tp`'s own modules keep their `pool::CtxHeader` path; the
+/// convention itself is shared (see [`crate::common::tpctx`]), because the
+/// process default pool uses the same context layout with a different
+/// release path.
+pub(crate) use crate::common::tpctx::CtxHeader;
 
 unsafe extern "system" fn finalize_ctx(_: PTP_CALLBACK_INSTANCE, ctx: *mut c_void) {
     if ctx.is_null() {

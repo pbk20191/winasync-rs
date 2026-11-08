@@ -465,6 +465,37 @@ mod tests {
         result.expect("deferred send timed out");
     }
 
+    /// The default-pool pump, with no runtime from this crate: `rio` alone,
+    /// and the caller writes no drain loop. `block_on` only parks this
+    /// thread — the completions are dispatched by a default-pool thread.
+    #[test]
+    fn default_pool_pump_drives_a_roundtrip() {
+        use super::super::cq::RioCq;
+        let cq = RioCq::with_default_pool(64).expect("default-pool cq");
+        let pool = RioBufferPool::new(512, 4).expect("pool");
+        let rq = RqConfig {
+            max_outstanding_recv: 8,
+            max_outstanding_send: 8,
+        };
+        let server = RioUdpSocket::bind(&cq, v4(), rq).expect("server");
+        let client = RioUdpSocket::bind(&cq, v4(), rq).expect("client");
+        client.connect(server.local_addr().unwrap()).unwrap();
+
+        let rx = server.recv(pool.acquire().unwrap()).expect("post recv");
+        let mut out = pool.acquire().unwrap();
+        out[..4].copy_from_slice(b"dflt");
+        out.set_len(4);
+        let tx = client.send(out).expect("post send");
+
+        assert_eq!(crate::common::block_on(tx).0.unwrap(), 4);
+        let (n, slice) = crate::common::block_on(rx);
+        assert_eq!(&slice[..n.unwrap()], b"dflt");
+
+        drop(server);
+        drop(client);
+        drop(cq);
+    }
+
     /// A polling queue with notification-free posts: no event, no TP_WAIT,
     /// no IOCP — the caller drains when it chooses. This is the shape of a
     /// hybrid loop's hot path.

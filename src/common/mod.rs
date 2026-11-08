@@ -24,6 +24,9 @@ pub mod winsock;
 // whose streams speak WinRT `IBuffer` instead.
 #[cfg(any(feature = "tp", feature = "rio"))]
 pub mod buffer;
+// The thread-pool callback-context convention.
+#[cfg(any(feature = "tp", feature = "rio"))]
+pub mod tpctx;
 // SOCKADDR conversions: neutral, used by every socket engine.
 #[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 pub mod sockaddr;
