@@ -13,9 +13,13 @@ use windows_core::{
 use windows_future::IAsyncAction;
 
 use super::tpio::OpHandle;
+use crate::common::hvaddr::{HvSocketAddr, HV_GUID_WILDCARD};
 
 /// RO_E_CLOSED — returned by members of a closed listener/stream.
 pub(crate) const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
+
+/// E_INVALIDARG — a bind form this listener's transport does not accept.
+const E_INVALIDARG: HRESULT = HRESULT(0x80070057u32 as i32);
 
 /// Custom fixed-IID interface exposing the stream/endpoint pair delivered by
 /// a `ConnectionReceived` event. GUID frozen here — do not change or reuse.
@@ -57,6 +61,7 @@ pub(crate) fn new_args(stream: IInspectable, endpoint: HSTRING) -> IConnectionRe
 enum Transport {
     NamedPipe,
     Unix,
+    HyperV,
 }
 
 /// The concrete accept source `try_arm` re-arms against once `BindAsync` has
@@ -86,6 +91,15 @@ enum AcceptSource {
         /// `None` until the first `arm` binds the persistent listen socket.
         listener: Mutex<Option<super::UnixStreamListener>>,
     },
+    /// AF_HYPERV, bound lazily on the first `arm` for the same gating reason
+    /// as the AF_UNIX variant. A bind error here (most often
+    /// `WSAEAFNOSUPPORT` where the Hyper-V socket provider is absent, or
+    /// `WSAEADDRINUSE` for a service GUID already listened on) surfaces on the
+    /// chain's first start, exactly like the unix one.
+    HyperV {
+        addr: HvSocketAddr,
+        listener: Mutex<Option<super::HvStreamListener>>,
+    },
 }
 
 impl AcceptSource {
@@ -102,6 +116,13 @@ impl AcceptSource {
                 let mut guard = listener.lock().unwrap();
                 if guard.is_none() {
                     *guard = Some(super::UnixStreamListener::bind(path)?);
+                }
+                guard.as_ref().unwrap().arm_accept(on_result)
+            }
+            AcceptSource::HyperV { addr, listener } => {
+                let mut guard = listener.lock().unwrap();
+                if guard.is_none() {
+                    *guard = Some(super::HvStreamListener::bind(*addr)?);
                 }
                 guard.as_ref().unwrap().arm_accept(on_result)
             }
@@ -232,6 +253,20 @@ impl ConnectionListener {
         })
     }
 
+    /// Constructs a listener bound to the Hyper-V socket (AF_HYPERV)
+    /// transport. Nothing is created in the kernel until
+    /// [`BindEndpointAsync`](Self::BindEndpointAsync) or
+    /// [`BindServiceNameAsync`](Self::BindServiceNameAsync) is called.
+    ///
+    /// This transport addresses by GUID pair, not by string, so plain
+    /// [`BindAsync`](Self::BindAsync) is rejected on it with `E_INVALIDARG`.
+    pub fn hyper_v() -> ComObject<ConnectionListener> {
+        ComObject::new(ConnectionListener {
+            state: Arc::new(ListenerState::new()),
+            transport: Transport::HyperV,
+        })
+    }
+
     /// Registers `handler` to be invoked (on a thread-pool thread) for each
     /// accepted connection. Returns a token for `RemoveConnectionReceived`.
     ///
@@ -355,17 +390,6 @@ impl ConnectionListener {
     /// if you need the error synchronously.
     #[allow(non_snake_case)]
     pub fn BindAsync(&self, endpoint: &HSTRING) -> Result<IAsyncAction> {
-        if self.state.closed.load(Ordering::Acquire) {
-            return Err(Error::from_hresult(RO_E_CLOSED));
-        }
-
-        // A second `BindAsync` replacing an in-flight chain must not orphan
-        // an uncancellable accept: cancel whatever is currently armed before
-        // installing the new source.
-        if let Some(op) = self.state.current_op.lock().unwrap().take() {
-            op.cancel();
-        }
-
         let source = match self.transport {
             Transport::NamedPipe => AcceptSource::NamedPipe(endpoint.to_string()),
             // The AF_UNIX listen socket is bound lazily on the first accept
@@ -375,9 +399,73 @@ impl ConnectionListener {
                 path: endpoint.to_string(),
                 listener: Mutex::new(None),
             },
+            // A Hyper-V endpoint is a GUID pair; there is no string form of it
+            // this listener accepts.
+            Transport::HyperV => return Err(Error::from_hresult(E_INVALIDARG)),
         };
+        self.install_source(source, endpoint.clone())
+    }
+
+    /// Binds the Hyper-V listener to one partition's `service_id` — the
+    /// AF_HYPERV counterpart of `StreamSocketListener::BindEndpointAsync`,
+    /// whose `(HostName, serviceName)` pair this mirrors: `vm_id` says *which
+    /// partition*, `service_id` says *which endpoint inside it*.
+    ///
+    /// GUIDs rather than a `HostName` because WinRT has no way to spell this
+    /// endpoint: `HostNameType` is `DomainName | Ipv4 | Ipv6 | Bluetooth`.
+    ///
+    /// Use `HV_GUID_WILDCARD` for `vm_id` to accept from any partition — or
+    /// just call [`BindServiceNameAsync`](Self::BindServiceNameAsync), which
+    /// is exactly that. Rejected with `E_INVALIDARG` on a named-pipe or
+    /// AF_UNIX listener.
+    #[allow(non_snake_case)]
+    pub fn BindEndpointAsync(
+        &self,
+        vm_id: &windows_core::GUID,
+        service_id: &windows_core::GUID,
+    ) -> Result<IAsyncAction> {
+        if !matches!(self.transport, Transport::HyperV) {
+            return Err(Error::from_hresult(E_INVALIDARG));
+        }
+        let addr = HvSocketAddr::new(*vm_id, *service_id);
+        let label = HSTRING::from(format!("{:?}/{:?}", addr.vm_id, addr.service_id));
+        self.install_source(
+            AcceptSource::HyperV {
+                addr,
+                listener: Mutex::new(None),
+            },
+            label,
+        )
+    }
+
+    /// Binds the Hyper-V listener to `service_id` on *any* partition — the
+    /// AF_HYPERV counterpart of `StreamSocketListener::BindServiceNameAsync`.
+    ///
+    /// The analogy is exact: where WinRT's version binds a service on every
+    /// local adapter, this binds a service GUID with `HV_GUID_WILDCARD` as the
+    /// VM id, accepting from any partition. Rejected with `E_INVALIDARG` on a
+    /// named-pipe or AF_UNIX listener.
+    #[allow(non_snake_case)]
+    pub fn BindServiceNameAsync(&self, service_id: &windows_core::GUID) -> Result<IAsyncAction> {
+        self.BindEndpointAsync(&HV_GUID_WILDCARD, service_id)
+    }
+
+    /// Shared tail of every `Bind*Async`: swap in the new accept source and
+    /// (re)start the chain if a consumer is already registered.
+    fn install_source(&self, source: AcceptSource, label: HSTRING) -> Result<IAsyncAction> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+
+        // A second bind replacing an in-flight chain must not orphan an
+        // uncancellable accept: cancel whatever is currently armed before
+        // installing the new source.
+        if let Some(op) = self.state.current_op.lock().unwrap().take() {
+            op.cancel();
+        }
+
         *self.state.source.lock().unwrap() = Some(Arc::new(source));
-        *self.state.endpoint.lock().unwrap() = Some(endpoint.clone());
+        *self.state.endpoint.lock().unwrap() = Some(label);
 
         // Start accepting only if a consumer is already registered (handler
         // gating). No handler => no accept; the chain starts on the first
@@ -817,6 +905,105 @@ mod listener_tests {
         let closable: IClosable = listener.cast().unwrap();
         closable.Close().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hyper_v_rejects_string_bind_and_others_reject_guid_bind() {
+        let service = windows_core::GUID::from_u128(0x7c41_e0d2_31ab_4f6e_a2b5_c80d93f14e77);
+
+        // A GUID endpoint has no string form this listener accepts.
+        let hv = ConnectionListener::hyper_v();
+        let e = hv.BindAsync(&HSTRING::from("loopback")).unwrap_err();
+        assert_eq!(e.code(), E_INVALIDARG);
+
+        // ...and conversely the string transports have no GUID endpoint.
+        let unix = ConnectionListener::unix();
+        assert_eq!(
+            unix.BindEndpointAsync(&HV_GUID_WILDCARD, &service).unwrap_err().code(),
+            E_INVALIDARG
+        );
+        let pipe = ConnectionListener::named_pipe();
+        assert_eq!(
+            pipe.BindServiceNameAsync(&service).unwrap_err().code(),
+            E_INVALIDARG
+        );
+    }
+
+    #[test]
+    fn hyper_v_connection_received_echo() {
+        // A service GUID of our own. Host-to-host loopback needs no
+        // GuestCommunicationServices registration; a machine with no Hyper-V
+        // socket provider at all reports a skip instead of failing.
+        let service = windows_core::GUID::from_u128(0x5a83_c7e1_9b04_4d26_8f17_63ca0e2b95d8);
+
+        let listener = ConnectionListener::hyper_v();
+        let (tx, rx) = mpsc::channel::<usize>();
+        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
+            let a = args.as_ref().unwrap();
+            let cra: IConnectionReceivedArgs = a.cast().unwrap();
+            let raw = unsafe {
+                let mut raw = core::ptr::null_mut();
+                cra.Stream(&mut raw).ok()?;
+                raw as usize
+            };
+            let _ = tx.send(raw);
+            Ok(())
+        });
+        listener.ConnectionReceived(&handler).unwrap();
+        // Handler is registered, so the lazy AF_HYPERV bind happens here and
+        // its error (e.g. WSAEAFNOSUPPORT) surfaces synchronously.
+        if let Err(e) = listener.BindServiceNameAsync(&service) {
+            eprintln!("skipped: AF_HYPERV listener bind unavailable ({e:?})");
+            return;
+        }
+
+        let client = match block_on(crate::comio::HvStreamSocket::connect(
+            HvSocketAddr::loopback(service),
+        )) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skipped: AF_HYPERV loopback connect refused ({e:?})");
+                return;
+            }
+        };
+        let server_raw = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("no ConnectionReceived");
+        let server = unsafe { IInspectable::from_raw(server_raw as *mut core::ffi::c_void) };
+
+        // The accepted connection is an ordinary WinRT duplex stream — the
+        // whole point of routing hvsock through this listener.
+        let c_out: IOutputStream = client.cast().unwrap();
+        let s_in: IInputStream = server.cast().unwrap();
+        let s_out: IOutputStream = server.cast().unwrap();
+        let c_in: IInputStream = client.cast().unwrap();
+        let wb = new_buffer(4).unwrap();
+        unsafe {
+            buffer_ptr(&wb.clone().into())
+                .unwrap()
+                .copy_from_nonoverlapping(b"hvsk".as_ptr(), 4);
+        }
+        wb.SetLength(4).unwrap();
+        block_on(c_out.WriteAsync(&wb.cast::<IBuffer>().unwrap()).unwrap().into_future()).unwrap();
+        let got: IBuffer = block_on(
+            s_in.ReadAsync(&new_buffer(4).unwrap().cast::<IBuffer>().unwrap(), 4, InputStreamOptions(0))
+                .unwrap()
+                .into_future(),
+        )
+        .unwrap();
+        block_on(s_out.WriteAsync(&got).unwrap().into_future()).unwrap();
+        let echoed: IBuffer = block_on(
+            c_in.ReadAsync(&new_buffer(4).unwrap().cast::<IBuffer>().unwrap(), 4, InputStreamOptions(0))
+                .unwrap()
+                .into_future(),
+        )
+        .unwrap();
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(buffer_ptr(&echoed).unwrap(), 4), b"hvsk");
+        }
+
+        let closable: IClosable = listener.cast().unwrap();
+        closable.Close().unwrap();
     }
 
     #[test]

@@ -71,7 +71,7 @@ fn raw_waker(parker: *const Parker) -> RawWaker {
 
 /// Runs the future to completion on the calling thread, parking between polls.
 pub fn block_on<F: Future>(f: F) -> F::Output {
-    let parker = Parker::new();
+    let parker = Parker::new(); 
     let waker = parker.waker();
     let mut cx = Context::from_waker(&waker);
     let mut f = pin!(f);

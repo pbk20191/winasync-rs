@@ -1,11 +1,16 @@
-//! COM components exposing named pipe and AF_UNIX transports through the same
-//! WinRT stream interfaces (`IInputStream`/`IOutputStream`/
+//! COM components exposing named pipe, AF_UNIX and Hyper-V socket transports
+//! through the same WinRT stream interfaces (`IInputStream`/`IOutputStream`/
 //! `IAsyncOperationWithProgress`) as `StreamSocket`, backed by Win32 overlapped
 //! IO on the default thread-pool callback environment (`pcbe = NULL`).
+//!
+//! All three are transports WinRT itself does not expose: `StreamSocket` has no
+//! named-pipe, AF_UNIX or AF_HYPERV support, and `HostName` cannot even name
+//! those endpoints.
 #![allow(dead_code)]
 
 pub mod asyncop;
 pub mod buffer;
+pub mod hvsock;
 pub mod listener;
 pub mod pipe;
 pub mod stream;
@@ -33,6 +38,8 @@ pub use listener::{ConnectionListener, IConnectionReceivedArgs};
 pub(crate) use stream::from_reg;
 #[allow(unused_imports)]
 pub use unix::{UnixStreamListener, UnixStreamSocket};
+#[allow(unused_imports)]
+pub use hvsock::{HvStreamListener, HvStreamSocket};
 
 pub(crate) use crate::common::check::check;
 

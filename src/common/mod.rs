@@ -10,6 +10,10 @@ pub mod oneshot;
 pub mod block_on;
 #[cfg(any(feature = "tp", feature = "comio"))]
 pub mod check;
+// AF_HYPERV addressing: pure declarations, shared by both overlapped runtimes'
+// Hyper-V socket transports.
+#[cfg(any(feature = "tp", feature = "comio"))]
+pub mod hvaddr;
 #[cfg(any(feature = "tp", feature = "comio"))]
 pub mod overlapped;
 
