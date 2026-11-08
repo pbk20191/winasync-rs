@@ -817,6 +817,55 @@
         assert_eq!(pool.available(), 4, "every slice returned to the pool");
     }
 
+    /// Vectored IO over pooled slices: scatter/gather no longer means
+    /// `Vec<Vec<u8>>`, so the buffer array can come from one slab.
+    #[test]
+    fn pooled_slices_go_through_vectored_io() {
+        use crate::common::buffer::SlabPool;
+        let rt = Runtime::new();
+        let pool = SlabPool::new(64, 6).unwrap();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let server = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let client = UdpSocket::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let server_addr = server.local_addr().unwrap();
+
+            // Gather three pooled slices into one datagram.
+            let mut parts = Vec::new();
+            for chunk in [b"aa", b"bb", b"cc"] {
+                let mut b = pool.acquire().unwrap();
+                b[..2].copy_from_slice(chunk);
+                b.set_len(2);
+                parts.push(b);
+            }
+            let (w, parts) = client.send_to_vectored(parts, server_addr).await;
+            assert_eq!(w.unwrap(), 6);
+            drop(parts);
+
+            // Scatter it back into two pooled slices of different sizes.
+            let mut a = pool.acquire().unwrap();
+            a.set_len(4);
+            let landing = vec![a, pool.acquire().unwrap()];
+            let (r, landing) = server.recv_from_vectored(landing).await;
+            let (n, _from) = r.unwrap();
+            let mut got = Vec::new();
+            for b in &landing {
+                got.extend_from_slice(b);
+            }
+            got.truncate(n);
+            assert_eq!(got, b"aabbcc");
+        }));
+        result.expect("pooled vectored roundtrip timed out");
+        assert_eq!(pool.available(), 6, "every slice returned to the pool");
+    }
+
     #[test]
     fn udp_vectored_roundtrip() {
         let rt = Runtime::new();

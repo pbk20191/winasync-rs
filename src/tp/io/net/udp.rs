@@ -28,20 +28,20 @@ unsafe impl<B: Send> Send for SendToPayload<B> {}
 
 /// Vectored counterpart of [`RecvFromPayload`]: the shared buffer/`WSABUF` pair
 /// plus the source-address slot the provider fills.
-struct VectoredFromPayload {
-    v: VectoredPayload,
+struct VectoredFromPayload<B> {
+    v: VectoredPayload<B>,
     from: SOCKADDR_STORAGE,
     from_len: i32,
 }
-unsafe impl Send for VectoredFromPayload {}
+unsafe impl<B: Send> Send for VectoredFromPayload<B> {}
 
 /// Vectored counterpart of [`SendToPayload`].
-struct VectoredToPayload {
-    v: VectoredPayload,
+struct VectoredToPayload<B> {
+    v: VectoredPayload<B>,
     to: SOCKADDR_STORAGE,
     to_len: i32,
 }
-unsafe impl Send for VectoredToPayload {}
+unsafe impl<B: Send> Send for VectoredToPayload<B> {}
 
 /// A bound UDP socket on a [`Runtime`]'s pool. Supports connectionless
 /// `send_to`/`recv_from` over IPv4 or IPv6.
@@ -197,10 +197,10 @@ impl UdpSocket {
     /// Scatter-receives one datagram into `bufs` with a vectored `WSARecvFrom`;
     /// resolves to the byte count plus the source address, and hands the buffers
     /// back. Truncation still fails with `WSAEMSGSIZE`.
-    pub fn recv_from_vectored(
+    pub fn recv_from_vectored<B: IoBufMut>(
         &self,
-        bufs: Vec<Vec<u8>>,
-    ) -> impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, Vec<Vec<u8>>)> + Send + use<>
+        bufs: Vec<B>,
+    ) -> impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, Vec<B>)> + Send + use<B>
     {
         let sock = self.res.socket();
         let fut = unsafe {
@@ -212,7 +212,7 @@ impl UdpSocket {
                     from_len: size_of::<SOCKADDR_STORAGE>() as i32,
                 },
                 move |ovl, p| {
-                    p.v.fill();
+                    p.v.fill_recv();
                     let r = WSARecvFrom(
                         sock,
                         &p.v.wsabufs,
@@ -239,11 +239,11 @@ impl UdpSocket {
 
     /// Gather-sends `bufs` as **one** datagram to `addr` with a vectored
     /// `WSASendTo`; resolves to the byte count and hands the buffers back.
-    pub fn send_to_vectored(
+    pub fn send_to_vectored<B: IoBuf>(
         &self,
-        bufs: Vec<Vec<u8>>,
+        bufs: Vec<B>,
         addr: SocketAddr,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
         let sock = self.res.socket();
         let mut to = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let to_len = write_sockaddr(&addr, &mut to);
@@ -256,7 +256,7 @@ impl UdpSocket {
                     to_len,
                 },
                 move |ovl, p| {
-                    p.v.fill();
+                    p.v.fill_send();
                     let r = WSASendTo(
                         sock,
                         &p.v.wsabufs,

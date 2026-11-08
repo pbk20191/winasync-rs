@@ -215,17 +215,17 @@ pub(in crate::tp::io) struct RecvPayload<B> {
 /// `WSABUF` array the provider reads. Both live in the op block for the op's
 /// duration; the array is built once in `issue` with exact capacity so it never
 /// reallocates out from under the kernel's pointer.
-pub(in crate::tp::io) struct VectoredPayload {
-    pub(in crate::tp::io) bufs: Vec<Vec<u8>>,
+pub(in crate::tp::io) struct VectoredPayload<B> {
+    pub(in crate::tp::io) bufs: Vec<B>,
     pub(in crate::tp::io) wsabufs: Vec<WSABUF>,
     pub(in crate::tp::io) flags: u32,
 }
 
 // WSABUF holds a raw pointer; the whole payload is owned by one op at a time.
-unsafe impl Send for VectoredPayload {}
+unsafe impl<B: Send> Send for VectoredPayload<B> {}
 
-impl VectoredPayload {
-    pub(in crate::tp::io) fn new(bufs: Vec<Vec<u8>>) -> Self {
+impl<B> VectoredPayload<B> {
+    pub(in crate::tp::io) fn new(bufs: Vec<B>) -> Self {
         let n = bufs.len();
         Self {
             bufs,
@@ -233,15 +233,37 @@ impl VectoredPayload {
             flags: 0,
         }
     }
+}
 
-    /// (Re)builds the `WSABUF` array to point at the owned buffers. Called from
-    /// `issue`, i.e. once, after the payload is parked in the op block.
-    pub(in crate::tp::io) fn fill(&mut self) {
+impl<B: IoBuf> VectoredPayload<B> {
+    /// (Re)builds the `WSABUF` array for a **send**, from shared pointers:
+    /// the provider only reads these buffers.
+    ///
+    /// Called from `issue`, i.e. once, after the payload is parked in the op
+    /// block — the array is pre-reserved to its exact length so it never
+    /// reallocates out from under the kernel's pointer.
+    pub(in crate::tp::io) fn fill_send(&mut self) {
+        self.wsabufs.clear();
+        for b in self.bufs.iter() {
+            self.wsabufs.push(WSABUF {
+                len: IoBuf::len(b) as u32,
+                // WSABUF is one type for both directions; a send never writes
+                // through it.
+                buf: windows_core::PSTR(b.stable_ptr() as *mut u8),
+            });
+        }
+    }
+}
+
+impl<B: IoBufMut> VectoredPayload<B> {
+    /// (Re)builds the `WSABUF` array for a **receive**, from mutable
+    /// pointers, so the provenance matches what the provider does with them.
+    pub(in crate::tp::io) fn fill_recv(&mut self) {
         self.wsabufs.clear();
         for b in self.bufs.iter_mut() {
             self.wsabufs.push(WSABUF {
-                len: b.len() as u32,
-                buf: windows_core::PSTR(b.as_mut_ptr()),
+                len: IoBuf::len(b) as u32,
+                buf: windows_core::PSTR(b.stable_mut_ptr()),
             });
         }
     }

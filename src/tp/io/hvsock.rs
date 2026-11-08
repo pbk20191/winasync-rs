@@ -199,14 +199,14 @@ impl HvStream {
     }
 
     /// Scatter-reads into `bufs` with one vectored `WSARecv`.
-    pub fn read_vectored(
+    pub fn read_vectored<B: IoBufMut>(
         &self,
-        bufs: Vec<Vec<u8>>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        bufs: Vec<B>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
-                p.fill();
+                p.fill_recv();
                 let r = WSARecv(sock, &p.wsabufs, None, &mut p.flags, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })
@@ -218,14 +218,14 @@ impl HvStream {
     }
 
     /// Gather-writes `bufs` with one vectored `WSASend`.
-    pub fn write_vectored(
+    pub fn write_vectored<B: IoBuf>(
         &self,
-        bufs: Vec<Vec<u8>>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        bufs: Vec<B>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
-                p.fill();
+                p.fill_send();
                 let r = WSASend(sock, &p.wsabufs, None, 0, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })

@@ -378,14 +378,14 @@ impl TcpStream {
     /// Scatter-reads into `bufs` with a single vectored `WSARecv` — the socket
     /// counterpart to `File::read_scatter`. Resolves to the total byte count
     /// (0 = peer closed) and hands the buffers back; they are filled in order.
-    pub fn read_vectored(
+    pub fn read_vectored<B: IoBufMut>(
         &self,
-        bufs: Vec<Vec<u8>>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        bufs: Vec<B>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
-                p.fill();
+                p.fill_recv();
                 let r = WSARecv(sock, &p.wsabufs, None, &mut p.flags, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })
@@ -399,14 +399,14 @@ impl TcpStream {
     /// Gather-writes `bufs` with a single vectored `WSASend` — the socket
     /// counterpart to `File::write_gather`. Resolves to the total byte count and
     /// hands the buffers back; they are sent in order as one contiguous stream.
-    pub fn write_vectored(
+    pub fn write_vectored<B: IoBuf>(
         &self,
-        bufs: Vec<Vec<u8>>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<Vec<u8>>)> + Send + use<> {
+        bufs: Vec<B>,
+    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, VectoredPayload::new(bufs), move |ovl, p| {
-                p.fill();
+                p.fill_send();
                 let r = WSASend(sock, &p.wsabufs, None, 0, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })
