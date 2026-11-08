@@ -32,9 +32,6 @@
 // so the allow lives here, as in `listener`.
 #![allow(non_snake_case)]
 
-use crate::common::block_on;
-use windows::Win32::Foundation::ERROR_PIPE_BUSY;
-use crate::common::hvaddr::HvSocketAddr;
 use core::ffi::c_void;
 use std::sync::Mutex;
 use windows_core::{
@@ -49,7 +46,25 @@ use windows_future::{
 use super::tpio::OpHandle;
 
 /// E_POINTER — a null out-parameter from a COM caller.
-const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
+pub(crate) const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
+
+/// What every connector here shares. GUID frozen — do not change or reuse.
+///
+/// `ConnectAsync` is deliberately **not** on it. The three take different
+/// addresses — a pipe name, a filesystem path, a pair of GUIDs — and the only
+/// way to put them on one signature is to erase the address into a variant
+/// and reject the wrong shapes at run time, which is exactly the
+/// `E_INVALIDARG` design the listeners were just freed from.
+///
+/// What it does carry is identity: a COM caller holding an unknown object can
+/// ask "is this a connector, and of what?" in one `QueryInterface` instead of
+/// trying each transport's interface in turn. The answer is also what to put
+/// in a log line.
+#[interface("6ec93a18-74d2-41b5-9c08-3f5ab0e712d6")]
+pub unsafe trait IStreamConnector: IUnknown {
+    /// A stable, lowercase transport name: `namedpipe`, `unix`, `hyperv`.
+    pub fn Transport(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT;
+}
 
 /// Connects to a named pipe. GUID frozen — do not change or reuse.
 #[interface("8d3f21b6-0c47-4e95-a1d8-6b92f05c7e34")]
@@ -83,7 +98,7 @@ pub unsafe trait IHyperVConnector: IUnknown {
 }
 
 /// Hands an `IAsyncOperation` back through a vtable out-parameter.
-fn out_operation(op: IAsyncOperation<IInspectable>, result: *mut *mut c_void) -> HRESULT {
+pub(crate) fn out_operation(op: IAsyncOperation<IInspectable>, result: *mut *mut c_void) -> HRESULT {
     if result.is_null() {
         return E_POINTER;
     }
@@ -221,7 +236,7 @@ const E_ILLEGAL_DELEGATE_ASSIGNMENT: HRESULT = HRESULT(0x80000018u32 as i32);
 
 /// Builds an operation and arms `start`, which must deliver exactly one
 /// result through the callback it is given.
-fn connect_op(
+pub(crate) fn connect_op(
     start: impl FnOnce(Box<dyn FnOnce(Result<IInspectable>) + Send>) -> Result<OpHandle>,
 ) -> IAsyncOperation<IInspectable> {
     let op: ComObject<ConnectOp> = ComObject::new(ConnectOp(Mutex::new(ConnectState {
@@ -241,112 +256,16 @@ fn connect_op(
     }
 }
 
-/// Connects to named pipes.
-#[implement(INamedPipeConnector)]
-pub struct NamedPipeConnector;
-
-impl NamedPipeConnector {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> ComObject<NamedPipeConnector> {
-        ComObject::new(NamedPipeConnector)
+/// Fills `IStreamConnector::Transport`.
+pub(crate) fn out_transport(
+    name: &str,
+    result: *mut core::mem::ManuallyDrop<HSTRING>,
+) -> HRESULT {
+    if result.is_null() {
+        return E_POINTER;
     }
-
-    /// Connects to `name`, resolving to the duplex WinRT stream.
-    pub fn connect(&self, name: &HSTRING) -> IAsyncOperation<IInspectable> {
-        // Opening the client end is a plain synchronous `CreateFileW`, so the
-        // usual case needs no thread at all: do it here and hand back a
-        // finished operation. Only `ERROR_PIPE_BUSY` has anything to wait
-        // for, and that wait goes to the pool rather than to the caller.
-        match super::NamedPipeClient::try_open(name) {
-            Ok(stream) => IAsyncOperation::ready(Ok(stream)),
-            Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
-                let name = name.to_string();
-                IAsyncOperation::spawn(move || block_on(super::NamedPipeClient::connect(&name)))
-            }
-            Err(e) => IAsyncOperation::ready(Err(e)),
-        }
-    }
-}
-
-impl INamedPipeConnector_Impl for NamedPipeConnector_Impl {
-    unsafe fn ConnectAsync(
-        &self,
-        name: core::mem::ManuallyDrop<HSTRING>,
-        result: *mut *mut c_void,
-    ) -> HRESULT {
-        out_operation(self.connect(&name), result)
-    }
-}
-
-/// Connects to AF_UNIX sockets.
-#[implement(IUnixConnector)]
-pub struct UnixConnector;
-
-impl UnixConnector {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> ComObject<UnixConnector> {
-        ComObject::new(UnixConnector)
-    }
-
-    /// Connects to the socket at `path`, resolving to the duplex WinRT
-    /// stream.
-    pub fn connect(&self, path: &HSTRING) -> IAsyncOperation<IInspectable> {
-        let path = path.to_string();
-        connect_op(move |sink| super::UnixStreamSocket::arm_connect(&path, sink))
-    }
-}
-
-impl IUnixConnector_Impl for UnixConnector_Impl {
-    unsafe fn ConnectAsync(
-        &self,
-        path: core::mem::ManuallyDrop<HSTRING>,
-        result: *mut *mut c_void,
-    ) -> HRESULT {
-        out_operation(self.connect(&path), result)
-    }
-}
-
-/// Connects to Hyper-V sockets.
-#[implement(IHyperVConnector)]
-pub struct HyperVConnector;
-
-impl HyperVConnector {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> ComObject<HyperVConnector> {
-        ComObject::new(HyperVConnector)
-    }
-
-    /// Connects to `service_id` on the partition `vm_id`, resolving to the
-    /// duplex WinRT stream.
-    ///
-    /// A connect to a partition that is not listening can sit for the
-    /// provider's own default; the Rust API's `connect_timeout_ms` is the
-    /// way to bound that, and is not exposed here.
-    pub fn connect(
-        &self,
-        vm_id: &windows_core::GUID,
-        service_id: &windows_core::GUID,
-    ) -> IAsyncOperation<IInspectable> {
-        let addr = HvSocketAddr::new(*vm_id, *service_id);
-        connect_op(move |sink| super::HvStreamSocket::arm_connect(addr, sink))
-    }
-}
-
-impl IHyperVConnector_Impl for HyperVConnector_Impl {
-    unsafe fn ConnectAsync(
-        &self,
-        vm_id: *const windows_core::GUID,
-        service_id: *const windows_core::GUID,
-        result: *mut *mut c_void,
-    ) -> HRESULT {
-        if vm_id.is_null() || service_id.is_null() {
-            return E_POINTER;
-        }
-        out_operation(
-            self.connect(unsafe { &*vm_id }, unsafe { &*service_id }),
-            result,
-        )
-    }
+    unsafe { *result = core::mem::ManuallyDrop::new(HSTRING::from(name)) };
+    HRESULT(0)
 }
 
 #[cfg(test)]
@@ -400,7 +319,7 @@ mod tests {
                 .expect("ConnectionReceived");
         }
 
-        let connector = UnixConnector::new();
+        let connector = crate::comio::UnixStreamSocket::new();
         let c: IUnixConnector = connector.cast().unwrap();
         let op: IAsyncOperation<IInspectable> = unsafe {
             let mut raw = core::ptr::null_mut();
@@ -482,7 +401,7 @@ mod tests {
         }
 
         // Connect through the connector's vtable.
-        let connector = NamedPipeConnector::new();
+        let connector = crate::comio::NamedPipeClient::new();
         let c: INamedPipeConnector = connector.cast().unwrap();
         let client: IInspectable = unsafe {
             let mut op = core::ptr::null_mut();
@@ -508,5 +427,38 @@ mod tests {
 
         let closable: windows::Foundation::IClosable = l.cast().unwrap();
         closable.Close().unwrap();
+    }
+
+    /// The one interface all three clients share. A caller that holds an
+    /// `IStreamConnector` learns which transport it has from `Transport`,
+    /// then asks for that transport's connect interface by `QueryInterface`
+    /// — the discovery step that replaces a connect member here.
+    ///
+    /// Nothing is connected: construction and identity are the whole test,
+    /// so it needs no listener, no pipe and no Hyper-V provider.
+    #[test]
+    fn every_client_reports_its_transport_through_the_shared_interface() {
+        fn transport_of(c: &IStreamConnector) -> String {
+            let mut s = core::mem::ManuallyDrop::new(HSTRING::new());
+            unsafe { c.Transport(&mut s).ok().expect("Transport") };
+            core::mem::ManuallyDrop::into_inner(s).to_string()
+        }
+
+        let pipe: IStreamConnector = crate::comio::NamedPipeClient::new().cast().unwrap();
+        let unix: IStreamConnector = crate::comio::UnixStreamSocket::new().cast().unwrap();
+        let hv: IStreamConnector = crate::comio::HvStreamSocket::new().cast().unwrap();
+
+        assert_eq!(transport_of(&pipe), "namedpipe");
+        assert_eq!(transport_of(&unix), "unix");
+        assert_eq!(transport_of(&hv), "hyperv");
+
+        // The name is not decoration: it says which connect interface the
+        // object actually carries, and only that one.
+        assert!(pipe.cast::<INamedPipeConnector>().is_ok());
+        assert!(pipe.cast::<IUnixConnector>().is_err());
+        assert!(unix.cast::<IUnixConnector>().is_ok());
+        assert!(unix.cast::<IHyperVConnector>().is_err());
+        assert!(hv.cast::<IHyperVConnector>().is_ok());
+        assert!(hv.cast::<INamedPipeConnector>().is_err());
     }
 }

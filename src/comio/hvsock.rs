@@ -19,6 +19,10 @@
 use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
+use super::connector::{
+    connect_op, out_operation, out_transport, IHyperVConnector, IHyperVConnector_Impl,
+    IStreamConnector, IStreamConnector_Impl, E_POINTER,
+};
 use super::listener::Accepted;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
@@ -222,6 +226,7 @@ impl HvStreamListener {
 }
 
 /// Client side of a Hyper-V socket connection.
+#[windows_core::implement(IStreamConnector, IHyperVConnector)]
 pub struct HvStreamSocket;
 
 impl HvStreamSocket {
@@ -339,4 +344,53 @@ impl HvStreamSocket {
         Ok(op)
     }
 
+}
+
+impl HvStreamSocket {
+    /// Creates the connector. It holds no state; connecting is what it does.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> windows_core::ComObject<HvStreamSocket> {
+        windows_core::ComObject::new(HvStreamSocket)
+    }
+
+    /// Typed Rust mirror of the vtable's `ConnectAsync`; the result arrives
+    /// from the `ConnectEx` completion, so no thread waits on it.
+    ///
+    /// A connect to a partition that is not listening can sit for the
+    /// provider's own default. The Rust `connect` takes a
+    /// `connect_timeout_ms` for that; this entry point does not expose one.
+    pub fn connect_async(
+        &self,
+        vm_id: &windows_core::GUID,
+        service_id: &windows_core::GUID,
+    ) -> windows_future::IAsyncOperation<windows_core::IInspectable> {
+        let addr = HvSocketAddr::new(*vm_id, *service_id);
+        connect_op(move |sink| Self::arm_connect(addr, sink))
+    }
+}
+
+impl IStreamConnector_Impl for HvStreamSocket_Impl {
+    unsafe fn Transport(
+        &self,
+        result: *mut core::mem::ManuallyDrop<windows_core::HSTRING>,
+    ) -> windows_core::HRESULT {
+        out_transport("hyperv", result)
+    }
+}
+
+impl IHyperVConnector_Impl for HvStreamSocket_Impl {
+    unsafe fn ConnectAsync(
+        &self,
+        vm_id: *const windows_core::GUID,
+        service_id: *const windows_core::GUID,
+        result: *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT {
+        if vm_id.is_null() || service_id.is_null() {
+            return E_POINTER;
+        }
+        out_operation(
+            self.connect_async(unsafe { &*vm_id }, unsafe { &*service_id }),
+            result,
+        )
+    }
 }

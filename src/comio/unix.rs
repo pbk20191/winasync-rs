@@ -15,6 +15,10 @@
 use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
+use super::connector::{
+    connect_op, out_operation, out_transport, IStreamConnector, IStreamConnector_Impl,
+    IUnixConnector, IUnixConnector_Impl,
+};
 use super::listener::Accepted;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
@@ -261,6 +265,7 @@ impl UnixStreamListener {
 }
 
 /// Client side of an AF_UNIX connection.
+#[windows_core::implement(IStreamConnector, IUnixConnector)]
 pub struct UnixStreamSocket;
 
 impl UnixStreamSocket {
@@ -384,6 +389,43 @@ impl UnixStreamSocket {
         Ok(op)
     }
 
+}
+
+impl UnixStreamSocket {
+    /// Creates the connector. It holds no state; connecting is what it does.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> windows_core::ComObject<UnixStreamSocket> {
+        windows_core::ComObject::new(UnixStreamSocket)
+    }
+
+    /// Typed Rust mirror of the vtable's `ConnectAsync`; the result arrives
+    /// from the `ConnectEx` completion, so no thread waits on it.
+    pub fn connect_async(
+        &self,
+        path: &windows_core::HSTRING,
+    ) -> windows_future::IAsyncOperation<windows_core::IInspectable> {
+        let path = path.to_string();
+        connect_op(move |sink| Self::arm_connect(&path, sink))
+    }
+}
+
+impl IStreamConnector_Impl for UnixStreamSocket_Impl {
+    unsafe fn Transport(
+        &self,
+        result: *mut core::mem::ManuallyDrop<windows_core::HSTRING>,
+    ) -> windows_core::HRESULT {
+        out_transport("unix", result)
+    }
+}
+
+impl IUnixConnector_Impl for UnixStreamSocket_Impl {
+    unsafe fn ConnectAsync(
+        &self,
+        path: core::mem::ManuallyDrop<windows_core::HSTRING>,
+        result: *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT {
+        out_operation(self.connect_async(&path), result)
+    }
 }
 
 #[cfg(test)]

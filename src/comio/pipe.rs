@@ -3,6 +3,10 @@
 //! pipes, the first end-to-end transport built on the `comio` overlapped-IO
 //! engine.
 
+use super::connector::{
+    out_operation, out_transport, INamedPipeConnector, INamedPipeConnector_Impl,
+    IStreamConnector, IStreamConnector_Impl,
+};
 use super::stream;
 use super::tpio::{self, IoReg, Issue, OpHandle};
 use super::waitop::await_io;
@@ -170,6 +174,7 @@ pub(crate) fn arm_accept(
 }
 
 /// Client side of a named pipe.
+#[windows_core::implement(IStreamConnector, INamedPipeConnector)]
 pub struct NamedPipeClient;
 
 impl NamedPipeClient {
@@ -230,6 +235,56 @@ impl NamedPipeClient {
                 None,
             )
         }
+    }
+}
+
+impl NamedPipeClient {
+    /// Creates the connector. It holds no state; connecting is what it does.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> windows_core::ComObject<NamedPipeClient> {
+        windows_core::ComObject::new(NamedPipeClient)
+    }
+
+    /// Typed Rust mirror of the vtable's `ConnectAsync`.
+    ///
+    /// Opening the client end is a plain synchronous `CreateFileW`, so the
+    /// usual case needs no thread at all: it is done here and handed back as
+    /// an already-finished operation. Only `ERROR_PIPE_BUSY` has anything to
+    /// wait for, and that wait goes to the thread pool rather than to the
+    /// caller.
+    pub fn connect_async(
+        &self,
+        name: &windows_core::HSTRING,
+    ) -> windows_future::IAsyncOperation<windows_core::IInspectable> {
+        match Self::try_open(name) {
+            Ok(stream) => windows_future::IAsyncOperation::ready(Ok(stream)),
+            Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
+                let name = name.to_string();
+                windows_future::IAsyncOperation::spawn(move || {
+                    crate::common::block_on(Self::connect(&name))
+                })
+            }
+            Err(e) => windows_future::IAsyncOperation::ready(Err(e)),
+        }
+    }
+}
+
+impl IStreamConnector_Impl for NamedPipeClient_Impl {
+    unsafe fn Transport(
+        &self,
+        result: *mut core::mem::ManuallyDrop<windows_core::HSTRING>,
+    ) -> windows_core::HRESULT {
+        out_transport("namedpipe", result)
+    }
+}
+
+impl INamedPipeConnector_Impl for NamedPipeClient_Impl {
+    unsafe fn ConnectAsync(
+        &self,
+        name: core::mem::ManuallyDrop<windows_core::HSTRING>,
+        result: *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT {
+        out_operation(self.connect_async(&name), result)
     }
 }
 

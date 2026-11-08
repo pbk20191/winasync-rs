@@ -33,12 +33,12 @@ pub use listener::{
     HyperVConnectionListener, IConnectionListener, IConnectionReceivedArgs, IHyperVListenerBind,
     INamedPipeListenerBind, IUnixListenerBind, NamedPipeConnectionListener, UnixConnectionListener,
 };
-// The client half: one connector per transport, so a COM caller can make a
-// connection as well as accept one.
+// The client half's interfaces. The connectors themselves are the existing
+// client types — `NamedPipeClient`, `UnixStreamSocket`, `HvStreamSocket` —
+// which now implement these, rather than three more types wrapping them.
 #[allow(unused_imports)]
 pub use connector::{
-    HyperVConnector, IHyperVConnector, INamedPipeConnector, IUnixConnector, NamedPipeConnector,
-    UnixConnector,
+    IHyperVConnector, INamedPipeConnector, IStreamConnector, IUnixConnector,
 };
 // `stream::from_reg` takes/returns crate-private types (`Arc<tpio::IoReg>`),
 // so it stays `pub(crate)` here rather than `pub` (the latter would be a hard
