@@ -32,7 +32,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Networking::WinSock::{
     RIORESULT, RIO_CORRUPT_CQ, RIO_CQ, RIO_EVENT_COMPLETION, RIO_IOCP_COMPLETION,
@@ -42,6 +42,7 @@ use windows::Win32::Networking::WinSock::{
 use windows::Win32::System::Threading::{
     CallbackMayRunLong, CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait,
     SetThreadpoolWait, WaitForThreadpoolWaitCallbacks, PTP_CALLBACK_INSTANCE, PTP_WAIT,
+    TP_CALLBACK_ENVIRON_V3,
 };
 
 use super::buffer::RioSlice;
@@ -50,7 +51,7 @@ use super::table::rio_table;
 use crate::common::winsock::wsa_last_err;
 use crate::common::tpctx::CtxHeader;
 #[cfg(feature = "tp")]
-use crate::tp::{Runtime, RuntimeInner};
+use crate::tp::Runtime;
 
 /// How many completions one dequeue call collects. Batching is the point of a
 /// completion queue — a larger batch amortises the call over more results.
@@ -120,13 +121,10 @@ struct CqState {
 /// How a completion queue announces that it has results.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
-    /// An event plus a TP_WAIT on `tp`'s private pool; the pump is ours, and
-    /// that pool's environment releases the context.
-    Pool,
-    /// An event plus a TP_WAIT on the **process default pool**; the pump is
-    /// ours, and we release the context, there being no finalization
-    /// callback.
-    DefaultPool,
+    /// An event plus a TP_WAIT; the pump is ours. Which pool it runs on is a
+    /// property of the callback environment, not of this queue's behaviour,
+    /// so one variant covers both.
+    Pump,
     /// An event the caller waits on with its own mechanism.
     Event,
     /// An IOCP the caller owns. The caller recognises the packet and calls
@@ -155,10 +153,11 @@ struct PoolPump {
     header: CtxHeader,
     state: Arc<CqState>,
     event: HANDLE,
-    /// Held in [`Mode::Pool`] so `tp`'s pool outlives its own callbacks.
-    /// The process default pool needs no such anchor.
-    #[cfg(feature = "tp")]
-    _rt: Option<Arc<RuntimeInner>>,
+    /// Whatever the environment's owner must outlive its own callbacks —
+    /// `tp`'s `RuntimeInner` for a private pool, nothing for the process
+    /// default one. Type-erased exactly as `IoReg::register` does it, so this
+    /// struct has one layout regardless of which features are on.
+    _keepalive: Option<Arc<dyn core::any::Any + Send + Sync>>,
 }
 
 unsafe impl Send for PoolPump {}
@@ -202,7 +201,11 @@ unsafe fn release_pump(ctx: *mut core::ffi::c_void) {
 pub struct RioCq {
     state: Arc<CqState>,
     /// The pump this queue owns, if any. Created and torn down as a unit.
-    pump: Mutex<Option<Pump>>,
+    ///
+    /// Not behind a mutex: only the constructors and `Drop` touch it, and
+    /// `Drop` has `&mut self`. A lock here would add a poison-panic path to a
+    /// destructor, where a panic during unwind aborts the process.
+    pump: Option<Pump>,
 }
 
 /// A TP_WAIT pump owned by this queue.
@@ -213,9 +216,10 @@ pub struct RioCq {
 struct Pump {
     wait: PTP_WAIT,
     event: HANDLE,
-    /// `Some` on the process default pool, whose null environment has no
-    /// finalization callback, so teardown releases the context here.
-    /// `None` on `tp`'s pool, whose environment releases it for us.
+    /// `Some` exactly when the callback environment is null, since only an
+    /// environment carries a `FinalizationCallback` to release the context
+    /// for us. Set from `env.is_none()` in one place, so the pairing cannot
+    /// drift the way two hand-written literals could.
     ctx_to_release: Option<*const PoolPump>,
 }
 
@@ -231,6 +235,61 @@ impl RioCq {
     /// overflow structurally impossible rather than something to handle.
     #[cfg(feature = "tp")]
     pub fn new(rt: &Runtime, size: u32) -> windows_core::Result<Arc<Self>> {
+        Self::with_pump(
+            size,
+            Some(rt.inner.pool.default_env()),
+            Some(rt.inner.clone()),
+        )
+    }
+
+    /// Creates a queue pumped from the **process default thread pool**.
+    ///
+    /// The same event + TP_WAIT drain loop as [`new`](Self::new), but on the
+    /// pool Windows gives every process, so it needs no runtime from this
+    /// crate and is available with the `rio` feature alone. For a queue that
+    /// should just work without the caller building a drain loop, this is the
+    /// one to reach for.
+    ///
+    /// # The cost of a shared pool
+    ///
+    /// That pool is shared with the CRT and with every other library in the
+    /// process. Each notification drains the queue until it is empty, so a
+    /// sustained flood of completions can hold a default-pool thread for as
+    /// long as it lasts. The pump calls `CallbackMayRunLong` on entry, which
+    /// asks the pool for a replacement thread immediately rather than after
+    /// its starvation detector fires, so other users of the pool are not
+    /// stalled behind a long drain — but the threads are still shared, and
+    /// this crate cannot size or prioritise them.
+    ///
+    /// With `tp` enabled, [`new`](Self::new) puts the same pump on a private
+    /// pool whose environment can be configured. Under heavy load prefer that,
+    /// or drive the queue from a loop you control
+    /// ([`with_iocp`](Self::with_iocp) / [`polling`](Self::polling)).
+    pub fn with_default_pool(size: u32) -> windows_core::Result<Arc<Self>> {
+        Self::with_pump(size, None, None)
+    }
+
+    /// The one pump constructor, parameterized by callback environment.
+    ///
+    /// `env` is the only thing that differs between the pools, and it decides
+    /// the one rule teardown must get right: an environment carries a
+    /// `FinalizationCallback` that releases the context, a null environment
+    /// does not. Deriving `ctx_to_release` from `env.is_none()` right here
+    /// makes that pairing structural — the alternative, two near-identical
+    /// constructors each setting both by hand, is a double free if they drift
+    /// one way and a leak the other.
+    ///
+    /// `keepalive` is whatever must outlive the pool's callbacks; `None` for
+    /// the process default pool, which outlives everything.
+    ///
+    /// # Safety
+    /// `env`, when given, must point at a callback environment that stays
+    /// valid for this queue's life — which `keepalive` is there to ensure.
+    fn with_pump(
+        size: u32,
+        env: Option<*const TP_CALLBACK_ENVIRON_V3>,
+        keepalive: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    ) -> windows_core::Result<Arc<Self>> {
         // Manual-reset: with NotifyReset the event is cleared by the next
         // RIONotify, not by the signal.
         let event = unsafe { CreateEventW(None, true, false, None)? };
@@ -258,7 +317,7 @@ impl RioCq {
             armed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             pump_error: AtomicU32::new(0),
-            mode: Mode::Pool,
+            mode: Mode::Pump,
         });
         let pump = Arc::new(PoolPump {
             header: CtxHeader {
@@ -266,18 +325,13 @@ impl RioCq {
             },
             state: state.clone(),
             event,
-            _rt: Some(rt.inner.clone()),
+            _keepalive: keepalive,
         });
-
         let ctx = Arc::into_raw(pump);
-        let wait = unsafe {
-            CreateThreadpoolWait(
-                Some(pump_callback),
-                Some(ctx as *mut core::ffi::c_void),
-                Some(rt.inner.pool.default_env()),
-            )
-        };
-        let wait = match wait {
+
+        let wait = match unsafe {
+            CreateThreadpoolWait(Some(pump_callback), Some(ctx as *mut core::ffi::c_void), env)
+        } {
             Ok(w) => w,
             Err(e) => {
                 // Hand the leaked Arc back before unwinding the construction.
@@ -292,104 +346,14 @@ impl RioCq {
 
         let this = Arc::new(RioCq {
             state: state.clone(),
-            pump: Mutex::new(Some(Pump {
+            pump: Some(Pump {
                 wait,
                 event,
-                // tp's environment finalizes the context for us.
-                ctx_to_release: None,
-            })),
+                // Only a null environment leaves the context to us.
+                ctx_to_release: env.is_none().then_some(ctx),
+            }),
         });
         // Arm for the first time: notify, then wait, in that order.
-        arm(&state, event, wait)?;
-        Ok(this)
-    }
-
-    /// Creates a queue pumped from the **process default thread pool**.
-    ///
-    /// The same event + TP_WAIT drain loop as [`new`](Self::new), but on the
-    /// pool Windows gives every process, so it needs no runtime from this
-    /// crate and is available with the `rio` feature alone. For a queue that
-    /// should just work without the caller building a drain loop, this is the
-    /// one to reach for.
-    ///
-    /// # The cost of a shared pool
-    ///
-    /// That pool is shared with the CRT and with every other library in the
-    /// process. Each notification drains the queue until it is empty, so a
-    /// sustained flood of completions can hold a default-pool thread for as
-    /// long as it lasts. The pump calls `CallbackMayRunLong` on entry, which
-    /// asks the pool for a replacement thread immediately rather than after
-    /// its starvation detector fires, so other users of the pool are not
-    /// stalled behind a long drain — but the threads are still shared, and
-    /// this crate cannot size or prioritise them.
-    ///
-    /// With `tp` enabled, [`new`](Self::new) puts the same pump on a private
-    /// pool whose environment can be configured. Under heavy load prefer that,
-    /// or drive the queue from a loop you control
-    /// ([`with_iocp`](Self::with_iocp) / [`polling`](Self::polling)).
-    pub fn with_default_pool(size: u32) -> windows_core::Result<Arc<Self>> {
-        let event = unsafe { CreateEventW(None, true, false, None)? };
-        let notify = RIO_NOTIFICATION_COMPLETION {
-            Type: RIO_EVENT_COMPLETION,
-            Anonymous: RIO_NOTIFICATION_COMPLETION_0 {
-                Event: RIO_NOTIFICATION_COMPLETION_0_0 {
-                    EventHandle: event,
-                    NotifyReset: true.into(),
-                },
-            },
-        };
-        let cq = match create_cq(size, Some(&notify)) {
-            Ok(cq) => cq,
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(event);
-                }
-                return Err(e);
-            }
-        };
-
-        let state = Arc::new(CqState {
-            cq,
-            armed: AtomicBool::new(false),
-            closing: AtomicBool::new(false),
-            pump_error: AtomicU32::new(0),
-            mode: Mode::DefaultPool,
-        });
-        let pump = Arc::new(PoolPump {
-            header: CtxHeader {
-                release: release_pump,
-            },
-            state: state.clone(),
-            event,
-            #[cfg(feature = "tp")]
-            _rt: None,
-        });
-        let ctx = Arc::into_raw(pump);
-
-        // Null environment: the process default pool.
-        let wait = match unsafe {
-            CreateThreadpoolWait(Some(pump_callback), Some(ctx as *mut core::ffi::c_void), None)
-        } {
-            Ok(w) => w,
-            Err(e) => {
-                unsafe { drop(Arc::from_raw(ctx)) };
-                close_cq(cq);
-                unsafe {
-                    let _ = CloseHandle(event);
-                }
-                return Err(e);
-            }
-        };
-
-        let this = Arc::new(RioCq {
-            state: state.clone(),
-            pump: Mutex::new(Some(Pump {
-                wait,
-                event,
-                // No finalization callback here, so teardown frees it.
-                ctx_to_release: Some(ctx),
-            })),
-        });
         arm(&state, event, wait)?;
         Ok(this)
     }
@@ -512,7 +476,7 @@ impl RioCq {
                 pump_error: AtomicU32::new(0),
                 mode,
             }),
-            pump: Mutex::new(None),
+            pump: None,
         })
     }
 
@@ -598,7 +562,7 @@ impl CqState {
     /// Whether this crate owns the pump, i.e. whether a caller touching the
     /// queue directly would be a second consumer.
     fn is_self_pumping(&self) -> bool {
-        matches!(self.mode, Mode::Pool | Mode::DefaultPool)
+        matches!(self.mode, Mode::Pump)
     }
 
     /// First error wins: later failures are consequences of the first.
@@ -835,7 +799,7 @@ impl Drop for RioCq {
     fn drop(&mut self) {
         self.state.closing.store(true, Ordering::Release);
 
-        let pump = self.pump.lock().unwrap().take();
+        let pump = self.pump.take();
         let Some(pump) = pump else {
             // Externally driven: no pump of ours, and no context was handed
             // to a callback object.
