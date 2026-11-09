@@ -316,6 +316,57 @@ pub(crate) mod tests {
         }
     }
 
+    /// A read cancelled while pending ends `Canceled`, not `Error`, and its
+    /// results are `ERROR_CANCELLED` -- the `IAsyncInfo` contract, which these
+    /// operations broke until `asyncop::settle`.
+    #[test]
+    fn a_cancelled_read_reports_canceled() {
+        use windows_future::{AsyncStatus, IAsyncInfo};
+
+        let name = format!(r"\\.\pipe\comio_cancel_{}", std::process::id());
+        let wname = windows_core::HSTRING::from(&name);
+        let server = unsafe {
+            CreateNamedPipeW(
+                &wname,
+                FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0),
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                None,
+            )
+        };
+        assert!(!server.is_invalid());
+        let client = unsafe {
+            CreateFileW(
+                &wname,
+                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                None,
+            )
+        }
+        .unwrap();
+        // Both ends stay open, so nothing but the cancel can end the read.
+        let _s = from_reg(IoReg::register(server, false).unwrap());
+        let c = from_reg(IoReg::register(client, false).unwrap());
+
+        let read = c
+            .cast::<IInputStream>()
+            .unwrap()
+            .ReadAsync(&new_buffer(8).unwrap().cast::<IBuffer>().unwrap(), 8, InputStreamOptions(0))
+            .unwrap();
+        let info: IAsyncInfo = read.cast().unwrap();
+        assert_eq!(info.Status().unwrap(), AsyncStatus::Started);
+        info.Cancel().unwrap();
+        let err = block_on(read.into_future()).unwrap_err();
+        assert_eq!(err.code(), crate::comio::asyncop::E_CANCELLED);
+        assert_eq!(info.Status().unwrap(), AsyncStatus::Canceled);
+    }
+
     /// Every interface the metadata promises, answered.
     ///
     /// `requires` in metadata does not create a vtable chain, so a class can

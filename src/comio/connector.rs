@@ -53,6 +53,9 @@ use super::tpio::OpHandle;
 /// `ConnectEx`.
 struct ConnectState {
     result: Option<Result<ITransportStream>>,
+    /// See `asyncop::settle`.
+    cancel_requested: bool,
+    canceled: bool,
     completed: Option<AsyncOperationCompletedHandler<ITransportStream>>,
     completed_assigned: bool,
     op: Option<OpHandle>,
@@ -75,7 +78,9 @@ impl ConnectOp_Impl {
         let (status, completed) = {
             let mut g = self.0.lock().unwrap();
             debug_assert!(g.result.is_none());
+            let (res, canceled) = super::asyncop::settle(res, g.cancel_requested);
             g.result = Some(res);
+            g.canceled = canceled;
             (g.status(), g.completed.take())
         };
         // Outside the lock: the handler may re-enter to read Status/GetResults.
@@ -91,6 +96,7 @@ impl ConnectState {
         match &self.result {
             None => AsyncStatus::Started,
             Some(Ok(_)) => AsyncStatus::Completed,
+            Some(Err(_)) if self.canceled => AsyncStatus::Canceled,
             Some(Err(_)) => AsyncStatus::Error,
         }
     }
@@ -110,8 +116,12 @@ impl IAsyncInfo_Impl for ConnectOp_Impl {
         })
     }
     fn Cancel(&self) -> Result<()> {
-        if let Some(op) = self.0.lock().unwrap().op.as_ref() {
-            op.cancel();
+        let mut g = self.0.lock().unwrap();
+        if g.result.is_none() {
+            g.cancel_requested = true;
+            if let Some(op) = g.op.as_ref() {
+                op.cancel();
+            }
         }
         Ok(())
     }
@@ -177,6 +187,8 @@ fn new_op() -> ComObject<ConnectOp> {
     ComObject::new(ConnectOp(
         Mutex::new(ConnectState {
             result: None,
+            cancel_requested: false,
+            canceled: false,
             completed: None,
             completed_assigned: false,
             op: None,

@@ -32,8 +32,42 @@ const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
 /// E_ILLEGAL_DELEGATE_ASSIGNMENT — `Completed` handler set more than once.
 const E_ILLEGAL_DELEGATE_ASSIGNMENT: HRESULT = HRESULT(0x80000018u32 as i32);
 
+/// `HRESULT_FROM_WIN32(ERROR_CANCELLED)`: what a cancelled operation's
+/// `GetResults` fails with, as it does for C++/WinRT and the system's own
+/// operations.
+pub(crate) const E_CANCELLED: HRESULT = HRESULT(0x800704C7u32 as i32);
+
+/// Turns the I/O's own outcome into the operation's, once `Cancel` has been
+/// called.
+///
+/// `IAsyncInfo::Cancel` is a request, and the WinRT contract for what follows
+/// is specific: an operation that ends *because* it was cancelled reports
+/// `AsyncStatus::Canceled`, not `Error`. The I/O cannot say that by itself --
+/// `CancelIoEx` makes it complete with `ERROR_OPERATION_ABORTED`, which is
+/// indistinguishable from any other failure unless someone remembers asking.
+/// This is where that is remembered. An operation that finished anyway --
+/// the cancel lost the race to the completion -- keeps its real outcome, as
+/// the contract allows.
+///
+/// Until 2026-11-09 these operations reported `Error` here. Nothing in-process
+/// noticed; the out-of-process test, which checks the status a remote caller
+/// sees, did.
+pub(crate) fn settle<T>(res: Result<T>, cancel_requested: bool) -> (Result<T>, bool) {
+    const ABORTED: HRESULT = HRESULT(0x800703E3u32 as i32); // ERROR_OPERATION_ABORTED
+    match res {
+        Err(e) if cancel_requested && e.code() == ABORTED => {
+            (Err(Error::from_hresult(E_CANCELLED)), true)
+        }
+        res => (res, false),
+    }
+}
+
 struct OpState<T: RuntimeType + 'static> {
     result: Option<Result<T>>,
+    /// `Cancel` was called while the operation was still running.
+    cancel_requested: bool,
+    /// It ended because of that; see [`settle`].
+    canceled: bool,
     completed: Option<AsyncOperationWithProgressCompletedHandler<T, u32>>,
     completed_assigned: bool,
     op: Option<OpHandle>,
@@ -44,6 +78,7 @@ impl<T: RuntimeType + 'static> OpState<T> {
         match &self.result {
             None => AsyncStatus::Started,
             Some(Ok(_)) => AsyncStatus::Completed,
+            Some(Err(_)) if self.canceled => AsyncStatus::Canceled,
             Some(Err(_)) => AsyncStatus::Error,
         }
     }
@@ -84,7 +119,9 @@ impl<T: RuntimeType + 'static> IoAsyncOp_Impl<T> {
         let (status, completed) = {
             let mut guard = self.0.lock().unwrap();
             debug_assert!(guard.result.is_none());
+            let (res, canceled) = settle(res, guard.cancel_requested);
             guard.result = Some(res);
+            guard.canceled = canceled;
             (guard.status(), guard.completed.take())
         };
         // Invoke outside the lock so the handler (which may re-enter to read
@@ -107,8 +144,12 @@ impl<T: RuntimeType + 'static> IAsyncInfo_Impl for IoAsyncOp_Impl<T> {
         Ok(self.0.lock().unwrap().error_code())
     }
     fn Cancel(&self) -> Result<()> {
-        if let Some(op) = self.0.lock().unwrap().op.as_ref() {
-            op.cancel();
+        let mut guard = self.0.lock().unwrap();
+        if guard.result.is_none() {
+            guard.cancel_requested = true;
+            if let Some(op) = guard.op.as_ref() {
+                op.cancel();
+            }
         }
         Ok(())
     }
@@ -159,6 +200,8 @@ fn new_object<T: RuntimeType + 'static>() -> ComObject<IoAsyncOp<T>> {
     ComObject::new(IoAsyncOp(
         Mutex::new(OpState {
             result: None,
+            cancel_requested: false,
+            canceled: false,
             completed: None,
             completed_assigned: false,
             op: None,
