@@ -313,27 +313,36 @@
         result.expect("disconnect alone timed out");
     }
 
-    #[test]
-    /// Known to fail rarely, and not yet reproduced: 60 isolated runs and 15
-    /// full-suite runs came back clean, so there is no verified fix here —
-    /// only enough diagnostics that the next occurrence names itself instead
-    /// of printing a bare `unwrap` panic.
+    /// Disconnect a client socket with `DisconnectEx(TF_REUSE_SOCKET)` and
+    /// connect the *same* socket again.
     ///
-    /// The leading hypothesis is TIME_WAIT, which this test is unusually
-    /// exposed to: the reused socket keeps its local binding, so
-    /// `reconnect(addr)` recreates the *identical* four-tuple the first
-    /// connection just tore down. If that is it, the failure will show as
-    /// `WSAEADDRINUSE` (10048) out of `reconnect` and the fix is to give the
-    /// second connection a different remote port, not to wait longer.
+    /// The second connection goes to a second listener, on purpose. The
+    /// reused socket keeps its local binding, so reconnecting to the first
+    /// listener recreates the identical four-tuple the first connection just
+    /// tore down -- and that tuple is in TIME_WAIT. It failed rarely that way
+    /// (60 isolated runs and 15 full suites were clean) until the release
+    /// suite caught it on 2026-11-10:
+    ///
+    /// ```text
+    /// reconnect to 127.0.0.1:55616 from Some(127.0.0.1:55618) failed:
+    ///     HRESULT(0x80070034)
+    /// ```
+    ///
+    /// `0x80070034` is `ERROR_DUP_NAME`, which is how `WSAEADDRINUSE` arrives
+    /// through the overlapped path: `ConnectEx` fails with
+    /// `STATUS_ADDRESS_ALREADY_EXISTS`, and `GetOverlappedResult` maps that
+    /// NTSTATUS to the Win32 error, not to the Winsock one. A different remote
+    /// port is a different tuple, and what the test is about -- the same
+    /// handle, with no new `socket()`/`bind()`/registration -- is unchanged.
+    #[test]
     fn disconnect_reconnect_client() {
         let rt = Runtime::new();
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
-            let listener = TcpListener::bind(
-                &rt,
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-            )
-            .unwrap();
+            let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+            let listener = TcpListener::bind(&rt, loopback).unwrap();
             let addr = listener.local_addr().unwrap();
+            let second = TcpListener::bind(&rt, loopback).unwrap();
+            let addr2 = second.local_addr().unwrap();
 
             // First connection on a fresh client socket.
             let client = TcpStream::connect(&rt, addr)
@@ -346,19 +355,17 @@
             assert_eq!(&b[..n.expect("first read")], b"one");
 
             // Finish the connection (close the peer), then disconnect + reuse the
-            // SAME client handle and reconnect — no new socket()/bind()/register.
+            // SAME client handle and reconnect -- no new socket()/bind()/register.
             drop(s1);
             client
                 .disconnect(true)
                 .await
                 .expect("graceful DisconnectEx after the peer closed");
-            client.reconnect(addr).await.unwrap_or_else(|e| {
-                panic!(
-                    "reconnect to {addr} from {local:?} failed: {e:?}                      (10048 = WSAEADDRINUSE, i.e. the four-tuple is still in TIME_WAIT)"
-                )
+            client.reconnect(addr2).await.unwrap_or_else(|e| {
+                panic!("reconnect to {addr2} from {local:?} failed: {e:?}")
             });
 
-            let s2 = listener.accept().await.expect("second accept");
+            let s2 = second.accept().await.expect("second accept");
             client.write(b"two".to_vec()).await.0.expect("second write");
             let (n, b) = s2.read(vec![0u8; 8]).await;
             assert_eq!(&b[..n.expect("second read")], b"two");
@@ -481,8 +488,6 @@
         result.expect("skip-completion echo timed out");
         // Without this the test would pass just as well with the mode inert:
         // waiting for a packet produces the same bytes, only slower.
-        // The counter only moves in debug builds; see its definition.
-        #[cfg(debug_assertions)]
         {
             let inlined =
                 INLINE_COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed) - inline_before;
@@ -491,7 +496,6 @@
                 "skip-completion mode never took the inline path — the flag is not in effect"
             );
         }
-        let _ = inline_before;
         drop(rt);
         // `LIVE_OPS` is process-global, so the only value this test can
         // assert on is the quiescent one: a snapshot taken at entry counts
@@ -1030,7 +1034,6 @@
         }))
         .expect("cancel storm timed out");
         drop(rt);
-        #[cfg(debug_assertions)]
         {
             for _ in 0..500 {
                 if super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
