@@ -18,7 +18,9 @@
 //!    count is back to zero.** This is the case a naive object count misses,
 //!    and the one that would corrupt a process: the pending completion is a
 //!    function pointer into this module.
-#![cfg(feature = "comio")]
+// The counters this measures are compiled in by `dylib`; without it
+// `can_unload` is an unconditional no and there is nothing to assert.
+#![cfg(all(feature = "comio", feature = "dylib"))]
 
 use winasync::comio::NamedPipeConnector;
 use winasync::comio::activation::{CLSID_NAMED_PIPE_CONNECTOR, DllGetClassObject};

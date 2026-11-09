@@ -213,6 +213,7 @@ unsafe fn release_op<P>(op: *mut c_void) {
     // Release, not Relaxed, for the same reason `Arc` uses it on the way
     // down: a thread that observes this counter at zero and acts on it (see
     // `comio::unload`) must see everything this op did.
+    #[cfg(any(debug_assertions, feature = "dylib"))]
     LIVE_OPS.fetch_sub(1, Ordering::Release);
     unsafe { drop(Box::from_raw(op as *mut Op<P>)) }
 }
@@ -317,6 +318,7 @@ pub unsafe fn submit<P>(
         },
         payload: UnsafeCell::new(Some(payload)),
     }));
+    #[cfg(any(debug_assertions, feature = "dylib"))]
     LIVE_OPS.fetch_add(1, Ordering::Relaxed);
 
     unsafe { StartThreadpoolIo(reg.io) };

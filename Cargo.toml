@@ -89,11 +89,31 @@ comio = [
     "windows/Win32_System_Pipes",
     "windows/Win32_System_WinRT",
     "windows/Win32_Security",
-    # The activation path: class factories, self-registration, module path.
+    # The activation path: class factories and the entry points COM finds
+    # them through. Registry and LibraryLoader are for the tests, which load
+    # the real DLL and write the CLSID keys an installer would.
     "windows/Win32_System_Com",
     "windows/Win32_System_Registry",
     "windows/Win32_System_LibraryLoader",
 ]
+
+# This build is the in-process server DLL.
+#
+# Deliberately not in `default`, and deliberately a feature rather than a
+# `cfg`: `crate-type = ["lib", "cdylib"]` is one rustc invocation emitting two
+# artifacts, so nothing distinguishes them at compile time. Declaring it is
+# the honest substitute.
+#
+# What it turns on is the module-lifetime accounting that `DllCanUnloadNow`
+# needs -- a count of live objects, server locks and in-flight operations.
+# A consumer linking the rlib never calls that export and should not pay for
+# the counters, and `common::overlapped` is on the submission path of `rio`
+# and `tp` as well, neither of which has the question to answer.
+#
+# `DllGetClassObject` and `DllGetActivationFactory` are *not* gated on this.
+# They are cold entry points with no per-operation cost, and leaving them
+# present keeps a plain `cargo build` producing a DLL that still activates.
+dylib = ["comio"]
 
 # DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.
 dq = [

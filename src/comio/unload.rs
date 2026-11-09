@@ -95,6 +95,12 @@ static LOCKS: AtomicUsize = AtomicUsize::new(0);
 /// wrapped count would read `usize::MAX` and pin the module loaded for the
 /// life of the process, turning somebody else's imbalance into our leak.
 pub(crate) fn lock_server(lock: bool) {
+    if !cfg!(feature = "dylib") {
+        // Nothing reads the count, so taking one would only be a leak of
+        // bookkeeping. `LockServer` still succeeds -- a caller locking a
+        // server that cannot be unloaded anyway has lost nothing.
+        return;
+    }
     if lock {
         LOCKS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -116,6 +122,7 @@ impl ModuleRef {
         // Relaxed is enough on the way up: the object being constructed is
         // not reachable by another thread until after this returns, so there
         // is nothing for this increment to be ordered against.
+        #[cfg(feature = "dylib")]
         OUTSTANDING.fetch_add(1, Ordering::Relaxed);
         Self(())
     }
@@ -138,6 +145,7 @@ impl Drop for ModuleRef {
         // Release, paired with the Acquire in `can_unload`: everything this
         // object did must be visible to a thread that goes on to observe the
         // count at zero and unload the module.
+        #[cfg(feature = "dylib")]
         OUTSTANDING.fetch_sub(1, Ordering::Release);
     }
 }
@@ -149,6 +157,11 @@ impl Drop for ModuleRef {
 /// spurious "no" costs nothing. The reverse ordering could see both counters
 /// at zero in a state where neither was.
 pub fn can_unload() -> bool {
+    // Without the counters there is no evidence, and absence of evidence is
+    // not an answer COM may act on. See the `dylib` feature in Cargo.toml.
+    if !cfg!(feature = "dylib") {
+        return false;
+    }
     // The flag first: it is the cheapest, it is one-way, and once it is set
     // no amount of releasing objects will make the answer yes again.
     !crate::common::winsock::wsa_initialized()
@@ -172,4 +185,110 @@ pub fn outstanding() -> usize {
 /// Server locks currently held. See [`outstanding`] for why this is public.
 pub fn locks_held() -> usize {
     LOCKS.load(Ordering::Acquire)
+}
+
+/// The module's own load/unload notifications.
+///
+/// Defining `DllMain` in a Rust cdylib works because the MSVC CRT's
+/// `_DllMainCRTStartup` calls whichever `DllMain` the module links, and
+/// `std` does not define one on this target — it hangs thread-local
+/// destructors off `.CRT$XL*` TLS callbacks instead, which this does not
+/// disturb. It is compiled into the rlib too, where nothing calls it.
+///
+/// It exists for one job, and only in debug builds: **catching a module that
+/// was unloaded while it still owned something.** `DllCanUnloadNow` is
+/// advisory, so a host is free to `FreeLibrary` this module without asking,
+/// and if it does so while an object or an operation is live the failure is a
+/// jump into freed code somewhere else entirely, minutes later, with no trace
+/// back to here. Checking at the moment of detach turns that into a message
+/// naming the counts.
+///
+/// There is deliberately no cleanup here. `DllMain` runs under the loader
+/// lock, where the useful things — `WSACleanup`, waiting on thread-pool
+/// callbacks, anything that could load or unload a module — are exactly what
+/// must not be called. Observing is safe; acting is not.
+///
+/// `DisableThreadLibraryCalls` is not called either. It would save two empty
+/// calls per thread and it interacts badly with static TLS, which this module
+/// has by way of `std`.
+///
+/// It lands in the module's export table, which it has no business being in:
+/// rustc exports every `no_mangle` symbol from a cdylib, and `pub` is not the
+/// lever — dropping it changes nothing. The alternative is a `.CRT$XLB` TLS
+/// callback, which is not exported and gets the same notifications, but which
+/// fails *silently* if the linker drops `_tls_used`. A visible export beats a
+/// diagnostic that might not be running, so this stays.
+#[cfg(all(feature = "dylib", windows))]
+#[unsafe(no_mangle)]
+extern "system" fn DllMain(
+    _instance: *mut core::ffi::c_void,
+    reason: u32,
+    reserved: *mut core::ffi::c_void,
+) -> i32 {
+    const DLL_PROCESS_DETACH: u32 = 0;
+    const DLL_PROCESS_ATTACH: u32 = 1;
+
+    match reason {
+        DLL_PROCESS_ATTACH => {
+            IN_DLL.store(true, Ordering::Release);
+        }
+        // `reserved` is null when the module is being unloaded by
+        // `FreeLibrary`, and non-null when the process is exiting. Only the
+        // first is a mistake: at process exit nothing will run again, so
+        // outstanding objects are not a dangling-call risk.
+        DLL_PROCESS_DETACH if reserved.is_null() => on_forced_unload(),
+        _ => {}
+    }
+    1 // TRUE; anything else fails the load.
+}
+
+/// Reports a module that is being unloaded with work outstanding.
+///
+/// Split out of `DllMain` rather than written inline so the release build is
+/// an empty call instead of a `cfg`-gated branch inside a match arm.
+#[cfg(all(feature = "dylib", windows, debug_assertions))]
+fn on_forced_unload() {
+    if can_unload() {
+        return;
+    }
+    // Not a panic: this is an `extern "system"` frame under the loader lock,
+    // where unwinding is the one thing worse than the bug being reported.
+    eprintln!(
+        "FATAL: {} unloaded with work outstanding --          {} object(s), {} server lock(s), {} operation(s) in flight{}.          Any interface the host still holds now points into freed code.",
+        env!("CARGO_PKG_NAME"),
+        OUTSTANDING.load(Ordering::Acquire),
+        LOCKS.load(Ordering::Acquire),
+        LIVE_OPS.load(Ordering::Acquire),
+        if crate::common::winsock::wsa_initialized() {
+            ", and Winsock was initialized"
+        } else {
+            ""
+        },
+    );
+    std::process::abort();
+}
+
+/// Release builds make no claim about this; `DllCanUnloadNow` is advisory and
+/// a host that ignores it is not doing anything the API forbids.
+#[cfg(all(feature = "dylib", windows, not(debug_assertions)))]
+fn on_forced_unload() {}
+
+/// Set by [`DllMain`] on attach. False in the rlib, where no loader ever
+/// calls it.
+///
+/// This is the "am I the cdylib?" answer, arrived at the cheap way. The
+/// alternative — `GetModuleHandleExW(FROM_ADDRESS)` compared against the
+/// executable's handle — is a loader call to learn something the loader
+/// already told us.
+static IN_DLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this code is running from the server DLL rather than linked into
+/// an executable.
+///
+/// Diagnostic only. Nothing branches on it: the counting is settled at
+/// compile time by the `dylib` feature, because a runtime guard on an
+/// object-construction path costs an atomic load to save an atomic
+/// increment.
+pub fn in_dll() -> bool {
+    IN_DLL.load(std::sync::atomic::Ordering::Acquire)
 }

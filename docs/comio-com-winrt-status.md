@@ -411,13 +411,31 @@ $l.Bind($name)
 
    남은 레이스는 API에 내재한다. `can_unload()`는 스냅샷이고 COM이 받는 건 언제나 스냅샷이다: 마지막 객체의 `Drop`이 카운트를 0으로 내린 뒤에도 이 모듈 코드를 통해 반환해야 한다. MS 지침이 `DllCanUnloadNow`를 권고적으로 다루고 `CoFreeUnusedLibraries`가 언로드를 미루는 이유다. 우리가 보장하는 건 우리 몫의 절반이다 — **센 것이 하나라도 남아 있으면 `S_OK`는 절대 안 나간다.** 거짓 `S_OK`가 크래시고, 거짓 `S_FALSE`는 다음 스윕까지 상주할 뿐이다.
 
-   남은 export 셋:
+   **`dylib` 피처 뒤로 넣었다.** `crate-type = ["lib", "cdylib"]`은 rustc를 **한 번** 돌려 두 산출물을 내므로 "cdylib일 때만"을 가르는 cfg가 없다 — 명시적으로 선언하는 게 정직한 대체물이다. default에는 **안 넣는다**: 기본 빌드가 비용을 안 내는 게 요점이다.
+
+   어디에 적용할지는 측정으로 갈렸다.
+
+   - **`LIVE_OPS`** — `common::overlapped`는 comio·rio·tp **셋 다**의 제출 경로인데, 답할 `DllCanUnloadNow`가 있는 건 `dylib` 빌드뿐이다. `#[cfg(any(debug_assertions, feature = "dylib"))]` — 런타임 비용 0.
+   - **`OUTSTANDING`** — 증가 지점 12곳이 전부 COM 객체 생성이다. 런타임 플래그로 가드하면 아끼려는 `fetch_add`와 **같은 값**(atomic 로드 + 분기)이 든다. 그래서 `ModuleRef`를 피처 없을 때 no-op ZST로 만들었다 — 필드 12곳은 그대로 두고 컴파일 타임에 사라진다.
+   - **`DllGetClassObject` / `DllGetActivationFactory`는 게이트하지 않는다.** 차가운 진입점이고 op당 비용이 없다. 평범한 `cargo build`가 여전히 활성화되는 DLL을 내는 편이 낫다.
+
+   `.def`는 build.rs가 생성한다 — export 목록이 피처에 달렸는데, 빌드가 정의하지 않는 심볼을 .def에 적으면 **export 누락이 아니라 링크 에러**(LNK2001)다. 실제로 6번에서 한 번 밟았다.
+
+   **`DllMain`을 붙였다 — 치우려고가 아니라 잡으려고.** `DllCanUnloadNow`는 권고적이라 호스트가 안 물어보고 `FreeLibrary`해도 규칙 위반이 아니다. 그 상태로 언로드되면 실패는 **한참 뒤 전혀 다른 곳**에서 해제된 코드로 점프하는 모양으로 나타나고 여기로 역추적되지 않는다. detach 시점(`reserved`가 null = `FreeLibrary`, non-null = 프로세스 종료이고 후자는 문제가 아니다)에 debug 빌드에서 확인해 카운트를 찍고 `abort`한다. panic이 아니다 — 로더 락 아래 `extern "system"` 프레임에서 unwind는 보고하려는 버그보다 나쁘다.
+
+   **치우는 일은 여기서 하지 않는다.** `DllMain`은 로더 락 아래서 돌고, 쓸모 있는 것들(`WSACleanup`, 스레드풀 콜백 대기, 모듈을 로드/언로드할 수 있는 모든 것)이 정확히 거기서 부르면 안 되는 것들이다. **관찰은 안전하고 행동은 아니다.** `DisableThreadLibraryCalls`도 안 부른다 — 스레드당 빈 호출 둘을 아끼자고 정적 TLS(`std` 경유로 이 모듈에 있다)와 나쁘게 얽힐 이유가 없다.
+
+   `DllMain`이 export 테이블에 올라가는 건 막지 못했다. rustc는 cdylib에서 `no_mangle` 심볼을 **`pub` 여부와 무관하게** 전부 내보낸다. 대안인 `.CRT$XLB` TLS 콜백은 export되지 않고 같은 알림을 받지만, 링커가 `_tls_used`를 떨구면 **조용히** 안 돈다. 안 돌지도 모르는 진단보다 보이는 export가 낫다.
+
+   남은 export — `dylib` 켰을 때:
 
    ```text
    1  DllCanUnloadNow
    2  DllGetActivationFactory
    3  DllGetClassObject
    ```
+
+   끄면 둘(`DllGetActivationFactory`, `DllGetClassObject`)이다. `DllMain`도 테이블에 보인다.
 
    *후속 (쉬움):* `LIVE_OPS`를 읽는 누수 단언들이 아직 `#[cfg(debug_assertions)]`다. 카운터가 정확해졌으니 이제 게이트를 풀면 릴리스에서도 의미가 생긴다 — tp/rio까지 번지는 별개 작업이라 미뤘다.
 

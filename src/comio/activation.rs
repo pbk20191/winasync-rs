@@ -105,8 +105,11 @@ use super::unload::ModuleRef;
 use core::ffi::c_void;
 use super::bindings::Pbk20191::WinAsync::Comio as rc;
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, S_FALSE, S_OK,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, S_OK,
 };
+// Only `DllCanUnloadNow` needs it, and only a `dylib` build has one.
+#[cfg(feature = "dylib")]
+use windows::Win32::Foundation::S_FALSE;
 use windows::Win32::System::Com::IClassFactory;
 use windows::Win32::System::Com::IClassFactory_Impl;
 use windows::Win32::System::WinRT::{IActivationFactory, IActivationFactory_Impl};
@@ -394,6 +397,10 @@ pub unsafe extern "system" fn DllGetActivationFactory(
 /// mistakes are not symmetric. A wrong `S_FALSE` costs a resident DLL until
 /// the next sweep; a wrong `S_OK` is a crash. Everything here is arranged so
 /// that only the first one is reachable.
+/// Present only in a `dylib` build, because only that build keeps the counts
+/// the answer comes from. Without the export COM never asks, which is the
+/// same outcome as an unconditional `S_FALSE` — see [`super::unload`].
+#[cfg(feature = "dylib")]
 #[unsafe(no_mangle)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     if super::unload::can_unload() { S_OK } else { S_FALSE }

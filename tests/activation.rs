@@ -31,6 +31,8 @@ use winasync::comio::bindings::Pbk20191::WinAsync::Comio::{
 use std::sync::mpsc;
 use windows::Foundation::TypedEventHandler;
 use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE};
+#[cfg(feature = "dylib")]
+use windows::Win32::Foundation::S_FALSE;
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW,
@@ -82,6 +84,7 @@ fn ensure_dll() -> std::path::PathBuf {
     let dir = profile_dir();
     let mut features = vec!["comio"];
     for (on, name) in [
+        (cfg!(feature = "dylib"), "dylib"),
         (cfg!(feature = "tp"), "tp"),
         (cfg!(feature = "dq"), "dq"),
         (cfg!(feature = "rio"), "rio"),
@@ -118,6 +121,21 @@ fn ensure_dll() -> std::path::PathBuf {
         path.display()
     );
     path
+}
+
+/// The DLL's own `DllCanUnloadNow`, reached the way COM reaches it.
+///
+/// Only a `dylib` build exports it; see the feature's entry in Cargo.toml.
+///
+/// # Safety
+///
+/// `module` must be this crate's loaded cdylib.
+#[cfg(feature = "dylib")]
+unsafe fn can_unload_now(module: HMODULE) -> HRESULT {
+    let addr = unsafe { GetProcAddress(module, PCSTR(c"DllCanUnloadNow".as_ptr().cast())) }
+        .expect("DllCanUnloadNow not exported -- is the `dylib` feature on?");
+    let f: unsafe extern "system" fn() -> HRESULT = unsafe { core::mem::transmute(addr) };
+    unsafe { f() }
 }
 
 /// The CLSID keys an installer would write, written by the test instead.
@@ -252,6 +270,18 @@ fn com_activation_round_trip_through_the_registered_dll() {
                     com_key_present(&CLSID_NAMED_PIPE_CONNECTION_LISTENER),
                 )
             });
+
+    // The module's own accounting, read across the boundary it is about.
+    // `comio::unload`'s unit coverage runs against the rlib's copy of the
+    // counters; this is the DLL's copy, incremented by an object the COM
+    // runtime just built. That the module loaded at all is the other half:
+    // `LoadLibraryW` fails if `DllMain` returns anything but TRUE.
+    #[cfg(feature = "dylib")]
+    assert_eq!(
+        unsafe { can_unload_now(module) },
+        S_FALSE,
+        "the DLL offered to unload while holding an object it had just created"
+    );
 
     let name = format!(r"\\.\pipe\comio_activation_{}", std::process::id());
     // The block below used to be raw-pointer out-params, `ManuallyDrop` and
