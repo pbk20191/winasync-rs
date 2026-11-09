@@ -61,8 +61,15 @@ mod Pbk20191 {
                 #[get] Transport: String;
             }
 
-            // The shape to keep in mind when adding one: AF_UNIX datagram, which is
-            // a real gap -- `DatagramSocket` is IP-only. WinRT's own datagram model
+            // The shape to keep in mind when adding one: AF_UNIX datagram. It would
+            // be a real gap -- `DatagramSocket` is IP-only -- but it is not one this
+            // component can fill yet, because Windows does not implement it: on
+            // build 26320, `WSASocketW(AF_UNIX, SOCK_DGRAM)` fails with
+            // WSAEAFNOSUPPORT and `SOCK_SEQPACKET` with WSAESOCKTNOSUPPORT; only
+            // `SOCK_STREAM` exists (measured 2026-11-10). It stays here as the
+            // design constraint the names below were chosen against, for whenever
+            // the kernel catches up -- or for any other connectionless transport.
+            // WinRT's own datagram model
             // is bind, a `MessageReceived` event, and `GetOutputStreamAsync(dest)`
             // for sending, so the class would be
             //

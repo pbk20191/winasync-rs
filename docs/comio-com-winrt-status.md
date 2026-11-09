@@ -547,7 +547,7 @@ $l.Bind($name)
 
 ## ABI 다듬기 (2026-11-09) — AF_UNIX 데이터그램을 미리 염두에 두고
 
-지금은 전부 연결 지향이다. 만약 AF_UNIX **데이터그램**을 넣는다면(WinRT에 없는 진짜 gap — `DatagramSocket`은 IP 전용) WinRT 자신의 모델은 *bind + `MessageReceived` 이벤트 + `GetOutputStreamAsync(목적지)`*다. 그 모양을 옆에 놓고 보니 현재 ABI에 세 군데가 어색했고, **소비자가 없는 지금** 고쳤다. 의미 변화는 없는 순수 개명 + 비대칭 하나.
+지금은 전부 연결 지향이다. 만약 AF_UNIX **데이터그램**을 넣는다면(WinRT에 없는 진짜 gap — `DatagramSocket`은 IP 전용. 다만 **Windows 커널이 아직 지원하지 않는다**: 빌드 26320에서 `WSASocketW(AF_UNIX, SOCK_DGRAM)`은 WSAEAFNOSUPPORT, `SOCK_SEQPACKET`은 WSAESOCKTNOSUPPORT로 실패하고 `SOCK_STREAM`만 된다. 2026-11-10 측정. 그래서 지금은 구현 후보가 아니라 이름을 정할 때 고려한 설계 제약일 뿐이다) WinRT 자신의 모델은 *bind + `MessageReceived` 이벤트 + `GetOutputStreamAsync(목적지)`*다. 그 모양을 옆에 놓고 보니 현재 ABI에 세 군데가 어색했고, **소비자가 없는 지금** 고쳤다. 의미 변화는 없는 순수 개명 + 비대칭 하나.
 
 | 전 | 후 | 이유 |
 | --- | --- | --- |
