@@ -25,11 +25,17 @@ use std::sync::mpsc;
 use windows::Foundation::TypedEventHandler;
 use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE, S_FALSE, S_OK};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
+};
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
+use windows::Win32::System::ApplicationInstallationAndServicing::{
+    ACTCTXW, ActivateActCtx, CreateActCtxW, DeactivateActCtx, ReleaseActCtx,
 };
 use windows::Win32::System::WinRT::{
     IActivationFactory, RO_INIT_MULTITHREADED, RoActivateInstance, RoInitialize,
 };
+use windows_core::PCWSTR;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CLSIDFromProgID, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
@@ -174,9 +180,23 @@ fn com_activation_round_trip_through_the_registered_dll() {
     );
 
     // --- The listener, created the way any COM caller would ---------------
+    // The failure message carries the registration state, because
+    // `REGDB_E_CLASSNOTREG` here means the keys this test just wrote are not
+    // the keys COM read — which hive the DLL registered into is the first
+    // thing worth knowing, and an elevated `regsvr32` run beforehand writes
+    // into a different one.
     let listener: IUnknown =
         unsafe { CoCreateInstance(&CLSID_NAMED_PIPE_CONNECTION_LISTENER, None, CLSCTX_INPROC_SERVER) }
-            .expect("CoCreateInstance(listener)");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "CoCreateInstance(listener): {e:?}
+                       DllRegisterServer returned {registered:?}
+                       HKCU CLSID key present: {}
+                       HKLM ActivatableClassId key present: {}",
+                    com_key_present(&CLSID_NAMED_PIPE_CONNECTION_LISTENER),
+                    winrt_key_present("Rustwinui3loop.NamedPipeConnector"),
+                )
+            });
 
     let name = format!(r"\\.\pipe\comio_activation_{}", std::process::id());
     // The block below used to be raw-pointer out-params, `ManuallyDrop` and
@@ -257,7 +277,7 @@ fn com_activation_round_trip_through_the_registered_dll() {
 
     // --- And the WinRT half of activation --------------------------------
     winrt_activation_factory(module);
-    ro_activate_instance_if_registered();
+    ro_activate_instance_reg_free(&path);
 
     // The module stays loaded on purpose: `DllCanUnloadNow` returns S_FALSE,
     // and objects created above are still alive in this scope. Dropping the
@@ -365,49 +385,109 @@ fn winrt_activation_factory(module: HMODULE) {
 }
 
 /// The last step of the WinRT path: `RoActivateInstance` by name, with the
-/// runtime doing the registry read and the `LoadLibrary` itself.
+/// runtime finding the module itself.
 ///
-/// Conditional, because `DllRegisterServer` writes the `ActivatableClassId`
-/// keys to `HKEY_LOCAL_MACHINE` and that needs elevation — there is no
-/// per-user alternative for a non-packaged component, which was measured
-/// rather than assumed: the same keys under `HKEY_CURRENT_USER` leave
-/// `RoActivateInstance` answering `REGDB_E_CLASSNOTREG`.
+/// Reg-free rather than through the registry, because the machine-wide route
+/// is closed to us: `HKLM\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId`
+/// is owned by `NT SERVICE\TrustedInstaller` and Administrators have read
+/// access only, so even an elevated `DllRegisterServer` is denied. A manifest
+/// loaded into an activation context needs no elevation at all, and is what
+/// a consumer that cannot edit its own host's manifest — `python.exe`, say —
+/// would use.
 ///
-/// So a non-elevated run says it skipped, and an elevated one proves the
-/// whole chain. The condition is the registry key itself rather than an
-/// elevation check, because that is the thing the result actually depends
-/// on — if the key is there, activation has no excuse.
-fn ro_activate_instance_if_registered() {
-    const NAME: &str = "Rustwinui3loop.NamedPipeConnector";
-
-    if !winrt_key_present(NAME) {
-        eprintln!(
-            "skipped: {NAME} is not registered under HKLM\\{WINRT_ROOT} (run `regsvr32` elevated to cover this step)"
-        );
-        return;
-    }
+/// The control matters here: the same two calls are made *before* the
+/// activation context is active and must fail, so a pass cannot be an
+/// accident of something else having registered these classes.
+fn ro_activate_instance_reg_free(dll: &Path) {
+    const NAMES: [&str; 2] = [
+        "Rustwinui3loop.NamedPipeConnector",
+        "Rustwinui3loop.NamedPipeConnectionListener",
+    ];
 
     unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.expect("RoInitialize");
 
-    let instance = unsafe { RoActivateInstance(&HSTRING::from(NAME)) }
-        .unwrap_or_else(|e| panic!("RoActivateInstance({NAME}): {e:?}"));
+    // Control: without the manifest there is nothing to find.
+    for name in NAMES {
+        let hr = unsafe { RoActivateInstance(&HSTRING::from(name)) }
+            .err()
+            .map(|e| e.code());
+        assert_eq!(
+            hr,
+            Some(REGDB_E_CLASSNOTREG),
+            "{name} activated with no activation context; something else has it registered"
+        );
+    }
 
-    assert_eq!(
-        instance
-            .GetRuntimeClassName()
-            .expect("GetRuntimeClassName")
-            .to_string(),
-        NAME
-    );
+    // The manifest is generated from the same `CLASSES` table the activation
+    // factory looks names up in, so the two cannot disagree.
+    let dir = dll.parent().expect("dll directory");
+    let manifest_path = dir.join("rustwinui3loop.manifest");
+    std::fs::write(&manifest_path, rustwinui3loop::comio::activation::manifest())
+        .expect("write manifest");
+
+    let source: Vec<u16> = manifest_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let ctx = ACTCTXW {
+        cbSize: core::mem::size_of::<ACTCTXW>() as u32,
+        lpSource: PCWSTR(source.as_ptr()),
+        ..Default::default()
+    };
+    let handle = unsafe { CreateActCtxW(&ctx) }.expect("CreateActCtxW");
+    let mut cookie = 0usize;
+    unsafe { ActivateActCtx(Some(handle), &mut cookie) }.expect("ActivateActCtx");
+
+    for name in NAMES {
+        let instance = unsafe { RoActivateInstance(&HSTRING::from(name)) }
+            .unwrap_or_else(|e| panic!("RoActivateInstance({name}): {e:?}"));
+        assert_eq!(
+            instance
+                .GetRuntimeClassName()
+                .expect("GetRuntimeClassName")
+                .to_string(),
+            name,
+            "activated object does not answer to the name it was asked for"
+        );
+    }
+
     // And it is the real object, not merely something named right.
-    let connector: IStreamConnector = instance.cast().expect("QI IStreamConnector");
+    let connector: IStreamConnector =
+        unsafe { RoActivateInstance(&HSTRING::from(NAMES[0])) }
+            .expect("RoActivateInstance")
+            .cast()
+            .expect("QI IStreamConnector");
     assert_eq!(
         connector.Transport().expect("Transport").to_string(),
         "namedpipe"
     );
+
+    unsafe { DeactivateActCtx(Default::default(), cookie) }.expect("DeactivateActCtx");
+    unsafe { ReleaseActCtx(handle) };
 }
 
 const WINRT_ROOT: &str = "SOFTWARE\\Microsoft\\WindowsRuntime\\ActivatableClassId";
+
+/// Whether the per-user COM registration for `clsid` exists — the key
+/// `CoCreateInstance` would have read.
+fn com_key_present(clsid: &windows_core::GUID) -> bool {
+    let d = clsid.data4;
+    let path = format!(
+        "Software\\Classes\\CLSID\\{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}\\InprocServer32",
+        clsid.data1, clsid.data2, clsid.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+    );
+    unsafe {
+        let mut key = HKEY::default();
+        let opened =
+            RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(path), None, KEY_READ, &mut key)
+                .is_ok();
+        if opened {
+            let _ = RegCloseKey(key);
+        }
+        opened
+    }
+}
 
 /// Whether the machine registration for `name` exists, read directly rather
 /// than inferred from an elevation check.

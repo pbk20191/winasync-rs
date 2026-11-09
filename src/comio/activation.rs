@@ -25,30 +25,36 @@
 //! No ProgIDs are registered. They existed for script hosts reaching these
 //! classes through `IDispatch`, and that layer is gone — see [`ComClass`].
 //!
-//! # One `regsvr32`, two hives, two privilege levels
+//! # How each half is reached
 //!
-//! [`DllRegisterServer`] writes both registrations, and they do not live
-//! in the same place. The COM half goes to
-//! `HKEY_CURRENT_USER\Software\Classes` and needs no elevation. The WinRT
-//! half goes under `HKEY_LOCAL_MACHINE` (see `WINRT_ROOT`) and always does:
-//! for a non-packaged component the only alternatives are that hive or a
-//! manifest on the *consuming* executable, and the latter is not an option
-//! for a shared interpreter like `python.exe`.
+//! COM is reached by registration. [`DllRegisterServer`] writes the class
+//! keys under `HKEY_CURRENT_USER\Software\Classes`, which needs no
+//! elevation, and `CoCreateInstance` reads them through the merged view.
 //!
-//! The per-user branch of the WinRT path is read for packaged apps only.
-//! That was measured, not assumed: the same keys written under
+//! WinRT is **not** reached by registration, and cannot be. The documented
+//! machine-wide path is
+//! `HKLM\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId`, and that
+//! tree is owned by `NT SERVICE\TrustedInstaller`: Administrators hold *read*
+//! access only, so an elevated `DllRegisterServer` is denied just like an
+//! ordinary one. Measured on Windows 11 26100, where every one of the 4,819
+//! registered classes resolves to a DLL inside `C:\Windows` and not one is
+//! third-party. The per-user branch is no help either: the same keys under
 //! `HKEY_CURRENT_USER` leave `RoActivateInstance` answering
-//! `REGDB_E_CLASSNOTREG`.
+//! `REGDB_E_CLASSNOTREG`, because that branch is read for packaged apps.
 //!
-//! So a non-elevated `regsvr32` can only do half the job, and that half is
-//! worth doing: it reports `S_FALSE` rather than an error, leaves
-//! `CoCreateInstance` working, and writes nothing partial. Elevated, it
-//! reports `S_OK` and `RoActivateInstance` works too.
-//! `docs/comio-com-winrt-status.md` has the reasoning.
+//! So WinRT is reached **reg-free**, through [`manifest`]: the consuming
+//! process supplies it as its own application manifest, or loads it at run
+//! time with `CreateActCtx` + `ActivateActCtx`. The second form is what a
+//! shared interpreter like `python.exe` needs, since its manifest is not
+//! ours to edit. Nothing else changes — the runtime still calls
+//! [`DllGetActivationFactory`] here, against the same metadata.
 //!
-//! Until those keys exist, `DllGetActivationFactory` is reachable by calling
-//! the export directly — which is what the integration test does, and what
-//! isolates "the factory works" from "the registry points at us".
+//! `register_winrt_under` is kept because it writes the right keys and an
+//! installer running as TrustedInstaller could use them. [`DllRegisterServer`]
+//! still calls it and still reports `S_FALSE` when it is denied, which in
+//! practice is always: the COM half is written, nothing is left partial, and
+//! `regsvr32` shows no error. `docs/comio-com-winrt-status.md` has the
+//! reasoning.
 //!
 //! # What the registration does and does not claim
 //!
@@ -427,16 +433,16 @@ pub extern "system" fn DllRegisterServer() -> HRESULT {
     if let Err(e) = unsafe { register_under(HKEY_CURRENT_USER, CLASSES_ROOT) } {
         return e.code();
     }
-    // Then WinRT, into the machine hive, which always does.
+    // Then WinRT, which in practice is always denied: that key is
+    // TrustedInstaller's, not an administrator's. See the module docs.
     //
-    // A denial there is reported as `S_FALSE`, not as an error. The two
-    // halves have different privilege requirements and only one of them can
-    // be met without elevation, so "COM registered, WinRT did not" is a
-    // real and useful outcome rather than a failure: `CoCreateInstance`
-    // works, `RoActivateInstance` does not, and nothing is left half-written.
-    // `S_FALSE` is how COM spells that — `regsvr32` treats it as success and
-    // shows no error, while a caller that wants both can test for `S_OK`
-    // exactly. Any other failure is a real one and is returned as such.
+    // Reported as `S_FALSE`, not as an error, because "COM registered, WinRT
+    // did not" is the normal outcome and a useful one: `CoCreateInstance`
+    // works, nothing is left half-written, and reg-free activation through
+    // [`manifest`] does not need this to have succeeded. `S_FALSE` is how
+    // COM spells a qualified success — `regsvr32` shows no error — while a
+    // caller that needs the keys can test for `S_OK` exactly. Any other
+    // failure is a real one and is returned as such.
     match unsafe { register_winrt_under(HKEY_LOCAL_MACHINE, WINRT_ROOT) } {
         Ok(()) => S_OK,
         Err(e) if e.code() == E_ACCESSDENIED => S_FALSE,
@@ -498,12 +504,14 @@ pub(crate) unsafe fn register_under(root: HKEY, base: &str) -> Result<()> {
     Ok(())
 }
 
-/// Where the Windows Runtime looks up a non-packaged component's classes.
+/// Where the Windows Runtime looks up a registered class.
 ///
-/// Machine-wide, and there is no per-user alternative for a non-packaged
-/// component: the HKCU branch of this path is read for packaged apps.
-/// `register_under`'s elevation-free `HKEY_CURRENT_USER\Software\Classes`
-/// trick has no counterpart here.
+/// Documented, correct, and closed to us: the tree is owned by
+/// `NT SERVICE\TrustedInstaller` and Administrators have read access only, so
+/// writing here fails whether or not the caller is elevated. Kept because an
+/// installer running with that identity *could* use it, and because the keys
+/// it writes are the right ones. [`manifest`] is how this component is
+/// actually reached.
 const WINRT_ROOT: &str = "SOFTWARE\\Microsoft\\WindowsRuntime\\ActivatableClassId";
 
 // The three DWORDs each class key carries. Values are from
@@ -520,11 +528,60 @@ const THREADING_TYPE_BOTH: u32 = 0;
 // answer `GetTrustLevel` gives, which `#[implement]` hardcodes to BaseTrust.
 const TRUST_LEVEL_BASE: u32 = 0;
 
+/// The reg-free activation manifest for this component.
+///
+/// This, not the registry, is how a non-packaged third-party component is
+/// reached. `register_winrt_under` below writes the keys the documented
+/// machine-wide path uses, and those keys cannot be written: the
+/// `ActivatableClassId` tree is owned by `NT SERVICE{B}TrustedInstaller` and
+/// Administrators hold *read* access only, so an elevated `regsvr32` is still
+/// denied. Measured on Windows 11 26100, where all 4,819 registered classes
+/// resolve to a DLL inside `C:{B}Windows` and not one is third-party.
+///
+/// A consuming process supplies this manifest instead, either as its own
+/// application manifest or by loading it at run time with `CreateActCtx` +
+/// `ActivateActCtx`. The second form is what a shared interpreter like
+/// `python.exe` needs, since its manifest is not ours to edit. Nothing else
+/// changes: the runtime still calls [`DllGetActivationFactory`] in this
+/// module, and the metadata is the same metadata.
+///
+/// `<file name>` carries no path. It resolves against the directory holding
+/// the manifest, or against `lpAssemblyDirectory` when the caller passes one
+/// — which is how the manifest can live apart from the DLL it names.
+///
+/// Generated from [`CLASSES`] rather than written out, for the same reason
+/// the class names themselves are: one list, so a class cannot appear in the
+/// metadata and go missing from the manifest.
+pub fn manifest() -> String {
+    let mut s = String::with_capacity(256 + CLASSES.len() * 160);
+    s.push_str(concat!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n",
+        "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n",
+        "  <assemblyIdentity type=\"win32\" name=\"Rustwinui3loop\" version=\"1.0.0.0\"/>\n",
+        "  <file name=\"rustwinui3loop.dll\">\n",
+    ));
+    for class in CLASSES {
+        // `threadingModel` here is the manifest spelling of the same claim
+        // `Threading` makes in the registry and `ThreadingModel = Both`
+        // makes for COM: these objects are agile.
+        s.push_str("    <activatableClass name=\"");
+        s.push_str(class.name);
+        s.push_str(concat!(
+            "\" threadingModel=\"both\"",
+            " xmlns=\"urn:schemas-microsoft-com:winrt.v1\"/>\n",
+        ));
+    }
+    s.push_str("  </file>\n</assembly>\n");
+    s
+}
+
 /// Writes the keys `RoActivateInstance` reads, the WinRT counterpart of
 /// [`register_under`].
 ///
-/// `base` is parameterised for the same reason: the round-trip test writes to
-/// a scratch key rather than to the live machine registration.
+/// Correct but, from an ordinary process, unreachable — see [`WINRT_ROOT`].
+/// The round-trip test therefore writes to a scratch key, which proves the
+/// key layout without proving the hive, and [`manifest`] is what actually
+/// makes these classes activatable.
 ///
 /// # Safety
 ///

@@ -4,7 +4,7 @@
 
 ## 방향 (2026-11-09 결정)
 
-**최종 목표는 WinRT 개념으로 스크립트 월드까지 노출하는 것**이고, 타깃 스크립트 호스트는 **모던 쪽(Python / Node / .NET 스크립팅)만**이다. 활성화는 당분간 HKLM(개발 중 승격 허용), 배포 모델은 나중에 정한다.
+**최종 목표는 WinRT 개념으로 스크립트 월드까지 노출하는 것**이고, 타깃 스크립트 호스트는 **모던 쪽(Python / Node / .NET 스크립팅)만**이다. 활성화는 **reg-free WinRT**(소비 프로세스의 매니페스트 / 액티베이션 컨텍스트)다 — 처음엔 HKLM + 승격으로 정했다가 **그 전제가 틀린 것으로 측정됐다**(아래 3번). 승격이 필요 없어졌다.
 
 이 결정이 정하는 것:
 
@@ -199,9 +199,9 @@ $l.Bind($name)
 
 ### 비용 1 — 활성화가 HKLM으로 간다
 
-[비패키지 서드파티 WinRT](https://blogs.windows.com/windowsdeveloper/2019/04/30/enhancing-non-packaged-desktop-apps-using-windows-runtime-components/)의 활성화는 `HKLM\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId`(머신 전역, 승격 필요) 아니면 **소비하는 앱 쪽** `application.manifest`의 `<activatableClass>`(reg-free WinRT)다. 후자는 `python.exe` / `node.exe` 같은 공유 인터프리터엔 못 넣는다. HKCU 경로는 패키지 앱용으로 보인다.
+*(이 절은 2026-11-09 측정 전에 쓴 것이고, 결론이 틀렸다 — 3번 참조.)* [비패키지 서드파티 WinRT](https://blogs.windows.com/windowsdeveloper/2019/04/30/enhancing-non-packaged-desktop-apps-using-windows-runtime-components/)의 활성화는 `HKLM\...\ActivatableClassId` 아니면 reg-free 매니페스트다. HKLM은 **승격으로도 못 쓰고**(TrustedInstaller 소유), 매니페스트는 `python.exe`에 못 넣지만 **런타임 `CreateActCtx`로 올리면 된다** — 그래서 reg-free가 답이다.
 
-지금의 "승격 없는 `regsvr32` 한 줄"을 잃는다. 개발 중엔 승격을 받기로 했고, **배포 모델은 미정**이다.
+→ **잃지 않는다.** reg-free는 승격도 레지스트리도 쓰지 않는다. 배포는 매니페스트 한 장을 DLL 옆에 두는 것이 전부다.
 
 ### 비용 2 — 표면의 기술을 어디에 둘 것인가 (미결)
 
@@ -235,24 +235,32 @@ $l.Bind($name)
 
    테스트는 이제 **부재를 단언**한다. `CLSIDFromProgID`가 `CO_E_CLASSSTRING`(0x800401F3)을 돌려주는지 본다 — `REGDB_E_CLASSNOTREG`가 아니다. 그건 "CLSID는 아는데 등록이 안 됐다"는 뜻이고 여기선 이름 단계에서 먼저 실패한다. (처음에 틀리게 적었다가 테스트가 잡아냈다.)
 
-   **CLSID / `InprocServer32` / `DllGetClassObject`는 남긴다.** HKCU `regsvr32`는 승격이 필요 없고 HKLM WinRT 등록은 필요하므로, 3번이 끝나고 PyWinRT로 검증되기 전까지 **이게 유일하게 동작하는 활성화 경로**다. 4번까지 통과하면 그때 다시 본다.
+   **CLSID / `InprocServer32` / `DllGetClassObject`는 남긴다.** 컴파일된 COM 호출자에게 여전히 유효하다. (3번에서 reg-free가 동작하는 것이 확인됐으므로 "유일하게 동작하는 경로"라는 이유는 사라졌다 — 4번 뒤에 다시 본다.)
 
-3. ~~HKLM `ActivatableClassId` 등록~~ · **완료** (2026-11-09, 승격 검증만 남음)
-   클래스마다 `DllPath`(REG_SZ) + `ActivationType` / `Threading` / `TrustLevel`(DWORD). 값은 SDK의 `activationregistration.h`에서 가져왔다:
+3. ~~활성화 등록~~ · **완료** (2026-11-09) — **단, HKLM이 아니라 reg-free로**
 
-   | 값 | 뜻 | 주의 |
-   | --- | --- | --- |
-   | `ActivationType = 0` | `InProcess` | |
-   | `Threading = 0` | `ThreadingType::BOTH` | **`ThreadingModel` 애트리뷰트 enum이 아니다.** 그쪽은 `Both = 3`이다. 헷갈려서 3을 쓰면 STA 전용 클래스로 등록된다 |
-   | `TrustLevel = 0` | `BaseTrust` | `GetTrustLevel`이 답하는 값과 같다 |
+   처음엔 HKLM `ActivatableClassId`로 계획했고 "개발 중엔 승격 OK"로 정해 뒀다. **그 전제가 틀렸다.** 승격해도 못 쓴다:
 
-   **HKCU는 안 된다 — 측정했다.** 같은 키를 `HKCU` 밑에 쓰고 `RoActivateInstance`를 부르면 `REGDB_E_CLASSNOTREG`다. 비패키지 컴포넌트의 per-user 경로는 없다. 그래서 HKLM이고, 승격이 필요하다.
+   ```
+   Owner: NT SERVICE\TrustedInstaller
+   NT SERVICE\TrustedInstaller   Allow  FullControl
+   BUILTIN\Administrators        Allow  ReadKey      ← 읽기만
+   ```
 
-   `DllRegisterServer`는 이제 **양쪽을 다 쓴다**. COM은 HKCU(승격 불필요), WinRT는 HKLM(승격 필요). 승격 없이 돌리면 HKLM이 거부되는데, 이때 **에러가 아니라 `S_FALSE`를 돌려준다** — `regsvr32`는 성공으로 보고 에러 대화상자를 안 띄우고, COM 활성화는 멀쩡히 동작하며, 반쯤 쓰인 상태도 남지 않는다. 승격하면 `S_OK`. 통합 테스트가 **돌아온 코드와 레지스트리 실제 상태가 일치하는지** 단언하므로 조용한 반쪽 등록은 통과하지 못한다.
+   승격한 관리자 토큰으로 `DllRegisterServer`를 직접 불러 확인했다 — `S_FALSE`, 아무것도 안 써진다. 이 머신에 등록된 **4,819개 클래스 전부가 `C:\Windows` 안**이고 서드파티는 **0개**다. 비패키지 서드파티에게 이 경로는 닫혀 있다.
 
-   `DllUnregisterServer`는 반대로 **HKLM 거부를 무시**한다. 쓸 수 없는 하이브는 쓴 적도 없는 하이브이므로, 거부를 보고하면 COM 쪽을 정상적으로 지운 비승격 `regsvr32 /u`가 전부 실패처럼 보인다.
+   **답은 reg-free WinRT다.** 소비 프로세스가 매니페스트를 들고 있으면 된다 — 자기 애플리케이션 매니페스트로 넣거나, 런타임에 `CreateActCtx` + `ActivateActCtx`로 올리거나. 후자가 `python.exe`처럼 매니페스트를 건드릴 수 없는 호스트의 답이다. 측정 결과:
 
-   **남은 것**: 승격해서 `RoActivateInstance`가 실제로 도는지 확인. 통합 테스트에 조건부로 들어 있다 — HKLM 키가 있으면 돌리고, 없으면 "skipped" 한 줄 찍는다.
+   ```
+   without act ctx: Rustwinui3loop.NamedPipeConnector -> HRESULT(0x80040154)
+   with    act ctx: Rustwinui3loop.NamedPipeConnector -> OK  name="Rustwinui3loop.NamedPipeConnector"
+   ```
+
+   **지금까지 만든 건 하나도 안 버린다.** reg-free도 같은 `DllGetActivationFactory`를 부르고 같은 메타데이터를 읽는다 — 바뀌는 건 *발견 방법*뿐이다.
+
+   `activation::manifest()`가 `CLASSES`에서 매니페스트를 생성한다(이름이 어긋날 수 없게). 통합 테스트가 **승격 없이 전 구간을 돈다**: 액티베이션 컨텍스트 *없이* 먼저 실패하는지 확인(컨트롤)하고, 올린 뒤 활성화해서 `GetRuntimeClassName`과 `IStreamConnector`까지 본다.
+
+   `register_winrt_under`는 남긴다 — 키 자체는 맞고, TrustedInstaller 권한으로 도는 인스톨러라면 쓸 수 있다. `DllRegisterServer`는 계속 호출하고 거부되면 `S_FALSE`를 돌려준다(= 사실상 항상).
 
 4. **Python end-to-end 검증** · 중간 · **수용 테스트**
    PyWinRT로 프로젝션을 생성하고, Python 스크립트가 리스너를 만들어 `AcceptAsync`를 await 한다. 이게 되면 목표 달성이다.
@@ -296,22 +304,22 @@ $l.Bind($name)
 
 - `ed43ce9` — IDispatch 레이어 삭제 + `.winmd` + 생성 바인딩 전환 + 클래스 리네임 + `DllGetActivationFactory`
 - `17d6263` — ProgID 키 제거
-- HKLM `ActivatableClassId` 등록 (미커밋)
+- `1a3dc0e` — WinRT 활성화 등록 (HKLM 시도)
+- reg-free 매니페스트로 전환 (미커밋)
 
 검증: `cargo test --all-features` 140 + 1 통과, `cargo doc` 경고 0, clippy 24건(전부 기존 `tp`/`rio`/`main.rs`).
 
 ### 재현
 
 ```powershell
-# COM만 (HKCU, 승격 불필요) — DllRegisterServer가 S_FALSE를 돌려준다
+# COM 등록 (HKCU, 승격 불필요). DllRegisterServer는 S_FALSE를 돌려준다 —
+# WinRT 키는 TrustedInstaller 소유라 못 쓰기 때문이고, 정상이다.
 Start-Process regsvr32 -ArgumentList '/s', 'target\debug\rustwinui3loop.dll' -Wait
+Start-Process regsvr32 -ArgumentList '/s', '/u', 'target\debug\rustwinui3loop.dll' -Wait
 
-# COM + WinRT (HKLM, 승격 필요) — S_OK, 이후 RoActivateInstance 동작
-Start-Process regsvr32 -Verb RunAs -ArgumentList '/s', 'target\debug\rustwinui3loop.dll' -Wait
-
-# 해제
-Start-Process regsvr32 -Verb RunAs -ArgumentList '/s', '/u', 'target\debug\rustwinui3loop.dll' -Wait
-
+# WinRT는 등록이 없다. 소비자가 매니페스트를 올린다:
+#   activation::manifest() -> rustwinui3loop.manifest (DLL 옆)
+#   CreateActCtx + ActivateActCtx -> RoActivateInstance
 # 전체 검증
 cargo test --all-features
 cargo clippy --all-targets --all-features
