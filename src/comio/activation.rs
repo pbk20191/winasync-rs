@@ -8,9 +8,9 @@
 //! runtime that these classes exist or which module holds them.
 //!
 //! This module is that missing half. It gives each of the six public classes
-//! a CLSID and a ProgID, exports the entry points an in-process server
-//! is defined by, and writes the registry keys that point a CLSID back at
-//! this module. After `regsvr32 rustwinui3loop.dll`, any language that can
+//! a CLSID and a runtime class name, exports the entry points an in-process
+//! server is defined by, and writes the registry keys that point a CLSID back
+//! at this module. After `regsvr32 rustwinui3loop.dll`, any language that can
 //! call `CoCreateInstance` can open a named pipe, an AF_UNIX socket or a
 //! Hyper-V socket through the same WinRT stream interfaces.
 //!
@@ -21,6 +21,9 @@
 //! Runtime an `IActivationFactory` for a runtime class name. Both read the
 //! same [`CLASSES`] table, whose names come from the generated class types in
 //! [`super::bindings`]. One object, one name, two front doors.
+//!
+//! No ProgIDs are registered. They existed for script hosts reaching these
+//! classes through `IDispatch`, and that layer is gone — see [`ComClass`].
 //!
 //! What is still missing is the WinRT counterpart of the registry keys below.
 //! `RoActivateInstance` finds this module through
@@ -129,7 +132,8 @@ use windows_core::{
 const CLASSES_ROOT: &str = "Software\\Classes";
 
 /// One activatable class: the CLSID a caller passes to `CoCreateInstance`,
-/// the ProgID that resolves to it, and the constructor behind both.
+/// the runtime class name `RoActivateInstance` resolves, and the
+/// constructor behind both.
 ///
 /// The constructor returns `IUnknown` rather than the concrete type because
 /// that is all activation needs — the caller asked for an IID, and the
@@ -138,11 +142,23 @@ const CLASSES_ROOT: &str = "Software\\Classes";
 pub struct ComClass {
     /// Frozen. Changing one breaks every caller that already compiled it in.
     pub clsid: GUID,
-    /// `Vendor.Component`, the name `CLSIDFromProgID` resolves — and, because
-    /// both are taken from [`super::bindings`], the same string the object
-    /// answers `GetRuntimeClassName` with and the key
-    /// [`DllGetActivationFactory`] looks up.
-    pub progid: &'static str,
+    /// The runtime class name: what `RoActivateInstance` is given, what
+    /// `GetRuntimeClassName` answers, and the key [`DllGetActivationFactory`]
+    /// looks up.
+    ///
+    /// Always taken from [`super::bindings`] via `class_name`, never
+    /// written out here, so the name in the metadata and the name in this
+    /// table cannot drift apart.
+    ///
+    /// This used to be registered as a ProgID as well. It is not any more. A
+    /// ProgID exists so a *script* can say
+    /// `New-Object -ComObject Rustwinui3loop.NamedPipeConnector`, and since
+    /// the `IDispatch` layer went (2026-11-09) that would hand a script an
+    /// object it has successfully created and cannot call a single method on.
+    /// Advertising the name was worse than not advertising it. A compiled
+    /// caller uses the CLSID, and a WinRT caller uses this name through
+    /// [`DllGetActivationFactory`].
+    pub name: &'static str,
     /// Human-readable; becomes the default value of the CLSID key.
     pub description: &'static str,
     create: fn() -> IUnknown,
@@ -157,37 +173,37 @@ pub struct ComClass {
 pub static CLASSES: &[ComClass] = &[
     ComClass {
         clsid: CLSID_NAMED_PIPE_CONNECTION_LISTENER,
-        progid: class_name::<rc::NamedPipeConnectionListener>(),
+        name: class_name::<rc::NamedPipeConnectionListener>(),
         description: "Named pipe connection listener",
         create: || super::NamedPipeConnectionListener::new().into_interface(),
     },
     ComClass {
         clsid: CLSID_UNIX_CONNECTION_LISTENER,
-        progid: class_name::<rc::UnixConnectionListener>(),
+        name: class_name::<rc::UnixConnectionListener>(),
         description: "AF_UNIX connection listener",
         create: || super::UnixConnectionListener::new().into_interface(),
     },
     ComClass {
         clsid: CLSID_HYPER_V_CONNECTION_LISTENER,
-        progid: class_name::<rc::HyperVConnectionListener>(),
+        name: class_name::<rc::HyperVConnectionListener>(),
         description: "Hyper-V socket connection listener",
         create: || super::HyperVConnectionListener::new().into_interface(),
     },
     ComClass {
         clsid: CLSID_NAMED_PIPE_CONNECTOR,
-        progid: class_name::<rc::NamedPipeConnector>(),
+        name: class_name::<rc::NamedPipeConnector>(),
         description: "Named pipe client connector",
         create: || super::NamedPipeConnector::new().into_interface(),
     },
     ComClass {
         clsid: CLSID_UNIX_CONNECTOR,
-        progid: class_name::<rc::UnixConnector>(),
+        name: class_name::<rc::UnixConnector>(),
         description: "AF_UNIX stream connector",
         create: || super::UnixConnector::new().into_interface(),
     },
     ComClass {
         clsid: CLSID_HYPER_V_CONNECTOR,
-        progid: class_name::<rc::HyperVConnector>(),
+        name: class_name::<rc::HyperVConnector>(),
         description: "Hyper-V socket stream connector",
         create: || super::HyperVConnector::new().into_interface(),
     },
@@ -209,8 +225,8 @@ pub const CLSID_HYPER_V_CONNECTOR: GUID = GUID::from_u128(0xbe6a6ff1_e2b8_4014_b
 ///
 /// A `const fn` so [`CLASSES`] can be a `static`: `RuntimeName` is the trait
 /// `windows-rs` reads that name through, and naming it here rather than
-/// repeating the literal is what makes the ProgID and the runtime class name
-/// the same string by construction.
+/// repeating the literal is what makes this table's name and the name the
+/// object reports the same string by construction.
 const fn class_name<C: windows_core::RuntimeName>() -> &'static str {
     C::NAME
 }
@@ -303,10 +319,11 @@ const REGDB_E_CLASSNOTREG: HRESULT = HRESULT(0x80040154u32 as i32);
 
 /// Looks a runtime class name up in [`CLASSES`].
 ///
-/// The name is the same string as the ProgID — both are taken from
-/// [`super::bindings`] — so one table answers both activation models.
+/// Matched against [`ComClass::name`], which is the same constant the object
+/// answers `GetRuntimeClassName` with — so a class renamed in the metadata
+/// cannot keep activating under its old name here.
 pub fn class_for_name(name: &str) -> Option<&'static ComClass> {
-    CLASSES.iter().find(|c| c.progid == name)
+    CLASSES.iter().find(|c| c.name == name)
 }
 
 /// The WinRT counterpart of [`ClassFactory`]: what `RoActivateInstance` asks
@@ -430,26 +447,9 @@ pub(crate) unsafe fn register_under(root: HKEY, base: &str) -> Result<()> {
                 set_value(server, "ThreadingModel", "Both")
             })();
             close(server);
-            r?;
-            // Lets a caller say "Rustwinui3loop.NamedPipeConnector" instead of
-            // carrying the GUID; `CLSIDFromProgID` reads this pair.
-            let progid = create_key(key, "ProgID")?;
-            let r = set_default(progid, class.progid);
-            close(progid);
             r
         })();
         close(key);
-        r?;
-
-        let named = unsafe { create_key(root, &format!("{base}\\{}", class.progid))? };
-        let r = (|| unsafe {
-            set_default(named, class.description)?;
-            let back = create_key(named, "CLSID")?;
-            let r = set_default(back, &clsid);
-            close(back);
-            r
-        })();
-        close(named);
         r?;
     }
 
@@ -468,18 +468,14 @@ pub(crate) unsafe fn register_under(root: HKEY, base: &str) -> Result<()> {
 pub(crate) unsafe fn unregister_under(root: HKEY, base: &str) -> Result<()> {
     let mut first_error = None;
     for class in CLASSES {
-        for path in [
-            format!("{base}\\CLSID\\{}", clsid_key(&class.clsid)),
-            format!("{base}\\{}", class.progid),
-        ] {
-            let status = unsafe { RegDeleteTreeW(root, &HSTRING::from(&path)) };
-            // A key that is not there is the state we wanted.
-            if status.is_err()
-                && status != windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
-                && first_error.is_none()
-            {
-                first_error = Some(HRESULT::from_win32(status.0));
-            }
+        let path = format!("{base}\\CLSID\\{}", clsid_key(&class.clsid));
+        let status = unsafe { RegDeleteTreeW(root, &HSTRING::from(&path)) };
+        // A key that is not there is the state we wanted.
+        if status.is_err()
+            && status != windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
+            && first_error.is_none()
+        {
+            first_error = Some(HRESULT::from_win32(status.0));
         }
     }
     match first_error {
@@ -740,22 +736,23 @@ mod tests {
                 .as_deref(),
                 Some("Both")
             );
-            // ProgID resolves to the CLSID and back.
+            // The human-readable name a registry browser shows.
             assert_eq!(
-                read_default(&format!("{base}\\CLSID\\{clsid}\\ProgID")).as_deref(),
-                Some(class.progid)
+                read_default(&format!("{base}\\CLSID\\{clsid}")).as_deref(),
+                Some(class.description)
             );
-            assert_eq!(
-                read_default(&format!("{base}\\{}\\CLSID", class.progid)).as_deref(),
-                Some(clsid.as_str())
-            );
+            // No ProgID, in either direction. Registering one would advertise
+            // `New-Object -ComObject <name>` to scripts that can no longer
+            // call a single method on what they would get back.
+            assert_eq!(read_default(&format!("{base}\\CLSID\\{clsid}\\ProgID")), None);
+            assert_eq!(read_default(&format!("{base}\\{}\\CLSID", class.name)), None);
         }
 
         unsafe { unregister_under(HKEY_CURRENT_USER, &base) }.expect("unregister");
         for class in CLASSES {
             let clsid = clsid_key(&class.clsid);
             assert_eq!(read_default(&format!("{base}\\CLSID\\{clsid}")), None);
-            assert_eq!(read_default(&format!("{base}\\{}", class.progid)), None);
+            assert_eq!(read_default(&format!("{base}\\{}", class.name)), None);
         }
 
         // Removing what is already gone is success, not an error: `regsvr32

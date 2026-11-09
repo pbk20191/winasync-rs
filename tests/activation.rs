@@ -184,18 +184,25 @@ fn com_activation_round_trip_through_the_registered_dll() {
     let events: IConnectionListener = listener.cast().expect("QI IConnectionListener");
     events.ConnectionReceived(&handler).expect("ConnectionReceived");
 
-    // --- The client, reached by ProgID rather than by CLSID ---------------
-    // `CLSIDFromProgID` is a second, independent read of what registration
-    // wrote: it resolves only if the ProgID key and its CLSID subkey are both
-    // right. It is also the runtime class name, which is the point of taking
-    // both from one constant.
-    let from_progid =
+    // --- No ProgID is registered any more ---------------------------------
+    // It used to be, and `CLSIDFromProgID` resolving it was a second,
+    // independent read of what registration wrote. The key is gone on
+    // purpose: a ProgID is for script hosts reaching the class through
+    // `IDispatch`, which these objects no longer implement, so resolving one
+    // would hand a script an object it could create and never call. Asserting
+    // the *absence* keeps that deliberate rather than accidental.
+    assert_eq!(
         unsafe { CLSIDFromProgID(&HSTRING::from("Rustwinui3loop.NamedPipeConnector")) }
-            .expect("CLSIDFromProgID");
-    assert_eq!(from_progid, CLSID_NAMED_PIPE_CONNECTOR);
+            .map(|_| ())
+            .map_err(|e| e.code()),
+        Err(CO_E_CLASSSTRING),
+        "a ProgID key came back; registration is advertising IDispatch again"
+    );
 
-    let client: IUnknown = unsafe { CoCreateInstance(&from_progid, None, CLSCTX_INPROC_SERVER) }
-        .expect("CoCreateInstance(client)");
+    // --- The client, by CLSID ---------------------------------------------
+    let client: IUnknown =
+        unsafe { CoCreateInstance(&CLSID_NAMED_PIPE_CONNECTOR, None, CLSCTX_INPROC_SERVER) }
+            .expect("CoCreateInstance(client)");
 
     // The shared interface answers for a COM-activated object too.
     let connector: IStreamConnector = client.cast().expect("QI IStreamConnector");
@@ -341,3 +348,8 @@ fn winrt_activation_factory(module: HMODULE) {
 
 /// REGDB_E_CLASSNOTREG, as `DllGetActivationFactory` documents it.
 const REGDB_E_CLASSNOTREG: HRESULT = HRESULT(0x80040154u32 as i32);
+
+/// CO_E_CLASSSTRING — what `CLSIDFromProgID` answers for a name that resolves
+/// to nothing. Not `REGDB_E_CLASSNOTREG`: that one means "the CLSID is known
+/// but unregistered", and here the lookup fails a step earlier, at the name.
+const CO_E_CLASSSTRING: HRESULT = HRESULT(0x800401F3u32 as i32);

@@ -26,7 +26,7 @@
 | 산출물 | 소비자가 프로젝션을 만들 때 쓰는 파일 | `metadata/rustwinui3loop.winmd` |
 | 바인딩 | `_Impl` 트레이트 + vtable. 체크인됨 | `src/comio/bindings.rs` |
 | 구현 | 위 트레이트를 구현 | `listener.rs` / `connector.rs` / `pipe.rs` / `unix.rs` / `hvsock.rs` / `stream.rs` |
-| 활성화 | CLSID/ProgID로 `CoCreateInstance`, HKCU per-user | `activation.rs` |
+| 활성화 | CLSID로 `CoCreateInstance` (HKCU per-user) + `DllGetActivationFactory` | `activation.rs` |
 
 ### 왜 메타데이터가 먼저여야 했나
 
@@ -230,6 +230,13 @@ $l.Bind($name)
 
    통합 테스트가 `RoActivateInstance`가 아니라 **export를 직접 호출**한다 — HKLM 등록(아래 3번)이 아직 없기 때문이고, 그 덕에 "팩토리가 동작한다"와 "레지스트리가 우리를 가리킨다"가 분리된다. 활성화된 객체에게 `GetRuntimeClassName`을 다시 물어 **요청한 이름과 일치하는지** 확인하므로, 한쪽만 리네임되면 깨진다. 비활성 클래스(`TransportStream`, `ConnectionReceivedArgs`)와 모르는 이름은 `REGDB_E_CLASSNOTREG`로 거절되는 것까지 확인한다.
 
+2b. ~~ProgID 키 제거~~ · **완료** (2026-11-09)
+   `IDispatch`를 지운 순간 ProgID 등록은 **거짓말이 됐다**. ProgID는 사실상 스크립트가 `New-Object -ComObject Rustwinui3loop.NamedPipeConnector` / `CreateObject(...)`라고 쓰기 위해 존재하는데, 지금 그렇게 하면 객체는 **만들어지고 메서드는 하나도 못 부른다**. 컴파일된 호출자는 CLSID를 쓰고 ProgID 키를 읽지 않는다. 키를 지웠고, `ComClass.progid`는 `ComClass.name`(런타임 클래스 이름)으로 개명했다 — 문자열 자체는 그대로다.
+
+   테스트는 이제 **부재를 단언**한다. `CLSIDFromProgID`가 `CO_E_CLASSSTRING`(0x800401F3)을 돌려주는지 본다 — `REGDB_E_CLASSNOTREG`가 아니다. 그건 "CLSID는 아는데 등록이 안 됐다"는 뜻이고 여기선 이름 단계에서 먼저 실패한다. (처음에 틀리게 적었다가 테스트가 잡아냈다.)
+
+   **CLSID / `InprocServer32` / `DllGetClassObject`는 남긴다.** HKCU `regsvr32`는 승격이 필요 없고 HKLM WinRT 등록은 필요하므로, 3번이 끝나고 PyWinRT로 검증되기 전까지 **이게 유일하게 동작하는 활성화 경로**다. 4번까지 통과하면 그때 다시 본다.
+
 3. **HKLM `ActivatableClassId` 등록** · 작음 · **다음**
    `DllPath` / `ActivationType=0` / `Threading` / `TrustLevel`. 이름은 `bindings`가 단일 출처다. 승격 필요(개발 중엔 OK로 합의). 이것만 쓰면 `RoActivateInstance`가 동작한다.
 
@@ -273,7 +280,8 @@ $l.Bind($name)
 
 **이번 세션 (2026-11-09)** — 중간 상태를 커밋해 두지 않아 앞 단계들은 하나로 합쳐 들어간다. 런타임 클래스 이름 작업(`runtimeclass.rs`)은 bindgen 출력으로 **대체되며 사라졌으므로** 따로 커밋할 산출물이 없고, IDispatch 삭제는 `.winmd` 전환과 같은 파일들을 건드려 분리하려면 `listener.rs` 800줄을 손으로 복원해야 한다:
 
-- IDispatch 레이어 삭제 + `.winmd` + 생성 바인딩 전환 + 클래스 리네임 + `DllGetActivationFactory`
+- `ed43ce9` — IDispatch 레이어 삭제 + `.winmd` + 생성 바인딩 전환 + 클래스 리네임 + `DllGetActivationFactory`
+- ProgID 키 제거 (이 커밋)
 
 검증: `cargo test --all-features` 140 + 1 통과, `cargo doc` 경고 0, clippy 24건(전부 기존 `tp`/`rio`/`main.rs`).
 
@@ -289,4 +297,4 @@ cargo test --all-features
 cargo clippy --all-targets --all-features
 ```
 
-`DllRegisterServer`가 쓰는 것은 이제 CLSID/ProgID 키뿐이다 — `.tlb`도, `Interface\{…}` 프록시 등록도 없다.
+`DllRegisterServer`가 쓰는 것은 이제 CLSID 키뿐이다 — ProgID도, `.tlb`도, `Interface\{…}` 프록시 등록도 없다.
