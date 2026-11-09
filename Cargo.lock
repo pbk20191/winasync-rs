@@ -312,9 +312,8 @@ dependencies = [
 
 [[package]]
 name = "windows-default"
-version = "0.100.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4882bb065b03115aa8891d44d076bbe843d286d8bfd0b55caaa4b049141a712"
+version = "0.101.0"
+source = "git+https://github.com/microsoft/windows-rs?rev=7f3b52427fdcccb980b8bf44c0d30c62963da33b#7f3b52427fdcccb980b8bf44c0d30c62963da33b"
 
 [[package]]
 name = "windows-future"
@@ -363,9 +362,8 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
 name = "windows-metadata"
-version = "0.100.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d3a758dc1da4ae61aa7f93afbb505d564c72dd6431e513ed581377857896a72"
+version = "0.101.0"
+source = "git+https://github.com/microsoft/windows-rs?rev=7f3b52427fdcccb980b8bf44c0d30c62963da33b#7f3b52427fdcccb980b8bf44c0d30c62963da33b"
 
 [[package]]
 name = "windows-numerics"
@@ -379,9 +377,8 @@ dependencies = [
 
 [[package]]
 name = "windows-rdl"
-version = "0.100.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fec90978da14e3ebd4a9b4347d3e17351804aafed9676a955d82b022747f789"
+version = "0.101.0"
+source = "git+https://github.com/microsoft/windows-rs?rev=7f3b52427fdcccb980b8bf44c0d30c62963da33b#7f3b52427fdcccb980b8bf44c0d30c62963da33b"
 dependencies = [
  "proc-macro2",
  "quote",

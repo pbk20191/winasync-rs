@@ -52,6 +52,7 @@ mod Rustwinui3loop {
     // deliberately absent: each transport is addressed differently, and one
     // shared bind would have to erase the address and reject the wrong shapes
     // at run time.
+    #[guid(auto)]
     interface IConnectionListener {
         event ConnectionReceived: Windows::Foundation::TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>;
         #[get] Information: String;
@@ -62,17 +63,20 @@ mod Rustwinui3loop {
         IConnectionReceivedArgs,
     }
 
+    #[guid(auto)]
     interface IConnectionReceivedArgs {
         #[get] Stream: TransportStream;
         #[get] RemoteEndpoint: String;
     }
 
+    #[guid(auto)]
     interface INamedPipeListenerBind {
-        fn BindAsync(&self, name: String) -> Windows::Foundation::IAsyncAction;
+        fn BindAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncAction;
     }
 
+    #[guid(auto)]
     interface IUnixListenerBind {
-        fn BindAsync(&self, path: String) -> Windows::Foundation::IAsyncAction;
+        fn BindAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncAction;
     }
 
     // Strings rather than a `HostName`, because WinRT cannot spell this
@@ -86,9 +90,10 @@ mod Rustwinui3loop {
     // where two raw GUIDs are not. `HvSocketAddr`'s `Display`/`FromStr` are
     // exact inverses, so nothing is lost: a caller may always spell either
     // half as a plain GUID. Rust callers keep the typed entry points.
+    #[guid(auto)]
     interface IHyperVListenerBind {
-        fn BindEndpointAsync(&self, endpoint: String) -> Windows::Foundation::IAsyncAction;
-        fn BindServiceNameAsync(&self, serviceName: String) -> Windows::Foundation::IAsyncAction;
+        fn BindEndpointAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncAction;
+        fn BindServiceNameAsync(&self, #[in] serviceName: String) -> Windows::Foundation::IAsyncAction;
     }
 
     #[Activatable(1)]
@@ -118,20 +123,24 @@ mod Rustwinui3loop {
 
     // Identity, not behaviour: a caller holding an unknown object can ask
     // "is this a connector, and of what?" in one `QueryInterface`.
+    #[guid(auto)]
     interface IStreamConnector {
         #[get] Transport: String;
     }
 
+    #[guid(auto)]
     interface INamedPipeConnector {
-        fn ConnectAsync(&self, name: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+        fn ConnectAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
     }
 
+    #[guid(auto)]
     interface IUnixConnector {
-        fn ConnectAsync(&self, path: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+        fn ConnectAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
     }
 
+    #[guid(auto)]
     interface IHyperVConnector {
-        fn ConnectAsync(&self, endpoint: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+        fn ConnectAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
     }
 
     #[Activatable(1)]

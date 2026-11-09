@@ -41,19 +41,25 @@ is done at run time rather than by shipping one beside the interpreter.
 
 ## Two upstream gaps this ran into
 
-**`windows-rdl` cannot emit a class constructor.** Its class encoder writes
-the `TypeDef`, its `InterfaceImpl`s and attributes, and no `MethodDef` rows —
-so there is no `.ctor` for PyWinRT to project, and the classes come out
-without `__new__`. Instance members are unaffected: PyWinRT reads those from
-the interfaces. [`activate_instance.py`](activate_instance.py) fills the gap
-by calling `IActivationFactory::ActivateInstance` on the factory the
-projection already knows how to find.
+**PyWinRT wants a `.ctor` row that `windows-rdl` does not emit.** Its class
+encoder writes the TypeDef, its `InterfaceImpl`s and attributes, and no
+MethodDef rows, so there is no `.ctor` for PyWinRT to project and the classes
+arrive without `__new__`. Instance members are unaffected: PyWinRT reads
+those from the interfaces. [`activate_instance.py`](activate_instance.py)
+fills the gap by calling `IActivationFactory::ActivateInstance` on the
+factory the projection already locates.
 
-It is the *class* `.ctor` specifically, not the attribute. We checked that
-first: matching the SDK's `Activatable(version, contract)` form and adding
-`ContractVersion` made no difference, and `Windows.Storage.Streams.InMemoryRandomAccessStream`
-— activatable with no factory interface — shows a bare `[activatable]` is
-enough when the `.ctor` row exists. Those experiments were reverted, since
+This is a PyWinRT requirement rather than a deficiency in the metadata, which
+is what the C# side settled: CsWinRT generates a working constructor from the
+same `.winmd` (see [`../csharp/`](../csharp/README.md)). It is satisfied by
+`ActivatableAttribute` alone. So the upstream report belongs with PyWinRT,
+not with `windows-rdl` — an earlier version of this file said otherwise.
+
+The attribute form is not the issue either. We checked that first: matching
+the SDK's `Activatable(version, contract)` and adding `ContractVersion` made
+no difference, and `Windows.Storage.Streams.InMemoryRandomAccessStream` —
+activatable with no factory interface — shows a bare `[activatable]` is
+enough once the `.ctor` row exists. Those experiments were reverted, since
 claiming membership in `Windows.Foundation.UniversalApiContract` would be
 false.
 

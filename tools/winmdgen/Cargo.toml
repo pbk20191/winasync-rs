@@ -11,10 +11,26 @@ publish = false
 # bindings are checked in instead, which is also what `windows-rs` itself does.
 
 [dependencies]
-# Writes ECMA-335. Only published at 0.100, which is fine: it emits a binary
-# `.winmd`, so its version has nothing to do with the `windows` crate we build
-# against.
-windows-rdl = "0.100"
+# Writes ECMA-335. Its version has nothing to do with the `windows` crate we
+# build against, because what it emits is a binary `.winmd`.
+#
+# Pinned to a `master` revision rather than the 0.100 release, because 0.100
+# cannot express a WinRT event. `windows-metadata`'s `File::Event` wrote the
+# handler type as a plain `TypeRef(namespace, name)`, dropping the generic
+# arguments and the arity suffix, so the Event row pointed at
+# `Windows.Foundation.TypedEventHandler` -- a type that does not exist, the
+# real one being ``TypedEventHandler`2``. Every WinRT event handler is generic,
+# so every event it emitted was malformed. PyWinRT never noticed, because it
+# infers events from `add_`/`remove_` naming; CsWinRT reads the row and
+# refuses the whole file.
+#
+# Pinned to a revision, not a branch: the RDL dialect is still moving ahead of
+# 0.101 -- this upgrade alone needed `#[guid(auto)]` and `#[in]` added to the
+# RDL. Move the pin deliberately, and regenerate when you do.
+#
+# Verified across the upgrade: all nine derived IIDs are unchanged, so the
+# ABI did not move.
+windows-rdl = { git = "https://github.com/microsoft/windows-rs", rev = "7f3b52427fdcccb980b8bf44c0d30c62963da33b" }
 # This one DOES have to match: it generates Rust that calls `windows-core`.
 # Pinned to the 0.62 line alongside `windows`/`windows-core` in the root
 # manifest. Verified to read a 0.100-produced `.winmd` without complaint.

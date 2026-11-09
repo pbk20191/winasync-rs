@@ -4,3 +4,7 @@
 python/out/
 python/.venv/
 python/dotnet-tools.json
+
+# C# build output; the projection under obj/ is generated from the winmd.
+csharp/bin/
+csharp/obj/
