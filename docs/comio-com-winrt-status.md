@@ -582,6 +582,27 @@ TLS를 구현하지 않기로 했으면 **가져와서 감쌀 수 있어야** �
 
 `a_stream_answers_everything_its_metadata_claims`가 이제 스트림이 약속한 인터페이스 전부에 답하는지 QI로 확인한다. 바로 앞의 `ITransport` 건과 같은 종류의 버그였고, 이번엔 테스트가 남는다.
 
+## out-of-process 서버 — 만들고 지웠다 (2026-11-09 ~ 11-10)
+
+클래식 COM LocalServer를 끝까지 구현하고 검증한 뒤 되돌렸다. 구현에는 midl로 만든
+프록시/스텁 DLL, `CoAddRefServerProcess`로 수명을 관리하는 서버 exe, 실제 프로세스
+경계를 넘는 통합 테스트가 포함됐다. 측정해 보니 in-process보다 왕복이 20~50배 느렸고,
+그 비용의 대부분은 호출 횟수였다. 무엇보다 IPC 전송 계층 앞에 데이터를 중계하는 프로세스를
+두는 것 자체가 구조적으로 맞지 않았다. 상세 내용(측정표, 되돌린 커밋, 다시 만든다면
+어떤 형태여야 하는지)은
+[`superpowers/specs/2026-11-09-comio-out-of-process-design.md`](superpowers/specs/2026-11-09-comio-out-of-process-design.md)에
+있다.
+
+남긴 것은 두 가지다.
+
+- **모든 타입에 `[Version(1)]`.** midl이 우리 메타데이터를 거부하지 않게 한다(MIDL4072).
+  IID는 바뀌지 않는다.
+- **취소된 연산이 `Canceled`로 끝나도록 수정.** 이전에는 `Error`로 끝났다. in-process에도
+  있던 계약 위반인데, 원격 호출자가 보는 상태를 검사하는 out-of-process 테스트가 찾아냈다.
+
+이름 기반 WinRT out-of-process(MSIX `outOfProcessServer`)는 시도하지 않았다. 데이터 중계
+형태라면 같은 이유로 의미가 없다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

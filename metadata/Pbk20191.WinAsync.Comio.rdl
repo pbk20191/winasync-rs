@@ -27,10 +27,13 @@
 // Every type carries `#[Version(1)]`. Nothing at run time reads it, and it is
 // not part of any IID -- adding it on 2026-11-09 left `bindings.rs` byte for
 // byte unchanged. It is there because `midl /winrt` refuses a Windows Runtime
-// type with neither a version nor a contract (MIDL4072), and midl is what
-// turns this metadata into the proxy/stub that carries these interfaces
-// across a process boundary (`ps/`). A type added without it fails
-// `cargo run -p winmdgen` at that step, not silently.
+// type with neither a version nor a contract (MIDL4072), so without it the
+// SDK's own tools (`winmdidl` + `midl`, the path to a proxy/stub) reject this
+// metadata outright. Nothing in this repository runs midl any more -- see
+// docs/superpowers/specs/2026-11-09-comio-out-of-process-design.md for the
+// out-of-process server that did, and why it was removed -- but metadata
+// that only our own toolchain accepts would be a defect. Add it to every
+// new type.
 //
 // It is also the file name of this file and of the `.winmd` beside it, which
 // is the convention every WinRT toolchain assumes when it looks for metadata
