@@ -19,7 +19,7 @@ pub mod Rustwinui3loop {
         IConnectionReceivedArgs
     );
     impl ConnectionReceivedArgs {
-        pub fn Stream(&self) -> windows_core::Result<TransportStream> {
+        pub fn Stream(&self) -> windows_core::Result<ITransportStream> {
             let this = self;
             unsafe {
                 let mut result__ = core::mem::zeroed();
@@ -94,7 +94,10 @@ pub mod Rustwinui3loop {
         pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
         where
             P0: windows_core::Param<
-                windows::Foundation::TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>,
+                windows::Foundation::TypedEventHandler<
+                    IConnectionListener,
+                    IConnectionReceivedArgs,
+                >,
             >,
         {
             let this = self;
@@ -211,7 +214,7 @@ pub mod Rustwinui3loop {
         pub fn ConnectAsync(
             &self,
             endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>> {
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
             let this = &windows_core::Interface::cast::<IHyperVConnector>(self)?;
             unsafe {
                 let mut result__ = core::mem::zeroed();
@@ -249,7 +252,7 @@ pub mod Rustwinui3loop {
     windows_core::imp::define_interface!(
         IConnectionListener,
         IConnectionListener_Vtbl,
-        0x04675f14_eeed_5ffe_9712_5b89136e5ed0
+        0x43e2248d_33c8_5d43_bce3_a8690dd65ec7
     );
     impl windows_core::RuntimeType for IConnectionListener {
         const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -264,7 +267,10 @@ pub mod Rustwinui3loop {
         pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
         where
             P0: windows_core::Param<
-                windows::Foundation::TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>,
+                windows::Foundation::TypedEventHandler<
+                    IConnectionListener,
+                    IConnectionReceivedArgs,
+                >,
             >,
         {
             let this = self;
@@ -308,7 +314,10 @@ pub mod Rustwinui3loop {
             &self,
             handler: windows_core::Ref<
                 '_,
-                windows::Foundation::TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>,
+                windows::Foundation::TypedEventHandler<
+                    IConnectionListener,
+                    IConnectionReceivedArgs,
+                >,
             >,
         ) -> windows_core::Result<i64>;
         fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()>;
@@ -403,7 +412,7 @@ pub mod Rustwinui3loop {
     windows_core::imp::define_interface!(
         IConnectionReceivedArgs,
         IConnectionReceivedArgs_Vtbl,
-        0x9fdea492_cc9b_5ba3_a483_014de3aaaef9
+        0xc57ac1e0_4d8e_5a55_9a52_9dacf2ceac2e
     );
     impl windows_core::RuntimeType for IConnectionReceivedArgs {
         const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -415,7 +424,7 @@ pub mod Rustwinui3loop {
         windows_core::IInspectable
     );
     impl IConnectionReceivedArgs {
-        pub fn Stream(&self) -> windows_core::Result<TransportStream> {
+        pub fn Stream(&self) -> windows_core::Result<ITransportStream> {
             let this = self;
             unsafe {
                 let mut result__ = core::mem::zeroed();
@@ -442,7 +451,7 @@ pub mod Rustwinui3loop {
         const NAME: &'static str = "Rustwinui3loop.IConnectionReceivedArgs";
     }
     pub trait IConnectionReceivedArgs_Impl: windows_core::IUnknownImpl {
-        fn Stream(&self) -> windows_core::Result<TransportStream>;
+        fn Stream(&self) -> windows_core::Result<ITransportStream>;
         fn RemoteEndpoint(&self) -> windows_core::Result<windows_core::HSTRING>;
     }
     impl IConnectionReceivedArgs_Vtbl {
@@ -649,7 +658,7 @@ pub mod Rustwinui3loop {
     windows_core::imp::define_interface!(
         IHyperVConnector,
         IHyperVConnector_Vtbl,
-        0xbd492f65_f1d3_5ed7_8d3b_26405b313fdf
+        0xf3bc3a2c_385a_56f7_8c5d_42a69cec6bce
     );
     impl windows_core::RuntimeType for IHyperVConnector {
         const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -664,7 +673,7 @@ pub mod Rustwinui3loop {
         pub fn ConnectAsync(
             &self,
             endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>> {
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
             let this = self;
             unsafe {
                 let mut result__ = core::mem::zeroed();
@@ -684,7 +693,7 @@ pub mod Rustwinui3loop {
         fn ConnectAsync(
             &self,
             endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>>;
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
     }
     impl IHyperVConnector_Vtbl {
         pub const fn new<Identity: IHyperVConnector_Impl, const OFFSET: isize>() -> Self {
@@ -815,7 +824,7 @@ pub mod Rustwinui3loop {
     windows_core::imp::define_interface!(
         INamedPipeConnector,
         INamedPipeConnector_Vtbl,
-        0x08b4e11b_0cec_5d66_89b1_0888f7c03779
+        0x9aba3c8b_0aaf_5d5f_b6ab_413f0374cf67
     );
     impl windows_core::RuntimeType for INamedPipeConnector {
         const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -830,7 +839,7 @@ pub mod Rustwinui3loop {
         pub fn ConnectAsync(
             &self,
             name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>> {
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
             let this = self;
             unsafe {
                 let mut result__ = core::mem::zeroed();
@@ -850,7 +859,7 @@ pub mod Rustwinui3loop {
         fn ConnectAsync(
             &self,
             name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>>;
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
     }
     impl INamedPipeConnector_Vtbl {
         pub const fn new<Identity: INamedPipeConnector_Impl, const OFFSET: isize>() -> Self {
@@ -967,6 +976,116 @@ pub mod Rustwinui3loop {
         ) -> windows_core::HRESULT,
     }
     windows_core::imp::define_interface!(
+        ITransportStream,
+        ITransportStream_Vtbl,
+        0xd18b108c_a36d_5837_99af_49d9b9bb0944
+    );
+    impl windows_core::RuntimeType for ITransportStream {
+        const SIGNATURE: windows_core::imp::ConstBuffer =
+            windows_core::imp::ConstBuffer::for_interface::<Self>();
+    }
+    windows_core::imp::interface_hierarchy!(
+        ITransportStream,
+        windows_core::IUnknown,
+        windows_core::IInspectable
+    );
+    windows_core::imp::required_hierarchy!(
+        ITransportStream,
+        windows::Foundation::IClosable,
+        windows::Storage::Streams::IInputStream,
+        windows::Storage::Streams::IOutputStream
+    );
+    impl ITransportStream {
+        pub fn Close(&self) -> windows_core::Result<()> {
+            let this = &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
+            unsafe {
+                (windows_core::Interface::vtable(this).Close)(windows_core::Interface::as_raw(this))
+                    .ok()
+            }
+        }
+        pub fn ReadAsync<P0>(
+            &self,
+            buffer: P0,
+            count: u32,
+            options: windows::Storage::Streams::InputStreamOptions,
+        ) -> windows_core::Result<
+            windows_future::IAsyncOperationWithProgress<windows::Storage::Streams::IBuffer, u32>,
+        >
+        where
+            P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+        {
+            let this =
+                &windows_core::Interface::cast::<windows::Storage::Streams::IInputStream>(self)?;
+            unsafe {
+                let mut result__ = core::mem::zeroed();
+                (windows_core::Interface::vtable(this).ReadAsync)(
+                    windows_core::Interface::as_raw(this),
+                    buffer.param().abi(),
+                    count,
+                    options,
+                    &mut result__,
+                )
+                .and_then(|| windows_core::Type::from_abi(result__))
+            }
+        }
+        pub fn WriteAsync<P0>(
+            &self,
+            buffer: P0,
+        ) -> windows_core::Result<windows_future::IAsyncOperationWithProgress<u32, u32>>
+        where
+            P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+        {
+            let this =
+                &windows_core::Interface::cast::<windows::Storage::Streams::IOutputStream>(self)?;
+            unsafe {
+                let mut result__ = core::mem::zeroed();
+                (windows_core::Interface::vtable(this).WriteAsync)(
+                    windows_core::Interface::as_raw(this),
+                    buffer.param().abi(),
+                    &mut result__,
+                )
+                .and_then(|| windows_core::Type::from_abi(result__))
+            }
+        }
+        pub fn FlushAsync(&self) -> windows_core::Result<windows_future::IAsyncOperation<bool>> {
+            let this =
+                &windows_core::Interface::cast::<windows::Storage::Streams::IOutputStream>(self)?;
+            unsafe {
+                let mut result__ = core::mem::zeroed();
+                (windows_core::Interface::vtable(this).FlushAsync)(
+                    windows_core::Interface::as_raw(this),
+                    &mut result__,
+                )
+                .and_then(|| windows_core::Type::from_abi(result__))
+            }
+        }
+    }
+    impl windows_core::RuntimeName for ITransportStream {
+        const NAME: &'static str = "Rustwinui3loop.ITransportStream";
+    }
+    pub trait ITransportStream_Impl:
+        windows::Foundation::IClosable_Impl
+        + windows::Storage::Streams::IInputStream_Impl
+        + windows::Storage::Streams::IOutputStream_Impl
+    {
+    }
+    impl ITransportStream_Vtbl {
+        pub const fn new<Identity: ITransportStream_Impl, const OFFSET: isize>() -> Self {
+            Self {
+                base__: windows_core::IInspectable_Vtbl::new::<Identity, ITransportStream, OFFSET>(
+                ),
+            }
+        }
+        pub fn matches(iid: &windows_core::GUID) -> bool {
+            iid == &<ITransportStream as windows_core::Interface>::IID
+        }
+    }
+    #[repr(C)]
+    #[doc(hidden)]
+    pub struct ITransportStream_Vtbl {
+        pub base__: windows_core::IInspectable_Vtbl,
+    }
+    windows_core::imp::define_interface!(
         IUnixBind,
         IUnixBind_Vtbl,
         0x06f176b2_2026_5c86_b99b_f7469e098efd
@@ -1048,7 +1167,7 @@ pub mod Rustwinui3loop {
     windows_core::imp::define_interface!(
         IUnixConnector,
         IUnixConnector_Vtbl,
-        0x4081ba88_3bde_58af_a6a4_04e9c6ddc7bb
+        0xe2f80d60_4d15_502c_96ff_c1c28402513c
     );
     impl windows_core::RuntimeType for IUnixConnector {
         const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -1063,7 +1182,7 @@ pub mod Rustwinui3loop {
         pub fn ConnectAsync(
             &self,
             path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>> {
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
             let this = self;
             unsafe {
                 let mut result__ = core::mem::zeroed();
@@ -1083,7 +1202,7 @@ pub mod Rustwinui3loop {
         fn ConnectAsync(
             &self,
             path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>>;
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
     }
     impl IUnixConnector_Vtbl {
         pub const fn new<Identity: IUnixConnector_Impl, const OFFSET: isize>() -> Self {
@@ -1168,7 +1287,10 @@ pub mod Rustwinui3loop {
         pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
         where
             P0: windows_core::Param<
-                windows::Foundation::TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>,
+                windows::Foundation::TypedEventHandler<
+                    IConnectionListener,
+                    IConnectionReceivedArgs,
+                >,
             >,
         {
             let this = self;
@@ -1270,7 +1392,7 @@ pub mod Rustwinui3loop {
         pub fn ConnectAsync(
             &self,
             name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>> {
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
             let this = &windows_core::Interface::cast::<INamedPipeConnector>(self)?;
             unsafe {
                 let mut result__ = core::mem::zeroed();
@@ -1312,11 +1434,12 @@ pub mod Rustwinui3loop {
         TransportStream,
         windows_core::IUnknown,
         windows_core::IInspectable,
-        windows::Storage::Streams::IInputStream
+        ITransportStream
     );
     windows_core::imp::required_hierarchy!(
         TransportStream,
         windows::Foundation::IClosable,
+        windows::Storage::Streams::IInputStream,
         windows::Storage::Streams::IOutputStream
     );
     impl TransportStream {
@@ -1338,7 +1461,8 @@ pub mod Rustwinui3loop {
         where
             P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
         {
-            let this = self;
+            let this =
+                &windows_core::Interface::cast::<windows::Storage::Streams::IInputStream>(self)?;
             unsafe {
                 let mut result__ = core::mem::zeroed();
                 (windows_core::Interface::vtable(this).ReadAsync)(
@@ -1384,15 +1508,12 @@ pub mod Rustwinui3loop {
         }
     }
     impl windows_core::RuntimeType for TransportStream {
-        const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::for_class::<
-            Self,
-            windows::Storage::Streams::IInputStream,
-        >();
+        const SIGNATURE: windows_core::imp::ConstBuffer =
+            windows_core::imp::ConstBuffer::for_class::<Self, ITransportStream>();
     }
     unsafe impl windows_core::Interface for TransportStream {
-        type Vtable = <windows::Storage::Streams::IInputStream as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID =
-            <windows::Storage::Streams::IInputStream as windows_core::Interface>::IID;
+        type Vtable = <ITransportStream as windows_core::Interface>::Vtable;
+        const IID: windows_core::GUID = <ITransportStream as windows_core::Interface>::IID;
     }
     impl windows_core::RuntimeName for TransportStream {
         const NAME: &'static str = "Rustwinui3loop.TransportStream";
@@ -1438,7 +1559,10 @@ pub mod Rustwinui3loop {
         pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
         where
             P0: windows_core::Param<
-                windows::Foundation::TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>,
+                windows::Foundation::TypedEventHandler<
+                    IConnectionListener,
+                    IConnectionReceivedArgs,
+                >,
             >,
         {
             let this = self;
@@ -1551,7 +1675,7 @@ pub mod Rustwinui3loop {
         pub fn ConnectAsync(
             &self,
             path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>> {
+        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
             let this = &windows_core::Interface::cast::<IUnixConnector>(self)?;
             unsafe {
                 let mut result__ = core::mem::zeroed();

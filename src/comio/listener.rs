@@ -15,15 +15,14 @@ use windows_future::IAsyncAction;
 use super::bindings;
 use super::bindings::Rustwinui3loop::{
     ConnectionReceivedArgs as ConnectionReceivedArgsClass, IConnectionListener,
+    IConnectionReceivedArgs,
     IConnectionListener_Impl, IConnectionReceivedArgs_Impl, ITransport_Impl, IHyperVBind_Impl,
-    INamedPipeBind_Impl, IUnixBind_Impl, TransportStream,
+    INamedPipeBind_Impl, ITransportStream, IUnixBind_Impl,
 };
 // Queried for by the tests below, which check that each listener exposes only
 // the bind its addressing supports.
 #[cfg(test)]
-use super::bindings::Rustwinui3loop::{
-    IConnectionReceivedArgs, IHyperVBind, INamedPipeBind, ITransport, IUnixBind,
-};
+use super::bindings::Rustwinui3loop::{IHyperVBind, INamedPipeBind, ITransport, IUnixBind};
 use super::tpio::OpHandle;
 use crate::common::hvaddr::{HvSocketAddr, HV_GUID_WILDCARD};
 
@@ -44,16 +43,16 @@ const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
 /// The sender is the *interface*, not any one listener class, which is what
 /// lets all three share one event in metadata.
 pub(crate) type ConnectionHandler =
-    TypedEventHandler<IConnectionListener, ConnectionReceivedArgsClass>;
+    TypedEventHandler<IConnectionListener, IConnectionReceivedArgs>;
 
 #[implement(bindings::Rustwinui3loop::ConnectionReceivedArgs)]
 struct ConnectionReceivedArgs {
-    stream: TransportStream,
+    stream: ITransportStream,
     endpoint: HSTRING,
 }
 
 impl IConnectionReceivedArgs_Impl for ConnectionReceivedArgs_Impl {
-    fn Stream(&self) -> Result<TransportStream> {
+    fn Stream(&self) -> Result<ITransportStream> {
         Ok(self.stream.clone())
     }
 
@@ -70,19 +69,19 @@ impl IConnectionReceivedArgs_Impl for ConnectionReceivedArgs_Impl {
 /// AF_UNIX client has no address to report, so those pass `None` and the
 /// event falls back to the listener's own bound endpoint, as before.
 pub(crate) struct Accepted {
-    pub(crate) stream: TransportStream,
+    pub(crate) stream: ITransportStream,
     pub(crate) remote: Option<HSTRING>,
 }
 
 impl Accepted {
     /// A connection from a transport with no peer name.
-    pub(crate) fn unnamed(stream: TransportStream) -> Self {
+    pub(crate) fn unnamed(stream: ITransportStream) -> Self {
         Self { stream, remote: None }
     }
 }
 
 /// Constructs the `Rustwinui3loop.ConnectionReceivedArgs` the event carries.
-pub(crate) fn new_args(stream: TransportStream, endpoint: HSTRING) -> ConnectionReceivedArgsClass {
+pub(crate) fn new_args(stream: ITransportStream, endpoint: HSTRING) -> ConnectionReceivedArgsClass {
     ConnectionReceivedArgs { stream, endpoint }.into()
 }
 
@@ -843,7 +842,7 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
 /// sender — the connection is carried by `args`, not the (nonexistent)
 /// sender object. Guards against a panicking consumer handler unwinding
 /// across this FFI-adjacent boundary.
-fn fire_event(state: &Arc<ListenerState>, stream: TransportStream, endpoint: HSTRING) {
+fn fire_event(state: &Arc<ListenerState>, stream: ITransportStream, endpoint: HSTRING) {
     let args = new_args(stream, endpoint);
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         state.event.call(|h| h.Invoke(None, &args));

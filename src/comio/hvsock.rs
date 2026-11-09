@@ -23,7 +23,7 @@ use super::bindings;
 use super::bindings::Rustwinui3loop::{IHyperVConnector_Impl, ITransport_Impl};
 use super::connector::connect_op;
 use super::listener::Accepted;
-use super::bindings::Rustwinui3loop::TransportStream;
+use super::bindings::Rustwinui3loop::ITransportStream;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
@@ -102,7 +102,7 @@ impl HvStreamListener {
     }
 
     /// Accepts one connection, returning it as a duplex WinRT stream.
-    pub async fn accept(&self) -> Result<TransportStream> {
+    pub async fn accept(&self) -> Result<ITransportStream> {
         let accept_sock = new_socket()?;
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
         let mut guard = AcceptSockGuard(accept_sock);
@@ -132,7 +132,7 @@ impl HvStreamListener {
         result?;
 
         let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
-        let finish = || -> Result<TransportStream> {
+        let finish = || -> Result<ITransportStream> {
             let listen_val = listen_sock.0.to_ne_bytes();
             sock_check(unsafe {
                 setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
@@ -238,7 +238,7 @@ pub(crate) const TRANSPORT: &str = "hyperv";
 
 impl HyperVConnector {
     /// Connects to `addr`, returning the connection as a duplex WinRT stream.
-    pub async fn connect(addr: HvSocketAddr) -> Result<TransportStream> {
+    pub async fn connect(addr: HvSocketAddr) -> Result<ITransportStream> {
         let sock = new_socket()?;
         let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket; the
@@ -294,7 +294,7 @@ impl HyperVConnector {
     /// that could be dropped first.
     pub(crate) fn arm_connect(
         addr: HvSocketAddr,
-        on_result: Box<dyn FnOnce(Result<TransportStream>) + Send>,
+        on_result: Box<dyn FnOnce(Result<ITransportStream>) + Send>,
     ) -> Result<OpHandle> {
         let sock = new_socket()?;
         let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
@@ -370,7 +370,7 @@ impl HyperVConnector {
         &self,
         vm_id: &windows_core::GUID,
         service_id: &windows_core::GUID,
-    ) -> windows_future::IAsyncOperation<TransportStream> {
+    ) -> windows_future::IAsyncOperation<ITransportStream> {
         let addr = HvSocketAddr::new(*vm_id, *service_id);
         connect_op(move |sink| Self::arm_connect(addr, sink))
     }
@@ -389,7 +389,7 @@ impl IHyperVConnector_Impl for HyperVConnector_Impl {
     fn ConnectAsync(
         &self,
         endpoint: &HSTRING,
-    ) -> Result<windows_future::IAsyncOperation<TransportStream>> {
+    ) -> Result<windows_future::IAsyncOperation<ITransportStream>> {
         let addr: HvSocketAddr = endpoint
             .to_string()
             .parse()

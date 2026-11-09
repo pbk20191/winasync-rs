@@ -19,7 +19,7 @@ use super::bindings;
 use super::bindings::Rustwinui3loop::{ITransport_Impl, IUnixConnector_Impl};
 use super::connector::connect_op;
 use super::listener::Accepted;
-use super::bindings::Rustwinui3loop::TransportStream;
+use super::bindings::Rustwinui3loop::ITransportStream;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
@@ -114,7 +114,7 @@ impl UnixStreamListener {
     }
 
     /// Accepts one connection, returning it as a duplex WinRT stream.
-    pub async fn accept(&self) -> Result<TransportStream> {
+    pub async fn accept(&self) -> Result<ITransportStream> {
         let accept_sock = new_socket()?;
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
         let mut guard = AcceptSockGuard(accept_sock);
@@ -156,7 +156,7 @@ impl UnixStreamListener {
         // Success: take the socket out of the guard so its `Drop` no longer
         // closes it (`IoReg::register` owns it from here).
         let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
-        let finish = || -> Result<TransportStream> {
+        let finish = || -> Result<ITransportStream> {
             // Until `SO_UPDATE_ACCEPT_CONTEXT` (value = the listen socket)
             // the accepted socket is half-configured.
             let listen_val = listen_sock.0.to_ne_bytes();
@@ -221,7 +221,7 @@ impl UnixStreamListener {
                     drop(addr_buf);
                     let res = if ioresult == 0 {
                         let listen_val = listen_sock.0.to_ne_bytes();
-                        let finish = || -> Result<TransportStream> {
+                        let finish = || -> Result<ITransportStream> {
                             sock_check(setsockopt(
                                 accept_sock,
                                 SOL_SOCKET,
@@ -278,7 +278,7 @@ pub(crate) const TRANSPORT: &str = "unix";
 impl UnixConnector {
     /// Connects to the AF_UNIX socket bound at `path`, returning the
     /// connection as a duplex WinRT stream.
-    pub async fn connect(path: &str) -> Result<TransportStream> {
+    pub async fn connect(path: &str) -> Result<ITransportStream> {
         let sock = new_socket()?;
         let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
@@ -339,7 +339,7 @@ impl UnixConnector {
     /// that could be dropped first.
     pub(crate) fn arm_connect(
         path: &str,
-        on_result: Box<dyn FnOnce(Result<TransportStream>) + Send>,
+        on_result: Box<dyn FnOnce(Result<ITransportStream>) + Send>,
     ) -> Result<OpHandle> {
         let sock = new_socket()?;
         let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
@@ -410,7 +410,7 @@ impl UnixConnector {
     pub fn connect_async(
         &self,
         path: &windows_core::HSTRING,
-    ) -> windows_future::IAsyncOperation<TransportStream> {
+    ) -> windows_future::IAsyncOperation<ITransportStream> {
         let path = path.to_string();
         connect_op(move |sink| Self::arm_connect(&path, sink))
     }
@@ -426,7 +426,7 @@ impl IUnixConnector_Impl for UnixConnector_Impl {
     fn ConnectAsync(
         &self,
         path: &windows_core::HSTRING,
-    ) -> Result<windows_future::IAsyncOperation<TransportStream>> {
+    ) -> Result<windows_future::IAsyncOperation<ITransportStream>> {
         Ok(self.connect_async(path))
     }
 }

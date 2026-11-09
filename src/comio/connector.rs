@@ -15,7 +15,7 @@
 //!
 //! # No blocked threads
 //!
-//! Each `ConnectAsync` returns an `IAsyncOperation<TransportStream>` whose
+//! Each `ConnectAsync` returns an `IAsyncOperation<ITransportStream>` whose
 //! result is delivered **from the overlapped completion**, not by running the
 //! connect to completion on a thread. AF_UNIX and AF_HYPERV arm a `ConnectEx`
 //! through `tpio::submit` and fill the operation from its callback — the same
@@ -40,24 +40,24 @@ use windows_future::{
     IAsyncOperation_Impl,
 };
 
-use super::bindings::Rustwinui3loop::TransportStream;
+use super::bindings::Rustwinui3loop::ITransportStream;
 use super::tpio::OpHandle;
 
-/// An `IAsyncOperation<TransportStream>` whose result arrives from an overlapped
+/// An `IAsyncOperation<ITransportStream>` whose result arrives from an overlapped
 /// completion rather than from a closure run to completion on a thread.
 ///
 /// The same state machine as `super::asyncop::IoAsyncOp`, which does this for
-/// reads and writes; this one is fixed to `IAsyncOperation<TransportStream>`,
+/// reads and writes; this one is fixed to `IAsyncOperation<ITransportStream>`,
 /// the shape a connect returns. `IAsyncInfo::Cancel` cancels the in-flight
 /// `ConnectEx`.
 struct ConnectState {
-    result: Option<Result<TransportStream>>,
-    completed: Option<AsyncOperationCompletedHandler<TransportStream>>,
+    result: Option<Result<ITransportStream>>,
+    completed: Option<AsyncOperationCompletedHandler<ITransportStream>>,
     completed_assigned: bool,
     op: Option<OpHandle>,
 }
 
-#[implement(IAsyncOperation<TransportStream>, windows_future::IAsyncInfo)]
+#[implement(IAsyncOperation<ITransportStream>, windows_future::IAsyncInfo)]
 struct ConnectOp(Mutex<ConnectState>);
 
 // SAFETY: the only non-`Send` data (the pending handler) lives behind the
@@ -70,7 +70,7 @@ unsafe impl Sync for ConnectOp {}
 impl ConnectOp_Impl {
     /// Stores the outcome and fires `Completed` if one is already assigned.
     /// Runs on the thread-pool completion thread.
-    fn complete(&self, res: Result<TransportStream>) {
+    fn complete(&self, res: Result<ITransportStream>) {
         let (status, completed) = {
             let mut g = self.0.lock().unwrap();
             debug_assert!(g.result.is_none());
@@ -79,7 +79,7 @@ impl ConnectOp_Impl {
         };
         // Outside the lock: the handler may re-enter to read Status/GetResults.
         if let Some(completed) = completed {
-            let sender: IAsyncOperation<TransportStream> = self.to_interface();
+            let sender: IAsyncOperation<ITransportStream> = self.to_interface();
             let _ = completed.Invoke(&sender, status);
         }
     }
@@ -119,10 +119,10 @@ impl IAsyncInfo_Impl for ConnectOp_Impl {
     }
 }
 
-impl IAsyncOperation_Impl<TransportStream> for ConnectOp_Impl {
+impl IAsyncOperation_Impl<ITransportStream> for ConnectOp_Impl {
     fn SetCompleted(
         &self,
-        handler: windows_core::Ref<'_, AsyncOperationCompletedHandler<TransportStream>>,
+        handler: windows_core::Ref<'_, AsyncOperationCompletedHandler<ITransportStream>>,
     ) -> Result<()> {
         let (fire, status) = {
             let mut g = self.0.lock().unwrap();
@@ -141,13 +141,13 @@ impl IAsyncOperation_Impl<TransportStream> for ConnectOp_Impl {
             }
         };
         if let Some(h) = fire {
-            let sender: IAsyncOperation<TransportStream> = self.to_interface();
+            let sender: IAsyncOperation<ITransportStream> = self.to_interface();
             let _ = h.Invoke(&sender, status);
         }
         Ok(())
     }
 
-    fn Completed(&self) -> Result<AsyncOperationCompletedHandler<TransportStream>> {
+    fn Completed(&self) -> Result<AsyncOperationCompletedHandler<ITransportStream>> {
         self.0
             .lock()
             .unwrap()
@@ -156,7 +156,7 @@ impl IAsyncOperation_Impl<TransportStream> for ConnectOp_Impl {
             .ok_or_else(|| windows_core::Error::from_hresult(E_ILLEGAL_METHOD_CALL))
     }
 
-    fn GetResults(&self) -> Result<TransportStream> {
+    fn GetResults(&self) -> Result<ITransportStream> {
         match &self.0.lock().unwrap().result {
             Some(r) => r.clone(),
             None => Err(windows_core::Error::from_hresult(E_ILLEGAL_METHOD_CALL)),
@@ -172,8 +172,8 @@ const E_ILLEGAL_DELEGATE_ASSIGNMENT: HRESULT = HRESULT(0x80000018u32 as i32);
 /// Builds an operation and arms `start`, which must deliver exactly one
 /// result through the callback it is given.
 pub(crate) fn connect_op(
-    start: impl FnOnce(Box<dyn FnOnce(Result<TransportStream>) + Send>) -> Result<OpHandle>,
-) -> IAsyncOperation<TransportStream> {
+    start: impl FnOnce(Box<dyn FnOnce(Result<ITransportStream>) + Send>) -> Result<OpHandle>,
+) -> IAsyncOperation<ITransportStream> {
     let op: ComObject<ConnectOp> = ComObject::new(ConnectOp(Mutex::new(ConnectState {
         result: None,
         completed: None,
@@ -231,7 +231,7 @@ mod tests {
 
         let connector = crate::comio::UnixConnector::new();
         let c: IUnixConnector = connector.cast().unwrap();
-        let op: IAsyncOperation<TransportStream> =
+        let op: IAsyncOperation<ITransportStream> =
             c.ConnectAsync(&HSTRING::from(&path)).expect("ConnectAsync");
 
         // Register a Completed handler the way a COM caller would, rather
@@ -294,7 +294,7 @@ mod tests {
         let server_raw = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("no ConnectionReceived");
-        let server = unsafe { TransportStream::from_raw(server_raw as *mut c_void) };
+        let server = unsafe { ITransportStream::from_raw(server_raw as *mut c_void) };
 
         // Both ends are real duplex streams.
         assert!(server.cast::<windows::Storage::Streams::IInputStream>().is_ok());

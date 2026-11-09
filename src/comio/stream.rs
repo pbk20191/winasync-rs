@@ -9,11 +9,12 @@
 use super::asyncop::IoAsyncOp;
 use super::buffer::buffer_ptr;
 use super::bindings;
+use super::bindings::Rustwinui3loop::ITransportStream_Impl;
 use super::tpio::{IoReg, Issue};
 use std::sync::Arc;
 use windows::Foundation::IClosable_Impl;
 use windows::Storage::Streams::{
-    IBuffer, IInputStream_Impl, IOutputStream, IOutputStream_Impl,
+    IBuffer, IInputStream, IInputStream_Impl, IOutputStream, IOutputStream_Impl,
     InputStreamOptions,
 };
 use windows::Win32::Foundation::ERROR_IO_PENDING;
@@ -60,11 +61,18 @@ unsafe impl Send for AcceptSockGuard {}
 /// A duplex WinRT stream over one overlapped-registered handle/socket.
 ///
 /// `Rustwinui3loop.TransportStream` in metadata; the generated class type
-/// leads the list so `GetRuntimeClassName` reports it, and because its
-/// `Interface::Vtable` *is* `IInputStream_Vtbl` — the class's default
-/// interface — nothing about the vtable changes by naming it here.
+/// leads the list so `GetRuntimeClassName` reports it, and its
+/// `Interface::Vtable` *is* the class's default interface, `ITransportStream`.
+///
+/// `IInputStream` has to be listed explicitly now. It used to be the default
+/// interface, so the class entry provided its chain for free; once
+/// `ITransportStream` took that place, `QueryInterface` for `IInputStream`
+/// started failing — an interface the metadata still promised. The lesson is
+/// that `requires` in metadata does not create a vtable chain: every
+/// interface an object answers has to appear in this list.
 #[implement(
     bindings::Rustwinui3loop::TransportStream,
+    IInputStream,
     IOutputStream,
     windows::Foundation::IClosable
 )]
@@ -75,16 +83,31 @@ pub struct TransportStream {
 
 /// Wraps an already-registered handle/socket as a WinRT stream object.
 ///
-/// Returns the projected class rather than an `IInspectable`: it is what the
-/// metadata says a connect or an accept produces, and a caller that wants
-/// `IInputStream`/`IOutputStream` can `.cast()` from it as before.
-pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Rustwinui3loop::TransportStream {
-    ComObject::new(TransportStream {
+/// Returns `ITransportStream`, which is what the metadata says a connect or
+/// an accept produces -- the interface rather than this class, so that a
+/// composed stream (a TLS wrapper, say) travels the same path. A caller that
+/// wants `IInputStream`/`IOutputStream` casts from it as before.
+pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Rustwinui3loop::ITransportStream {
+    let object = ComObject::new(TransportStream {
         reg,
         closed: std::sync::atomic::AtomicBool::new(false),
-    })
-    .to_interface()
+    });
+    // A `QueryInterface` that cannot fail: `ITransportStream` is this class's
+    // default interface, so it is the vtable the object already hands out.
+    // `#[implement]` only generates the infallible conversion for types named
+    // in its list, and naming the interface there as well would buy a second,
+    // identical vtable chain to avoid one QI per accepted connection.
+    windows_core::Interface::cast(
+        &object.to_interface::<bindings::Rustwinui3loop::TransportStream>(),
+    )
+    .expect("TransportStream does not answer its own default interface")
 }
+
+// `ITransportStream` adds no members -- it names the combination of the three
+// below, so that a composed stream can be substituted anywhere ours is used.
+// The generated trait requires exactly those three, which this type already
+// implements, so there is nothing to write.
+impl ITransportStream_Impl for TransportStream_Impl {}
 
 impl IClosable_Impl for TransportStream_Impl {
     /// Releases this stream's own reference to the underlying registration;
@@ -290,12 +313,40 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every interface the metadata promises, answered.
+    ///
+    /// `requires` in metadata does not create a vtable chain, so a class can
+    /// declare an interface and refuse it at `QueryInterface` while compiling
+    /// perfectly. That is how `IInputStream` broke when `ITransportStream`
+    /// took its place as the default interface: it stopped being in any chain
+    /// and nothing said so until a consumer cast for it.
+    #[test]
+    fn a_stream_answers_everything_its_metadata_claims() {
+        use windows::Foundation::IClosable;
+        use windows::Storage::Streams::{IInputStream, IOutputStream};
+        use windows_core::Interface;
+
+        let (server, client) = tests::pipe_pair();
+        for (what, stream) in [("server", &server), ("client", &client)] {
+            assert!(stream.cast::<IInputStream>().is_ok(), "{what}: IInputStream");
+            assert!(stream.cast::<IOutputStream>().is_ok(), "{what}: IOutputStream");
+            assert!(stream.cast::<IClosable>().is_ok(), "{what}: IClosable");
+            // And the class it actually is, reachable from the interface.
+            assert!(
+                stream
+                    .cast::<bindings::Rustwinui3loop::TransportStream>()
+                    .is_ok(),
+                "{what}: TransportStream"
+            );
+        }
+    }
+
     /// Creates a connected overlapped named-pipe pair and wraps each end as
     /// a `Rustwinui3loop.TransportStream`, mirroring the setup in
     /// `stream_read_write_roundtrip`. Returns `(server, client)`.
     pub(crate) fn pipe_pair() -> (
-        bindings::Rustwinui3loop::TransportStream,
-        bindings::Rustwinui3loop::TransportStream,
+        bindings::Rustwinui3loop::ITransportStream,
+        bindings::Rustwinui3loop::ITransportStream,
     ) {
         let name = format!(
             r"\\.\pipe\comio_stream_{}_{}",

@@ -8,7 +8,9 @@ var connector = new NamedPipeConnector();
 Console.WriteLine($"ctor worked, transport = {connector.Transport}");
 
 var listener = new NamedPipeConnectionListener();
-var tcs = new TaskCompletionSource<TransportStream>();
+// The ABI hands out the interface, not the class, so a composed
+// stream -- a TLS wrapper, say -- travels the same path.
+var tcs = new TaskCompletionSource<ITransportStream>();
 
 // A real C# event, which only exists because the Event row is now well formed.
 listener.ConnectionReceived += (sender, args) => tcs.TrySetResult(args.Stream);

@@ -324,8 +324,15 @@ $l.Bind($name)
    ```
    PyWinRT는 텍스트 테이블을 내고 런타임은 바이너리를 읽는다. `winrt-table-compiler`(PyPI)가 그 사이를 잇는다 — 이게 없어서 한참 헤맸다.
 
-5. **hvsock TLS** · 중간 · *독립 트랙*
-   메모리에 "진짜 gap"으로 남은 유일한 항목(2026-11-08 보류). WinRT의 TLS는 `StreamSocket`의 `SocketProtectionLevel`에만 있고, hvsock은 **host↔guest 신뢰 경계**를 넘으므로 여기서만 실제 필요하다(로컬 파이프엔 무의미). Schannel을 `TransportStream` 위에 얹으면 `IInputStream`/`IOutputStream` 모양이 유지된다. `.winmd` 트랙과 겹치지 않으니 언제 해도 된다.
+5. ~~hvsock TLS~~ · **폐기** (2026-11-09) — 대신 **합성 가능하게** 만들었다
+
+   근거를 두 번 느슨하게 잡았다가 물러섰다. 처음엔 "WinRT에 없는 gap"을 가치 근거로 썼는데 그건 **필요조건이지 충분조건이 아니다**. 다음엔 "컨피덴셜 VM이면 뒤집힌다"고 했는데, 거기서 필요한 건 **증명(attestation) 기반 키 수립**이지 TLS가 아니다 — 이미지에 심은 인증서는 그 게스트를 읽을 수 있으면 같이 읽힌다.
+
+   **왜 불필요한가.** hvsock은 네트워크가 아니라 VMBus를 지난다. 호스트는 어차피 게스트 메모리를 읽고, 게스트끼리는 서로의 채널을 못 본다. 막아줄 중간자가 구조적으로 없다. MS 문서도 "VMBus 위로 직접 전송되므로 TLS 같은 표준 네트워크 암호화는 일반적으로 불필요 — 애플리케이션 고유의 규정 준수나 멀티테넌트 신뢰 경계가 요구하지 않는 한"이라고 적는다.
+
+   **인가는 이미 더 나은 수단이 있다.** accept가 보고하는 peer `vm_id`는 커널의 진술이라 게스트가 위조할 수 없고, 이미 `RemoteEndpoint`로 올라온다. 다만 **파티션 단위이지 프로세스 단위가 아니다** — 게스트에는 AF_HYPERV용 프로세스 경계가 없어서, Winsock을 쓸 수 있는 게스트 프로세스면 등록된 service id에 닿을 수 있다. 호스트 쪽은 HCS의 `BindSecurityDescriptor`/`ConnectSecurityDescriptor`로 프로세스 단위 제한이 가능하지만, 그건 VM을 구성하는 자리에서 설정하는 것이지 이 라이브러리가 할 일이 아니다.
+
+   **그래서 구현 대신 합성 가능하게 바꿨다.** 아래 "ABI 다듬기" 2차 참조.
 
 6. **out-of-process 활성화** · 중간 · *나중*
    WinRT에도 `OutOfProcessServer` 모델이 있다. 마샬링·아파트먼트·수명을 전부 강제로 통과시키는 값은 그대로지만, in-proc으로 3번을 먼저 끝내는 편이 낫다.
@@ -363,6 +370,25 @@ $l.Bind($name)
 ### 이 과정에서 잡은 것
 
 RDL에 `ITransport`를 추가하고 Rust `#[implement]`에는 안 넣었더니 **컴파일이 멀쩡히 통과했다.** 메타데이터는 "이 인터페이스를 구현한다"고 선언하는데 객체는 QI에서 거절하는 상태 — 소비자가 처음 시도할 때까지 아무도 모른다. `com_vtable_surface_works_for_every_transport`가 이제 `ITransport` QI를 단언한다.
+
+## ABI 다듬기 2차 — 합성 가능하게 (2026-11-09)
+
+TLS를 구현하지 않기로 했으면 **가져와서 감쌀 수 있어야** 한다. 그런데 메타데이터가 구체 클래스를 박아놔서 막혀 있었다 — 래퍼를 만들어도 우리 API를 통과할 수 없었다.
+
+| 전 | 후 |
+| --- | --- |
+| (없음) | `interface ITransportStream: IInputStream + IOutputStream + IClosable` |
+| `IConnectionReceivedArgs::Stream -> TransportStream` | `-> ITransportStream` |
+| `I*Connector::ConnectAsync -> IAsyncOperation<TransportStream>` | `<ITransportStream>` |
+| `TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>` | `<..., IConnectionReceivedArgs>` |
+
+이제 TLS 래퍼가 `ITransportStream`을 구현하면 **우리 것이 가는 모든 곳에 간다** — 커넥터 반환값, `IConnectionReceivedArgs`, `DataReader`. 이벤트 args도 인터페이스라 *합성된 리스너*(우리 걸로 accept하고 암호화된 스트림을 넘기는)가 이벤트를 띄울 수 있다. sender를 인터페이스로 둔 이유와 같은 논리다.
+
+### 여기서도 같은 함정을 밟았다
+
+`ITransportStream`이 디폴트 인터페이스가 되면서 `IInputStream`이 **어느 vtable 체인에도 없게 됐다** — 전에는 그게 디폴트라 클래스 항목이 공짜로 제공했다. 메타데이터는 여전히 `requires`로 약속하는데 QI는 거절하는 상태로, 컴파일은 멀쩡히 통과했다. **`requires`는 vtable 체인을 만들지 않는다.** `#[implement]` 목록에 직접 적어야 한다.
+
+`a_stream_answers_everything_its_metadata_claims`가 이제 스트림이 약속한 인터페이스 전부에 답하는지 QI로 확인한다. 바로 앞의 `ITransport` 건과 같은 종류의 버그였고, 이번엔 테스트가 남는다.
 
 ## 커밋 상태
 

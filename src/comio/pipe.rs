@@ -5,7 +5,7 @@
 
 use super::bindings;
 use super::bindings::Rustwinui3loop::{
-    INamedPipeConnector_Impl, ITransport_Impl, TransportStream,
+    INamedPipeConnector_Impl, ITransport_Impl, ITransportStream,
 };
 use super::stream;
 use super::tpio::{self, IoReg, Issue, OpHandle};
@@ -39,7 +39,7 @@ impl NamedPipeListener {
     /// Creates a new instance of the named pipe and asynchronously waits for
     /// a client to connect, returning the connected instance as a duplex
     /// WinRT stream.
-    pub async fn accept(&self) -> Result<TransportStream> {
+    pub async fn accept(&self) -> Result<ITransportStream> {
         let handle = unsafe {
             CreateNamedPipeW(
                 &self.name,
@@ -188,7 +188,7 @@ impl NamedPipeConnector {
     /// Opens the client end of an existing named pipe. If every server
     /// instance is momentarily busy (`ERROR_PIPE_BUSY`), waits via
     /// `WaitNamedPipeW` for one to free up and retries once.
-    pub async fn connect(name: &str) -> Result<TransportStream> {
+    pub async fn connect(name: &str) -> Result<ITransportStream> {
         let wname = HSTRING::from(name);
         let handle = match Self::open(&wname) {
             Ok(h) => h,
@@ -215,7 +215,7 @@ impl NamedPipeConnector {
 
     /// One synchronous open attempt, with no `ERROR_PIPE_BUSY` wait: the
     /// caller decides whether to wait and on whose thread.
-    pub(crate) fn try_open(wname: &HSTRING) -> Result<TransportStream> {
+    pub(crate) fn try_open(wname: &HSTRING) -> Result<ITransportStream> {
         let handle = Self::open(wname)?;
         match IoReg::register(handle, false) {
             Ok(reg) => Ok(stream::from_reg(reg)),
@@ -262,7 +262,7 @@ impl NamedPipeConnector {
     pub fn connect_async(
         &self,
         name: &windows_core::HSTRING,
-    ) -> windows_future::IAsyncOperation<TransportStream> {
+    ) -> windows_future::IAsyncOperation<ITransportStream> {
         match Self::try_open(name) {
             Ok(stream) => windows_future::IAsyncOperation::ready(Ok(stream)),
             Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
@@ -286,7 +286,7 @@ impl INamedPipeConnector_Impl for NamedPipeConnector_Impl {
     fn ConnectAsync(
         &self,
         name: &HSTRING,
-    ) -> Result<windows_future::IAsyncOperation<TransportStream>> {
+    ) -> Result<windows_future::IAsyncOperation<ITransportStream>> {
         Ok(self.connect_async(name))
     }
 }

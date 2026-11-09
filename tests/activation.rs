@@ -18,8 +18,8 @@ use rustwinui3loop::comio::activation::{
     CLSID_NAMED_PIPE_CONNECTOR, CLSID_NAMED_PIPE_CONNECTION_LISTENER,
 };
 use rustwinui3loop::comio::bindings::Rustwinui3loop::{
-    ConnectionReceivedArgs, IConnectionListener, INamedPipeConnector, INamedPipeBind,
-    ITransport, TransportStream,
+    IConnectionListener, IConnectionReceivedArgs, INamedPipeBind, INamedPipeConnector,
+    ITransport, ITransportStream,
 };
 use std::sync::mpsc;
 use windows::Foundation::TypedEventHandler;
@@ -207,7 +207,7 @@ fn com_activation_round_trip_through_the_registered_dll() {
     // not `Send`, and this crosses from the thread-pool callback thread to
     // the test's. Ownership transfers with it.
     let (accepted_tx, accepted_rx) = mpsc::channel::<usize>();
-    let handler = TypedEventHandler::<IConnectionListener, ConnectionReceivedArgs>::new(
+    let handler = TypedEventHandler::<IConnectionListener, IConnectionReceivedArgs>::new(
         move |_sender, args| {
             let stream = args.as_ref().unwrap().Stream()?;
             let _ = accepted_tx.send(stream.into_raw() as usize);
@@ -260,7 +260,7 @@ fn com_activation_round_trip_through_the_registered_dll() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("no ConnectionReceived");
     let server =
-        unsafe { TransportStream::from_raw(server_raw as *mut core::ffi::c_void) };
+        unsafe { ITransportStream::from_raw(server_raw as *mut core::ffi::c_void) };
     assert!(
         server
             .cast::<windows::Storage::Streams::IInputStream>()

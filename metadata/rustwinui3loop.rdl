@@ -56,13 +56,48 @@ mod Rustwinui3loop {
     // ---------------------------------------------------------------------
     // The stream
     //
-    // What every transport hands back, on both ends. It owns no interface of
-    // its own: it *is* a WinRT stream, so it implements the ones WinRT already
-    // declares and nothing more. Not activatable — a stream only ever comes
-    // from a connect or an accept, never from `new`.
+    // What every transport hands back, on both ends. Not activatable -- a
+    // stream only ever comes from a connect or an accept, never from `new`.
     // ---------------------------------------------------------------------
 
+    // A closable duplex stream, and the type every stream crosses this ABI
+    // as. It adds no members of its own: the three it requires are the whole
+    // contract, and naming that combination is the point.
+    //
+    // Everything returns this rather than the concrete class so the surface
+    // can be *composed*, not only consumed. Encryption is the case to have in
+    // mind, and the reason it is composed rather than built in:
+    //
+    // Hyper-V socket traffic crosses VMBus, not a network, so TLS there is
+    // redundant for the usual threat -- the host can already read guest
+    // memory, and guests cannot see each other's channels. Where the host is
+    // genuinely untrusted (a confidential VM) what is needed is attested key
+    // exchange, which plain TLS does not give. What is left is compliance
+    // mandates and multi-tenant trust boundaries: real, but somebody else's
+    // policy, and better served by their own TLS stack than by ours.
+    //
+    // So: bring a stack and wrap. A wrapper implements this interface and
+    // then flows anywhere ours does -- out of a connector, through
+    // `IConnectionReceivedArgs`, into `DataReader`. Return the concrete class
+    // instead and a composed stream has nowhere to go.
+    //
+    // Note what encryption would *not* buy on this transport. Authorization
+    // already has a better primitive: the peer `vm_id` an accept reports
+    // comes from the kernel and a guest cannot forge it. It identifies a
+    // partition and nothing finer -- a guest has no per-process boundary for
+    // AF_HYPERV, so any guest process that can reach Winsock can reach a
+    // registered service id. On the host side HCS can restrict that per
+    // process, through `BindSecurityDescriptor`/`ConnectSecurityDescriptor`,
+    // but that is configured where the VM is configured, not from here.
+    #[guid(auto)]
+    interface ITransportStream:
+        Windows::Storage::Streams::IInputStream
+        + Windows::Storage::Streams::IOutputStream
+        + Windows::Foundation::IClosable {
+    }
+
     class TransportStream {
+        ITransportStream,
         Windows::Storage::Streams::IInputStream,
         Windows::Storage::Streams::IOutputStream,
         Windows::Foundation::IClosable,
@@ -74,14 +109,17 @@ mod Rustwinui3loop {
 
     // The members every listener shares, whatever it is bound to.
     //
-    // The sender type parameter is this interface rather than any one class,
-    // which is what lets all three listeners raise the same event. Binding is
+    // Both type parameters of the event are interfaces rather than classes.
+    // The sender being one is what lets all three listeners raise the same
+    // event; the args being one is what lets something else raise it at all,
+    // which a composed listener -- one that accepts through ours and hands on
+    // an encrypted stream -- has to do. Binding is
     // deliberately absent: each transport is addressed differently, and one
     // shared bind would have to erase the address and reject the wrong shapes
     // at run time.
     #[guid(auto)]
     interface IConnectionListener {
-        event ConnectionReceived: Windows::Foundation::TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>;
+        event ConnectionReceived: Windows::Foundation::TypedEventHandler<IConnectionListener, IConnectionReceivedArgs>;
         #[get] Information: String;
     }
 
@@ -92,7 +130,7 @@ mod Rustwinui3loop {
 
     #[guid(auto)]
     interface IConnectionReceivedArgs {
-        #[get] Stream: TransportStream;
+        #[get] Stream: ITransportStream;
         #[get] RemoteEndpoint: String;
     }
 
@@ -153,17 +191,17 @@ mod Rustwinui3loop {
 
     #[guid(auto)]
     interface INamedPipeConnector {
-        fn ConnectAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+        fn ConnectAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
     }
 
     #[guid(auto)]
     interface IUnixConnector {
-        fn ConnectAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+        fn ConnectAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
     }
 
     #[guid(auto)]
     interface IHyperVConnector {
-        fn ConnectAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+        fn ConnectAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
     }
 
     #[Activatable(1)]
