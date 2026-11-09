@@ -12,10 +12,17 @@
 //! objects. The objects come from the DLL's copy of the code while this test
 //! runs the rlib's copy, so the two halves meet only across the COM ABI,
 //! exactly as a C++ or C# caller would meet them.
+//!
+//! This test also plays the installer. `comio::activation` stopped exporting
+//! `DllRegisterServer` on 2026-11-09 and writes no registry keys at all, so
+//! the COM half of activation is now something a *consumer* opts into. The
+//! keys written below are the ones that consumer would write, taken from the
+//! `ComClass` table the component publishes for exactly that purpose, and
+//! removed again however this test ends.
 #![cfg(feature = "comio")]
 
 use rustwinui3loop::comio::activation::{
-    CLSID_NAMED_PIPE_CONNECTOR, CLSID_NAMED_PIPE_CONNECTION_LISTENER,
+    CLASSES, CLSID_NAMED_PIPE_CONNECTOR, CLSID_NAMED_PIPE_CONNECTION_LISTENER, clsid_key,
 };
 use rustwinui3loop::comio::bindings::Rustwinui3loop::{
     IConnectionListener, IConnectionReceivedArgs, INamedPipeBind, INamedPipeConnector,
@@ -23,9 +30,10 @@ use rustwinui3loop::comio::bindings::Rustwinui3loop::{
 };
 use std::sync::mpsc;
 use windows::Foundation::TypedEventHandler;
-use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE, S_FALSE, S_OK};
+use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE};
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW,
 };
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -41,8 +49,6 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_core::{HRESULT, HSTRING, IUnknown, Interface, PCSTR};
-
-type DllEntry = unsafe extern "system" fn() -> HRESULT;
 
 /// Where the cdylib lands.
 ///
@@ -114,39 +120,106 @@ fn ensure_dll() -> std::path::PathBuf {
     path
 }
 
-/// Loads the DLL and calls one of its exported `Dll*` entry points.
-///
-/// Going through `GetProcAddress` rather than calling the statically linked
-/// copy is the whole point: the registration has to be performed *by the
-/// module being registered*, because `DllRegisterServer` writes the path of
-/// whichever module it runs in. Called from the rlib's copy it would
-/// register this test executable, which COM cannot load.
-unsafe fn call_entry(module: HMODULE, name: &[u8]) -> HRESULT {
-    let addr = unsafe { GetProcAddress(module, PCSTR(name.as_ptr())) }
-        .unwrap_or_else(|| panic!("{} not exported", String::from_utf8_lossy(name)));
-    let f: DllEntry = unsafe { core::mem::transmute(addr) };
-    unsafe { f() }
-}
-
-/// Unregisters on the way out, however the test ends.
+/// The CLSID keys an installer would write, written by the test instead.
 ///
 /// This is the one test in the tree that writes to the live registry
-/// (`HKEY_CURRENT_USER\Software\Classes`, under this crate's own CLSIDs —
-/// no elevation, nothing machine-wide). A panic mid-test still runs this,
+/// (`HKEY_CURRENT_USER\Software\Classes`, under this crate's own CLSIDs — no
+/// elevation, nothing machine-wide). A panic mid-test still runs the `Drop`,
 /// so a failed run does not leave class registrations pointing at a
 /// `target/debug` path that may later be deleted.
-struct Registered(HMODULE);
+///
+/// Writing it here rather than calling an export is simpler than what it
+/// replaced, and the reason is worth recording. `DllRegisterServer` had to
+/// run *inside* the DLL: the server path it recorded was the path of whichever
+/// module it ran in, so calling the statically linked copy would have
+/// registered this test executable, which COM cannot load. A caller writing
+/// the keys has the path in hand and that whole hazard disappears.
+///
+/// Every class in [`CLASSES`] is registered, not only the two this test
+/// activates, because a half-registered component is not a state any real
+/// consumer would produce.
+struct Registered(Vec<String>);
+
+impl Registered {
+    fn install(dll: &Path) -> Self {
+        let server = dll.to_string_lossy().into_owned();
+        let mut written = Vec::with_capacity(CLASSES.len());
+        for class in CLASSES {
+            let base = format!("Software\\Classes\\CLSID\\{}", clsid_key(&class.clsid));
+            unsafe {
+                let key = create_key(&base);
+                // Conventional, and the one thing `ComClass::description`
+                // exists for now that the component writes no keys itself.
+                set_sz(key, PCWSTR::null(), class.description);
+                let _ = RegCloseKey(key);
+
+                let server_key = create_key(&format!("{base}\\InprocServer32"));
+                // The value COM actually loads.
+                set_sz(server_key, PCWSTR::null(), &server);
+                set_sz(
+                    server_key,
+                    PCWSTR(windows_core::w!("ThreadingModel").as_ptr()),
+                    "Both",
+                );
+                let _ = RegCloseKey(server_key);
+            }
+            written.push(base);
+        }
+        Self(written)
+    }
+}
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        let hr = unsafe { call_entry(self.0, b"DllUnregisterServer\0") };
-        if hr.is_err() {
-            // Cannot panic here — this may already be unwinding — but a
-            // silent failure would leave class registrations behind that
-            // point at a build directory, so at least say so.
-            eprintln!("DllUnregisterServer failed: {hr:?}; HKCU class keys may remain");
+        for path in &self.0 {
+            let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(path)) };
+            if status.is_err() {
+                // Cannot panic here — this may already be unwinding — but a
+                // silent failure would leave class registrations behind that
+                // point at a build directory, so at least say so.
+                eprintln!("removing {path} failed: {status:?}; HKCU class keys may remain");
+            }
         }
     }
+}
+
+/// # Safety
+///
+/// The returned key is open and must be closed by the caller.
+unsafe fn create_key(path: &str) -> HKEY {
+    let mut key = HKEY::default();
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(path),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    assert!(status.is_ok(), "RegCreateKeyExW({path}): {status:?}");
+    key
+}
+
+/// Writes a `REG_SZ`. A null `name` is the key's default value.
+///
+/// # Safety
+///
+/// `key` must be open for writing and `name` must be null or a valid
+/// null-terminated wide string.
+unsafe fn set_sz(key: HKEY, name: PCWSTR, value: &str) {
+    // `REG_SZ` is counted in bytes and the count must include the
+    // terminator, which `encode_utf16` does not emit.
+    let mut bytes = Vec::with_capacity((value.len() + 1) * 2);
+    for u in value.encode_utf16().chain(core::iter::once(0u16)) {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    let status = unsafe { RegSetValueExW(key, name, None, REG_SZ, Some(&bytes)) };
+    assert!(status.is_ok(), "RegSetValueExW: {status:?}");
 }
 
 /// One test rather than several: registration is process-wide and
@@ -162,39 +235,21 @@ fn com_activation_round_trip_through_the_registered_dll() {
         .expect("CoInitializeEx");
 
     let module = unsafe { LoadLibraryW(&HSTRING::from(path.as_os_str())) }.expect("LoadLibraryW");
-    // `S_OK` means both halves registered; `S_FALSE` means the machine-wide
-    // WinRT half was denied because this run is not elevated, leaving only
-    // the per-user COM half in place. Both are successes, and which one came
-    // back has to agree with what is actually in the registry — so a silent
-    // half-registration cannot pass.
-    let registered = unsafe { call_entry(module, b"DllRegisterServer\0") };
-    assert!(
-        registered == S_OK || registered == S_FALSE,
-        "DllRegisterServer: {registered:?}"
-    );
-    let _registered = Registered(module);
-    assert_eq!(
-        winrt_key_present("Rustwinui3loop.NamedPipeConnector"),
-        registered == S_OK,
-        "DllRegisterServer said {registered:?} but the registry disagrees"
-    );
+    let _registered = Registered::install(&path);
 
     // --- The listener, created the way any COM caller would ---------------
-    // The failure message carries the registration state, because
-    // `REGDB_E_CLASSNOTREG` here means the keys this test just wrote are not
-    // the keys COM read — which hive the DLL registered into is the first
-    // thing worth knowing, and an elevated `regsvr32` run beforehand writes
-    // into a different one.
+    // The failure message carries the registry state, because
+    // `REGDB_E_CLASSNOTREG` here means the keys just written are not the keys
+    // COM read — which hive was consulted is the first thing worth knowing,
+    // and a stale elevated `regsvr32` from an older build wrote into a
+    // different one.
     let listener: IUnknown =
         unsafe { CoCreateInstance(&CLSID_NAMED_PIPE_CONNECTION_LISTENER, None, CLSCTX_INPROC_SERVER) }
             .unwrap_or_else(|e| {
                 panic!(
                     "CoCreateInstance(listener): {e:?}
-                       DllRegisterServer returned {registered:?}
-                       HKCU CLSID key present: {}
-                       HKLM ActivatableClassId key present: {}",
+                       HKCU InprocServer32 key present: {}",
                     com_key_present(&CLSID_NAMED_PIPE_CONNECTION_LISTENER),
-                    winrt_key_present("Rustwinui3loop.NamedPipeConnector"),
                 )
             });
 
@@ -279,9 +334,9 @@ fn com_activation_round_trip_through_the_registered_dll() {
     winrt_activation_factory(module);
     ro_activate_instance_reg_free(&path);
 
-    // The module stays loaded on purpose: `DllCanUnloadNow` returns S_FALSE,
-    // and objects created above are still alive in this scope. Dropping the
-    // reference `LoadLibraryW` took is all this undoes.
+    // The module stays loaded on purpose: there is no `DllCanUnloadNow` to
+    // ask, and objects created above are still alive in this scope. Dropping
+    // the reference `LoadLibraryW` took is all this undoes.
     drop(_registered);
     unsafe { FreeLibrary(module) }.expect("FreeLibrary");
 }
@@ -467,8 +522,6 @@ fn ro_activate_instance_reg_free(dll: &Path) {
     unsafe { ReleaseActCtx(handle) };
 }
 
-const WINRT_ROOT: &str = "SOFTWARE\\Microsoft\\WindowsRuntime\\ActivatableClassId";
-
 /// Whether the per-user COM registration for `clsid` exists — the key
 /// `CoCreateInstance` would have read.
 fn com_key_present(clsid: &windows_core::GUID) -> bool {
@@ -482,20 +535,6 @@ fn com_key_present(clsid: &windows_core::GUID) -> bool {
         let opened =
             RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(path), None, KEY_READ, &mut key)
                 .is_ok();
-        if opened {
-            let _ = RegCloseKey(key);
-        }
-        opened
-    }
-}
-
-/// Whether the machine registration for `name` exists, read directly rather
-/// than inferred from an elevation check.
-fn winrt_key_present(name: &str) -> bool {
-    unsafe {
-        let mut key = HKEY::default();
-        let path = HSTRING::from(format!("{WINRT_ROOT}\\{name}"));
-        let opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE, &path, None, KEY_READ, &mut key).is_ok();
         if opened {
             let _ = RegCloseKey(key);
         }

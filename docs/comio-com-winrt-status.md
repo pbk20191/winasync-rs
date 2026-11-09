@@ -26,7 +26,7 @@
 | 산출물 | 소비자가 프로젝션을 만들 때 쓰는 파일 | `metadata/rustwinui3loop.winmd` |
 | 바인딩 | `_Impl` 트레이트 + vtable. 체크인됨 | `src/comio/bindings.rs` |
 | 구현 | 위 트레이트를 구현 | `listener.rs` / `connector.rs` / `pipe.rs` / `unix.rs` / `hvsock.rs` / `stream.rs` |
-| 활성화 | CLSID로 `CoCreateInstance`(HKCU) + 런타임 클래스 이름으로 `RoActivateInstance`(HKLM) | `activation.rs` |
+| 활성화 | 런타임 클래스 이름으로 `RoActivateInstance`(reg-free 매니페스트). CLSID `CoCreateInstance`는 소비자가 직접 등록하면 | `activation.rs` |
 
 ### 왜 메타데이터가 먼저여야 했나
 
@@ -93,9 +93,7 @@ fn ConnectAsync(&self, name: &HSTRING) -> Result<IAsyncOperation<TransportStream
 
 ```text
 regsvr32 /s rustwinui3loop.dll
-TlbImp.exe "%LOCALAPPDATA%
-ustwinui3loop
-ustwinui3loop.tlb" ^
+TlbImp.exe "%LOCALAPPDATA%\rustwinui3loop\rustwinui3loop.tlb" ^
     /out:Rustwinui3loop.Interop.dll /namespace:Rustwinui3loop
 ```
 
@@ -110,7 +108,7 @@ $l.Bind($name)
 
 **같이 사라진 것 하나 — `CoIncrementMTAUsage`.** `SinkSet::advise`가 첫 `Advise` 때 불러서 프로세스에 MTA가 살아 있게 했다. 아래 "측정으로 밝혀진 것"의 `CO_E_NOTINITIALIZED`가 그 이야기인데, 지금은 아파트먼트를 넘는 콜백 경로가 없어서 필요가 없다. `.winmd` 이벤트 경로가 아파트먼트를 다시 넘게 되면 **같은 문제가 같은 모양으로 돌아온다**. 그때 다시 만들 것.
 
-**낡은 등록.** 이전 빌드로 등록한 적이 있으면 `Interface\{…}`와 `TypeLib` 키가 레지스트리에 남는다. 지금 바이너리는 그 IID들을 모르므로 지우지 못한다. 무해하다 — 옛 바이너리로 `regsvr32 /u` 하거나 그냥 둬도 된다.
+**낡은 등록.** 이전 빌드로 등록한 적이 있으면 `Interface\{…}`·`TypeLib`·`CLSID` 키가 레지스트리에 남는다. 지금 바이너리는 지우지 못한다 — 그 IID들을 모르고, 애초에 `DllUnregisterServer`가 없다(6번). 무해하다. 치우려면 옛 바이너리로 `regsvr32 /u` 하거나 `HKCU\Software\Classes\CLSID` 아래 해당 키를 직접 지우면 된다.
 
 ## 호스트별 도달 범위
 
@@ -260,7 +258,7 @@ $l.Bind($name)
 
    `activation::manifest()`가 `CLASSES`에서 매니페스트를 생성한다(이름이 어긋날 수 없게). 통합 테스트가 **승격 없이 전 구간을 돈다**: 액티베이션 컨텍스트 *없이* 먼저 실패하는지 확인(컨트롤)하고, 올린 뒤 활성화해서 `GetRuntimeClassName`과 `IStreamConnector`까지 본다.
 
-   `register_winrt_under`는 남긴다 — 키 자체는 맞고, TrustedInstaller 권한으로 도는 인스톨러라면 쓸 수 있다. `DllRegisterServer`는 계속 호출하고 거부되면 `S_FALSE`를 돌려준다(= 사실상 항상).
+   ~~`register_winrt_under`는 남긴다~~ — **지웠다. 아래 6번 참조.**
 
 4. ~~Python end-to-end 검증~~ · **완료** (2026-11-09) — **수용 기준 달성**
 
@@ -334,7 +332,38 @@ $l.Bind($name)
 
    **그래서 구현 대신 합성 가능하게 바꿨다.** 아래 "ABI 다듬기" 2차 참조.
 
-6. **out-of-process 활성화** · 중간 · *나중*
+6. ~~자기등록 export~~ · **삭제** (2026-11-09) — ProgID와 같은 거짓말이었다
+
+   export 다섯 개를 호출자 기준으로 다시 봤다.
+
+   | export | 실제 호출자 | 판정 |
+   | --- | --- | --- |
+   | `DllGetActivationFactory` | `RoActivateInstance` → Python·C# | **유지** — `.winmd`를 의미 있게 만드는 유일한 export |
+   | `DllGetClassObject` | `CoCreateInstance` | **유지** — 18줄, 아래 참조 |
+   | `DllCanUnloadNow` | `CoFreeUnusedLibraries` | **삭제** |
+   | `DllRegisterServer` | `regsvr32` | **삭제** |
+   | `DllUnregisterServer` | `regsvr32 /u` | **삭제** |
+
+   **`DllRegisterServer`가 왜 거짓말인가.** 3번에서 확인했듯 WinRT 절반은 **항상** `E_ACCESSDENIED`고 우리가 `S_FALSE`로 덮었다. 즉 성공처럼 보이는 호출이 실제로 남기는 건 HKCU CLSID 키뿐이다. 그런데 그 CLSID로 객체를 만들어도 **쓰려면 WinRT 타입이 필요하다** — `ITransportStream`은 `IInputStream`/`IOutputStream`/`IClosable`을 요구하고, 반환은 `IAsyncOperation<ITransportStream>`, 이벤트는 `TypedEventHandler<,>`다. 그걸 손으로 선언할 사람이면 이미 `.winmd`를 읽고 있고, 그러면 `RoGetActivationFactory`를 쓴다. 실제로 동작을 증명한 소비자(`python/`, `csharp/`)는 **둘 다 reg-free**다. CLSID 경로의 소비자는 자기 테스트가 유일했다 — 순환 논법이다.
+
+   IDispatch를 지웠을 때 ProgID가 거짓이 된 것과 **같은 종류의 거짓이 한 단계 위에서** 벌어지고 있었다. 같은 이유로 같이 지웠다. (자기등록 자체도 MS가 10년째 인스톨러를 떼어내고 있는 방식이다 — MSIX와 reg-free가 대체재다.)
+
+   **`DllCanUnloadNow`는 왜 같이 지우나.** 무조건 `S_FALSE`를 돌려주고 있었는데 — export를 **안 하면 동작이 똑같다**. `CoFreeUnusedLibraries`/`RoFreeUnusedLibraries`는 `GetProcAddress`로 찾고, 없는 모듈은 언로드를 시도하지 않는다. 거절을 부재가 이미 표현하고 있으니 함수는 의식(ceremony)이었다.
+
+   **`DllGetClassObject`는 왜 남기나.** WinRT 인터페이스는 *COM 인터페이스이기도 하다.* CLSID를 **직접 등록한** 소비자는 액티베이션 컨텍스트 없이 `CoCreateInstance`로 같은 vtable을 받는다. 18줄이고, 지우는 건 능력을 없애는 것이지만 자기등록을 지우는 건 **"머신 상태를 우리가 관리한다"는 주장만 거둬들이는** 것이다. 컴포넌트는 이제 자기를 *기술*할 뿐 머신을 건드리지 않는다 — `manifest()`가 reg-free 매니페스트를 생성하고, `ComClass`(CLSID·이름·설명)와 `clsid_key()`가 인스톨러에게 필요한 걸 전부 공개한다.
+
+   **증명은 그대로다.** 통합 테스트가 그 인스톨러 역할을 한다: 여섯 클래스 전부의 HKCU 키를 직접 쓰고, `CoCreateInstance`로 전 구간을 돌고, 어떻게 끝나든 `Drop`에서 지운다. 오히려 단순해졌다 — `DllRegisterServer`는 *자기가 실행되는 모듈*의 경로를 기록해서 반드시 DLL 안에서 돌아야 했는데(rlib 복사본을 부르면 테스트 exe가 등록된다), 호출자가 쓰면 경로는 그냥 인자다.
+
+   남은 export는 정확히 둘이다:
+
+   ```text
+   1  DllGetActivationFactory
+   2  DllGetClassObject
+   ```
+
+   Rust 테스트 142 + 1 통과, clippy 0, `cargo doc` 0.
+
+7. **out-of-process 활성화** · 중간 · *나중*
    WinRT에도 `OutOfProcessServer` 모델이 있다. 마샬링·아파트먼트·수명을 전부 강제로 통과시키는 값은 그대로지만, in-proc으로 3번을 먼저 끝내는 편이 낫다.
 
 ### 폐기 (2026-11-09 방향 결정에 따라)

@@ -1,15 +1,20 @@
-; Export list for the cdylib, which is the COM in-process server.
+; Export list for the cdylib, which is the in-process activation server.
 ;
-; Rust already exports these four through `#[unsafe(no_mangle)]`, so this
-; file is not what makes them reachable — `PRIVATE` is. Without it MSVC warns
-; LNK4104 on each one: these names are only ever reached by `GetProcAddress`
-; from the COM loader, never linked against, so putting them in the generated
-; import library would invite a caller to bind to them statically. `PRIVATE`
-; keeps them in the DLL's export table and out of the .lib.
+; Rust already exports these through `#[unsafe(no_mangle)]`, so this file is
+; not what makes them reachable — `PRIVATE` is. Without it MSVC warns LNK4104
+; on each one: these names are only ever reached by `GetProcAddress` from the
+; COM and WinRT loaders, never linked against, so putting them in the
+; generated import library would invite a caller to bind to them statically.
+; `PRIVATE` keeps them in the DLL's export table and out of the .lib.
 ;
-; See src/comio/activation.rs for what each one does.
+; Listing a name here does not restrict the export table — `no_mangle` alone
+; is enough to be exported, which is why `DllGetActivationFactory` was
+; reachable for a while without appearing here. It is listed now so it gets
+; the same `PRIVATE` treatment as the rest.
+;
+; Self-registration (`DllRegisterServer` / `DllUnregisterServer`) and
+; `DllCanUnloadNow` were removed on 2026-11-09; src/comio/activation.rs has
+; the reasoning for each.
 EXPORTS
-    DllGetClassObject   PRIVATE
-    DllCanUnloadNow     PRIVATE
-    DllRegisterServer   PRIVATE
-    DllUnregisterServer PRIVATE
+    DllGetActivationFactory PRIVATE
+    DllGetClassObject       PRIVATE
