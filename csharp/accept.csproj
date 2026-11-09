@@ -10,7 +10,7 @@
          own manifest, so there is no registry read and no CreateActCtx. -->
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <!-- Project the third-party namespace out of the winmd referenced below. -->
-    <CsWinRTIncludes>Rustwinui3loop</CsWinRTIncludes>
+    <CsWinRTIncludes>Pbk20191</CsWinRTIncludes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -20,8 +20,8 @@
   <ItemGroup>
     <!-- CsWinRT turns every .winmd on the reference path into a projection
          input, then removes it from the compiler references. -->
-    <Reference Include="rustwinui3loop-metadata">
-      <HintPath>../metadata/rustwinui3loop.winmd</HintPath>
+    <Reference Include="Pbk20191.WinAsync.Comio">
+      <HintPath>../metadata/Pbk20191.WinAsync.Comio.winmd</HintPath>
       <IsWinMDFile>true</IsWinMDFile>
       <Private>false</Private>
     </Reference>
@@ -32,7 +32,7 @@
        resolution examines it and fails with "PE image does not have
        metadata": it is a native DLL, not a managed one. -->
   <Target Name="CopyComponent" AfterTargets="Build">
-    <Copy SourceFiles="../target/debug/rustwinui3loop.dll"
+    <Copy SourceFiles="../target/debug/winasync.dll"
           DestinationFolder="$(OutDir)" />
   </Target>
 </Project>

@@ -8,1695 +8,1790 @@
     clippy::all
 )]
 
-pub mod Rustwinui3loop {
-    #[repr(transparent)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct ConnectionReceivedArgs(windows_core::IUnknown);
-    windows_core::imp::interface_hierarchy!(
-        ConnectionReceivedArgs,
-        windows_core::IUnknown,
-        windows_core::IInspectable,
-        IConnectionReceivedArgs
-    );
-    impl ConnectionReceivedArgs {
-        pub fn Stream(&self) -> windows_core::Result<ITransportStream> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Stream)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+pub mod Pbk20191 {
+    pub mod WinAsync {
+        pub mod Comio {
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct ConnectionReceivedArgs(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
+                ConnectionReceivedArgs,
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                IConnectionReceivedArgs
+            );
+            impl ConnectionReceivedArgs {
+                pub fn Stream(&self) -> windows_core::Result<ITransportStream> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Stream)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn RemoteEndpoint(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteEndpoint)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
             }
-        }
-        pub fn RemoteEndpoint(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).RemoteEndpoint)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
+            impl windows_core::RuntimeType for ConnectionReceivedArgs {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, IConnectionReceivedArgs>();
             }
-        }
-    }
-    impl windows_core::RuntimeType for ConnectionReceivedArgs {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_class::<Self, IConnectionReceivedArgs>();
-    }
-    unsafe impl windows_core::Interface for ConnectionReceivedArgs {
-        type Vtable = <IConnectionReceivedArgs as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID = <IConnectionReceivedArgs as windows_core::Interface>::IID;
-    }
-    impl windows_core::RuntimeName for ConnectionReceivedArgs {
-        const NAME: &'static str = "Rustwinui3loop.ConnectionReceivedArgs";
-    }
-    #[repr(transparent)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct HyperVConnectionListener(windows_core::IUnknown);
-    windows_core::imp::interface_hierarchy!(
-        HyperVConnectionListener,
-        windows_core::IUnknown,
-        windows_core::IInspectable,
-        IConnectionListener
-    );
-    windows_core::imp::required_hierarchy!(
-        HyperVConnectionListener,
-        windows::Foundation::IClosable,
-        IHyperVBind,
-        ITransport
-    );
-    impl HyperVConnectionListener {
-        pub fn new() -> windows_core::Result<Self> {
-            Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
-        }
-        fn IActivationFactory<
-            R,
-            F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
-        >(
-            callback: F,
-        ) -> windows_core::Result<R> {
-            static SHARED: windows_core::imp::FactoryCache<
+            unsafe impl windows_core::Interface for ConnectionReceivedArgs {
+                type Vtable = <IConnectionReceivedArgs as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID =
+                    <IConnectionReceivedArgs as windows_core::Interface>::IID;
+            }
+            impl windows_core::RuntimeName for ConnectionReceivedArgs {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.ConnectionReceivedArgs";
+            }
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct HyperVConnectionListener(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
                 HyperVConnectionListener,
-                windows_core::imp::IGenericFactory,
-            > = windows_core::imp::FactoryCache::new();
-            SHARED.call(callback)
-        }
-        pub fn Close(&self) -> windows_core::Result<()> {
-            let this = &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
-            unsafe {
-                (windows_core::Interface::vtable(this).Close)(windows_core::Interface::as_raw(this))
-                    .ok()
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                IConnectionListener
+            );
+            windows_core::imp::required_hierarchy!(
+                HyperVConnectionListener,
+                windows::Foundation::IClosable,
+                IHyperVBind,
+                ITransport
+            );
+            impl HyperVConnectionListener {
+                pub fn new() -> windows_core::Result<Self> {
+                    Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+                }
+                fn IActivationFactory<
+                    R,
+                    F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+                >(
+                    callback: F,
+                ) -> windows_core::Result<R> {
+                    static SHARED: windows_core::imp::FactoryCache<
+                        HyperVConnectionListener,
+                        windows_core::imp::IGenericFactory,
+                    > = windows_core::imp::FactoryCache::new();
+                    SHARED.call(callback)
+                }
+                pub fn Close(&self) -> windows_core::Result<()> {
+                    let this =
+                        &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Close)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
+                where
+                    P0: windows_core::Param<
+                        windows::Foundation::TypedEventHandler<
+                            IConnectionListener,
+                            IConnectionReceivedArgs,
+                        >,
+                    >,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectionReceived)(
+                            windows_core::Interface::as_raw(this),
+                            handler.param().abi(),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).RemoveConnectionReceived)(
+                            windows_core::Interface::as_raw(this),
+                            token,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Information)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn BindEndpointAsync(
+                    &self,
+                    endpoint: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = &windows_core::Interface::cast::<IHyperVBind>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindEndpointAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(endpoint),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn BindServiceNameAsync(
+                    &self,
+                    servicename: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = &windows_core::Interface::cast::<IHyperVBind>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindServiceNameAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(servicename),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = &windows_core::Interface::cast::<ITransport>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Transport)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
             }
-        }
-        pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
-        where
-            P0: windows_core::Param<
-                windows::Foundation::TypedEventHandler<
-                    IConnectionListener,
-                    IConnectionReceivedArgs,
-                >,
-            >,
-        {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectionReceived)(
-                    windows_core::Interface::as_raw(this),
-                    handler.param().abi(),
-                    &mut result__,
-                )
-                .map(|| result__)
+            impl windows_core::RuntimeType for HyperVConnectionListener {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, IConnectionListener>();
             }
-        }
-        pub fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()> {
-            let this = self;
-            unsafe {
-                (windows_core::Interface::vtable(this).RemoveConnectionReceived)(
-                    windows_core::Interface::as_raw(this),
-                    token,
-                )
-                .ok()
+            unsafe impl windows_core::Interface for HyperVConnectionListener {
+                type Vtable = <IConnectionListener as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID =
+                    <IConnectionListener as windows_core::Interface>::IID;
             }
-        }
-        pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Information)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
+            impl windows_core::RuntimeName for HyperVConnectionListener {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.HyperVConnectionListener";
             }
-        }
-        pub fn BindEndpointAsync(
-            &self,
-            endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction> {
-            let this = &windows_core::Interface::cast::<IHyperVBind>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).BindEndpointAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(endpoint),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-        pub fn BindServiceNameAsync(
-            &self,
-            servicename: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction> {
-            let this = &windows_core::Interface::cast::<IHyperVBind>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).BindServiceNameAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(servicename),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-        pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = &windows_core::Interface::cast::<ITransport>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Transport)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeType for HyperVConnectionListener {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_class::<Self, IConnectionListener>();
-    }
-    unsafe impl windows_core::Interface for HyperVConnectionListener {
-        type Vtable = <IConnectionListener as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID = <IConnectionListener as windows_core::Interface>::IID;
-    }
-    impl windows_core::RuntimeName for HyperVConnectionListener {
-        const NAME: &'static str = "Rustwinui3loop.HyperVConnectionListener";
-    }
-    #[repr(transparent)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct HyperVConnector(windows_core::IUnknown);
-    windows_core::imp::interface_hierarchy!(
-        HyperVConnector,
-        windows_core::IUnknown,
-        windows_core::IInspectable,
-        ITransport
-    );
-    windows_core::imp::required_hierarchy!(HyperVConnector, IHyperVConnector);
-    impl HyperVConnector {
-        pub fn new() -> windows_core::Result<Self> {
-            Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
-        }
-        fn IActivationFactory<
-            R,
-            F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
-        >(
-            callback: F,
-        ) -> windows_core::Result<R> {
-            static SHARED: windows_core::imp::FactoryCache<
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct HyperVConnector(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
                 HyperVConnector,
-                windows_core::imp::IGenericFactory,
-            > = windows_core::imp::FactoryCache::new();
-            SHARED.call(callback)
-        }
-        pub fn ConnectAsync(
-            &self,
-            endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
-            let this = &windows_core::Interface::cast::<IHyperVConnector>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(endpoint),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-        pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Transport)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeType for HyperVConnector {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_class::<Self, ITransport>();
-    }
-    unsafe impl windows_core::Interface for HyperVConnector {
-        type Vtable = <ITransport as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID = <ITransport as windows_core::Interface>::IID;
-    }
-    impl windows_core::RuntimeName for HyperVConnector {
-        const NAME: &'static str = "Rustwinui3loop.HyperVConnector";
-    }
-    windows_core::imp::define_interface!(
-        IConnectionListener,
-        IConnectionListener_Vtbl,
-        0x43e2248d_33c8_5d43_bce3_a8690dd65ec7
-    );
-    impl windows_core::RuntimeType for IConnectionListener {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        IConnectionListener,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl IConnectionListener {
-        pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
-        where
-            P0: windows_core::Param<
-                windows::Foundation::TypedEventHandler<
-                    IConnectionListener,
-                    IConnectionReceivedArgs,
-                >,
-            >,
-        {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectionReceived)(
-                    windows_core::Interface::as_raw(this),
-                    handler.param().abi(),
-                    &mut result__,
-                )
-                .map(|| result__)
-            }
-        }
-        pub fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()> {
-            let this = self;
-            unsafe {
-                (windows_core::Interface::vtable(this).RemoveConnectionReceived)(
-                    windows_core::Interface::as_raw(this),
-                    token,
-                )
-                .ok()
-            }
-        }
-        pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Information)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeName for IConnectionListener {
-        const NAME: &'static str = "Rustwinui3loop.IConnectionListener";
-    }
-    pub trait IConnectionListener_Impl: windows_core::IUnknownImpl {
-        fn ConnectionReceived(
-            &self,
-            handler: windows_core::Ref<
-                '_,
-                windows::Foundation::TypedEventHandler<
-                    IConnectionListener,
-                    IConnectionReceivedArgs,
-                >,
-            >,
-        ) -> windows_core::Result<i64>;
-        fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()>;
-        fn Information(&self) -> windows_core::Result<windows_core::HSTRING>;
-    }
-    impl IConnectionListener_Vtbl {
-        pub const fn new<Identity: IConnectionListener_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn ConnectionReceived<
-                Identity: IConnectionListener_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                handler: *mut core::ffi::c_void,
-                result__: *mut i64,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IConnectionListener_Impl::ConnectionReceived(
-                        this,
-                        core::mem::transmute_copy(&handler),
-                    ) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            windows_core::HRESULT(0)
-                        }
-                        Err(err) => err.into(),
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                ITransport
+            );
+            windows_core::imp::required_hierarchy!(HyperVConnector, IHyperVConnector);
+            impl HyperVConnector {
+                pub fn new() -> windows_core::Result<Self> {
+                    Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+                }
+                fn IActivationFactory<
+                    R,
+                    F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+                >(
+                    callback: F,
+                ) -> windows_core::Result<R> {
+                    static SHARED: windows_core::imp::FactoryCache<
+                        HyperVConnector,
+                        windows_core::imp::IGenericFactory,
+                    > = windows_core::imp::FactoryCache::new();
+                    SHARED.call(callback)
+                }
+                pub fn ConnectAsync(
+                    &self,
+                    endpoint: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>
+                {
+                    let this = &windows_core::Interface::cast::<IHyperVConnector>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(endpoint),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Transport)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
                     }
                 }
             }
-            unsafe extern "system" fn RemoveConnectionReceived<
-                Identity: IConnectionListener_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                token: i64,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    IConnectionListener_Impl::RemoveConnectionReceived(this, token).into()
-                }
+            impl windows_core::RuntimeType for HyperVConnector {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, ITransport>();
             }
-            unsafe extern "system" fn Information<
-                Identity: IConnectionListener_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IConnectionListener_Impl::Information(this) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
-                        }
-                        Err(err) => err.into(),
+            unsafe impl windows_core::Interface for HyperVConnector {
+                type Vtable = <ITransport as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID = <ITransport as windows_core::Interface>::IID;
+            }
+            impl windows_core::RuntimeName for HyperVConnector {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.HyperVConnector";
+            }
+            windows_core::imp::define_interface!(
+                IConnectionListener,
+                IConnectionListener_Vtbl,
+                0xd0e8ff19_ba8b_5263_9551_0f052dada51b
+            );
+            impl windows_core::RuntimeType for IConnectionListener {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IConnectionListener,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IConnectionListener {
+                pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
+                where
+                    P0: windows_core::Param<
+                        windows::Foundation::TypedEventHandler<
+                            IConnectionListener,
+                            IConnectionReceivedArgs,
+                        >,
+                    >,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectionReceived)(
+                            windows_core::Interface::as_raw(this),
+                            handler.param().abi(),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).RemoveConnectionReceived)(
+                            windows_core::Interface::as_raw(this),
+                            token,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Information)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
                     }
                 }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, IConnectionListener, OFFSET>(
-                ),
-                ConnectionReceived: ConnectionReceived::<Identity, OFFSET>,
-                RemoveConnectionReceived: RemoveConnectionReceived::<Identity, OFFSET>,
-                Information: Information::<Identity, OFFSET>,
+            impl windows_core::RuntimeName for IConnectionListener {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IConnectionListener";
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<IConnectionListener as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct IConnectionListener_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub ConnectionReceived: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            *mut i64,
-        ) -> windows_core::HRESULT,
-        pub RemoveConnectionReceived:
-            unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
-        pub Information: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    windows_core::imp::define_interface!(
-        IConnectionReceivedArgs,
-        IConnectionReceivedArgs_Vtbl,
-        0xc57ac1e0_4d8e_5a55_9a52_9dacf2ceac2e
-    );
-    impl windows_core::RuntimeType for IConnectionReceivedArgs {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        IConnectionReceivedArgs,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl IConnectionReceivedArgs {
-        pub fn Stream(&self) -> windows_core::Result<ITransportStream> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Stream)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            pub trait IConnectionListener_Impl: windows_core::IUnknownImpl {
+                fn ConnectionReceived(
+                    &self,
+                    handler: windows_core::Ref<
+                        '_,
+                        windows::Foundation::TypedEventHandler<
+                            IConnectionListener,
+                            IConnectionReceivedArgs,
+                        >,
+                    >,
+                ) -> windows_core::Result<i64>;
+                fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()>;
+                fn Information(&self) -> windows_core::Result<windows_core::HSTRING>;
             }
-        }
-        pub fn RemoteEndpoint(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).RemoteEndpoint)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeName for IConnectionReceivedArgs {
-        const NAME: &'static str = "Rustwinui3loop.IConnectionReceivedArgs";
-    }
-    pub trait IConnectionReceivedArgs_Impl: windows_core::IUnknownImpl {
-        fn Stream(&self) -> windows_core::Result<ITransportStream>;
-        fn RemoteEndpoint(&self) -> windows_core::Result<windows_core::HSTRING>;
-    }
-    impl IConnectionReceivedArgs_Vtbl {
-        pub const fn new<Identity: IConnectionReceivedArgs_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn Stream<
-                Identity: IConnectionReceivedArgs_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IConnectionReceivedArgs_Impl::Stream(this) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl IConnectionListener_Vtbl {
+                pub const fn new<Identity: IConnectionListener_Impl, const OFFSET: isize>() -> Self
+                {
+                    unsafe extern "system" fn ConnectionReceived<
+                        Identity: IConnectionListener_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        handler: *mut core::ffi::c_void,
+                        result__: *mut i64,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IConnectionListener_Impl::ConnectionReceived(
+                                this,
+                                core::mem::transmute_copy(&handler),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    unsafe extern "system" fn RemoveConnectionReceived<
+                        Identity: IConnectionListener_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        token: i64,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            IConnectionListener_Impl::RemoveConnectionReceived(this, token).into()
+                        }
+                    }
+                    unsafe extern "system" fn Information<
+                        Identity: IConnectionListener_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IConnectionListener_Impl::Information(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            IConnectionListener,
+                            OFFSET,
+                        >(),
+                        ConnectionReceived: ConnectionReceived::<Identity, OFFSET>,
+                        RemoveConnectionReceived: RemoveConnectionReceived::<Identity, OFFSET>,
+                        Information: Information::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IConnectionListener as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IConnectionListener_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub ConnectionReceived: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut i64,
+                )
+                    -> windows_core::HRESULT,
+                pub RemoveConnectionReceived:
+                    unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+                pub Information: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                IConnectionReceivedArgs,
+                IConnectionReceivedArgs_Vtbl,
+                0x661712ac_63e3_5243_a91a_6409d33fc02b
+            );
+            impl windows_core::RuntimeType for IConnectionReceivedArgs {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IConnectionReceivedArgs,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IConnectionReceivedArgs {
+                pub fn Stream(&self) -> windows_core::Result<ITransportStream> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Stream)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn RemoteEndpoint(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteEndpoint)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
                     }
                 }
             }
-            unsafe extern "system" fn RemoteEndpoint<
-                Identity: IConnectionReceivedArgs_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IConnectionReceivedArgs_Impl::RemoteEndpoint(this) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl windows_core::RuntimeName for IConnectionReceivedArgs {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IConnectionReceivedArgs";
+            }
+            pub trait IConnectionReceivedArgs_Impl: windows_core::IUnknownImpl {
+                fn Stream(&self) -> windows_core::Result<ITransportStream>;
+                fn RemoteEndpoint(&self) -> windows_core::Result<windows_core::HSTRING>;
+            }
+            impl IConnectionReceivedArgs_Vtbl {
+                pub const fn new<Identity: IConnectionReceivedArgs_Impl, const OFFSET: isize>(
+                ) -> Self {
+                    unsafe extern "system" fn Stream<
+                        Identity: IConnectionReceivedArgs_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IConnectionReceivedArgs_Impl::Stream(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    unsafe extern "system" fn RemoteEndpoint<
+                        Identity: IConnectionReceivedArgs_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IConnectionReceivedArgs_Impl::RemoteEndpoint(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            IConnectionReceivedArgs,
+                            OFFSET,
+                        >(),
+                        Stream: Stream::<Identity, OFFSET>,
+                        RemoteEndpoint: RemoteEndpoint::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IConnectionReceivedArgs as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IConnectionReceivedArgs_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub Stream: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub RemoteEndpoint: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                IHyperVBind,
+                IHyperVBind_Vtbl,
+                0x38dec2e0_5f8f_5b4b_8ceb_e57d53390c1c
+            );
+            impl windows_core::RuntimeType for IHyperVBind {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IHyperVBind,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IHyperVBind {
+                pub fn BindEndpointAsync(
+                    &self,
+                    endpoint: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindEndpointAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(endpoint),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn BindServiceNameAsync(
+                    &self,
+                    servicename: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindServiceNameAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(servicename),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<
-                    Identity,
-                    IConnectionReceivedArgs,
-                    OFFSET,
-                >(),
-                Stream: Stream::<Identity, OFFSET>,
-                RemoteEndpoint: RemoteEndpoint::<Identity, OFFSET>,
+            impl windows_core::RuntimeName for IHyperVBind {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IHyperVBind";
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<IConnectionReceivedArgs as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct IConnectionReceivedArgs_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub Stream: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-        pub RemoteEndpoint: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    windows_core::imp::define_interface!(
-        IHyperVBind,
-        IHyperVBind_Vtbl,
-        0xdf3d2cac_c6dc_5db7_85b5_282f5be3241d
-    );
-    impl windows_core::RuntimeType for IHyperVBind {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        IHyperVBind,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl IHyperVBind {
-        pub fn BindEndpointAsync(
-            &self,
-            endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).BindEndpointAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(endpoint),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            pub trait IHyperVBind_Impl: windows_core::IUnknownImpl {
+                fn BindEndpointAsync(
+                    &self,
+                    endpoint: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction>;
+                fn BindServiceNameAsync(
+                    &self,
+                    serviceName: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction>;
             }
-        }
-        pub fn BindServiceNameAsync(
-            &self,
-            servicename: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).BindServiceNameAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(servicename),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeName for IHyperVBind {
-        const NAME: &'static str = "Rustwinui3loop.IHyperVBind";
-    }
-    pub trait IHyperVBind_Impl: windows_core::IUnknownImpl {
-        fn BindEndpointAsync(
-            &self,
-            endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction>;
-        fn BindServiceNameAsync(
-            &self,
-            serviceName: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction>;
-    }
-    impl IHyperVBind_Vtbl {
-        pub const fn new<Identity: IHyperVBind_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn BindEndpointAsync<
-                Identity: IHyperVBind_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                endpoint: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IHyperVBind_Impl::BindEndpointAsync(this, core::mem::transmute(&endpoint))
-                    {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl IHyperVBind_Vtbl {
+                pub const fn new<Identity: IHyperVBind_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn BindEndpointAsync<
+                        Identity: IHyperVBind_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        endpoint: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHyperVBind_Impl::BindEndpointAsync(
+                                this,
+                                core::mem::transmute(&endpoint),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    unsafe extern "system" fn BindServiceNameAsync<
+                        Identity: IHyperVBind_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        servicename: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHyperVBind_Impl::BindServiceNameAsync(
+                                this,
+                                core::mem::transmute(&servicename),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<Identity, IHyperVBind, OFFSET>(
+                        ),
+                        BindEndpointAsync: BindEndpointAsync::<Identity, OFFSET>,
+                        BindServiceNameAsync: BindServiceNameAsync::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IHyperVBind as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IHyperVBind_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub BindEndpointAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub BindServiceNameAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                IHyperVConnector,
+                IHyperVConnector_Vtbl,
+                0x7668644d_7c82_57dc_a371_b7404f3e99b0
+            );
+            impl windows_core::RuntimeType for IHyperVConnector {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IHyperVConnector,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IHyperVConnector {
+                pub fn ConnectAsync(
+                    &self,
+                    endpoint: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(endpoint),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
             }
-            unsafe extern "system" fn BindServiceNameAsync<
-                Identity: IHyperVBind_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                servicename: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IHyperVBind_Impl::BindServiceNameAsync(
-                        this,
-                        core::mem::transmute(&servicename),
-                    ) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl windows_core::RuntimeName for IHyperVConnector {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IHyperVConnector";
+            }
+            pub trait IHyperVConnector_Impl: windows_core::IUnknownImpl {
+                fn ConnectAsync(
+                    &self,
+                    endpoint: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
+            }
+            impl IHyperVConnector_Vtbl {
+                pub const fn new<Identity: IHyperVConnector_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn ConnectAsync<
+                        Identity: IHyperVConnector_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        endpoint: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHyperVConnector_Impl::ConnectAsync(
+                                this,
+                                core::mem::transmute(&endpoint),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            IHyperVConnector,
+                            OFFSET,
+                        >(),
+                        ConnectAsync: ConnectAsync::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IHyperVConnector as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IHyperVConnector_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub ConnectAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                INamedPipeBind,
+                INamedPipeBind_Vtbl,
+                0x4e5db519_5fb8_5e37_81c8_b08a4a10b4fa
+            );
+            impl windows_core::RuntimeType for INamedPipeBind {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                INamedPipeBind,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl INamedPipeBind {
+                pub fn BindAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(name),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, IHyperVBind, OFFSET>(),
-                BindEndpointAsync: BindEndpointAsync::<Identity, OFFSET>,
-                BindServiceNameAsync: BindServiceNameAsync::<Identity, OFFSET>,
+            impl windows_core::RuntimeName for INamedPipeBind {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.INamedPipeBind";
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<IHyperVBind as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct IHyperVBind_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub BindEndpointAsync: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-        pub BindServiceNameAsync: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    windows_core::imp::define_interface!(
-        IHyperVConnector,
-        IHyperVConnector_Vtbl,
-        0xf3bc3a2c_385a_56f7_8c5d_42a69cec6bce
-    );
-    impl windows_core::RuntimeType for IHyperVConnector {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        IHyperVConnector,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl IHyperVConnector {
-        pub fn ConnectAsync(
-            &self,
-            endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(endpoint),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            pub trait INamedPipeBind_Impl: windows_core::IUnknownImpl {
+                fn BindAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction>;
             }
-        }
-    }
-    impl windows_core::RuntimeName for IHyperVConnector {
-        const NAME: &'static str = "Rustwinui3loop.IHyperVConnector";
-    }
-    pub trait IHyperVConnector_Impl: windows_core::IUnknownImpl {
-        fn ConnectAsync(
-            &self,
-            endpoint: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
-    }
-    impl IHyperVConnector_Vtbl {
-        pub const fn new<Identity: IHyperVConnector_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn ConnectAsync<
-                Identity: IHyperVConnector_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                endpoint: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IHyperVConnector_Impl::ConnectAsync(this, core::mem::transmute(&endpoint))
-                    {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl INamedPipeBind_Vtbl {
+                pub const fn new<Identity: INamedPipeBind_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn BindAsync<
+                        Identity: INamedPipeBind_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        name: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match INamedPipeBind_Impl::BindAsync(this, core::mem::transmute(&name))
+                            {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            INamedPipeBind,
+                            OFFSET,
+                        >(),
+                        BindAsync: BindAsync::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<INamedPipeBind as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct INamedPipeBind_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub BindAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                INamedPipeConnector,
+                INamedPipeConnector_Vtbl,
+                0x9ad13fb2_9c7f_5286_a9cf_71f9b4c3e08f
+            );
+            impl windows_core::RuntimeType for INamedPipeConnector {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                INamedPipeConnector,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl INamedPipeConnector {
+                pub fn ConnectAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(name),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, IHyperVConnector, OFFSET>(
-                ),
-                ConnectAsync: ConnectAsync::<Identity, OFFSET>,
+            impl windows_core::RuntimeName for INamedPipeConnector {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.INamedPipeConnector";
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<IHyperVConnector as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct IHyperVConnector_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub ConnectAsync: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    windows_core::imp::define_interface!(
-        INamedPipeBind,
-        INamedPipeBind_Vtbl,
-        0x5f2ba75a_a86d_573c_8402_da55071520cc
-    );
-    impl windows_core::RuntimeType for INamedPipeBind {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        INamedPipeBind,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl INamedPipeBind {
-        pub fn BindAsync(
-            &self,
-            name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).BindAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(name),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            pub trait INamedPipeConnector_Impl: windows_core::IUnknownImpl {
+                fn ConnectAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
             }
-        }
-    }
-    impl windows_core::RuntimeName for INamedPipeBind {
-        const NAME: &'static str = "Rustwinui3loop.INamedPipeBind";
-    }
-    pub trait INamedPipeBind_Impl: windows_core::IUnknownImpl {
-        fn BindAsync(
-            &self,
-            name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction>;
-    }
-    impl INamedPipeBind_Vtbl {
-        pub const fn new<Identity: INamedPipeBind_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn BindAsync<
-                Identity: INamedPipeBind_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                name: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match INamedPipeBind_Impl::BindAsync(this, core::mem::transmute(&name)) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl INamedPipeConnector_Vtbl {
+                pub const fn new<Identity: INamedPipeConnector_Impl, const OFFSET: isize>() -> Self
+                {
+                    unsafe extern "system" fn ConnectAsync<
+                        Identity: INamedPipeConnector_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        name: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match INamedPipeConnector_Impl::ConnectAsync(
+                                this,
+                                core::mem::transmute(&name),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            INamedPipeConnector,
+                            OFFSET,
+                        >(),
+                        ConnectAsync: ConnectAsync::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<INamedPipeConnector as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct INamedPipeConnector_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub ConnectAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                ITransport,
+                ITransport_Vtbl,
+                0x9455e7de_0c4f_5d23_902a_a44ebf0a4ae6
+            );
+            impl windows_core::RuntimeType for ITransport {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                ITransport,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl ITransport {
+                pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Transport)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
                     }
                 }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, INamedPipeBind, OFFSET>(),
-                BindAsync: BindAsync::<Identity, OFFSET>,
+            impl windows_core::RuntimeName for ITransport {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.ITransport";
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<INamedPipeBind as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct INamedPipeBind_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub BindAsync: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    windows_core::imp::define_interface!(
-        INamedPipeConnector,
-        INamedPipeConnector_Vtbl,
-        0x9aba3c8b_0aaf_5d5f_b6ab_413f0374cf67
-    );
-    impl windows_core::RuntimeType for INamedPipeConnector {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        INamedPipeConnector,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl INamedPipeConnector {
-        pub fn ConnectAsync(
-            &self,
-            name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(name),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            pub trait ITransport_Impl: windows_core::IUnknownImpl {
+                fn Transport(&self) -> windows_core::Result<windows_core::HSTRING>;
             }
-        }
-    }
-    impl windows_core::RuntimeName for INamedPipeConnector {
-        const NAME: &'static str = "Rustwinui3loop.INamedPipeConnector";
-    }
-    pub trait INamedPipeConnector_Impl: windows_core::IUnknownImpl {
-        fn ConnectAsync(
-            &self,
-            name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
-    }
-    impl INamedPipeConnector_Vtbl {
-        pub const fn new<Identity: INamedPipeConnector_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn ConnectAsync<
-                Identity: INamedPipeConnector_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                name: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match INamedPipeConnector_Impl::ConnectAsync(this, core::mem::transmute(&name))
-                    {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl ITransport_Vtbl {
+                pub const fn new<Identity: ITransport_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn Transport<
+                        Identity: ITransport_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match ITransport_Impl::Transport(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<Identity, ITransport, OFFSET>(
+                        ),
+                        Transport: Transport::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<ITransport as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct ITransport_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub Transport: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                ITransportStream,
+                ITransportStream_Vtbl,
+                0xad413f92_1757_501d_b24a_765e6b4e883c
+            );
+            impl windows_core::RuntimeType for ITransportStream {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                ITransportStream,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            windows_core::imp::required_hierarchy!(
+                ITransportStream,
+                windows::Foundation::IClosable,
+                windows::Storage::Streams::IInputStream,
+                windows::Storage::Streams::IOutputStream
+            );
+            impl ITransportStream {
+                pub fn Close(&self) -> windows_core::Result<()> {
+                    let this =
+                        &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Close)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn ReadAsync<P0>(
+                    &self,
+                    buffer: P0,
+                    count: u32,
+                    options: windows::Storage::Streams::InputStreamOptions,
+                ) -> windows_core::Result<
+                    windows_future::IAsyncOperationWithProgress<
+                        windows::Storage::Streams::IBuffer,
+                        u32,
+                    >,
+                >
+                where
+                    P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = &windows_core::Interface::cast::<
+                        windows::Storage::Streams::IInputStream,
+                    >(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ReadAsync)(
+                            windows_core::Interface::as_raw(this),
+                            buffer.param().abi(),
+                            count,
+                            options,
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn WriteAsync<P0>(
+                    &self,
+                    buffer: P0,
+                ) -> windows_core::Result<windows_future::IAsyncOperationWithProgress<u32, u32>>
+                where
+                    P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = &windows_core::Interface::cast::<
+                        windows::Storage::Streams::IOutputStream,
+                    >(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).WriteAsync)(
+                            windows_core::Interface::as_raw(this),
+                            buffer.param().abi(),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn FlushAsync(
+                    &self,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<bool>> {
+                    let this = &windows_core::Interface::cast::<
+                        windows::Storage::Streams::IOutputStream,
+                    >(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).FlushAsync)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, INamedPipeConnector, OFFSET>(
-                ),
-                ConnectAsync: ConnectAsync::<Identity, OFFSET>,
+            impl windows_core::RuntimeName for ITransportStream {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.ITransportStream";
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<INamedPipeConnector as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct INamedPipeConnector_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub ConnectAsync: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    windows_core::imp::define_interface!(
-        ITransport,
-        ITransport_Vtbl,
-        0x01df6a49_56d1_5bd7_9e17_d3db9340d448
-    );
-    impl windows_core::RuntimeType for ITransport {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        ITransport,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl ITransport {
-        pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Transport)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
+            pub trait ITransportStream_Impl:
+                windows::Foundation::IClosable_Impl
+                + windows::Storage::Streams::IInputStream_Impl
+                + windows::Storage::Streams::IOutputStream_Impl
+            {
             }
-        }
-    }
-    impl windows_core::RuntimeName for ITransport {
-        const NAME: &'static str = "Rustwinui3loop.ITransport";
-    }
-    pub trait ITransport_Impl: windows_core::IUnknownImpl {
-        fn Transport(&self) -> windows_core::Result<windows_core::HSTRING>;
-    }
-    impl ITransport_Vtbl {
-        pub const fn new<Identity: ITransport_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn Transport<Identity: ITransport_Impl, const OFFSET: isize>(
-                this: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match ITransport_Impl::Transport(this) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
-                        }
-                        Err(err) => err.into(),
+            impl ITransportStream_Vtbl {
+                pub const fn new<Identity: ITransportStream_Impl, const OFFSET: isize>() -> Self {
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            ITransportStream,
+                            OFFSET,
+                        >(),
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<ITransportStream as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct ITransportStream_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+            }
+            windows_core::imp::define_interface!(
+                IUnixBind,
+                IUnixBind_Vtbl,
+                0x70facc3f_8f25_53f5_8ba3_9c919f1f9534
+            );
+            impl windows_core::RuntimeType for IUnixBind {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IUnixBind,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IUnixBind {
+                pub fn BindAsync(
+                    &self,
+                    path: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(path),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, ITransport, OFFSET>(),
-                Transport: Transport::<Identity, OFFSET>,
+            impl windows_core::RuntimeName for IUnixBind {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IUnixBind";
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<ITransport as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct ITransport_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub Transport: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    windows_core::imp::define_interface!(
-        ITransportStream,
-        ITransportStream_Vtbl,
-        0xd18b108c_a36d_5837_99af_49d9b9bb0944
-    );
-    impl windows_core::RuntimeType for ITransportStream {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        ITransportStream,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    windows_core::imp::required_hierarchy!(
-        ITransportStream,
-        windows::Foundation::IClosable,
-        windows::Storage::Streams::IInputStream,
-        windows::Storage::Streams::IOutputStream
-    );
-    impl ITransportStream {
-        pub fn Close(&self) -> windows_core::Result<()> {
-            let this = &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
-            unsafe {
-                (windows_core::Interface::vtable(this).Close)(windows_core::Interface::as_raw(this))
-                    .ok()
+            pub trait IUnixBind_Impl: windows_core::IUnknownImpl {
+                fn BindAsync(
+                    &self,
+                    path: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction>;
             }
-        }
-        pub fn ReadAsync<P0>(
-            &self,
-            buffer: P0,
-            count: u32,
-            options: windows::Storage::Streams::InputStreamOptions,
-        ) -> windows_core::Result<
-            windows_future::IAsyncOperationWithProgress<windows::Storage::Streams::IBuffer, u32>,
-        >
-        where
-            P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
-        {
-            let this =
-                &windows_core::Interface::cast::<windows::Storage::Streams::IInputStream>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ReadAsync)(
-                    windows_core::Interface::as_raw(this),
-                    buffer.param().abi(),
-                    count,
-                    options,
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-        pub fn WriteAsync<P0>(
-            &self,
-            buffer: P0,
-        ) -> windows_core::Result<windows_future::IAsyncOperationWithProgress<u32, u32>>
-        where
-            P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
-        {
-            let this =
-                &windows_core::Interface::cast::<windows::Storage::Streams::IOutputStream>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).WriteAsync)(
-                    windows_core::Interface::as_raw(this),
-                    buffer.param().abi(),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-        pub fn FlushAsync(&self) -> windows_core::Result<windows_future::IAsyncOperation<bool>> {
-            let this =
-                &windows_core::Interface::cast::<windows::Storage::Streams::IOutputStream>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).FlushAsync)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeName for ITransportStream {
-        const NAME: &'static str = "Rustwinui3loop.ITransportStream";
-    }
-    pub trait ITransportStream_Impl:
-        windows::Foundation::IClosable_Impl
-        + windows::Storage::Streams::IInputStream_Impl
-        + windows::Storage::Streams::IOutputStream_Impl
-    {
-    }
-    impl ITransportStream_Vtbl {
-        pub const fn new<Identity: ITransportStream_Impl, const OFFSET: isize>() -> Self {
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, ITransportStream, OFFSET>(
-                ),
-            }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<ITransportStream as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct ITransportStream_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-    }
-    windows_core::imp::define_interface!(
-        IUnixBind,
-        IUnixBind_Vtbl,
-        0x06f176b2_2026_5c86_b99b_f7469e098efd
-    );
-    impl windows_core::RuntimeType for IUnixBind {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        IUnixBind,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl IUnixBind {
-        pub fn BindAsync(
-            &self,
-            path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).BindAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(path),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeName for IUnixBind {
-        const NAME: &'static str = "Rustwinui3loop.IUnixBind";
-    }
-    pub trait IUnixBind_Impl: windows_core::IUnknownImpl {
-        fn BindAsync(
-            &self,
-            path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction>;
-    }
-    impl IUnixBind_Vtbl {
-        pub const fn new<Identity: IUnixBind_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn BindAsync<Identity: IUnixBind_Impl, const OFFSET: isize>(
-                this: *mut core::ffi::c_void,
-                path: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IUnixBind_Impl::BindAsync(this, core::mem::transmute(&path)) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl IUnixBind_Vtbl {
+                pub const fn new<Identity: IUnixBind_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn BindAsync<
+                        Identity: IUnixBind_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        path: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IUnixBind_Impl::BindAsync(this, core::mem::transmute(&path)) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<Identity, IUnixBind, OFFSET>(
+                        ),
+                        BindAsync: BindAsync::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IUnixBind as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IUnixBind_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub BindAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                IUnixConnector,
+                IUnixConnector_Vtbl,
+                0x79876e3d_a244_5aa3_93fe_ff040f1522ec
+            );
+            impl windows_core::RuntimeType for IUnixConnector {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IUnixConnector,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IUnixConnector {
+                pub fn ConnectAsync(
+                    &self,
+                    path: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(path),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, IUnixBind, OFFSET>(),
-                BindAsync: BindAsync::<Identity, OFFSET>,
+            impl windows_core::RuntimeName for IUnixConnector {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IUnixConnector";
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<IUnixBind as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct IUnixBind_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub BindAsync: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    windows_core::imp::define_interface!(
-        IUnixConnector,
-        IUnixConnector_Vtbl,
-        0xe2f80d60_4d15_502c_96ff_c1c28402513c
-    );
-    impl windows_core::RuntimeType for IUnixConnector {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_interface::<Self>();
-    }
-    windows_core::imp::interface_hierarchy!(
-        IUnixConnector,
-        windows_core::IUnknown,
-        windows_core::IInspectable
-    );
-    impl IUnixConnector {
-        pub fn ConnectAsync(
-            &self,
-            path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(path),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            pub trait IUnixConnector_Impl: windows_core::IUnknownImpl {
+                fn ConnectAsync(
+                    &self,
+                    path: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
             }
-        }
-    }
-    impl windows_core::RuntimeName for IUnixConnector {
-        const NAME: &'static str = "Rustwinui3loop.IUnixConnector";
-    }
-    pub trait IUnixConnector_Impl: windows_core::IUnknownImpl {
-        fn ConnectAsync(
-            &self,
-            path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
-    }
-    impl IUnixConnector_Vtbl {
-        pub const fn new<Identity: IUnixConnector_Impl, const OFFSET: isize>() -> Self {
-            unsafe extern "system" fn ConnectAsync<
-                Identity: IUnixConnector_Impl,
-                const OFFSET: isize,
-            >(
-                this: *mut core::ffi::c_void,
-                path: *mut core::ffi::c_void,
-                result__: *mut *mut core::ffi::c_void,
-            ) -> windows_core::HRESULT {
-                unsafe {
-                    let this: &Identity =
-                        &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IUnixConnector_Impl::ConnectAsync(this, core::mem::transmute(&path)) {
-                        Ok(ok__) => {
-                            result__.write(core::mem::transmute_copy(&ok__));
-                            core::mem::forget(ok__);
-                            windows_core::HRESULT(0)
+            impl IUnixConnector_Vtbl {
+                pub const fn new<Identity: IUnixConnector_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn ConnectAsync<
+                        Identity: IUnixConnector_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        path: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IUnixConnector_Impl::ConnectAsync(
+                                this,
+                                core::mem::transmute(&path),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
                         }
-                        Err(err) => err.into(),
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            IUnixConnector,
+                            OFFSET,
+                        >(),
+                        ConnectAsync: ConnectAsync::<Identity, OFFSET>,
                     }
                 }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IUnixConnector as windows_core::Interface>::IID
+                }
             }
-            Self {
-                base__: windows_core::IInspectable_Vtbl::new::<Identity, IUnixConnector, OFFSET>(),
-                ConnectAsync: ConnectAsync::<Identity, OFFSET>,
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IUnixConnector_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub ConnectAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
             }
-        }
-        pub fn matches(iid: &windows_core::GUID) -> bool {
-            iid == &<IUnixConnector as windows_core::Interface>::IID
-        }
-    }
-    #[repr(C)]
-    #[doc(hidden)]
-    pub struct IUnixConnector_Vtbl {
-        pub base__: windows_core::IInspectable_Vtbl,
-        pub ConnectAsync: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT,
-    }
-    #[repr(transparent)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct NamedPipeConnectionListener(windows_core::IUnknown);
-    windows_core::imp::interface_hierarchy!(
-        NamedPipeConnectionListener,
-        windows_core::IUnknown,
-        windows_core::IInspectable,
-        IConnectionListener
-    );
-    windows_core::imp::required_hierarchy!(
-        NamedPipeConnectionListener,
-        windows::Foundation::IClosable,
-        INamedPipeBind,
-        ITransport
-    );
-    impl NamedPipeConnectionListener {
-        pub fn new() -> windows_core::Result<Self> {
-            Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
-        }
-        fn IActivationFactory<
-            R,
-            F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
-        >(
-            callback: F,
-        ) -> windows_core::Result<R> {
-            static SHARED: windows_core::imp::FactoryCache<
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct NamedPipeConnectionListener(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
                 NamedPipeConnectionListener,
-                windows_core::imp::IGenericFactory,
-            > = windows_core::imp::FactoryCache::new();
-            SHARED.call(callback)
-        }
-        pub fn Close(&self) -> windows_core::Result<()> {
-            let this = &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
-            unsafe {
-                (windows_core::Interface::vtable(this).Close)(windows_core::Interface::as_raw(this))
-                    .ok()
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                IConnectionListener
+            );
+            windows_core::imp::required_hierarchy!(
+                NamedPipeConnectionListener,
+                windows::Foundation::IClosable,
+                INamedPipeBind,
+                ITransport
+            );
+            impl NamedPipeConnectionListener {
+                pub fn new() -> windows_core::Result<Self> {
+                    Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+                }
+                fn IActivationFactory<
+                    R,
+                    F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+                >(
+                    callback: F,
+                ) -> windows_core::Result<R> {
+                    static SHARED: windows_core::imp::FactoryCache<
+                        NamedPipeConnectionListener,
+                        windows_core::imp::IGenericFactory,
+                    > = windows_core::imp::FactoryCache::new();
+                    SHARED.call(callback)
+                }
+                pub fn Close(&self) -> windows_core::Result<()> {
+                    let this =
+                        &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Close)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
+                where
+                    P0: windows_core::Param<
+                        windows::Foundation::TypedEventHandler<
+                            IConnectionListener,
+                            IConnectionReceivedArgs,
+                        >,
+                    >,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectionReceived)(
+                            windows_core::Interface::as_raw(this),
+                            handler.param().abi(),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).RemoveConnectionReceived)(
+                            windows_core::Interface::as_raw(this),
+                            token,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Information)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn BindAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = &windows_core::Interface::cast::<INamedPipeBind>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(name),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = &windows_core::Interface::cast::<ITransport>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Transport)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
             }
-        }
-        pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
-        where
-            P0: windows_core::Param<
-                windows::Foundation::TypedEventHandler<
-                    IConnectionListener,
-                    IConnectionReceivedArgs,
-                >,
-            >,
-        {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectionReceived)(
-                    windows_core::Interface::as_raw(this),
-                    handler.param().abi(),
-                    &mut result__,
-                )
-                .map(|| result__)
+            impl windows_core::RuntimeType for NamedPipeConnectionListener {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, IConnectionListener>();
             }
-        }
-        pub fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()> {
-            let this = self;
-            unsafe {
-                (windows_core::Interface::vtable(this).RemoveConnectionReceived)(
-                    windows_core::Interface::as_raw(this),
-                    token,
-                )
-                .ok()
+            unsafe impl windows_core::Interface for NamedPipeConnectionListener {
+                type Vtable = <IConnectionListener as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID =
+                    <IConnectionListener as windows_core::Interface>::IID;
             }
-        }
-        pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Information)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
+            impl windows_core::RuntimeName for NamedPipeConnectionListener {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.NamedPipeConnectionListener";
             }
-        }
-        pub fn BindAsync(
-            &self,
-            name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction> {
-            let this = &windows_core::Interface::cast::<INamedPipeBind>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).BindAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(name),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-        pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = &windows_core::Interface::cast::<ITransport>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Transport)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeType for NamedPipeConnectionListener {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_class::<Self, IConnectionListener>();
-    }
-    unsafe impl windows_core::Interface for NamedPipeConnectionListener {
-        type Vtable = <IConnectionListener as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID = <IConnectionListener as windows_core::Interface>::IID;
-    }
-    impl windows_core::RuntimeName for NamedPipeConnectionListener {
-        const NAME: &'static str = "Rustwinui3loop.NamedPipeConnectionListener";
-    }
-    #[repr(transparent)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct NamedPipeConnector(windows_core::IUnknown);
-    windows_core::imp::interface_hierarchy!(
-        NamedPipeConnector,
-        windows_core::IUnknown,
-        windows_core::IInspectable,
-        ITransport
-    );
-    windows_core::imp::required_hierarchy!(NamedPipeConnector, INamedPipeConnector);
-    impl NamedPipeConnector {
-        pub fn new() -> windows_core::Result<Self> {
-            Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
-        }
-        fn IActivationFactory<
-            R,
-            F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
-        >(
-            callback: F,
-        ) -> windows_core::Result<R> {
-            static SHARED: windows_core::imp::FactoryCache<
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct NamedPipeConnector(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
                 NamedPipeConnector,
-                windows_core::imp::IGenericFactory,
-            > = windows_core::imp::FactoryCache::new();
-            SHARED.call(callback)
-        }
-        pub fn ConnectAsync(
-            &self,
-            name: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
-            let this = &windows_core::Interface::cast::<INamedPipeConnector>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(name),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                ITransport
+            );
+            windows_core::imp::required_hierarchy!(NamedPipeConnector, INamedPipeConnector);
+            impl NamedPipeConnector {
+                pub fn new() -> windows_core::Result<Self> {
+                    Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+                }
+                fn IActivationFactory<
+                    R,
+                    F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+                >(
+                    callback: F,
+                ) -> windows_core::Result<R> {
+                    static SHARED: windows_core::imp::FactoryCache<
+                        NamedPipeConnector,
+                        windows_core::imp::IGenericFactory,
+                    > = windows_core::imp::FactoryCache::new();
+                    SHARED.call(callback)
+                }
+                pub fn ConnectAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>
+                {
+                    let this = &windows_core::Interface::cast::<INamedPipeConnector>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(name),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Transport)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
             }
-        }
-        pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Transport)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
+            impl windows_core::RuntimeType for NamedPipeConnector {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, ITransport>();
             }
-        }
-    }
-    impl windows_core::RuntimeType for NamedPipeConnector {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_class::<Self, ITransport>();
-    }
-    unsafe impl windows_core::Interface for NamedPipeConnector {
-        type Vtable = <ITransport as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID = <ITransport as windows_core::Interface>::IID;
-    }
-    impl windows_core::RuntimeName for NamedPipeConnector {
-        const NAME: &'static str = "Rustwinui3loop.NamedPipeConnector";
-    }
-    #[repr(transparent)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct TransportStream(windows_core::IUnknown);
-    windows_core::imp::interface_hierarchy!(
-        TransportStream,
-        windows_core::IUnknown,
-        windows_core::IInspectable,
-        ITransportStream
-    );
-    windows_core::imp::required_hierarchy!(
-        TransportStream,
-        windows::Foundation::IClosable,
-        windows::Storage::Streams::IInputStream,
-        windows::Storage::Streams::IOutputStream
-    );
-    impl TransportStream {
-        pub fn Close(&self) -> windows_core::Result<()> {
-            let this = &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
-            unsafe {
-                (windows_core::Interface::vtable(this).Close)(windows_core::Interface::as_raw(this))
-                    .ok()
+            unsafe impl windows_core::Interface for NamedPipeConnector {
+                type Vtable = <ITransport as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID = <ITransport as windows_core::Interface>::IID;
             }
-        }
-        pub fn ReadAsync<P0>(
-            &self,
-            buffer: P0,
-            count: u32,
-            options: windows::Storage::Streams::InputStreamOptions,
-        ) -> windows_core::Result<
-            windows_future::IAsyncOperationWithProgress<windows::Storage::Streams::IBuffer, u32>,
-        >
-        where
-            P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
-        {
-            let this =
-                &windows_core::Interface::cast::<windows::Storage::Streams::IInputStream>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ReadAsync)(
-                    windows_core::Interface::as_raw(this),
-                    buffer.param().abi(),
-                    count,
-                    options,
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            impl windows_core::RuntimeName for NamedPipeConnector {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.NamedPipeConnector";
             }
-        }
-        pub fn WriteAsync<P0>(
-            &self,
-            buffer: P0,
-        ) -> windows_core::Result<windows_future::IAsyncOperationWithProgress<u32, u32>>
-        where
-            P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
-        {
-            let this =
-                &windows_core::Interface::cast::<windows::Storage::Streams::IOutputStream>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).WriteAsync)(
-                    windows_core::Interface::as_raw(this),
-                    buffer.param().abi(),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct TransportStream(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
+                TransportStream,
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                ITransportStream
+            );
+            windows_core::imp::required_hierarchy!(
+                TransportStream,
+                windows::Foundation::IClosable,
+                windows::Storage::Streams::IInputStream,
+                windows::Storage::Streams::IOutputStream
+            );
+            impl TransportStream {
+                pub fn Close(&self) -> windows_core::Result<()> {
+                    let this =
+                        &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Close)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn ReadAsync<P0>(
+                    &self,
+                    buffer: P0,
+                    count: u32,
+                    options: windows::Storage::Streams::InputStreamOptions,
+                ) -> windows_core::Result<
+                    windows_future::IAsyncOperationWithProgress<
+                        windows::Storage::Streams::IBuffer,
+                        u32,
+                    >,
+                >
+                where
+                    P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = &windows_core::Interface::cast::<
+                        windows::Storage::Streams::IInputStream,
+                    >(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ReadAsync)(
+                            windows_core::Interface::as_raw(this),
+                            buffer.param().abi(),
+                            count,
+                            options,
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn WriteAsync<P0>(
+                    &self,
+                    buffer: P0,
+                ) -> windows_core::Result<windows_future::IAsyncOperationWithProgress<u32, u32>>
+                where
+                    P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = &windows_core::Interface::cast::<
+                        windows::Storage::Streams::IOutputStream,
+                    >(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).WriteAsync)(
+                            windows_core::Interface::as_raw(this),
+                            buffer.param().abi(),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn FlushAsync(
+                    &self,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<bool>> {
+                    let this = &windows_core::Interface::cast::<
+                        windows::Storage::Streams::IOutputStream,
+                    >(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).FlushAsync)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
             }
-        }
-        pub fn FlushAsync(&self) -> windows_core::Result<windows_future::IAsyncOperation<bool>> {
-            let this =
-                &windows_core::Interface::cast::<windows::Storage::Streams::IOutputStream>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).FlushAsync)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
+            impl windows_core::RuntimeType for TransportStream {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, ITransportStream>();
             }
-        }
-    }
-    impl windows_core::RuntimeType for TransportStream {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_class::<Self, ITransportStream>();
-    }
-    unsafe impl windows_core::Interface for TransportStream {
-        type Vtable = <ITransportStream as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID = <ITransportStream as windows_core::Interface>::IID;
-    }
-    impl windows_core::RuntimeName for TransportStream {
-        const NAME: &'static str = "Rustwinui3loop.TransportStream";
-    }
-    #[repr(transparent)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct UnixConnectionListener(windows_core::IUnknown);
-    windows_core::imp::interface_hierarchy!(
-        UnixConnectionListener,
-        windows_core::IUnknown,
-        windows_core::IInspectable,
-        IConnectionListener
-    );
-    windows_core::imp::required_hierarchy!(
-        UnixConnectionListener,
-        windows::Foundation::IClosable,
-        ITransport,
-        IUnixBind
-    );
-    impl UnixConnectionListener {
-        pub fn new() -> windows_core::Result<Self> {
-            Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
-        }
-        fn IActivationFactory<
-            R,
-            F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
-        >(
-            callback: F,
-        ) -> windows_core::Result<R> {
-            static SHARED: windows_core::imp::FactoryCache<
+            unsafe impl windows_core::Interface for TransportStream {
+                type Vtable = <ITransportStream as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID = <ITransportStream as windows_core::Interface>::IID;
+            }
+            impl windows_core::RuntimeName for TransportStream {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.TransportStream";
+            }
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct UnixConnectionListener(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
                 UnixConnectionListener,
-                windows_core::imp::IGenericFactory,
-            > = windows_core::imp::FactoryCache::new();
-            SHARED.call(callback)
-        }
-        pub fn Close(&self) -> windows_core::Result<()> {
-            let this = &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
-            unsafe {
-                (windows_core::Interface::vtable(this).Close)(windows_core::Interface::as_raw(this))
-                    .ok()
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                IConnectionListener
+            );
+            windows_core::imp::required_hierarchy!(
+                UnixConnectionListener,
+                windows::Foundation::IClosable,
+                ITransport,
+                IUnixBind
+            );
+            impl UnixConnectionListener {
+                pub fn new() -> windows_core::Result<Self> {
+                    Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+                }
+                fn IActivationFactory<
+                    R,
+                    F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+                >(
+                    callback: F,
+                ) -> windows_core::Result<R> {
+                    static SHARED: windows_core::imp::FactoryCache<
+                        UnixConnectionListener,
+                        windows_core::imp::IGenericFactory,
+                    > = windows_core::imp::FactoryCache::new();
+                    SHARED.call(callback)
+                }
+                pub fn Close(&self) -> windows_core::Result<()> {
+                    let this =
+                        &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Close)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
+                where
+                    P0: windows_core::Param<
+                        windows::Foundation::TypedEventHandler<
+                            IConnectionListener,
+                            IConnectionReceivedArgs,
+                        >,
+                    >,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectionReceived)(
+                            windows_core::Interface::as_raw(this),
+                            handler.param().abi(),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).RemoveConnectionReceived)(
+                            windows_core::Interface::as_raw(this),
+                            token,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Information)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = &windows_core::Interface::cast::<ITransport>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Transport)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn BindAsync(
+                    &self,
+                    path: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = &windows_core::Interface::cast::<IUnixBind>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(path),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
             }
-        }
-        pub fn ConnectionReceived<P0>(&self, handler: P0) -> windows_core::Result<i64>
-        where
-            P0: windows_core::Param<
-                windows::Foundation::TypedEventHandler<
-                    IConnectionListener,
-                    IConnectionReceivedArgs,
-                >,
-            >,
-        {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectionReceived)(
-                    windows_core::Interface::as_raw(this),
-                    handler.param().abi(),
-                    &mut result__,
-                )
-                .map(|| result__)
+            impl windows_core::RuntimeType for UnixConnectionListener {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, IConnectionListener>();
             }
-        }
-        pub fn RemoveConnectionReceived(&self, token: i64) -> windows_core::Result<()> {
-            let this = self;
-            unsafe {
-                (windows_core::Interface::vtable(this).RemoveConnectionReceived)(
-                    windows_core::Interface::as_raw(this),
-                    token,
-                )
-                .ok()
+            unsafe impl windows_core::Interface for UnixConnectionListener {
+                type Vtable = <IConnectionListener as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID =
+                    <IConnectionListener as windows_core::Interface>::IID;
             }
-        }
-        pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Information)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
+            impl windows_core::RuntimeName for UnixConnectionListener {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.UnixConnectionListener";
             }
-        }
-        pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = &windows_core::Interface::cast::<ITransport>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Transport)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
-            }
-        }
-        pub fn BindAsync(
-            &self,
-            path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncAction> {
-            let this = &windows_core::Interface::cast::<IUnixBind>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).BindAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(path),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeType for UnixConnectionListener {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_class::<Self, IConnectionListener>();
-    }
-    unsafe impl windows_core::Interface for UnixConnectionListener {
-        type Vtable = <IConnectionListener as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID = <IConnectionListener as windows_core::Interface>::IID;
-    }
-    impl windows_core::RuntimeName for UnixConnectionListener {
-        const NAME: &'static str = "Rustwinui3loop.UnixConnectionListener";
-    }
-    #[repr(transparent)]
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct UnixConnector(windows_core::IUnknown);
-    windows_core::imp::interface_hierarchy!(
-        UnixConnector,
-        windows_core::IUnknown,
-        windows_core::IInspectable,
-        ITransport
-    );
-    windows_core::imp::required_hierarchy!(UnixConnector, IUnixConnector);
-    impl UnixConnector {
-        pub fn new() -> windows_core::Result<Self> {
-            Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
-        }
-        fn IActivationFactory<
-            R,
-            F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
-        >(
-            callback: F,
-        ) -> windows_core::Result<R> {
-            static SHARED: windows_core::imp::FactoryCache<
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct UnixConnector(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
                 UnixConnector,
-                windows_core::imp::IGenericFactory,
-            > = windows_core::imp::FactoryCache::new();
-            SHARED.call(callback)
-        }
-        pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
-            let this = self;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).Transport)(
-                    windows_core::Interface::as_raw(this),
-                    &mut result__,
-                )
-                .map(|| core::mem::transmute(result__))
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                ITransport
+            );
+            windows_core::imp::required_hierarchy!(UnixConnector, IUnixConnector);
+            impl UnixConnector {
+                pub fn new() -> windows_core::Result<Self> {
+                    Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+                }
+                fn IActivationFactory<
+                    R,
+                    F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+                >(
+                    callback: F,
+                ) -> windows_core::Result<R> {
+                    static SHARED: windows_core::imp::FactoryCache<
+                        UnixConnector,
+                        windows_core::imp::IGenericFactory,
+                    > = windows_core::imp::FactoryCache::new();
+                    SHARED.call(callback)
+                }
+                pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Transport)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn ConnectAsync(
+                    &self,
+                    path: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>
+                {
+                    let this = &windows_core::Interface::cast::<IUnixConnector>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(path),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+            }
+            impl windows_core::RuntimeType for UnixConnector {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, ITransport>();
+            }
+            unsafe impl windows_core::Interface for UnixConnector {
+                type Vtable = <ITransport as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID = <ITransport as windows_core::Interface>::IID;
+            }
+            impl windows_core::RuntimeName for UnixConnector {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.UnixConnector";
             }
         }
-        pub fn ConnectAsync(
-            &self,
-            path: &windows_core::HSTRING,
-        ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>> {
-            let this = &windows_core::Interface::cast::<IUnixConnector>(self)?;
-            unsafe {
-                let mut result__ = core::mem::zeroed();
-                (windows_core::Interface::vtable(this).ConnectAsync)(
-                    windows_core::Interface::as_raw(this),
-                    core::mem::transmute_copy(path),
-                    &mut result__,
-                )
-                .and_then(|| windows_core::Type::from_abi(result__))
-            }
-        }
-    }
-    impl windows_core::RuntimeType for UnixConnector {
-        const SIGNATURE: windows_core::imp::ConstBuffer =
-            windows_core::imp::ConstBuffer::for_class::<Self, ITransport>();
-    }
-    unsafe impl windows_core::Interface for UnixConnector {
-        type Vtable = <ITransport as windows_core::Interface>::Vtable;
-        const IID: windows_core::GUID = <ITransport as windows_core::Interface>::IID;
-    }
-    impl windows_core::RuntimeName for UnixConnector {
-        const NAME: &'static str = "Rustwinui3loop.UnixConnector";
     }
 }

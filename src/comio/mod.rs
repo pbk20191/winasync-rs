@@ -9,7 +9,7 @@
 //!
 //! # Where the interfaces come from
 //!
-//! Not from this module. `metadata/rustwinui3loop.rdl` describes the whole
+//! Not from this module. `metadata/winasync.rdl` describes the whole
 //! WinRT surface, `tools/winmdgen` compiles it to the `.winmd` this component
 //! publishes and runs `windows-bindgen` over that, and the result is
 //! [`bindings`]. Everything here implements those generated traits.
@@ -95,13 +95,13 @@ pub use listener::{
 };
 // The listener-side interfaces now come from metadata; see [`bindings`].
 #[allow(unused_imports)]
-pub use bindings::Rustwinui3loop::{
+pub use bindings::Pbk20191::WinAsync::Comio::{
     IConnectionListener, IConnectionReceivedArgs, IHyperVBind, INamedPipeBind,
     IUnixBind,
 };
 // The client half's interfaces now come from metadata; see [`bindings`].
 #[allow(unused_imports)]
-pub use bindings::Rustwinui3loop::{
+pub use bindings::Pbk20191::WinAsync::Comio::{
     IHyperVConnector, INamedPipeConnector, ITransport, IUnixConnector,
 };
 // `stream::from_reg` takes/returns crate-private types (`Arc<tpio::IoReg>`),
@@ -301,7 +301,7 @@ mod tests {
         let name = ours.GetRuntimeClassName().expect("GetRuntimeClassName");
         assert_eq!(
             name.to_string(),
-            <crate::comio::bindings::Rustwinui3loop::NamedPipeConnectionListener as windows_core::RuntimeName>::NAME,
+            <crate::comio::bindings::Pbk20191::WinAsync::Comio::NamedPipeConnectionListener as windows_core::RuntimeName>::NAME,
             "GetRuntimeClassName said {name:?}"
         );
         assert_eq!(

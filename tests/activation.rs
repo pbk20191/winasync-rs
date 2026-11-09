@@ -21,10 +21,10 @@
 //! removed again however this test ends.
 #![cfg(feature = "comio")]
 
-use rustwinui3loop::comio::activation::{
+use winasync::comio::activation::{
     CLASSES, CLSID_NAMED_PIPE_CONNECTOR, CLSID_NAMED_PIPE_CONNECTION_LISTENER, clsid_key,
 };
-use rustwinui3loop::comio::bindings::Rustwinui3loop::{
+use winasync::comio::bindings::Pbk20191::WinAsync::Comio::{
     IConnectionListener, IConnectionReceivedArgs, INamedPipeBind, INamedPipeConnector,
     ITransport, ITransportStream,
 };
@@ -111,7 +111,7 @@ fn ensure_dll() -> std::path::PathBuf {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let path = dir.join("rustwinui3loop.dll");
+    let path = dir.join("winasync.dll");
     assert!(
         path.exists(),
         "{} missing after a successful build — is `crate-type` still [\"lib\", \"cdylib\"]?",
@@ -284,7 +284,7 @@ fn com_activation_round_trip_through_the_registered_dll() {
     // would hand a script an object it could create and never call. Asserting
     // the *absence* keeps that deliberate rather than accidental.
     assert_eq!(
-        unsafe { CLSIDFromProgID(&HSTRING::from("Rustwinui3loop.NamedPipeConnector")) }
+        unsafe { CLSIDFromProgID(&HSTRING::from("Pbk20191.WinAsync.Comio.NamedPipeConnector")) }
             .map(|_| ())
             .map_err(|e| e.code()),
         Err(CO_E_CLASSSTRING),
@@ -382,12 +382,12 @@ fn winrt_activation_factory(module: HMODULE) {
     };
 
     for name in [
-        "Rustwinui3loop.NamedPipeConnectionListener",
-        "Rustwinui3loop.UnixConnectionListener",
-        "Rustwinui3loop.HyperVConnectionListener",
-        "Rustwinui3loop.NamedPipeConnector",
-        "Rustwinui3loop.UnixConnector",
-        "Rustwinui3loop.HyperVConnector",
+        "Pbk20191.WinAsync.Comio.NamedPipeConnectionListener",
+        "Pbk20191.WinAsync.Comio.UnixConnectionListener",
+        "Pbk20191.WinAsync.Comio.HyperVConnectionListener",
+        "Pbk20191.WinAsync.Comio.NamedPipeConnector",
+        "Pbk20191.WinAsync.Comio.UnixConnector",
+        "Pbk20191.WinAsync.Comio.HyperVConnector",
     ] {
         let factory = factory_for(name).unwrap_or_else(|hr| panic!("{name}: {hr:?}"));
         let instance = unsafe { factory.ActivateInstance() }
@@ -405,9 +405,9 @@ fn winrt_activation_factory(module: HMODULE) {
     // Classes that exist in the metadata but are not `#[Activatable]`, so the
     // factory must refuse them rather than quietly make one.
     for name in [
-        "Rustwinui3loop.TransportStream",
-        "Rustwinui3loop.ConnectionReceivedArgs",
-        "Rustwinui3loop.NoSuchClass",
+        "Pbk20191.WinAsync.Comio.TransportStream",
+        "Pbk20191.WinAsync.Comio.ConnectionReceivedArgs",
+        "Pbk20191.WinAsync.Comio.NoSuchClass",
         "Windows.Storage.Streams.Buffer",
     ] {
         assert_eq!(
@@ -431,7 +431,7 @@ fn winrt_activation_factory(module: HMODULE) {
     assert_eq!(
         unsafe {
             get_factory(
-                core::mem::ManuallyDrop::new(HSTRING::from("Rustwinui3loop.NamedPipeConnector")),
+                core::mem::ManuallyDrop::new(HSTRING::from("Pbk20191.WinAsync.Comio.NamedPipeConnector")),
                 core::ptr::null_mut(),
             )
         },
@@ -455,8 +455,8 @@ fn winrt_activation_factory(module: HMODULE) {
 /// accident of something else having registered these classes.
 fn ro_activate_instance_reg_free(dll: &Path) {
     const NAMES: [&str; 2] = [
-        "Rustwinui3loop.NamedPipeConnector",
-        "Rustwinui3loop.NamedPipeConnectionListener",
+        "Pbk20191.WinAsync.Comio.NamedPipeConnector",
+        "Pbk20191.WinAsync.Comio.NamedPipeConnectionListener",
     ];
 
     unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.expect("RoInitialize");
@@ -476,8 +476,8 @@ fn ro_activate_instance_reg_free(dll: &Path) {
     // The manifest is generated from the same `CLASSES` table the activation
     // factory looks names up in, so the two cannot disagree.
     let dir = dll.parent().expect("dll directory");
-    let manifest_path = dir.join("rustwinui3loop.manifest");
-    std::fs::write(&manifest_path, rustwinui3loop::comio::activation::manifest())
+    let manifest_path = dir.join("winasync.manifest");
+    std::fs::write(&manifest_path, winasync::comio::activation::manifest())
         .expect("write manifest");
 
     let source: Vec<u16> = manifest_path

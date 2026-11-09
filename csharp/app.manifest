@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Rustwinui3loop" version="1.0.0.0"/>
-  <file name="rustwinui3loop.dll">
-    <activatableClass name="Rustwinui3loop.NamedPipeConnectionListener" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
-    <activatableClass name="Rustwinui3loop.UnixConnectionListener" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
-    <activatableClass name="Rustwinui3loop.HyperVConnectionListener" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
-    <activatableClass name="Rustwinui3loop.NamedPipeConnector" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
-    <activatableClass name="Rustwinui3loop.UnixConnector" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
-    <activatableClass name="Rustwinui3loop.HyperVConnector" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
+  <assemblyIdentity type="win32" name="Pbk20191.WinAsync.Comio" version="1.0.0.0"/>
+  <file name="winasync.dll">
+    <activatableClass name="Pbk20191.WinAsync.Comio.NamedPipeConnectionListener" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
+    <activatableClass name="Pbk20191.WinAsync.Comio.UnixConnectionListener" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
+    <activatableClass name="Pbk20191.WinAsync.Comio.HyperVConnectionListener" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
+    <activatableClass name="Pbk20191.WinAsync.Comio.NamedPipeConnector" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
+    <activatableClass name="Pbk20191.WinAsync.Comio.UnixConnector" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
+    <activatableClass name="Pbk20191.WinAsync.Comio.HyperVConnector" threadingModel="both" xmlns="urn:schemas-microsoft-com:winrt.v1"/>
   </file>
 </assembly>

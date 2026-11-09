@@ -2,6 +2,8 @@
 
 *기준일: 2026-11-09*
 
+> **개명 (2026-11-09).** 크레이트 `rustwinui3loop` → **`winasync`**, WinRT 네임스페이스 `Rustwinui3loop` → **`Pbk20191.WinAsync.Comio`**. 아래 "개명" 절.
+
 ## 방향 (2026-11-09 결정)
 
 **최종 목표는 WinRT 개념으로 스크립트 월드까지 노출하는 것**이고, 타깃 스크립트 호스트는 **모던 쪽(Python / Node / .NET 스크립팅)만**이다. 활성화는 **reg-free WinRT**(소비 프로세스의 매니페스트 / 액티베이션 컨텍스트)다 — 처음엔 HKLM + 승격으로 정했다가 **그 전제가 틀린 것으로 측정됐다**(아래 3번). 승격이 필요 없어졌다.
@@ -21,12 +23,32 @@
 
 | 겹 | 무엇을 하나 | 위치 |
 | --- | --- | --- |
-| 메타데이터 | 17개 타입(클래스 8 + 인터페이스 9)의 단일 출처 | `metadata/rustwinui3loop.rdl` |
+| 메타데이터 | 17개 타입(클래스 8 + 인터페이스 9)의 단일 출처 | `metadata/Pbk20191.WinAsync.Comio.rdl` |
 | 생성기 | RDL → `.winmd` → Rust 바인딩. 손으로 돌린다 | `tools/winmdgen` (`cargo run -p winmdgen`) |
-| 산출물 | 소비자가 프로젝션을 만들 때 쓰는 파일 | `metadata/rustwinui3loop.winmd` |
+| 산출물 | 소비자가 프로젝션을 만들 때 쓰는 파일 | `metadata/Pbk20191.WinAsync.Comio.winmd` |
 | 바인딩 | `_Impl` 트레이트 + vtable. 체크인됨 | `src/comio/bindings.rs` |
 | 구현 | 위 트레이트를 구현 | `listener.rs` / `connector.rs` / `pipe.rs` / `unix.rs` / `hvsock.rs` / `stream.rs` |
 | 활성화 | 런타임 클래스 이름으로 `RoActivateInstance`(reg-free 매니페스트). CLSID `CoCreateInstance`는 소비자가 직접 등록하면 | `activation.rs` |
+
+### 개명 (2026-11-09)
+
+| | 전 | 후 |
+| --- | --- | --- |
+| cargo 패키지 / cdylib | `rustwinui3loop` | **`winasync`** |
+| bin | `rustwinui3loop-demo` | `winasync-demo` |
+| WinRT 네임스페이스 | `Rustwinui3loop` | **`Pbk20191.WinAsync.Comio`** |
+| 공개 클래스 | `Rustwinui3loop.NamedPipeConnector` | `Pbk20191.WinAsync.Comio.NamedPipeConnector` |
+| 메타데이터 파일 | `metadata/rustwinui3loop.{rdl,winmd}` | `metadata/Pbk20191.WinAsync.Comio.{rdl,winmd}` |
+
+**왜 지금.** 네임스페이스는 사적인 이름이 아니라 **공개 식별자**다 — Python 사용자가 타이핑하는 것이고, 매니페스트 여섯 줄이 그 문자열이고, `#[guid(auto)]` IID 아홉 개가 **정규화된 이름의 해시**다. 바꾸면 IID가 전부 다시 유도된다. 외부 소비자가 0인 지금이 그게 공짜인 마지막 시점이었다. (CLSID 여섯 개는 손으로 박은 GUID라 영향 없다.)
+
+**왜 이 이름.** 옛 이름은 내용물을 가리키지 못했다 — comio 7.8k / tp 7.0k / rio 3.2k / dq 1.5k 줄인데, `winui3`는 `src/dq/mod.rs` 한 군데뿐이고 `loop`는 네 기둥 중 아무것도 지칭하지 않는다. `winasync`는 네 기둥의 공통분모이고 crates.io에서 비어 있다 (`winio`는 피했다 — 이미 **우리 의존성**이다).
+
+네임스페이스는 **벤더 + 프로젝트 + 모듈**이다. WinRT 관례는 역방향 DNS가 아니라 `Microsoft.UI.Xaml` / `Windows.Storage.Streams`처럼 벤더가 앞에 온다. 벤더 세그먼트는 작성자의 GitHub 정체성이라 레지스트리 없이도 충돌이 없다. 파일명도 네임스페이스와 같게 맞췄다 — 모든 WinRT 툴체인이 이름으로 메타데이터를 찾을 때 가정하는 규약이다.
+
+**검증.** 양쪽 프로젝션을 새로 생성해서 끝까지 돌렸다 — Python `ROUND-TRIP-OK`(Hyper-V 포함), C# `CS-ROUND-TRIP-OK`.
+
+**같이 고친 것.** `python/stage.sh`가 PyWinRT 패키지 경로를 하드코딩하고 있었는데(네임스페이스가 인코딩돼 있어서 개명하자 바로 깨졌다) `_table.pywinrt.txt`를 찾아서 유도하도록 바꿨다. `.winmd` 경로도 `$REPO`(Git Bash 형식 `/e/...`)로 넘기고 있었는데 pywinrt는 .NET 툴이라 해석하지 못하고, MSYS도 고쳐주지 않는다 — `<package>;<path>`가 한 인자이고 세미콜론이 path-list 구분자로 읽히기 때문이다. 상대 경로로 바꿨다. 셋째, 이전에 백슬래시가 반토막 나면서 깨져 있던 줄 연결도 복구했다.
 
 ### 왜 메타데이터가 먼저여야 했나
 
@@ -92,14 +114,14 @@ fn ConnectAsync(&self, name: &HSTRING) -> Result<IAsyncOperation<TransportStream
 **동작했었다.** 지운 게 안 되던 코드라서가 아니다. PowerShell/VBScript/WSH에서 전부 돌려보고 출력까지 확인했었다. 기록으로만 남긴다:
 
 ```text
-regsvr32 /s rustwinui3loop.dll
-TlbImp.exe "%LOCALAPPDATA%\rustwinui3loop\rustwinui3loop.tlb" ^
-    /out:Rustwinui3loop.Interop.dll /namespace:Rustwinui3loop
+regsvr32 /s winasync.dll
+TlbImp.exe "%LOCALAPPDATA%\winasync\winasync.tlb" ^
+    /out:WinAsync.Interop.dll /namespace:Pbk20191.WinAsync.Comio
 ```
 
 ```powershell
-Add-Type -Path .\Rustwinui3loop.Interop.dll
-$l = New-Object Rustwinui3loop.NamedPipeConnectionListenerClass   # -ComObject 아님
+Add-Type -Path .\WinAsync.Interop.dll
+$l = New-Object Pbk20191.WinAsync.Comio.NamedPipeConnectionListenerClass   # -ComObject 아님
 Register-ObjectEvent -InputObject $l -EventName ConnectionReceived -SourceIdentifier conn -Action {
     $EventArgs.ReadText(64)
 }
@@ -153,7 +175,7 @@ $l.Bind($name)
 
 | 메서드 | 지금 응답 | 어디서 결정되나 | 훅 |
 | --- | --- | --- | --- |
-| `GetRuntimeClassName` | `"Rustwinui3loop.<클래스>"` | `#[implement]` 목록 **첫 타입**의 `RuntimeName::NAME` | **있다** — 첫 줄을 런타임 클래스 타입으로 바꾸면 끝 |
+| `GetRuntimeClassName` | `"Pbk20191.WinAsync.Comio.<클래스>"` | `#[implement]` 목록 **첫 타입**의 `RuntimeName::NAME` | **있다** — 첫 줄을 런타임 클래스 타입으로 바꾸면 끝 |
 | `GetIids` | `count=0`, `values=null` | `IInspectable_Vtbl::new`가 설치하는 **자유 함수**에 하드코딩 | **없음** — 타입 파라미터를 아예 안 받음 |
 | `GetTrustLevel` | `0` (BaseTrust) | 매크로가 `TrustLevel=` 속성값을 직접 넣음 | 있다 (`Partial`/`Full`). `BaseTrust`가 맞는 답이라 안 쓴다 |
 
@@ -229,7 +251,7 @@ $l.Bind($name)
    통합 테스트가 `RoActivateInstance`가 아니라 **export를 직접 호출**한다 — HKLM 등록(아래 3번)이 아직 없기 때문이고, 그 덕에 "팩토리가 동작한다"와 "레지스트리가 우리를 가리킨다"가 분리된다. 활성화된 객체에게 `GetRuntimeClassName`을 다시 물어 **요청한 이름과 일치하는지** 확인하므로, 한쪽만 리네임되면 깨진다. 비활성 클래스(`TransportStream`, `ConnectionReceivedArgs`)와 모르는 이름은 `REGDB_E_CLASSNOTREG`로 거절되는 것까지 확인한다.
 
 2b. ~~ProgID 키 제거~~ · **완료** (2026-11-09)
-   `IDispatch`를 지운 순간 ProgID 등록은 **거짓말이 됐다**. ProgID는 사실상 스크립트가 `New-Object -ComObject Rustwinui3loop.NamedPipeConnector` / `CreateObject(...)`라고 쓰기 위해 존재하는데, 지금 그렇게 하면 객체는 **만들어지고 메서드는 하나도 못 부른다**. 컴파일된 호출자는 CLSID를 쓰고 ProgID 키를 읽지 않는다. 키를 지웠고, `ComClass.progid`는 `ComClass.name`(런타임 클래스 이름)으로 개명했다 — 문자열 자체는 그대로다.
+   `IDispatch`를 지운 순간 ProgID 등록은 **거짓말이 됐다**. ProgID는 사실상 스크립트가 `New-Object -ComObject Pbk20191.WinAsync.Comio.NamedPipeConnector` / `CreateObject(...)`라고 쓰기 위해 존재하는데, 지금 그렇게 하면 객체는 **만들어지고 메서드는 하나도 못 부른다**. 컴파일된 호출자는 CLSID를 쓰고 ProgID 키를 읽지 않는다. 키를 지웠고, `ComClass.progid`는 `ComClass.name`(런타임 클래스 이름)으로 개명했다 — 문자열 자체는 그대로다.
 
    테스트는 이제 **부재를 단언**한다. `CLSIDFromProgID`가 `CO_E_CLASSSTRING`(0x800401F3)을 돌려주는지 본다 — `REGDB_E_CLASSNOTREG`가 아니다. 그건 "CLSID는 아는데 등록이 안 됐다"는 뜻이고 여기선 이름 단계에서 먼저 실패한다. (처음에 틀리게 적었다가 테스트가 잡아냈다.)
 
@@ -250,8 +272,8 @@ $l.Bind($name)
    **답은 reg-free WinRT다.** 소비 프로세스가 매니페스트를 들고 있으면 된다 — 자기 애플리케이션 매니페스트로 넣거나, 런타임에 `CreateActCtx` + `ActivateActCtx`로 올리거나. 후자가 `python.exe`처럼 매니페스트를 건드릴 수 없는 호스트의 답이다. 측정 결과:
 
    ```
-   without act ctx: Rustwinui3loop.NamedPipeConnector -> HRESULT(0x80040154)
-   with    act ctx: Rustwinui3loop.NamedPipeConnector -> OK  name="Rustwinui3loop.NamedPipeConnector"
+   without act ctx: Pbk20191.WinAsync.Comio.NamedPipeConnector -> HRESULT(0x80040154)
+   with    act ctx: Pbk20191.WinAsync.Comio.NamedPipeConnector -> OK  name="Pbk20191.WinAsync.Comio.NamedPipeConnector"
    ```
 
    **지금까지 만든 건 하나도 안 버린다.** reg-free도 같은 `DllGetActivationFactory`를 부르고 같은 메타데이터를 읽는다 — 바뀌는 건 *발견 방법*뿐이다.
@@ -278,7 +300,7 @@ $l.Bind($name)
    - `await connector.connect_async(...)` — 진짜 `IAsyncOperation<TransportStream>`
    - `DataWriter`/`DataReader` — **윈도우 자신의** 스트림 클래스가 우리 스트림을 읽고 썼다. `TransportStream`이 진짜 `IInputStream`/`IOutputStream`이 아니면 불가능하다.
 
-   **PyWinRT는 우리 winmd를 그대로 먹었다.** 걱정했던 `[ContractVersion]`/`[Version]` 부재는 문제가 아니었다. 8 클래스 + 9 인터페이스 전부 생성됐고, 파라미터화 IID도 정확하다 — `AsyncOperationCompletedHandler<TransportStream>`의 시그니처가 `rc(Rustwinui3loop.TransportStream;{905a0fe2-...})`로 나왔는데 저 GUID가 우리가 선언한 디폴트 인터페이스 `IInputStream`이다.
+   **PyWinRT는 우리 winmd를 그대로 먹었다.** 걱정했던 `[ContractVersion]`/`[Version]` 부재는 문제가 아니었다. 8 클래스 + 9 인터페이스 전부 생성됐고, 파라미터화 IID도 정확하다 — `AsyncOperationCompletedHandler<TransportStream>`의 시그니처가 `rc(Pbk20191.WinAsync.Comio.TransportStream;{905a0fe2-...})`로 나왔는데 저 GUID가 우리가 선언한 디폴트 인터페이스 `IInputStream`이다.
 
    ### 걸린 것 1 — `windows-rdl`은 클래스 생성자를 못 낸다
 
@@ -483,11 +505,11 @@ TLS를 구현하지 않기로 했으면 **가져와서 감쌀 수 있어야** �
 ```powershell
 # COM 등록 (HKCU, 승격 불필요). DllRegisterServer는 S_FALSE를 돌려준다 —
 # WinRT 키는 TrustedInstaller 소유라 못 쓰기 때문이고, 정상이다.
-Start-Process regsvr32 -ArgumentList '/s', 'target\debug\rustwinui3loop.dll' -Wait
-Start-Process regsvr32 -ArgumentList '/s', '/u', 'target\debug\rustwinui3loop.dll' -Wait
+Start-Process regsvr32 -ArgumentList '/s', 'target\debug\winasync.dll' -Wait
+Start-Process regsvr32 -ArgumentList '/s', '/u', 'target\debug\winasync.dll' -Wait
 
 # WinRT는 등록이 없다. 소비자가 매니페스트를 올린다:
-#   activation::manifest() -> rustwinui3loop.manifest (DLL 옆)
+#   activation::manifest() -> winasync.manifest (DLL 옆)
 #   CreateActCtx + ActivateActCtx -> RoActivateInstance
 # 전체 검증
 cargo test --all-features

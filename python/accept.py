@@ -6,12 +6,17 @@ manifest loaded into this process's activation context.
 """
 import asyncio, os, pathlib, sys
 
-PKG_ROOT = pathlib.Path(__file__).parent / "out" / "rustwinui3loop-Rustwinui3loop" / "rustwinui3loop"
+NAMESPACE = "Pbk20191.WinAsync.Comio"
+# `stage.sh` writes the projection here. The import root is the directory
+# holding the top-level package; the component and its manifest sit at the
+# bottom, in the package the namespace maps to.
+PKG_ROOT = pathlib.Path(__file__).parent / "out" / f"winasync-{NAMESPACE}" / "winasync"
+PKG = PKG_ROOT.joinpath(*NAMESPACE.lower().split("."))
 sys.path.insert(0, str(PKG_ROOT))
 import actctx
-actctx.activate(str(PKG_ROOT / "rustwinui3loop" / "rustwinui3loop.manifest"))
+actctx.activate(str(PKG / "winasync.manifest"))
 
-import rustwinui3loop as rw
+import pbk20191.winasync.comio as rw
 from activate_instance import activate
 from winrt.windows.storage.streams import DataReader, DataWriter
 

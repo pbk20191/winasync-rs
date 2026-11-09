@@ -20,10 +20,10 @@
 //!    function pointer into this module.
 #![cfg(feature = "comio")]
 
-use rustwinui3loop::comio::NamedPipeConnector;
-use rustwinui3loop::comio::activation::{CLSID_NAMED_PIPE_CONNECTOR, DllGetClassObject};
-use rustwinui3loop::comio::bindings::Rustwinui3loop::ITransportStream;
-use rustwinui3loop::comio::unload::{can_unload, locks_held, outstanding};
+use winasync::comio::NamedPipeConnector;
+use winasync::comio::activation::{CLSID_NAMED_PIPE_CONNECTOR, DllGetClassObject};
+use winasync::comio::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
+use winasync::comio::unload::{can_unload, locks_held, outstanding};
 use std::time::{Duration, Instant};
 use windows::Storage::Streams::{Buffer, IInputStream, IOutputStream, InputStreamOptions};
 use windows::Win32::System::Com::IClassFactory;
@@ -156,8 +156,8 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
     // Constructing the connector is not enough — `wsa_init` runs when a
     // socket is actually created. A connect to a path nothing is listening
     // on creates one and then fails, which is all this needs.
-    let unix = rustwinui3loop::comio::UnixConnector::new();
-    let typed: rustwinui3loop::comio::bindings::Rustwinui3loop::IUnixConnector =
+    let unix = winasync::comio::UnixConnector::new();
+    let typed: winasync::comio::bindings::Pbk20191::WinAsync::Comio::IUnixConnector =
         unix.cast().expect("QI IUnixConnector");
     let path = std::env::temp_dir().join(format!("comio_unload_{}.sock", std::process::id()));
     let _ = typed
@@ -175,11 +175,11 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
 
 /// A listener bound to a fresh pipe name, plus that name.
 fn bound_listener() -> (
-    windows_core::ComObject<rustwinui3loop::comio::NamedPipeConnectionListener>,
+    windows_core::ComObject<winasync::comio::NamedPipeConnectionListener>,
     String,
 ) {
-    use rustwinui3loop::comio::NamedPipeConnectionListener;
-    use rustwinui3loop::comio::bindings::Rustwinui3loop::{
+    use winasync::comio::NamedPipeConnectionListener;
+    use winasync::comio::bindings::Pbk20191::WinAsync::Comio::{
         IConnectionListener, IConnectionReceivedArgs,
     };
     use windows::Foundation::TypedEventHandler;
@@ -203,7 +203,7 @@ fn bound_listener() -> (
 /// The client end of `name`.
 fn connect(name: &str) -> ITransportStream {
     let connector = NamedPipeConnector::new();
-    let typed: rustwinui3loop::comio::bindings::Rustwinui3loop::INamedPipeConnector =
+    let typed: winasync::comio::bindings::Pbk20191::WinAsync::Comio::INamedPipeConnector =
         connector.cast().expect("QI INamedPipeConnector");
     typed
         .ConnectAsync(&windows_core::HSTRING::from(name))

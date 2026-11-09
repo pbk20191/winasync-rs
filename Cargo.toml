@@ -1,5 +1,5 @@
 [package]
-name = "rustwinui3loop"
+name = "winasync"
 version = "0.1.0"
 edition = "2024"
 
@@ -21,11 +21,11 @@ members = ["tools/winmdgen"]
 crate-type = ["lib", "cdylib"]
 
 # Renamed off the package name because the cdylib now claims
-# `rustwinui3loop.pdb`, which a bin of the same name would also emit —
+# `winasydylib-featuredylib-featurenc.pdb`, which a bin of the same name would also emit —
 # cargo warns on the collision and says it may become a hard error. There is
 # still only one bin, so `cargo run` is unaffected.
 [[bin]]
-name = "rustwinui3loop-demo"
+name = "winasync-demo"
 path = "src/main.rs"
 
 [dependencies]

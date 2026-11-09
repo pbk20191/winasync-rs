@@ -5,7 +5,7 @@
 
 use crate::comio::unload::ModuleRef;
 use super::bindings;
-use super::bindings::Rustwinui3loop::{
+use super::bindings::Pbk20191::WinAsync::Comio::{
     INamedPipeConnector_Impl, ITransport_Impl, ITransportStream,
 };
 use super::stream;
@@ -176,8 +176,8 @@ pub(crate) fn arm_accept(
 
 /// Client side of a named pipe.
 #[windows_core::implement(
-    bindings::Rustwinui3loop::NamedPipeConnector,
-    bindings::Rustwinui3loop::INamedPipeConnector
+    bindings::Pbk20191::WinAsync::Comio::NamedPipeConnector,
+    bindings::Pbk20191::WinAsync::Comio::INamedPipeConnector
 )]
 pub struct NamedPipeConnector {
     _module: ModuleRef,

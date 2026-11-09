@@ -21,10 +21,10 @@ use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
 use super::bindings;
-use super::bindings::Rustwinui3loop::{IHyperVConnector_Impl, ITransport_Impl};
+use super::bindings::Pbk20191::WinAsync::Comio::{IHyperVConnector_Impl, ITransport_Impl};
 use super::connector::connect_op;
 use super::listener::Accepted;
-use super::bindings::Rustwinui3loop::ITransportStream;
+use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
@@ -228,8 +228,8 @@ impl HvStreamListener {
 
 /// Client side of a Hyper-V socket connection.
 #[windows_core::implement(
-    bindings::Rustwinui3loop::HyperVConnector,
-    bindings::Rustwinui3loop::IHyperVConnector
+    bindings::Pbk20191::WinAsync::Comio::HyperVConnector,
+    bindings::Pbk20191::WinAsync::Comio::IHyperVConnector
 )]
 pub struct HyperVConnector {
     _module: ModuleRef,

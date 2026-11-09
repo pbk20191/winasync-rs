@@ -7,7 +7,7 @@
 //! filesystem path and a pair of GUIDs cannot share one signature.
 //!
 //! The interfaces themselves are no longer declared here. They live in
-//! `metadata/rustwinui3loop.rdl` and are generated into [`super::bindings`],
+//! `metadata/winasync.rdl` and are generated into [`super::bindings`],
 //! because a hand-written `#[interface]` cannot derive from `IInspectable`
 //! and so cannot be a WinRT interface at all. What stays in this module is
 //! the part metadata cannot express: the operation object behind every
@@ -41,7 +41,7 @@ use windows_future::{
     IAsyncOperation_Impl,
 };
 
-use super::bindings::Rustwinui3loop::ITransportStream;
+use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
 use super::tpio::OpHandle;
 
 /// An `IAsyncOperation<ITransportStream>` whose result arrives from an overlapped
@@ -204,7 +204,7 @@ pub(crate) fn connect_op(
 mod tests {
     use super::*;
     // Every interface under test now comes from metadata.
-    use crate::comio::bindings::Rustwinui3loop::*;
+    use crate::comio::bindings::Pbk20191::WinAsync::Comio::*;
     use crate::comio::listener::{ConnectionHandler, NamedPipeConnectionListener};
     use core::ffi::c_void;
     use std::sync::mpsc;
@@ -216,7 +216,7 @@ mod tests {
     /// then `GetResults` after.
     #[test]
     fn unix_connector_completes_from_the_overlapped_callback() {
-        use crate::comio::bindings::Rustwinui3loop::IUnixBind;
+        use crate::comio::bindings::Pbk20191::WinAsync::Comio::IUnixBind;
         use crate::comio::listener::UnixConnectionListener;
 
         let path = std::env::temp_dir()

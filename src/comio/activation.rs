@@ -103,7 +103,7 @@
 
 use super::unload::ModuleRef;
 use core::ffi::c_void;
-use super::bindings::Rustwinui3loop as rc;
+use super::bindings::Pbk20191::WinAsync::Comio as rc;
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, S_FALSE, S_OK,
 };
@@ -135,7 +135,7 @@ pub struct ComClass {
     ///
     /// This used to be registered as a ProgID as well. It is not any more. A
     /// ProgID exists so a *script* can say
-    /// `New-Object -ComObject Rustwinui3loop.NamedPipeConnector`, and since
+    /// `New-Object -ComObject Pbk20191.WinAsync.Comio.NamedPipeConnector`, and since
     /// the `IDispatch` layer went (2026-11-09) that would hand a script an
     /// object it has successfully created and cannot call a single method on.
     /// Advertising the name was worse than not advertising it. A compiled
@@ -429,8 +429,8 @@ pub fn manifest() -> String {
     s.push_str(concat!(
         "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n",
         "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n",
-        "  <assemblyIdentity type=\"win32\" name=\"Rustwinui3loop\" version=\"1.0.0.0\"/>\n",
-        "  <file name=\"rustwinui3loop.dll\">\n",
+        "  <assemblyIdentity type=\"win32\" name=\"Pbk20191.WinAsync.Comio\" version=\"1.0.0.0\"/>\n",
+        "  <file name=\"winasync.dll\">\n",
     ));
     for class in CLASSES {
         // `threadingModel="both"` is the manifest spelling of the claim

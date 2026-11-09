@@ -1,4 +1,4 @@
-//! Compiles `metadata/rustwinui3loop.rdl` into the `.winmd` this component
+//! Compiles `metadata/Pbk20191.WinAsync.Comio.rdl` into the `.winmd` this component
 //! publishes, then generates the Rust bindings the crate implements against.
 //!
 //! Run from the repository root:
@@ -15,9 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// `metadata/rustwinui3loop.rdl` → `metadata/rustwinui3loop.winmd`.
-const RDL: &str = "metadata/rustwinui3loop.rdl";
-const WINMD: &str = "metadata/rustwinui3loop.winmd";
+/// The file name is the namespace, which is the convention every WinRT
+/// toolchain assumes when it goes looking for metadata by name.
+const RDL: &str = "metadata/Pbk20191.WinAsync.Comio.rdl";
+const WINMD: &str = "metadata/Pbk20191.WinAsync.Comio.winmd";
 /// Generated; do not edit. Lives beside the module that implements it.
 const BINDINGS: &str = "src/comio/bindings.rs";
 
@@ -47,7 +48,7 @@ fn main() {
         "--out",
         bindings.to_str().expect("bindings path is not UTF-8"),
         "--filter",
-        "Rustwinui3loop",
+        "Pbk20191",
         // Emit the `*_Impl` traits and `*_Vtbl::new` constructors, i.e. the
         // *implementer's* side. Without it we would get a consumer-only
         // projection and have nothing for `#[implement]` to attach to.

@@ -18,7 +18,8 @@ ROUND-TRIP-OK
 Nothing generated is checked in, so stage it first:
 
 ```bash
-dotnet tool install --local PyWinRT
+dotnet new tool-manifest   # once; python/dotnet-tools.json is not checked in
+dotnet tool install PyWinRT
 python -m pip install winrt-runtime winrt-Windows.Foundation \
                       winrt-Windows.Storage.Streams winrt-table-compiler
 ./stage.sh
@@ -27,7 +28,7 @@ python accept.py
 
 `stage.sh` builds the cdylib, runs `cargo test --test activation` (which
 writes the reg-free manifest out of `activation::manifest()`), generates the
-projection from `metadata/rustwinui3loop.winmd`, compiles the projection
+projection from `metadata/Pbk20191.WinAsync.Comio.winmd`, compiles the projection
 table, and copies the DLL and manifest into the package.
 
 ## How the component is reached

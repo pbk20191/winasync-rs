@@ -2,11 +2,11 @@
 
 // Only the three-engine demo tail below consumes it.
 #[cfg(all(feature = "tp", feature = "comio", feature = "dq"))]
-use rustwinui3loop::comio;
+use winasync::comio;
 #[cfg(feature = "dq")]
-use rustwinui3loop::dq;
+use winasync::dq;
 #[cfg(feature = "tp")]
-use rustwinui3loop::tp;
+use winasync::tp;
 
 // All of these feed the `dq`-only WinUI demo tail in `main`.
 #[cfg(feature = "dq")]

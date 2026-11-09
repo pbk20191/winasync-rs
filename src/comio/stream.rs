@@ -10,7 +10,7 @@ use crate::comio::unload::ModuleRef;
 use super::asyncop::IoAsyncOp;
 use super::buffer::buffer_ptr;
 use super::bindings;
-use super::bindings::Rustwinui3loop::ITransportStream_Impl;
+use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream_Impl;
 use super::tpio::{IoReg, Issue};
 use std::sync::Arc;
 use windows::Foundation::IClosable_Impl;
@@ -61,7 +61,7 @@ unsafe impl Send for AcceptSockGuard {}
 
 /// A duplex WinRT stream over one overlapped-registered handle/socket.
 ///
-/// `Rustwinui3loop.TransportStream` in metadata; the generated class type
+/// `Pbk20191.WinAsync.Comio.TransportStream` in metadata; the generated class type
 /// leads the list so `GetRuntimeClassName` reports it, and its
 /// `Interface::Vtable` *is* the class's default interface, `ITransportStream`.
 ///
@@ -72,7 +72,7 @@ unsafe impl Send for AcceptSockGuard {}
 /// that `requires` in metadata does not create a vtable chain: every
 /// interface an object answers has to appear in this list.
 #[implement(
-    bindings::Rustwinui3loop::TransportStream,
+    bindings::Pbk20191::WinAsync::Comio::TransportStream,
     IInputStream,
     IOutputStream,
     windows::Foundation::IClosable
@@ -89,7 +89,7 @@ pub struct TransportStream {
 /// an accept produces -- the interface rather than this class, so that a
 /// composed stream (a TLS wrapper, say) travels the same path. A caller that
 /// wants `IInputStream`/`IOutputStream` casts from it as before.
-pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Rustwinui3loop::ITransportStream {
+pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Pbk20191::WinAsync::Comio::ITransportStream {
     let object = ComObject::new(TransportStream {
         reg,
         closed: std::sync::atomic::AtomicBool::new(false),
@@ -101,7 +101,7 @@ pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Rustwinui3loop::ITransportS
     // in its list, and naming the interface there as well would buy a second,
     // identical vtable chain to avoid one QI per accepted connection.
     windows_core::Interface::cast(
-        &object.to_interface::<bindings::Rustwinui3loop::TransportStream>(),
+        &object.to_interface::<bindings::Pbk20191::WinAsync::Comio::TransportStream>(),
     )
     .expect("TransportStream does not answer its own default interface")
 }
@@ -337,7 +337,7 @@ pub(crate) mod tests {
             // And the class it actually is, reachable from the interface.
             assert!(
                 stream
-                    .cast::<bindings::Rustwinui3loop::TransportStream>()
+                    .cast::<bindings::Pbk20191::WinAsync::Comio::TransportStream>()
                     .is_ok(),
                 "{what}: TransportStream"
             );
@@ -345,11 +345,11 @@ pub(crate) mod tests {
     }
 
     /// Creates a connected overlapped named-pipe pair and wraps each end as
-    /// a `Rustwinui3loop.TransportStream`, mirroring the setup in
+    /// a `Pbk20191.WinAsync.Comio.TransportStream`, mirroring the setup in
     /// `stream_read_write_roundtrip`. Returns `(server, client)`.
     pub(crate) fn pipe_pair() -> (
-        bindings::Rustwinui3loop::ITransportStream,
-        bindings::Rustwinui3loop::ITransportStream,
+        bindings::Pbk20191::WinAsync::Comio::ITransportStream,
+        bindings::Pbk20191::WinAsync::Comio::ITransportStream,
     ) {
         let name = format!(
             r"\\.\pipe\comio_stream_{}_{}",

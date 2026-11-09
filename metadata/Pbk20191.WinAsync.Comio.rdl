@@ -1,0 +1,238 @@
+// The WinRT surface of `comio`, as metadata.
+//
+// This file is the source of truth for the ABI: `tools/winmdgen` compiles it
+// to `Pbk20191.WinAsync.Comio.winmd` with `windows-rdl`, then runs `windows-bindgen`
+// over that to produce `src/comio/bindings.rs`. The Rust interfaces are
+// *generated from here*, not described by it — which is the whole reason this
+// file exists. A hand-written `#[interface]` cannot be a WinRT interface:
+// `windows-interface` emits `Parent_Vtbl::new::<Identity, OFFSET>` and needs a
+// `Parent_Impl` trait, and `IInspectable` has neither (its `new` takes three
+// type parameters and there is no `IInspectable_Impl`). So every interface
+// here derives from `IUnknown` three slots in, where a projection expects
+// `IInspectable` six slots in. Only bindgen emits the latter.
+//
+// IIDs are **derived**, not chosen. `windows-rdl` hashes each interface's
+// signature with the midlrt algorithm, exactly as MIDL 3.0 would, so an
+// independent consumer that recomputes them agrees. That is also why the
+// frozen GUIDs from the `#[interface]` era are gone: these interfaces inherit
+// from `IInspectable` and carry different members, so reusing an old IID for a
+// different vtable would be the one unforgivable COM error.
+//
+// The namespace is `Pbk20191.WinAsync.Comio`: vendor, project, module, which
+// is how WinRT reads (`Microsoft.UI.Xaml`, `Windows.Storage.Streams`) rather
+// than reverse DNS. The vendor segment is the author's GitHub identity, which
+// is what makes it collision-free without a registry; `Windows.` itself is
+// reserved for the `windows` crate (microsoft/win32metadata#998).
+//
+// It is also the file name of this file and of the `.winmd` beside it, which
+// is the convention every WinRT toolchain assumes when it looks for metadata
+// by name.
+//
+// Renamed from `Rustwinui3loop` on 2026-11-09, which re-derived every IID --
+// they are hashes of the fully qualified names. Free to do only because the
+// component has no external consumers yet.
+
+use Windows::Foundation::Metadata::*;
+
+#[winrt]
+mod Pbk20191 {
+    mod WinAsync {
+        mod Comio {
+            // Identity, not behaviour: a caller holding an unknown object can ask
+            // "which transport is this?" in one `QueryInterface`.
+            //
+            // Deliberately not named for any role. Connectors and listeners both
+            // answer it, and so would a datagram socket -- binding, connecting and
+            // listening are three things one transport does, not three transports.
+            #[guid(auto)]
+            interface ITransport {
+                #[get] Transport: String;
+            }
+
+            // The shape to keep in mind when adding one: AF_UNIX datagram, which is
+            // a real gap -- `DatagramSocket` is IP-only. WinRT's own datagram model
+            // is bind, a `MessageReceived` event, and `GetOutputStreamAsync(dest)`
+            // for sending, so the class would be
+            //
+            //     class UnixDatagramSocket { IUnixDatagramSocket, IUnixBind, IClosable }
+            //
+            // reusing `IUnixBind` unchanged and answering `ITransport` like everything
+            // else. That is why neither of those is named for listening: the names
+            // here were `IStreamConnector` and `I*ListenerBind`, and a datagram socket
+            // would have had to either implement something it is not or duplicate the
+            // member. `Information` is deliberately *not* hoisted alongside them --
+            // WinRT itself repeats it on `StreamSocketListener` and `DatagramSocket`
+            // rather than sharing, and a connector binds to nothing, so it would have
+            // only an empty string to report.
+
+            // ---------------------------------------------------------------------
+            // The stream
+            //
+            // What every transport hands back, on both ends. Not activatable -- a
+            // stream only ever comes from a connect or an accept, never from `new`.
+            // ---------------------------------------------------------------------
+
+            // A closable duplex stream, and the type every stream crosses this ABI
+            // as. It adds no members of its own: the three it requires are the whole
+            // contract, and naming that combination is the point.
+            //
+            // Everything returns this rather than the concrete class so the surface
+            // can be *composed*, not only consumed. Encryption is the case to have in
+            // mind, and the reason it is composed rather than built in:
+            //
+            // Hyper-V socket traffic crosses VMBus, not a network, so TLS there is
+            // redundant for the usual threat -- the host can already read guest
+            // memory, and guests cannot see each other's channels. Where the host is
+            // genuinely untrusted (a confidential VM) what is needed is attested key
+            // exchange, which plain TLS does not give. What is left is compliance
+            // mandates and multi-tenant trust boundaries: real, but somebody else's
+            // policy, and better served by their own TLS stack than by ours.
+            //
+            // So: bring a stack and wrap. A wrapper implements this interface and
+            // then flows anywhere ours does -- out of a connector, through
+            // `IConnectionReceivedArgs`, into `DataReader`. Return the concrete class
+            // instead and a composed stream has nowhere to go.
+            //
+            // Note what encryption would *not* buy on this transport. Authorization
+            // already has a better primitive: the peer `vm_id` an accept reports
+            // comes from the kernel and a guest cannot forge it. It identifies a
+            // partition and nothing finer -- a guest has no per-process boundary for
+            // AF_HYPERV, so any guest process that can reach Winsock can reach a
+            // registered service id. On the host side HCS can restrict that per
+            // process, through `BindSecurityDescriptor`/`ConnectSecurityDescriptor`,
+            // but that is configured where the VM is configured, not from here.
+            #[guid(auto)]
+            interface ITransportStream:
+                Windows::Storage::Streams::IInputStream
+                + Windows::Storage::Streams::IOutputStream
+                + Windows::Foundation::IClosable {
+            }
+
+            class TransportStream {
+                ITransportStream,
+                Windows::Storage::Streams::IInputStream,
+                Windows::Storage::Streams::IOutputStream,
+                Windows::Foundation::IClosable,
+            }
+
+            // ---------------------------------------------------------------------
+            // Listeners
+            // ---------------------------------------------------------------------
+
+            // The members every listener shares, whatever it is bound to.
+            //
+            // Both type parameters of the event are interfaces rather than classes.
+            // The sender being one is what lets all three listeners raise the same
+            // event; the args being one is what lets something else raise it at all,
+            // which a composed listener -- one that accepts through ours and hands on
+            // an encrypted stream -- has to do. Binding is
+            // deliberately absent: each transport is addressed differently, and one
+            // shared bind would have to erase the address and reject the wrong shapes
+            // at run time.
+            #[guid(auto)]
+            interface IConnectionListener {
+                event ConnectionReceived: Windows::Foundation::TypedEventHandler<IConnectionListener, IConnectionReceivedArgs>;
+                #[get] Information: String;
+            }
+
+            // One accepted connection.
+            class ConnectionReceivedArgs {
+                IConnectionReceivedArgs,
+            }
+
+            #[guid(auto)]
+            interface IConnectionReceivedArgs {
+                #[get] Stream: ITransportStream;
+                #[get] RemoteEndpoint: String;
+            }
+
+            #[guid(auto)]
+            interface INamedPipeBind {
+                fn BindAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncAction;
+            }
+
+            #[guid(auto)]
+            interface IUnixBind {
+                fn BindAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncAction;
+            }
+
+            // Strings rather than a `HostName`, because WinRT cannot spell this
+            // endpoint: `HostNameType` is `DomainName | Ipv4 | Ipv6 | Bluetooth`.
+            //
+            // Strings rather than the pair of GUIDs the transport actually takes,
+            // for two reasons. A projection cannot call a `(GUID, GUID) -> pointer`
+            // member today — PyWinRT's ABI call shape census has no callback for
+            // that shape, so the typed form projects and then raises. And
+            // `hv://loopback/vsock:5000` is what a script wants to write anyway,
+            // where two raw GUIDs are not. `HvSocketAddr`'s `Display`/`FromStr` are
+            // exact inverses, so nothing is lost: a caller may always spell either
+            // half as a plain GUID. Rust callers keep the typed entry points.
+            #[guid(auto)]
+            interface IHyperVBind {
+                fn BindEndpointAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncAction;
+                fn BindServiceNameAsync(&self, #[in] serviceName: String) -> Windows::Foundation::IAsyncAction;
+            }
+
+            #[Activatable(1)]
+            class NamedPipeConnectionListener {
+                IConnectionListener,
+                ITransport,
+                INamedPipeBind,
+                Windows::Foundation::IClosable,
+            }
+
+            #[Activatable(1)]
+            class UnixConnectionListener {
+                IConnectionListener,
+                ITransport,
+                IUnixBind,
+                Windows::Foundation::IClosable,
+            }
+
+            #[Activatable(1)]
+            class HyperVConnectionListener {
+                IConnectionListener,
+                ITransport,
+                IHyperVBind,
+                Windows::Foundation::IClosable,
+            }
+
+            // ---------------------------------------------------------------------
+            // Connectors
+            // ---------------------------------------------------------------------
+
+            #[guid(auto)]
+            interface INamedPipeConnector {
+                fn ConnectAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
+            }
+
+            #[guid(auto)]
+            interface IUnixConnector {
+                fn ConnectAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
+            }
+
+            #[guid(auto)]
+            interface IHyperVConnector {
+                fn ConnectAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
+            }
+
+            #[Activatable(1)]
+            class NamedPipeConnector {
+                ITransport,
+                INamedPipeConnector,
+            }
+
+            #[Activatable(1)]
+            class UnixConnector {
+                ITransport,
+                IUnixConnector,
+            }
+
+            #[Activatable(1)]
+            class HyperVConnector {
+                ITransport,
+                IHyperVConnector,
+            }
+        }
+    }
+}

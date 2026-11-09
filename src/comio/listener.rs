@@ -14,7 +14,7 @@ use windows_core::{ComObject, Error, HRESULT, HSTRING, Result, implement};
 use windows_future::IAsyncAction;
 
 use super::bindings;
-use super::bindings::Rustwinui3loop::{
+use super::bindings::Pbk20191::WinAsync::Comio::{
     ConnectionReceivedArgs as ConnectionReceivedArgsClass, IConnectionListener,
     IConnectionReceivedArgs,
     IConnectionListener_Impl, IConnectionReceivedArgs_Impl, ITransport_Impl, IHyperVBind_Impl,
@@ -23,7 +23,7 @@ use super::bindings::Rustwinui3loop::{
 // Queried for by the tests below, which check that each listener exposes only
 // the bind its addressing supports.
 #[cfg(test)]
-use super::bindings::Rustwinui3loop::{IHyperVBind, INamedPipeBind, ITransport, IUnixBind};
+use super::bindings::Pbk20191::WinAsync::Comio::{IHyperVBind, INamedPipeBind, ITransport, IUnixBind};
 use super::tpio::OpHandle;
 use crate::common::hvaddr::{HvSocketAddr, HV_GUID_WILDCARD};
 
@@ -34,7 +34,7 @@ pub(crate) const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
 const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
 
 // The interfaces are no longer declared here: they live in
-// `metadata/rustwinui3loop.rdl` and are generated into `super::bindings`.
+// `metadata/winasync.rdl` and are generated into `super::bindings`.
 // A hand-written `#[interface]` derives from `IUnknown` and cannot derive
 // from `IInspectable` at all, so it could never have been a WinRT interface
 // — see that file's header for the mechanical reason.
@@ -46,7 +46,7 @@ const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
 pub(crate) type ConnectionHandler =
     TypedEventHandler<IConnectionListener, IConnectionReceivedArgs>;
 
-#[implement(bindings::Rustwinui3loop::ConnectionReceivedArgs)]
+#[implement(bindings::Pbk20191::WinAsync::Comio::ConnectionReceivedArgs)]
 struct ConnectionReceivedArgs {
     stream: ITransportStream,
     endpoint: HSTRING,
@@ -82,7 +82,7 @@ impl Accepted {
     }
 }
 
-/// Constructs the `Rustwinui3loop.ConnectionReceivedArgs` the event carries.
+/// Constructs the `Pbk20191.WinAsync.Comio.ConnectionReceivedArgs` the event carries.
 pub(crate) fn new_args(stream: ITransportStream, endpoint: HSTRING) -> ConnectionReceivedArgsClass {
     ConnectionReceivedArgs {
         stream,
@@ -429,9 +429,9 @@ macro_rules! listener_impls {
 /// pipe instance — starts only once the listener is both bound and has a
 /// `ConnectionReceived` handler.
 #[implement(
-    bindings::Rustwinui3loop::NamedPipeConnectionListener,
-    bindings::Rustwinui3loop::ITransport,
-    bindings::Rustwinui3loop::INamedPipeBind,
+    bindings::Pbk20191::WinAsync::Comio::NamedPipeConnectionListener,
+    bindings::Pbk20191::WinAsync::Comio::ITransport,
+    bindings::Pbk20191::WinAsync::Comio::INamedPipeBind,
     windows::Foundation::IClosable
 )]
 pub struct NamedPipeConnectionListener {
@@ -444,9 +444,9 @@ pub struct NamedPipeConnectionListener {
 /// The listen socket is created on the first accept, so binding alone leaves
 /// nothing on disk.
 #[implement(
-    bindings::Rustwinui3loop::UnixConnectionListener,
-    bindings::Rustwinui3loop::ITransport,
-    bindings::Rustwinui3loop::IUnixBind,
+    bindings::Pbk20191::WinAsync::Comio::UnixConnectionListener,
+    bindings::Pbk20191::WinAsync::Comio::ITransport,
+    bindings::Pbk20191::WinAsync::Comio::IUnixBind,
     windows::Foundation::IClosable
 )]
 pub struct UnixConnectionListener {
@@ -458,9 +458,9 @@ pub struct UnixConnectionListener {
 ///
 /// The listen socket is created on the first accept, as for AF_UNIX.
 #[implement(
-    bindings::Rustwinui3loop::HyperVConnectionListener,
-    bindings::Rustwinui3loop::ITransport,
-    bindings::Rustwinui3loop::IHyperVBind,
+    bindings::Pbk20191::WinAsync::Comio::HyperVConnectionListener,
+    bindings::Pbk20191::WinAsync::Comio::ITransport,
+    bindings::Pbk20191::WinAsync::Comio::IHyperVBind,
     windows::Foundation::IClosable
 )]
 pub struct HyperVConnectionListener {

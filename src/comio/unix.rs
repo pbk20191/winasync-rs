@@ -17,10 +17,10 @@ use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
 use super::bindings;
-use super::bindings::Rustwinui3loop::{ITransport_Impl, IUnixConnector_Impl};
+use super::bindings::Pbk20191::WinAsync::Comio::{ITransport_Impl, IUnixConnector_Impl};
 use super::connector::connect_op;
 use super::listener::Accepted;
-use super::bindings::Rustwinui3loop::ITransportStream;
+use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
@@ -267,8 +267,8 @@ impl UnixStreamListener {
 
 /// Client side of an AF_UNIX connection.
 #[windows_core::implement(
-    bindings::Rustwinui3loop::UnixConnector,
-    bindings::Rustwinui3loop::IUnixConnector
+    bindings::Pbk20191::WinAsync::Comio::UnixConnector,
+    bindings::Pbk20191::WinAsync::Comio::IUnixConnector
 )]
 pub struct UnixConnector {
     _module: ModuleRef,
