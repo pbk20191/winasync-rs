@@ -1,0 +1,81 @@
+# Windows only: every pillar is a Windows API.
+#
+# What runs where, and why:
+#
+# - `dq` is built and linted but not tested. Its tests bootstrap the Windows
+#   App SDK 2.x runtime, which hosted runners do not have installed. Run them
+#   locally (`cargo test --features dq -- --test-threads=1`).
+# - Hyper-V socket tests skip themselves where the AF_HYPERV provider is
+#   absent, which on a hosted runner is the usual case.
+# - `tests/racedll.rs` only exists in release builds (a debug server DLL
+#   aborts on the forced unload it performs), hence the release leg.
+# - The integration tests build the server DLL themselves (`cargo build -p
+#   winasync-dll`) and write, then remove, per-user HKCU class keys.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Every feature except `dq`; see above.
+  TEST_FEATURES: tp,comio,rio,counters,dylib,futures-io
+
+jobs:
+  test:
+    name: test (${{ matrix.profile }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.profile }}
+      - name: cargo test
+        shell: bash
+        run: |
+          flag=""
+          [ "${{ matrix.profile }}" = release ] && flag="--release"
+          cargo test $flag --no-default-features --features "$TEST_FEATURES"
+
+  # Each pillar on its own. These builds have broken independently of the
+  # all-features one before: a feature quietly relying on a `windows`
+  # module only another feature enabled.
+  features:
+    name: test (${{ matrix.features }} only)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [comio, tp, rio, "tp,rio"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.features }}
+      - run: cargo test --no-default-features --features "${{ matrix.features }}"
+
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (whole workspace, every feature, dq included)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: rustdoc
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: server DLL
+        run: cargo build -p winasync-dll --release
