@@ -33,12 +33,18 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 /// Number of live op blocks — leak tests assert this settles back to 0.
 ///
-/// Always *defined* so tests and re-exports compile in every profile, but
-/// only *updated* in debug builds: the counter is diagnostic, and a release
-/// build should not pay an atomic per operation for it. A release run
-/// therefore sees it pinned at 0, which makes the leak assertions trivially
-/// true there — they are meaningful in the debug runs the suite normally
-/// uses.
+/// Maintained in every profile. It was debug-only until 2026-11-09, on the
+/// reasoning that a release build should not pay an atomic per operation for
+/// a diagnostic. The counter stopped being a diagnostic when
+/// `comio::unload::can_unload` started reading it: an op block holds a
+/// completion callback that is a function pointer into the module, so a count
+/// that is pinned at 0 in release would tell `DllCanUnloadNow` it may unload
+/// a module with I/O in flight. The cost is one relaxed `fetch_add` against a
+/// submission that also performs `StartThreadpoolIo` and a syscall.
+///
+/// The leak assertions that read it are still `#[cfg(debug_assertions)]`, so
+/// they did not change behaviour here — but they could now be ungated and
+/// would mean something, which they could not before.
 pub static LIVE_OPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Ops finished inline because their handle had opted out of the completion
@@ -46,8 +52,9 @@ pub static LIVE_OPS: AtomicUsize = AtomicUsize::new(0);
 /// effect would behave identically — correct, just not faster — so tests
 /// assert this actually moves.
 ///
-/// Same debug-only update rule as [`LIVE_OPS`], so the assertion that it
-/// moves is itself gated to debug builds.
+/// Updated in debug builds only, which [`LIVE_OPS`] no longer is: nothing
+/// reads this one for correctness, so it keeps the rule they used to share.
+/// The assertion that it moves is gated to debug builds to match.
 pub static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// A handle registered with a pool's TP_IO; owns the kernel handle + TP_IO.
@@ -203,8 +210,10 @@ pub struct Op<P> {
 }
 
 unsafe fn release_op<P>(op: *mut c_void) {
-    #[cfg(debug_assertions)]
-    LIVE_OPS.fetch_sub(1, Ordering::Relaxed);
+    // Release, not Relaxed, for the same reason `Arc` uses it on the way
+    // down: a thread that observes this counter at zero and acts on it (see
+    // `comio::unload`) must see everything this op did.
+    LIVE_OPS.fetch_sub(1, Ordering::Release);
     unsafe { drop(Box::from_raw(op as *mut Op<P>)) }
 }
 
@@ -308,7 +317,6 @@ pub unsafe fn submit<P>(
         },
         payload: UnsafeCell::new(Some(payload)),
     }));
-    #[cfg(debug_assertions)]
     LIVE_OPS.fetch_add(1, Ordering::Relaxed);
 
     unsafe { StartThreadpoolIo(reg.io) };

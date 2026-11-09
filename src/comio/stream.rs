@@ -6,6 +6,7 @@
 //! type are drop-in compatible with `windows-future`'s awaiting and with
 //! `DataReader`/`DataWriter`.
 
+use crate::comio::unload::ModuleRef;
 use super::asyncop::IoAsyncOp;
 use super::buffer::buffer_ptr;
 use super::bindings;
@@ -79,6 +80,7 @@ unsafe impl Send for AcceptSockGuard {}
 pub struct TransportStream {
     reg: Arc<IoReg>,
     closed: std::sync::atomic::AtomicBool,
+    _module: ModuleRef,
 }
 
 /// Wraps an already-registered handle/socket as a WinRT stream object.
@@ -91,6 +93,7 @@ pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Rustwinui3loop::ITransportS
     let object = ComObject::new(TransportStream {
         reg,
         closed: std::sync::atomic::AtomicBool::new(false),
+        _module: ModuleRef::new(),
     });
     // A `QueryInterface` that cannot fail: `ITransportStream` is this class's
     // default interface, so it is the vtable the object already hands out.
@@ -224,7 +227,7 @@ impl IOutputStream_Impl for TransportStream_Impl {
     }
 
     fn FlushAsync(&self) -> Result<IAsyncOperation<bool>> {
-        Ok(IAsyncOperation::<bool>::spawn(|| Ok(true)))
+        Ok(super::settled::op_done(true))
     }
 }
 

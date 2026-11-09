@@ -73,9 +73,11 @@ pub mod connector;
 pub mod hvsock;
 pub mod listener;
 pub mod pipe;
+pub mod settled;
 pub mod stream;
 pub mod tpio;
 pub mod unix;
+pub mod unload;
 pub mod waitop;
 
 // Public transport surface. Nothing outside `comio`'s own tests consumes

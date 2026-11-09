@@ -5,6 +5,7 @@
 // rejects an attribute of its own, so the allow lives here.
 #![allow(non_snake_case)]
 
+use crate::comio::unload::ModuleRef;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,6 +50,7 @@ pub(crate) type ConnectionHandler =
 struct ConnectionReceivedArgs {
     stream: ITransportStream,
     endpoint: HSTRING,
+    _module: ModuleRef,
 }
 
 impl IConnectionReceivedArgs_Impl for ConnectionReceivedArgs_Impl {
@@ -82,7 +84,12 @@ impl Accepted {
 
 /// Constructs the `Rustwinui3loop.ConnectionReceivedArgs` the event carries.
 pub(crate) fn new_args(stream: ITransportStream, endpoint: HSTRING) -> ConnectionReceivedArgsClass {
-    ConnectionReceivedArgs { stream, endpoint }.into()
+    ConnectionReceivedArgs {
+        stream,
+        endpoint,
+        _module: ModuleRef::new(),
+    }
+    .into()
 }
 
 /// How a listener issues one accept.
@@ -321,7 +328,7 @@ impl ListenerCore {
         // Start accepting only if a consumer is already registered; otherwise
         // the chain starts on the first `ConnectionReceived`.
         ensure_running(self.state.clone())?;
-        Ok(IAsyncAction::spawn(|| Ok(())))
+        Ok(super::settled::action_done())
     }
 }
 
@@ -359,6 +366,7 @@ macro_rules! listener_impls {
             pub fn new() -> ComObject<$name> {
                 ComObject::new($name {
                     core: ListenerCore::new(),
+                    _module: ModuleRef::new(),
                 })
             }
 
@@ -428,6 +436,7 @@ macro_rules! listener_impls {
 )]
 pub struct NamedPipeConnectionListener {
     core: ListenerCore,
+    _module: ModuleRef,
 }
 
 /// A listener that accepts AF_UNIX (Unix domain socket) connections.
@@ -442,6 +451,7 @@ pub struct NamedPipeConnectionListener {
 )]
 pub struct UnixConnectionListener {
     core: ListenerCore,
+    _module: ModuleRef,
 }
 
 /// A listener that accepts Hyper-V socket (AF_HYPERV) connections.
@@ -455,6 +465,7 @@ pub struct UnixConnectionListener {
 )]
 pub struct HyperVConnectionListener {
     core: ListenerCore,
+    _module: ModuleRef,
 }
 
 // Which transport this listener is, answered from the same constant its

@@ -22,9 +22,26 @@ use windows::Win32::Networking::WinSock::{
 #[cfg(any(feature = "tp", feature = "comio"))]
 use windows_core::GUID;
 
-/// Process-wide Winsock initialization, deliberately never torn down
-/// (`WSACleanup` is not called — a library has no way to know it is the last
-/// user). Idempotent and safe to call from every socket constructor.
+/// Process-wide Winsock initialization. Idempotent and safe to call from
+/// every socket constructor.
+///
+/// Never torn down. The reason given here used to be that "a library has no
+/// way to know it is the last user", which misreads the API — `WSAStartup`
+/// and `WSACleanup` are refcounted precisely so each component balances its
+/// own call and nobody has to know about the others.
+///
+/// The real reason is the pointers. `SIO_GET_EXTENSION_FUNCTION_POINTER`
+/// hands out `ConnectEx` / `AcceptEx` addresses that belong to the *provider*,
+/// and `connectex` / `acceptex` below cache them in `OnceLock`s that cannot be
+/// reset. A `WSACleanup` that dropped the refcount to zero may unload the
+/// provider, leaving those caches pointing at freed code — a worse failure
+/// than the leak it would fix.
+///
+/// For a statically linked rlib that costs nothing: the process exits and
+/// Windows reclaims everything. For the cdylib it is load-bearing, because a
+/// module that has taken process-global state it cannot give back must not
+/// tell COM it is unloadable. [`wsa_initialized`] is how
+/// `comio::unload::can_unload` finds that out.
 pub fn wsa_init() {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -32,7 +49,20 @@ pub fn wsa_init() {
         let mut data = WSADATA::default();
         let r = WSAStartup(0x0202, &mut data);
         assert_eq!(r, 0, "WSAStartup failed: {r}");
+        WSA_UP.store(true, core::sync::atomic::Ordering::Release);
     });
+}
+
+/// Set once [`wsa_init`] has run, and never cleared.
+static WSA_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether this module has called `WSAStartup`.
+///
+/// Read by `comio::unload::can_unload`. Deliberately a plain flag rather than
+/// a count: there is no release path for it to balance against, which is the
+/// whole point — see [`wsa_init`].
+pub fn wsa_initialized() -> bool {
+    WSA_UP.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// The calling thread's last Winsock error as an `HRESULT`.

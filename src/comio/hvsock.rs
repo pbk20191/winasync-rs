@@ -16,6 +16,7 @@
 //! differ; see [`crate::common::hvaddr`] for the addressing, shared with
 //! `tp`'s Hyper-V transport.
 
+use crate::comio::unload::ModuleRef;
 use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
@@ -230,7 +231,9 @@ impl HvStreamListener {
     bindings::Rustwinui3loop::HyperVConnector,
     bindings::Rustwinui3loop::IHyperVConnector
 )]
-pub struct HyperVConnector;
+pub struct HyperVConnector {
+    _module: ModuleRef,
+}
 
 /// The one spelling of this transport's name, as the vtable's `Transport`
 /// reports it.
@@ -357,7 +360,9 @@ impl HyperVConnector {
     /// Creates the connector. It holds no state; connecting is what it does.
     #[allow(clippy::new_without_default)]
     pub fn new() -> windows_core::ComObject<HyperVConnector> {
-        windows_core::ComObject::new(HyperVConnector)
+        windows_core::ComObject::new(HyperVConnector {
+            _module: ModuleRef::new(),
+        })
     }
 
     /// Typed Rust mirror of the vtable's `ConnectAsync`; the result arrives

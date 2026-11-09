@@ -12,9 +12,11 @@
 ; reachable for a while without appearing here. It is listed now so it gets
 ; the same `PRIVATE` treatment as the rest.
 ;
-; Self-registration (`DllRegisterServer` / `DllUnregisterServer`) and
-; `DllCanUnloadNow` were removed on 2026-11-09; src/comio/activation.rs has
-; the reasoning for each.
+; Self-registration (`DllRegisterServer` / `DllUnregisterServer`) was removed
+; on 2026-11-09; src/comio/activation.rs has the reasoning. `DllCanUnloadNow`
+; went with it and came back the same day, this time answering from a real
+; count of what is live -- see src/comio/unload.rs.
 EXPORTS
     DllGetActivationFactory PRIVATE
     DllGetClassObject       PRIVATE
+    DllCanUnloadNow         PRIVATE

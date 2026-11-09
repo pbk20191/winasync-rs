@@ -12,6 +12,7 @@
 //! * the `OpHandle` returned by `submit` is stored in the state so
 //!   `IAsyncInfo::Cancel` can cancel the in-flight IO.
 
+use crate::comio::unload::ModuleRef;
 use super::check;
 use super::tpio::{submit, IoReg, Issue, OpHandle};
 use std::sync::{Arc, Mutex};
@@ -63,7 +64,7 @@ impl<T: RuntimeType + 'static> OpState<T> {
 }
 
 #[implement(IAsyncOperationWithProgress<T, u32>, windows_future::IAsyncInfo)]
-pub(crate) struct IoAsyncOp<T>(Mutex<OpState<T>>)
+pub(crate) struct IoAsyncOp<T>(Mutex<OpState<T>>, ModuleRef)
 where
     T: RuntimeType + 'static;
 
@@ -155,12 +156,15 @@ impl<T: RuntimeType + 'static> IAsyncOperationWithProgress_Impl<T, u32> for IoAs
 }
 
 fn new_object<T: RuntimeType + 'static>() -> ComObject<IoAsyncOp<T>> {
-    ComObject::new(IoAsyncOp(Mutex::new(OpState {
-        result: None,
-        completed: None,
-        completed_assigned: false,
-        op: None,
-    })))
+    ComObject::new(IoAsyncOp(
+        Mutex::new(OpState {
+            result: None,
+            completed: None,
+            completed_assigned: false,
+            op: None,
+        }),
+        ModuleRef::new(),
+    ))
 }
 
 impl IoAsyncOp<IBuffer> {

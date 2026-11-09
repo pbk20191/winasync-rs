@@ -3,6 +3,7 @@
 //! pipes, the first end-to-end transport built on the `comio` overlapped-IO
 //! engine.
 
+use crate::comio::unload::ModuleRef;
 use super::bindings;
 use super::bindings::Rustwinui3loop::{
     INamedPipeConnector_Impl, ITransport_Impl, ITransportStream,
@@ -178,7 +179,9 @@ pub(crate) fn arm_accept(
     bindings::Rustwinui3loop::NamedPipeConnector,
     bindings::Rustwinui3loop::INamedPipeConnector
 )]
-pub struct NamedPipeConnector;
+pub struct NamedPipeConnector {
+    _module: ModuleRef,
+}
 
 /// The one spelling of this transport's name, as the vtable's `Transport`
 /// reports it.
@@ -249,7 +252,9 @@ impl NamedPipeConnector {
     /// Creates the connector. It holds no state; connecting is what it does.
     #[allow(clippy::new_without_default)]
     pub fn new() -> windows_core::ComObject<NamedPipeConnector> {
-        windows_core::ComObject::new(NamedPipeConnector)
+        windows_core::ComObject::new(NamedPipeConnector {
+            _module: ModuleRef::new(),
+        })
     }
 
     /// Typed Rust mirror of the vtable's `ConnectAsync`.

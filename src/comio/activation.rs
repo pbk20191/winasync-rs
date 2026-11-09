@@ -101,10 +101,11 @@
 //! the absence already expresses. The DLL stays resident for the life of the
 //! process either way.
 
+use super::unload::ModuleRef;
 use core::ffi::c_void;
 use super::bindings::Rustwinui3loop as rc;
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, S_OK,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::IClassFactory;
 use windows::Win32::System::Com::IClassFactory_Impl;
@@ -226,7 +227,7 @@ pub fn class_for(clsid: &GUID) -> Option<&'static ComClass> {
 /// class it makes is settled once, here, instead of being re-decided on
 /// every call.
 #[implement(IClassFactory)]
-struct ClassFactory(&'static ComClass);
+struct ClassFactory(&'static ComClass, ModuleRef);
 
 impl IClassFactory_Impl for ClassFactory_Impl {
     fn CreateInstance(
@@ -259,10 +260,14 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         unsafe { unknown.query(iid, object).ok() }
     }
 
-    /// Accepted and ignored, because [`DllCanUnloadNow`] never agrees to
-    /// unload in the first place. Failing it instead would break callers
-    /// that lock the server as a matter of course.
-    fn LockServer(&self, _lock: BOOL) -> Result<()> {
+    /// Honoured: a lock is a caller saying "keep this module loaded even
+    /// with no objects out", and [`DllCanUnloadNow`] now has an answer that
+    /// can change, so the claim has somewhere to land.
+    ///
+    /// It used to be accepted and ignored, which was sound only because the
+    /// answer was an unconditional refusal.
+    fn LockServer(&self, lock: BOOL) -> Result<()> {
+        super::unload::lock_server(lock.as_bool());
         Ok(())
     }
 }
@@ -292,7 +297,7 @@ pub unsafe extern "system" fn DllGetClassObject(
     let Some(class) = class_for(unsafe { &*clsid }) else {
         return CLASS_E_CLASSNOTAVAILABLE;
     };
-    let factory: IClassFactory = ClassFactory(class).into();
+    let factory: IClassFactory = ClassFactory(class, ModuleRef::new()).into();
     unsafe { factory.query(iid, object) }
 }
 
@@ -324,7 +329,7 @@ pub fn class_for_name(name: &str) -> Option<&'static ComClass> {
 /// but they are only ever produced by a connect or an accept, and the
 /// metadata says so — there is nothing to keep in step by hand.
 #[implement(IActivationFactory)]
-struct ActivationFactory(&'static ComClass);
+struct ActivationFactory(&'static ComClass, ModuleRef);
 
 impl IActivationFactory_Impl for ActivationFactory_Impl {
     fn ActivateInstance(&self) -> Result<IInspectable> {
@@ -373,9 +378,25 @@ pub unsafe extern "system" fn DllGetActivationFactory(
     let Some(class) = class_for_name(&name.to_string()) else {
         return REGDB_E_CLASSNOTREG;
     };
-    let activation: IActivationFactory = ActivationFactory(class).into();
+    let activation: IActivationFactory = ActivationFactory(class, ModuleRef::new()).into();
     unsafe { *factory = activation.into_raw() };
     S_OK
+}
+
+/// Whether this module may be unloaded.
+///
+/// `S_OK` only when nothing this module owns can still execute: no live
+/// objects, no server locks, no overlapped operations in flight. See
+/// [`super::unload`] for what is counted and why that list is the right one.
+///
+/// Unloading a module that still holds a vtable, a pending completion or a
+/// queued thread-pool callback is a jump into freed code, so the two possible
+/// mistakes are not symmetric. A wrong `S_FALSE` costs a resident DLL until
+/// the next sweep; a wrong `S_OK` is a crash. Everything here is arranged so
+/// that only the first one is reachable.
+#[unsafe(no_mangle)]
+pub extern "system" fn DllCanUnloadNow() -> HRESULT {
+    if super::unload::can_unload() { S_OK } else { S_FALSE }
 }
 
 /// The reg-free activation manifest for this component.

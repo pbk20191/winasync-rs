@@ -12,6 +12,7 @@
 //! memory alive until the op's real completion, not merely until the
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
+use crate::comio::unload::ModuleRef;
 use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
@@ -269,7 +270,9 @@ impl UnixStreamListener {
     bindings::Rustwinui3loop::UnixConnector,
     bindings::Rustwinui3loop::IUnixConnector
 )]
-pub struct UnixConnector;
+pub struct UnixConnector {
+    _module: ModuleRef,
+}
 
 /// The one spelling of this transport's name, as the vtable's `Transport`
 /// reports it.
@@ -402,7 +405,9 @@ impl UnixConnector {
     /// Creates the connector. It holds no state; connecting is what it does.
     #[allow(clippy::new_without_default)]
     pub fn new() -> windows_core::ComObject<UnixConnector> {
-        windows_core::ComObject::new(UnixConnector)
+        windows_core::ComObject::new(UnixConnector {
+            _module: ModuleRef::new(),
+        })
     }
 
     /// Typed Rust mirror of the vtable's `ConnectAsync`; the result arrives

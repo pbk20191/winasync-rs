@@ -340,7 +340,7 @@ $l.Bind($name)
    | --- | --- | --- |
    | `DllGetActivationFactory` | `RoActivateInstance` → Python·C# | **유지** — `.winmd`를 의미 있게 만드는 유일한 export |
    | `DllGetClassObject` | `CoCreateInstance` | **유지** — 18줄, 아래 참조 |
-   | `DllCanUnloadNow` | `CoFreeUnusedLibraries` | **삭제** |
+   | `DllCanUnloadNow` | `CoFreeUnusedLibraries` | **삭제했다가 되살림** — 7번 |
    | `DllRegisterServer` | `regsvr32` | **삭제** |
    | `DllUnregisterServer` | `regsvr32 /u` | **삭제** |
 
@@ -348,7 +348,7 @@ $l.Bind($name)
 
    IDispatch를 지웠을 때 ProgID가 거짓이 된 것과 **같은 종류의 거짓이 한 단계 위에서** 벌어지고 있었다. 같은 이유로 같이 지웠다. (자기등록 자체도 MS가 10년째 인스톨러를 떼어내고 있는 방식이다 — MSIX와 reg-free가 대체재다.)
 
-   **`DllCanUnloadNow`는 왜 같이 지우나.** 무조건 `S_FALSE`를 돌려주고 있었는데 — export를 **안 하면 동작이 똑같다**. `CoFreeUnusedLibraries`/`RoFreeUnusedLibraries`는 `GetProcAddress`로 찾고, 없는 모듈은 언로드를 시도하지 않는다. 거절을 부재가 이미 표현하고 있으니 함수는 의식(ceremony)이었다.
+   **`DllCanUnloadNow`는 왜 같이 지우나.** 무조건 `S_FALSE`를 돌려주고 있었는데 — export를 **안 하면 동작이 똑같다**. `CoFreeUnusedLibraries`/`RoFreeUnusedLibraries`는 `GetProcAddress`로 찾고, 없는 모듈은 언로드를 시도하지 않는다. 거절을 부재가 이미 표현하고 있으니 함수는 의식(ceremony)이었다. *(이 판단은 같은 날 7번에서 뒤집혔다 — 무조건 거절이 유일한 답이라고 본 근거 하나가 틀렸다.)*
 
    **`DllGetClassObject`는 왜 남기나.** WinRT 인터페이스는 *COM 인터페이스이기도 하다.* CLSID를 **직접 등록한** 소비자는 액티베이션 컨텍스트 없이 `CoCreateInstance`로 같은 vtable을 받는다. 18줄이고, 지우는 건 능력을 없애는 것이지만 자기등록을 지우는 건 **"머신 상태를 우리가 관리한다"는 주장만 거둬들이는** 것이다. 컴포넌트는 이제 자기를 *기술*할 뿐 머신을 건드리지 않는다 — `manifest()`가 reg-free 매니페스트를 생성하고, `ComClass`(CLSID·이름·설명)와 `clsid_key()`가 인스톨러에게 필요한 걸 전부 공개한다.
 
@@ -363,7 +363,43 @@ $l.Bind($name)
 
    Rust 테스트 142 + 1 통과, clippy 0, `cargo doc` 0.
 
-7. **out-of-process 활성화** · 중간 · *나중*
+7. ~~`DllCanUnloadNow`~~ · **되살림, 이번엔 진짜 답으로** (2026-11-09)
+
+   6번에서 지운 근거는 둘이었다. 하나(*"`S_FALSE`는 부재가 이미 표현한다"*)는 맞다. 다른 하나 — **"정직하게 셀 방법이 없다"** — 는 틀렸고, 그 안의 구체적 주장이 틀렸다: *"같은 타입이 순수 Rust 경로에서도 만들어지는데 거긴 모듈 카운트를 건드릴 이유가 없다."* 뒤집혀 있다. Rust가 만든 객체도 **vtable이 이 모듈 안**이라 똑같이 세야 하고, rlib 빌드에서는 아무도 그 합을 읽지 않는다. **생성자에서 세면 두 빌드 모양 모두에서 맞다.**
+
+   **무엇을 세나.** 셋인데 셋째를 빠뜨리기 쉽다.
+
+   | | 무엇 | 어디 |
+   | --- | --- | --- |
+   | 객체 | `#[implement]` 타입 11개가 `ModuleRef` 필드를 든다 | `comio::unload` |
+   | 서버 락 | `IClassFactory::LockServer(TRUE)` | 〃 |
+   | **진행 중 I/O** | overlapped op — 완료 콜백이 이 모듈 안의 함수 포인터다 | `common::overlapped::LIVE_OPS` |
+
+   셋째가 핵심이다. 살아 있는 COM 객체가 **하나도 없는데** op이 떠 있을 수 있고, 그 상태로 언로드하면 해제된 코드로 점프한다. 다행히 `LIVE_OPS`가 이미 정확히 그걸 세고 있었다 — 다만 `#[cfg(debug_assertions)]`라 릴리스에선 0에 고정이었다. **항상 켜도록 바꿨다**(op당 relaxed atomic 1회 — `StartThreadpoolIo` + syscall 옆에서는 잡음). 진단용이던 카운터가 안전성 근거가 됐으니 당연한 대가다.
+
+   **구멍 하나를 메워야 했다.** `windows-future`가 만드는 객체는 vtable이 우리 DLL 안인데(Rust 의존성이라 여기로 모노모픽된다) **Drop 훅이 없다.** ABI를 넘는 곳이 셋이었고 전부 *이미 끝난* 결과라, 우리 타입으로 바꿨다 — `comio::settled`의 `SettledAction`/`SettledOp<T>`, 그리고 connect 실패 경로는 기존 `ConnectOp`를 즉시 완료시킨다. 비동기 동작은 일부러 시시하다; **타입을 소유하는 것**이 `ModuleRef`를 살 수 있는 유일한 길이라서 존재한다.
+
+   **그리고 객체가 전부는 아니다.** 모듈이 설치한 **프로세스 전역 상태**도 돌려줘야 한다. `wsa_init()`이 첫 소켓에서 `WSAStartup`을 걸고 아무도 내리지 않는다. 그 상태로 언로드하면 참조가 영구히 남고, 다시 로드되면 새 모듈 인스턴스의 `Once`가 초기화돼 **또 `WSAStartup`**을 — 로드 주기마다 하나씩 쌓인다.
+
+   기존 주석의 이유(*"라이브러리는 자기가 마지막 사용자인지 알 수 없다"*)는 API를 잘못 읽은 것이다. `WSAStartup`/`WSACleanup`은 refcount라서 **각자 자기 호출만 맞추면** 된다. 진짜 이유는 따로 있다: `unix.rs`/`hvsock.rs`가 `SIO_GET_EXTENSION_FUNCTION_POINTER`로 받은 `ConnectEx`/`AcceptEx` 주소를 `OnceLock`에 캐시하는데, 이건 **프로바이더 소유**다. refcount를 0으로 내리는 `WSACleanup`은 프로바이더를 내릴 수 있고, 그러면 리셋 불가능한 캐시가 해제된 코드를 가리킨다. **누수를 댕글링 호출과 바꾸는 건 방향이 거꾸로다.**
+
+   그래서 `can_unload()`는 Winsock이 올라온 뒤로는 그냥 "아니오"다. 세는 일이 헛돌지는 않는다 — **네임드 파이프는 Winsock을 안 건드려서** 파이프 전용 세션은 언로드 가능하고, 그게 흔한 경우다. 제한을 풀려면 양쪽을 다 해야 한다: 균형 잡힌 `WSACleanup` **그리고** 재질의 가능한 프로바이더 포인터 캐시. 되찾는 게 수백 KB라 지금은 값을 못 한다.
+
+   **측정.** `tests/unload.rs`는 통합 테스트다 — 카운터가 프로세스 전역이라 **자기 프로세스가 필요**하고, 단위 테스트였으면 객체를 만드는 다른 모든 테스트와 레이스한다. 증명 순서: 새 프로세스는 언로드 가능 → 객체 하나가 막고 해제하면 풀림(QI는 두 번째 이유가 아님) → 서버 락이 객체 없이도 막음(진짜 `IClassFactory` 경유) → 그리고 **객체 0개인데 op이 떠 있는 상태를 실제로 관찰**한다. 마지막 단언은 그 상태를 못 봤으면 실패한다 — `LIVE_OPS`가 다시 debug로 묶이면 바로 잡힌다.
+
+   남은 레이스는 API에 내재한다. `can_unload()`는 스냅샷이고 COM이 받는 건 언제나 스냅샷이다: 마지막 객체의 `Drop`이 카운트를 0으로 내린 뒤에도 이 모듈 코드를 통해 반환해야 한다. MS 지침이 `DllCanUnloadNow`를 권고적으로 다루고 `CoFreeUnusedLibraries`가 언로드를 미루는 이유다. 우리가 보장하는 건 우리 몫의 절반이다 — **센 것이 하나라도 남아 있으면 `S_OK`는 절대 안 나간다.** 거짓 `S_OK`가 크래시고, 거짓 `S_FALSE`는 다음 스윕까지 상주할 뿐이다.
+
+   남은 export 셋:
+
+   ```text
+   1  DllCanUnloadNow
+   2  DllGetActivationFactory
+   3  DllGetClassObject
+   ```
+
+   *후속 (쉬움):* `LIVE_OPS`를 읽는 누수 단언들이 아직 `#[cfg(debug_assertions)]`다. 카운터가 정확해졌으니 이제 게이트를 풀면 릴리스에서도 의미가 생긴다 — tp/rio까지 번지는 별개 작업이라 미뤘다.
+
+8. **out-of-process 활성화** · 중간 · *나중*
    WinRT에도 `OutOfProcessServer` 모델이 있다. 마샬링·아파트먼트·수명을 전부 강제로 통과시키는 값은 그대로지만, in-proc으로 3번을 먼저 끝내는 편이 낫다.
 
 ### 폐기 (2026-11-09 방향 결정에 따라)

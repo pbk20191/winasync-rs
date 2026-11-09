@@ -33,6 +33,7 @@
 // shaped to, not Rust naming slips.
 #![allow(non_snake_case)]
 
+use crate::comio::unload::ModuleRef;
 use std::sync::Mutex;
 use windows_core::{ComObject, HRESULT, IUnknownImpl, Result, implement};
 use windows_future::{
@@ -58,7 +59,7 @@ struct ConnectState {
 }
 
 #[implement(IAsyncOperation<ITransportStream>, windows_future::IAsyncInfo)]
-struct ConnectOp(Mutex<ConnectState>);
+struct ConnectOp(Mutex<ConnectState>, ModuleRef);
 
 // SAFETY: the only non-`Send` data (the pending handler) lives behind the
 // `Mutex` and every access is serialized by it; the object is agile, so its
@@ -174,20 +175,28 @@ const E_ILLEGAL_DELEGATE_ASSIGNMENT: HRESULT = HRESULT(0x80000018u32 as i32);
 pub(crate) fn connect_op(
     start: impl FnOnce(Box<dyn FnOnce(Result<ITransportStream>) + Send>) -> Result<OpHandle>,
 ) -> IAsyncOperation<ITransportStream> {
-    let op: ComObject<ConnectOp> = ComObject::new(ConnectOp(Mutex::new(ConnectState {
-        result: None,
-        completed: None,
-        completed_assigned: false,
-        op: None,
-    })));
+    let op: ComObject<ConnectOp> = ComObject::new(ConnectOp(
+        Mutex::new(ConnectState {
+            result: None,
+            completed: None,
+            completed_assigned: false,
+            op: None,
+        }),
+        ModuleRef::new(),
+    ));
     let sink = op.clone();
     match start(Box::new(move |res| sink.complete(res))) {
         Ok(handle) => {
             op.0.lock().unwrap().op = Some(handle);
             op.to_interface()
         }
-        // Never armed, so nothing will call back: finish it here.
-        Err(e) => IAsyncOperation::ready(Err(e)),
+        // Never armed, so nothing will call back: finish it here. Through
+        // `op` rather than `IAsyncOperation::ready`, so the object handed
+        // back is one this module counts -- see `comio::unload`.
+        Err(e) => {
+            op.complete(Err(e));
+            op.to_interface()
+        }
     }
 }
 
