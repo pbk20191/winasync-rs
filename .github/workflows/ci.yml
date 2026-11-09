@@ -2,9 +2,12 @@
 #
 # What runs where, and why:
 #
-# - `dq` is built and linted but not tested. Its tests bootstrap the Windows
-#   App SDK 2.x runtime, which hosted runners do not have installed. Run them
-#   locally (`cargo test --features dq -- --test-threads=1`).
+# - `dq`'s tests bootstrap the Windows App SDK 2.x runtime, which hosted
+#   runners lack, so every job that tests `dq` installs it first
+#   (`.github/actions/windows-app-runtime`). Those jobs also run with
+#   `--test-threads=1`, the repository's convention for `dq`: a
+#   `DispatcherQueue` test is only sound alone, and `DQ_TEST_LOCK` is a
+#   backstop, not the plan.
 # - Hyper-V socket tests skip themselves where the AF_HYPERV provider is
 #   absent, which on a hosted runner is the usual case.
 # - `tests/racedll.rs` only exists in release builds (a debug server DLL
@@ -21,8 +24,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Every feature except `dq`; see above.
-  TEST_FEATURES: tp,comio,rio,counters,dylib,futures-io
 
 jobs:
   test:
@@ -38,12 +39,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.profile }}
-      - name: cargo test
+      - uses: ./.github/actions/windows-app-runtime
+      - name: cargo test (every feature)
         shell: bash
         run: |
           flag=""
           [ "${{ matrix.profile }}" = release ] && flag="--release"
-          cargo test $flag --no-default-features --features "$TEST_FEATURES"
+          cargo test $flag --all-features -- --test-threads=1
 
   # Each pillar on its own. These builds have broken independently of the
   # all-features one before: a feature quietly relying on a `windows`
@@ -54,14 +56,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        features: [comio, tp, rio, "tp,rio"]
+        features: [comio, tp, rio, "tp,rio", dq]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: features-${{ matrix.features }}
-      - run: cargo test --no-default-features --features "${{ matrix.features }}"
+      - if: contains(matrix.features, 'dq')
+        uses: ./.github/actions/windows-app-runtime
+      - shell: bash
+        run: |
+          threads=""
+          case "${{ matrix.features }}" in *dq*) threads="-- --test-threads=1";; esac
+          cargo test --no-default-features --features "${{ matrix.features }}" $threads
 
   lint:
     runs-on: windows-latest

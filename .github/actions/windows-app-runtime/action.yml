@@ -1,0 +1,33 @@
+name: Install the Windows App SDK runtime
+description: >-
+  Installs the Windows App SDK 2.x runtime, which the `dq` tests bootstrap
+  into their package graph (`Microsoft.WindowsAppRuntime.2_8wekyb3d8bbwe`,
+  through `winio-winui3`'s `WindowsAppSDKVersion::V2`). Hosted runners do not
+  have it.
+
+inputs:
+  version:
+    description: >-
+      Exact runtime version, pinned so a new release cannot change CI under us.
+      Any 2.x satisfies the bootstrap; bump deliberately.
+    default: 2.6.5
+
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $v = '${{ inputs.version }}'
+        $minor = ($v -split '\.')[0..1] -join '.'
+        $url = "https://aka.ms/windowsappsdk/$minor/$v/windowsappruntimeinstall-x64.exe"
+        $exe = Join-Path $env:RUNNER_TEMP 'windowsappruntimeinstall-x64.exe'
+        Invoke-WebRequest -Uri $url -OutFile $exe
+        & $exe --quiet
+        if ($LASTEXITCODE -ne 0) { throw "runtime installer exited $LASTEXITCODE" }
+        # The installer's exit code is not the whole story: what the tests need
+        # is this package family, so check for it by name.
+        $pkg = Get-AppxPackage -Name 'Microsoft.WindowsAppRuntime.2' |
+          Where-Object Architecture -eq 'X64'
+        if (-not $pkg) { throw 'Microsoft.WindowsAppRuntime.2 (x64) is not installed' }
+        $pkg | Format-Table Name, Version, Architecture -AutoSize
