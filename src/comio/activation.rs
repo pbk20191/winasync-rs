@@ -8,23 +8,32 @@
 //! runtime that these classes exist or which module holds them.
 //!
 //! This module is that missing half. It gives each of the six public classes
-//! a CLSID and a ProgID, exports the four entry points an in-process server
+//! a CLSID and a ProgID, exports the entry points an in-process server
 //! is defined by, and writes the registry keys that point a CLSID back at
 //! this module. After `regsvr32 rustwinui3loop.dll`, any language that can
 //! call `CoCreateInstance` can open a named pipe, an AF_UNIX socket or a
 //! Hyper-V socket through the same WinRT stream interfaces.
 //!
-//! # Where this is going, as of 2026-11-09
+//! # Two activation models, one table
 //!
-//! CLSID activation is the COM half, and comio is heading for the WinRT one:
-//! a `.winmd`, `DllGetActivationFactory` beside `DllGetClassObject`, and
-//! `ActivatableClassId` registration beside the keys written here. That path
-//! is additive — this module keeps working for the frozen `IDispatch` layer
-//! ([`super::dispatch`]) — but it is not per-user. Third-party WinRT
-//! activation outside a package means `HKEY_LOCAL_MACHINE`, or a manifest on
-//! the *consuming* executable, which is not an option for a shared
-//! interpreter. The elevation-free `regsvr32` below does not carry over.
+//! This module now serves both. [`DllGetClassObject`] hands COM an
+//! `IClassFactory` for a CLSID; [`DllGetActivationFactory`] hands the Windows
+//! Runtime an `IActivationFactory` for a runtime class name. Both read the
+//! same [`CLASSES`] table, whose names come from the generated class types in
+//! [`super::bindings`]. One object, one name, two front doors.
+//!
+//! What is still missing is the WinRT counterpart of the registry keys below.
+//! `RoActivateInstance` finds this module through
+//! `HKLM\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId`, and that is
+//! machine-wide: third-party WinRT activation outside a package is either
+//! `HKEY_LOCAL_MACHINE` or a manifest on the *consuming* executable, which is
+//! not an option for a shared interpreter like `python.exe`. So the
+//! elevation-free `regsvr32` below does not carry over to the WinRT half.
 //! `docs/comio-com-winrt-status.md` has the reasoning.
+//!
+//! Until those keys exist, `DllGetActivationFactory` is reachable by calling
+//! the export directly — which is what the integration test does, and what
+//! isolates "the factory works" from "the registry points at us".
 //!
 //! # What the registration does and does not claim
 //!
@@ -40,23 +49,21 @@
 //!
 //! `ThreadingModel = Both` says the objects are safe to use from an STA or
 //! the MTA. They are: every one of them is `Send + Sync` and already
-//! delivers completions on thread-pool threads. Whether a given *interface*
-//! on them can leave the apartment it was created in is a separate question,
-//! and the answer differs by family:
+//! delivers completions on thread-pool threads.
 //!
-//! * The dispinterfaces marshal. [`super::typelib`] describes them and
-//!   `register_interfaces` points their `Interface` keys at the oleaut32
-//!   dispatch proxy, so COM can build a proxy from the library. The event
-//!   path depends on this: `cscript` is a single-threaded STA, the accept
-//!   completes on a thread-pool thread, and the sink call has to cross.
-//! * The interfaces this crate declares itself — `IConnectionListener`, the
-//!   `*ListenerBind` pair — do not. They are custom interfaces with no
-//!   registered proxy/stub, and the library does not describe them, so COM
-//!   has nothing to marshal them with. Use those inside one apartment.
+//! Whether a given *interface* on them can leave the apartment it was created
+//! in is a separate question, and today the answer is no. Every interface here
+//! is one this crate declares itself — `IConnectionListener`, the
+//! `*ListenerBind` pair, `IStreamConnector` — with no registered proxy/stub
+//! and no metadata describing it, so COM has nothing to marshal them with.
+//! Use them inside one apartment. (Until 2026-11-09 the dispinterfaces did
+//! marshal, through oleaut32's dispatch proxy; that layer is gone. Publishing
+//! a `.winmd` is what restores marshalling, this time for the real
+//! interfaces.)
 //!
-//! `Both` is what keeps that the normal case: the object is created directly
-//! in the caller's apartment rather than in a host STA it would then have to
-//! marshal out of.
+//! `Both` is what keeps the in-apartment case the normal one: the object is
+//! created directly in the caller's apartment rather than in a host STA it
+//! would then have to marshal out of.
 //!
 //! # What a caller can do with an activated object
 //!
@@ -65,22 +72,20 @@
 //! of its own. `regsvr32 rustwinui3loop.dll` then `CoCreateInstance` is the
 //! whole setup.
 //!
-//! Scripting hosts work too, through [`super::dispatch`]: every class here
-//! also implements `IDispatch`, so
-//! `New-Object -ComObject Rustwinui3loop.NamedPipeClient` is followed by
-//! calls that actually run. The members a script sees are named and shaped
-//! differently from the vtable's — blocking where the vtable is async — and
-//! that module explains why.
+//! Scripting hosts do **not** work, and that is deliberate as of 2026-11-09.
+//! These classes used to implement `IDispatch` and ship a type library, so
+//! `New-Object -ComObject Rustwinui3loop.NamedPipeConnector` could be driven from
+//! PowerShell, VBScript and VBA. That layer is deleted. It could only describe
+//! a *blocking translation* of this surface — automation has no notion of a
+//! parameterized interface, so the vtable's `IAsyncOperation` returns could
+//! not appear in it at all — and the whole point of the WinRT direction is to
+//! stop translating. Scripts come back through a `.winmd` and a projection,
+//! with the async model intact.
 //!
-//! The type library ([`super::typelib`]) adds early binding on top of that,
-//! but only over what the dispinterfaces describe — the blocking members.
-//! VBA can declare `As NamedPipeClient` and gets IntelliSense over `Connect`,
-//! `Accept` and `WriteText`; nothing in the library mentions the vtable's
-//! `IAsyncOperation` returns. A type library has no notion of a parameterized
-//! interface, and an automation client would have no way to await one even if
-//! handed it. Reaching the async model from another language means reading
-//! WinRT metadata, which this crate does not ship — so that is Rust today, or
-//! a caller that redeclares the interfaces itself.
+//! Registrations written by a build from before that change leave stale
+//! `Interface\{…}` and `TypeLib` keys behind, because the IIDs they named no
+//! longer exist here to delete. They are inert; `regsvr32 /u` with the old
+//! binary, or ignoring them, are both fine.
 //!
 //! # Why `DllCanUnloadNow` always refuses
 //!
@@ -97,11 +102,14 @@
 //! which is what `CoFreeUnusedLibraries` would otherwise reclaim.
 
 use core::ffi::c_void;
+use super::bindings::Rustwinui3loop as rc;
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, HMODULE, S_FALSE, S_OK,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, HMODULE, S_FALSE,
+    S_OK,
 };
 use windows::Win32::System::Com::IClassFactory;
 use windows::Win32::System::Com::IClassFactory_Impl;
+use windows::Win32::System::WinRT::{IActivationFactory, IActivationFactory_Impl};
 use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
@@ -111,7 +119,8 @@ use windows::Win32::System::Registry::{
     RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
 };
 use windows_core::{
-    BOOL, GUID, HRESULT, HSTRING, IUnknown, Interface, PCWSTR, Ref, Result, implement,
+    BOOL, GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, PCWSTR, Ref, Result,
+    implement,
 };
 
 /// The registry root the shipped entry points use, split out so the
@@ -129,7 +138,10 @@ const CLASSES_ROOT: &str = "Software\\Classes";
 pub struct ComClass {
     /// Frozen. Changing one breaks every caller that already compiled it in.
     pub clsid: GUID,
-    /// `Vendor.Component`, the name `CLSIDFromProgID` resolves.
+    /// `Vendor.Component`, the name `CLSIDFromProgID` resolves — and, because
+    /// both are taken from [`super::bindings`], the same string the object
+    /// answers `GetRuntimeClassName` with and the key
+    /// [`DllGetActivationFactory`] looks up.
     pub progid: &'static str,
     /// Human-readable; becomes the default value of the CLSID key.
     pub description: &'static str,
@@ -145,39 +157,39 @@ pub struct ComClass {
 pub static CLASSES: &[ComClass] = &[
     ComClass {
         clsid: CLSID_NAMED_PIPE_CONNECTION_LISTENER,
-        progid: "Rustwinui3loop.NamedPipeConnectionListener",
+        progid: class_name::<rc::NamedPipeConnectionListener>(),
         description: "Named pipe connection listener",
         create: || super::NamedPipeConnectionListener::new().into_interface(),
     },
     ComClass {
         clsid: CLSID_UNIX_CONNECTION_LISTENER,
-        progid: "Rustwinui3loop.UnixConnectionListener",
+        progid: class_name::<rc::UnixConnectionListener>(),
         description: "AF_UNIX connection listener",
         create: || super::UnixConnectionListener::new().into_interface(),
     },
     ComClass {
         clsid: CLSID_HYPER_V_CONNECTION_LISTENER,
-        progid: "Rustwinui3loop.HyperVConnectionListener",
+        progid: class_name::<rc::HyperVConnectionListener>(),
         description: "Hyper-V socket connection listener",
         create: || super::HyperVConnectionListener::new().into_interface(),
     },
     ComClass {
-        clsid: CLSID_NAMED_PIPE_CLIENT,
-        progid: "Rustwinui3loop.NamedPipeClient",
+        clsid: CLSID_NAMED_PIPE_CONNECTOR,
+        progid: class_name::<rc::NamedPipeConnector>(),
         description: "Named pipe client connector",
-        create: || super::NamedPipeClient::new().into_interface(),
+        create: || super::NamedPipeConnector::new().into_interface(),
     },
     ComClass {
-        clsid: CLSID_UNIX_STREAM_SOCKET,
-        progid: "Rustwinui3loop.UnixStreamSocket",
+        clsid: CLSID_UNIX_CONNECTOR,
+        progid: class_name::<rc::UnixConnector>(),
         description: "AF_UNIX stream connector",
-        create: || super::UnixStreamSocket::new().into_interface(),
+        create: || super::UnixConnector::new().into_interface(),
     },
     ComClass {
-        clsid: CLSID_HV_STREAM_SOCKET,
-        progid: "Rustwinui3loop.HvStreamSocket",
+        clsid: CLSID_HYPER_V_CONNECTOR,
+        progid: class_name::<rc::HyperVConnector>(),
         description: "Hyper-V socket stream connector",
-        create: || super::HvStreamSocket::new().into_interface(),
+        create: || super::HyperVConnector::new().into_interface(),
     },
 ];
 
@@ -189,9 +201,19 @@ pub const CLSID_UNIX_CONNECTION_LISTENER: GUID =
     GUID::from_u128(0x60be1b42_01c6_486d_9b68_4e7af1503e30);
 pub const CLSID_HYPER_V_CONNECTION_LISTENER: GUID =
     GUID::from_u128(0xbf4265d3_3218_4f06_ad62_00d9edc2ffd3);
-pub const CLSID_NAMED_PIPE_CLIENT: GUID = GUID::from_u128(0x2ad42747_717e_4994_9457_5e2b1ba48247);
-pub const CLSID_UNIX_STREAM_SOCKET: GUID = GUID::from_u128(0xdb436265_333f_4f3e_a7fd_a3f842a639d4);
-pub const CLSID_HV_STREAM_SOCKET: GUID = GUID::from_u128(0xbe6a6ff1_e2b8_4014_b608_168668baf43d);
+pub const CLSID_NAMED_PIPE_CONNECTOR: GUID = GUID::from_u128(0x2ad42747_717e_4994_9457_5e2b1ba48247);
+pub const CLSID_UNIX_CONNECTOR: GUID = GUID::from_u128(0xdb436265_333f_4f3e_a7fd_a3f842a639d4);
+pub const CLSID_HYPER_V_CONNECTOR: GUID = GUID::from_u128(0xbe6a6ff1_e2b8_4014_b608_168668baf43d);
+
+/// The runtime class name `C` answers `GetRuntimeClassName` with.
+///
+/// A `const fn` so [`CLASSES`] can be a `static`: `RuntimeName` is the trait
+/// `windows-rs` reads that name through, and naming it here rather than
+/// repeating the literal is what makes the ProgID and the runtime class name
+/// the same string by construction.
+const fn class_name<C: windows_core::RuntimeName>() -> &'static str {
+    C::NAME
+}
 
 /// Looks a CLSID up in [`CLASSES`].
 pub fn class_for(clsid: &GUID) -> Option<&'static ComClass> {
@@ -275,6 +297,87 @@ pub unsafe extern "system" fn DllGetClassObject(
     unsafe { factory.query(iid, object) }
 }
 
+/// REGDB_E_CLASSNOTREG — the documented answer when this module does not
+/// implement the requested runtime class.
+const REGDB_E_CLASSNOTREG: HRESULT = HRESULT(0x80040154u32 as i32);
+
+/// Looks a runtime class name up in [`CLASSES`].
+///
+/// The name is the same string as the ProgID — both are taken from
+/// [`super::bindings`] — so one table answers both activation models.
+pub fn class_for_name(name: &str) -> Option<&'static ComClass> {
+    CLASSES.iter().find(|c| c.progid == name)
+}
+
+/// The WinRT counterpart of [`ClassFactory`]: what `RoActivateInstance` asks
+/// for before it asks for an instance.
+///
+/// Simpler than the COM one because WinRT split the two concerns the class
+/// factory conflates. `IActivationFactory::ActivateInstance` takes no IID and
+/// no aggregation outer — it returns the object as `IInspectable` and the
+/// caller queries from there — so the aggregation refusal and the
+/// out-parameter clearing that `IClassFactory::CreateInstance` needs have no
+/// counterpart here.
+///
+/// Only the six classes marked `#[Activatable]` in the metadata reach this.
+/// `TransportStream` and `ConnectionReceivedArgs` are runtime classes too,
+/// but they are only ever produced by a connect or an accept, and the
+/// metadata says so — there is nothing to keep in step by hand.
+#[implement(IActivationFactory)]
+struct ActivationFactory(&'static ComClass);
+
+impl IActivationFactory_Impl for ActivationFactory_Impl {
+    fn ActivateInstance(&self) -> Result<IInspectable> {
+        // The same constructor `CoCreateInstance` reaches, queried to the
+        // interface WinRT hands back rather than the one COM does. Both
+        // succeed on every class here: these objects are `IInspectable`
+        // because every interface they implement now derives from it.
+        (self.0.create)().cast()
+    }
+}
+
+/// Hands the Windows Runtime the activation factory for `name`.
+///
+/// The WinRT sibling of [`DllGetClassObject`], and the export that makes the
+/// published `.winmd` mean something: a projection reads the metadata, calls
+/// `RoActivateInstance`, and the runtime loads this module and calls here.
+/// Without it the metadata describes classes nothing can create.
+///
+/// Return values follow the documented contract: `E_INVALIDARG` for a null
+/// argument, `REGDB_E_CLASSNOTREG` for a class this module does not
+/// implement.
+///
+/// # Safety
+///
+/// Called by the Windows Runtime with a valid `HSTRING` and out-pointer. The
+/// string stays the caller's: it arrives by value as a borrowed handle, which
+/// is why it is taken as a `ManuallyDrop` rather than an owned `HSTRING` that
+/// would be released on return.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn DllGetActivationFactory(
+    name: core::mem::ManuallyDrop<HSTRING>,
+    factory: *mut *mut c_void,
+) -> HRESULT {
+    if factory.is_null() {
+        return E_INVALIDARG;
+    }
+    // Cleared first, for the same reason `DllGetClassObject` clears its own:
+    // a caller that ignores the HRESULT sees null rather than a pointer it
+    // would go on to release.
+    unsafe { *factory = core::ptr::null_mut() };
+    // A null `HSTRING` handle *is* the empty string, so this covers both the
+    // documented null case and a caller asking for a class called "".
+    if name.is_empty() {
+        return E_INVALIDARG;
+    }
+    let Some(class) = class_for_name(&name.to_string()) else {
+        return REGDB_E_CLASSNOTREG;
+    };
+    let activation: IActivationFactory = ActivationFactory(class).into();
+    unsafe { *factory = activation.into_raw() };
+    S_OK
+}
+
 /// Refuses to be unloaded; see the module docs for why this is the sound
 /// answer rather than a lazy one.
 #[unsafe(no_mangle)]
@@ -289,9 +392,7 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 /// rebuild at a new path is picked up.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllRegisterServer() -> HRESULT {
-    match unsafe { register_under(HKEY_CURRENT_USER, CLASSES_ROOT) }
-        .and_then(|()| super::typelib::register())
-    {
+    match unsafe { register_under(HKEY_CURRENT_USER, CLASSES_ROOT) } {
         Ok(()) => S_OK,
         Err(e) => e.code(),
     }
@@ -300,10 +401,7 @@ pub extern "system" fn DllRegisterServer() -> HRESULT {
 /// Removes everything [`DllRegisterServer`] wrote. What `regsvr32 /u` calls.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllUnregisterServer() -> HRESULT {
-    // The library goes first: it is registered under its own LIBID rather
-    // than under the class keys, so losing those first would strand it.
-    let lib = super::typelib::unregister();
-    match unsafe { unregister_under(HKEY_CURRENT_USER, CLASSES_ROOT) }.and(lib) {
+    match unsafe { unregister_under(HKEY_CURRENT_USER, CLASSES_ROOT) } {
         Ok(()) => S_OK,
         Err(e) => e.code(),
     }
@@ -333,22 +431,11 @@ pub(crate) unsafe fn register_under(root: HKEY, base: &str) -> Result<()> {
             })();
             close(server);
             r?;
-            // Lets a caller say "Rustwinui3loop.NamedPipeClient" instead of
+            // Lets a caller say "Rustwinui3loop.NamedPipeConnector" instead of
             // carrying the GUID; `CLSIDFromProgID` reads this pair.
             let progid = create_key(key, "ProgID")?;
             let r = set_default(progid, class.progid);
             close(progid);
-            r?;
-            // Points a host at the library that describes this class, which
-            // is how it finds the default and source interfaces without
-            // asking the object. See `super::typelib`.
-            let tl = create_key(key, "TypeLib")?;
-            let r = set_default(tl, &clsid_key(&super::typelib::LIBID));
-            close(tl);
-            r?;
-            let ver = create_key(key, "Version")?;
-            let r = set_default(ver, &version_string());
-            close(ver);
             r
         })();
         close(key);
@@ -366,52 +453,6 @@ pub(crate) unsafe fn register_under(root: HKEY, base: &str) -> Result<()> {
         r?;
     }
 
-    // The dispinterfaces, so a host can resolve one by IID — which is what
-    // `FindConnectionPoint` callers and cross-apartment marshalling of the
-    // event sink both do.
-    unsafe { register_interfaces(root, base) }
-}
-
-/// `1.0`, the one place the library version is spelled for the registry.
-fn version_string() -> String {
-    let (major, minor) = super::typelib::VERSION;
-    format!("{major}.{minor}")
-}
-
-/// Registers the dispinterfaces this library declares.
-///
-/// `ProxyStubClsid32` is oleaut32's own dispatch proxy
-/// (`{00020420-…}`): a dispinterface has no vtable to marshal, so the
-/// standard IDispatch proxy is exactly right, and naming it is what lets an
-/// event sink be called from the thread-pool thread an accept completes on
-/// when the sink lives in a different apartment.
-///
-/// # Safety
-///
-/// `root` must be a live registry key the caller may write to.
-unsafe fn register_interfaces(root: HKEY, base: &str) -> Result<()> {
-    const PS_DISPATCH: &str = "{00020420-0000-0000-c000-000000000046}";
-    let libid = clsid_key(&super::typelib::LIBID);
-    for (name, iid) in super::typelib::DISPINTERFACE_IDS {
-        let iid = clsid_key(iid);
-        let key = unsafe { create_key(root, &format!("{base}\\Interface\\{iid}"))? };
-        let r = (|| unsafe {
-            set_default(key, name)?;
-            let ps = create_key(key, "ProxyStubClsid32")?;
-            let r = set_default(ps, PS_DISPATCH);
-            close(ps);
-            r?;
-            let tl = create_key(key, "TypeLib")?;
-            let r = (|| {
-                set_default(tl, &libid)?;
-                set_value(tl, "Version", &version_string())
-            })();
-            close(tl);
-            r
-        })();
-        close(key);
-        r?;
-    }
     Ok(())
 }
 
@@ -586,13 +627,13 @@ mod tests {
             (CLSID_HYPER_V_CONNECTION_LISTENER, |u| {
                 u.cast::<super::super::IHyperVListenerBind>().is_ok()
             }),
-            (CLSID_NAMED_PIPE_CLIENT, |u| {
+            (CLSID_NAMED_PIPE_CONNECTOR, |u| {
                 u.cast::<super::super::INamedPipeConnector>().is_ok()
             }),
-            (CLSID_UNIX_STREAM_SOCKET, |u| {
+            (CLSID_UNIX_CONNECTOR, |u| {
                 u.cast::<super::super::IUnixConnector>().is_ok()
             }),
-            (CLSID_HV_STREAM_SOCKET, |u| {
+            (CLSID_HYPER_V_CONNECTOR, |u| {
                 u.cast::<super::super::IHyperVConnector>().is_ok()
             }),
         ];
@@ -638,7 +679,7 @@ mod tests {
         assert!(
             unsafe {
                 DllGetClassObject(
-                    &CLSID_NAMED_PIPE_CLIENT,
+                    &CLSID_NAMED_PIPE_CONNECTOR,
                     &super::super::IUnixConnector::IID,
                     &mut raw,
                 )
@@ -650,12 +691,12 @@ mod tests {
         // Aggregation, which these objects cannot support.
         let factory: IClassFactory = unsafe {
             let mut f = core::ptr::null_mut();
-            DllGetClassObject(&CLSID_UNIX_STREAM_SOCKET, &IClassFactory::IID, &mut f)
+            DllGetClassObject(&CLSID_UNIX_CONNECTOR, &IClassFactory::IID, &mut f)
                 .ok()
                 .unwrap();
             IClassFactory::from_raw(f)
         };
-        let outer: IUnknown = super::super::NamedPipeClient::new().into_interface();
+        let outer: IUnknown = super::super::NamedPipeConnector::new().into_interface();
         let err = unsafe { factory.CreateInstance::<_, IUnknown>(&outer) }
             .expect_err("aggregation must be refused");
         assert_eq!(err.code(), CLASS_E_NOAGGREGATION);

@@ -15,21 +15,21 @@
 #![cfg(feature = "comio")]
 
 use rustwinui3loop::comio::activation::{
-    CLSID_NAMED_PIPE_CLIENT, CLSID_NAMED_PIPE_CONNECTION_LISTENER,
+    CLSID_NAMED_PIPE_CONNECTOR, CLSID_NAMED_PIPE_CONNECTION_LISTENER,
 };
-use rustwinui3loop::comio::{
-    IConnectionListener, IConnectionReceivedArgs, INamedPipeConnector, INamedPipeListenerBind,
-    IStreamConnector,
+use rustwinui3loop::comio::bindings::Rustwinui3loop::{
+    ConnectionReceivedArgs, IConnectionListener, INamedPipeConnector, INamedPipeListenerBind,
+    IStreamConnector, TransportStream,
 };
 use std::sync::mpsc;
 use windows::Foundation::TypedEventHandler;
-use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE};
+use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CLSIDFromProgID, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows_core::{HRESULT, HSTRING, IInspectable, IUnknown, Interface, PCSTR};
-use windows_future::IAsyncOperation;
+use windows_core::{HRESULT, HSTRING, IUnknown, Interface, PCSTR};
 
 type DllEntry = unsafe extern "system" fn() -> HRESULT;
 
@@ -162,75 +162,61 @@ fn com_activation_round_trip_through_the_registered_dll() {
             .expect("CoCreateInstance(listener)");
 
     let name = format!(r"\\.\pipe\comio_activation_{}", std::process::id());
+    // The block below used to be raw-pointer out-params, `ManuallyDrop` and
+    // hand-checked `HRESULT`s. The generated WinRT bindings carry the result
+    // in the return value and the failure in an `Err`, so what is left is the
+    // test rather than the marshalling.
+    // The raw pointer rather than the object: a WinRT interface wrapper is
+    // not `Send`, and this crosses from the thread-pool callback thread to
+    // the test's. Ownership transfers with it.
     let (accepted_tx, accepted_rx) = mpsc::channel::<usize>();
-    let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
-        let args: IConnectionReceivedArgs = args.as_ref().unwrap().cast().unwrap();
-        let raw = unsafe {
-            let mut raw = core::ptr::null_mut();
-            args.Stream(&mut raw).ok()?;
-            raw as usize
-        };
-        let _ = accepted_tx.send(raw);
-        Ok(())
-    });
+    let handler = TypedEventHandler::<IConnectionListener, ConnectionReceivedArgs>::new(
+        move |_sender, args| {
+            let stream = args.as_ref().unwrap().Stream()?;
+            let _ = accepted_tx.send(stream.into_raw() as usize);
+            Ok(())
+        },
+    );
 
     let bind: INamedPipeListenerBind = listener.cast().expect("QI INamedPipeListenerBind");
-    unsafe {
-        let mut action = core::ptr::null_mut();
-        bind.BindAsync(core::mem::ManuallyDrop::new(HSTRING::from(&name)), &mut action)
-            .ok()
-            .expect("BindAsync");
-        drop(windows_future::IAsyncAction::from_raw(action));
-    }
+    bind.BindAsync(&HSTRING::from(&name)).expect("BindAsync");
 
     let events: IConnectionListener = listener.cast().expect("QI IConnectionListener");
-    unsafe {
-        let mut token = 0i64;
-        events
-            .ConnectionReceived(handler.as_raw(), &mut token)
-            .ok()
-            .expect("ConnectionReceived");
-    }
+    events.ConnectionReceived(&handler).expect("ConnectionReceived");
 
     // --- The client, reached by ProgID rather than by CLSID ---------------
     // `CLSIDFromProgID` is a second, independent read of what registration
-    // wrote: it resolves only if the ProgID key and its CLSID subkey are
-    // both right.
-    let from_progid = unsafe {
-        CLSIDFromProgID(&HSTRING::from("Rustwinui3loop.NamedPipeClient"))
-    }
-    .expect("CLSIDFromProgID");
-    assert_eq!(from_progid, CLSID_NAMED_PIPE_CLIENT);
+    // wrote: it resolves only if the ProgID key and its CLSID subkey are both
+    // right. It is also the runtime class name, which is the point of taking
+    // both from one constant.
+    let from_progid =
+        unsafe { CLSIDFromProgID(&HSTRING::from("Rustwinui3loop.NamedPipeConnector")) }
+            .expect("CLSIDFromProgID");
+    assert_eq!(from_progid, CLSID_NAMED_PIPE_CONNECTOR);
 
     let client: IUnknown = unsafe { CoCreateInstance(&from_progid, None, CLSCTX_INPROC_SERVER) }
         .expect("CoCreateInstance(client)");
 
     // The shared interface answers for a COM-activated object too.
     let connector: IStreamConnector = client.cast().expect("QI IStreamConnector");
-    let transport = unsafe {
-        let mut s = core::mem::ManuallyDrop::new(HSTRING::new());
-        connector.Transport(&mut s).ok().expect("Transport");
-        core::mem::ManuallyDrop::into_inner(s).to_string()
-    };
-    assert_eq!(transport, "namedpipe");
+    assert_eq!(
+        connector.Transport().expect("Transport").to_string(),
+        "namedpipe"
+    );
 
     let connect: INamedPipeConnector = client.cast().expect("QI INamedPipeConnector");
-    let connected: IInspectable = unsafe {
-        let mut op = core::ptr::null_mut();
-        connect
-            .ConnectAsync(core::mem::ManuallyDrop::new(HSTRING::from(&name)), &mut op)
-            .ok()
-            .expect("ConnectAsync");
-        IAsyncOperation::<IInspectable>::from_raw(op)
-    }
-    .join()
-    .expect("connect result");
+    let connected = connect
+        .ConnectAsync(&HSTRING::from(&name))
+        .expect("ConnectAsync")
+        .join()
+        .expect("connect result");
 
     // --- Both ends are real streams ---------------------------------------
     let server_raw = accepted_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("no ConnectionReceived");
-    let server = unsafe { IInspectable::from_raw(server_raw as *mut core::ffi::c_void) };
+    let server =
+        unsafe { TransportStream::from_raw(server_raw as *mut core::ffi::c_void) };
     assert!(
         server
             .cast::<windows::Storage::Streams::IInputStream>()
@@ -245,9 +231,8 @@ fn com_activation_round_trip_through_the_registered_dll() {
     let closable: windows::Foundation::IClosable = events.cast().unwrap();
     closable.Close().unwrap();
 
-    // --- And the same thing from languages that have no vtables -----------
-    powershell_round_trip();
-    wsh_event_round_trip();
+    // --- And the WinRT half of activation --------------------------------
+    winrt_activation_factory(module);
 
     // The module stays loaded on purpose: `DllCanUnloadNow` returns S_FALSE,
     // and objects created above are still alive in this scope. Dropping the
@@ -256,139 +241,103 @@ fn com_activation_round_trip_through_the_registered_dll() {
     unsafe { FreeLibrary(module) }.expect("FreeLibrary");
 }
 
-/// Runs the whole transport from Windows PowerShell, in its own process.
+/// The `DllGetActivationFactory` export, exercised exactly as the Windows
+/// Runtime would call it.
 ///
-/// This is the only check that nothing in the chain quietly depends on being
-/// called from Rust. PowerShell has no way to declare `INamedPipeConnector`;
-/// every call below goes out as `GetIDsOfNames` then `Invoke`, through a
-/// COM automation layer written years before this crate. If the DISPIDs, the
-/// `DISPPARAMS` argument order, the VARIANT types or the registration were
-/// wrong, it is this that would notice.
+/// Deliberately *not* going through `RoActivateInstance`: that would need the
+/// `HKLM\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId` registration,
+/// which needs elevation and is not written yet. Calling the export directly
+/// tests everything on this side of that registry read — the name lookup, the
+/// factory, `ActivateInstance`, and the identity of what comes back — and
+/// leaves only the registry entry itself unproven.
 ///
-/// `powershell.exe` rather than `pwsh`: Windows PowerShell ships with the
-/// OS, so the test does not depend on anything being installed. It also runs
-/// STA by default, which exercises the apartment the `ThreadingModel = Both`
-/// registration claims to support.
-fn powershell_round_trip() {
-    let pipe = format!(r"\\.\pipe\comio_ps_{}", std::process::id());
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$name = '{pipe}'
+/// Each class is asked for by the name the metadata gives it, and the object
+/// that comes back is asked what it is. The two have to agree: the lookup
+/// table and `GetRuntimeClassName` both read the same constant, so a class
+/// renamed in only one place fails here.
+fn winrt_activation_factory(module: HMODULE) {
+    type GetActivationFactory = unsafe extern "system" fn(
+        core::mem::ManuallyDrop<HSTRING>,
+        *mut *mut core::ffi::c_void,
+    ) -> HRESULT;
 
-$listener = New-Object -ComObject Rustwinui3loop.NamedPipeConnectionListener
-$listener.Bind($name)
-if ($listener.Information() -ne $name) {{ throw "Information: $($listener.Information())" }}
+    let addr = unsafe { GetProcAddress(module, PCSTR(c"DllGetActivationFactory".as_ptr().cast())) }
+        .expect("DllGetActivationFactory not exported");
+    let get_factory: GetActivationFactory = unsafe { core::mem::transmute(addr) };
 
-$client = New-Object -ComObject Rustwinui3loop.NamedPipeClient
-if ($client.Transport() -ne 'namedpipe') {{ throw "Transport: $($client.Transport())" }}
+    let factory_for = |name: &str| -> Result<IActivationFactory, HRESULT> {
+        let mut raw = core::ptr::null_mut();
+        let hr = unsafe {
+            get_factory(
+                core::mem::ManuallyDrop::new(HSTRING::from(name)),
+                &mut raw,
+            )
+        };
+        if hr.is_ok() {
+            Ok(unsafe { IActivationFactory::from_raw(raw) })
+        } else {
+            assert!(raw.is_null(), "{name}: failed but still wrote a pointer");
+            Err(hr)
+        }
+    };
 
-# Connect first, Accept second: the listener queued the connection at Bind,
-# which is what lets one thread do both.
-$clientStream = $client.Connect($name)
-$serverStream = $listener.Accept(5000)
+    for name in [
+        "Rustwinui3loop.NamedPipeConnectionListener",
+        "Rustwinui3loop.UnixConnectionListener",
+        "Rustwinui3loop.HyperVConnectionListener",
+        "Rustwinui3loop.NamedPipeConnector",
+        "Rustwinui3loop.UnixConnector",
+        "Rustwinui3loop.HyperVConnector",
+    ] {
+        let factory = factory_for(name).unwrap_or_else(|hr| panic!("{name}: {hr:?}"));
+        let instance = unsafe { factory.ActivateInstance() }
+            .unwrap_or_else(|e| panic!("{name}: ActivateInstance: {e:?}"));
+        assert_eq!(
+            instance
+                .GetRuntimeClassName()
+                .unwrap_or_else(|e| panic!("{name}: GetRuntimeClassName: {e:?}"))
+                .to_string(),
+            name,
+            "activated object does not answer to the name it was asked for"
+        );
+    }
 
-$sent = 'hello from powershell'
-$n = $clientStream.WriteText($sent)
-if ($n -ne $sent.Length) {{ throw "WriteText returned $n" }}
-$got = $serverStream.ReadText(64)
-if ($got -ne $sent) {{ throw "ReadText: '$got'" }}
+    // Classes that exist in the metadata but are not `#[Activatable]`, so the
+    // factory must refuse them rather than quietly make one.
+    for name in [
+        "Rustwinui3loop.TransportStream",
+        "Rustwinui3loop.ConnectionReceivedArgs",
+        "Rustwinui3loop.NoSuchClass",
+        "Windows.Storage.Streams.Buffer",
+    ] {
+        assert_eq!(
+            factory_for(name).err(),
+            Some(REGDB_E_CLASSNOTREG),
+            "{name} should not be activatable here"
+        );
+    }
 
-$serverStream.WriteText('ack') | Out-Null
-$back = $clientStream.ReadText(64)
-if ($back -ne 'ack') {{ throw "reverse: '$back'" }}
-
-$clientStream.Close()
-$listener.Close()
-Write-Output 'ROUND-TRIP-OK'
-"#
+    // The documented answer for a null argument, both ways round.
+    let mut raw = core::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            get_factory(
+                core::mem::ManuallyDrop::new(HSTRING::new()),
+                &mut raw,
+            )
+        },
+        E_INVALIDARG
     );
-
-    let path = std::env::temp_dir().join(format!("comio_dispatch_{}.ps1", std::process::id()));
-    std::fs::write(&path, script).expect("write script");
-    let out = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&path)
-        .output()
-        .expect("spawn powershell");
-    let _ = std::fs::remove_file(&path);
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success() && stdout.contains("ROUND-TRIP-OK"),
-        "PowerShell could not drive the objects.\nstatus: {:?}\nstdout: {}\nstderr: {}",
-        out.status,
-        stdout,
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// Runs the listener's *event* from Windows Script Host, in its own process.
-///
-/// This is what the type library and the connection points are for, and the
-/// only check that reaches all of it. `WScript.ConnectObject` asks the
-/// object for its class info, reads the coclass's `[default, source]`
-/// interface out of the registered library, finds the matching connection
-/// point and advises a sink — none of which this crate performs, and any of
-/// which would silently leave the event undelivered if the library were
-/// wrong.
-///
-/// It is also the only test where the sink is in a different apartment from
-/// the thread that raises the event: `cscript` is single-threaded STA, the
-/// accept completes on a thread-pool thread, and the call has to marshal.
-/// That is what the `CoIncrementMTAUsage` in `SinkSet::advise` exists for —
-/// without it this fails with `CO_E_NOTINITIALIZED` while every in-process
-/// test still passes.
-fn wsh_event_round_trip() {
-    let pipe = format!(r"\\.\pipe\comio_wsh_{}", std::process::id());
-    let script = format!(
-        r#"Dim gotEvent, gotText
-gotEvent = False
-gotText = ""
-PipeName = "{pipe}"
-
-Set listener = CreateObject("Rustwinui3loop.NamedPipeConnectionListener")
-WScript.ConnectObject listener, "L_"
-listener.Bind PipeName
-
-Set client = CreateObject("Rustwinui3loop.NamedPipeClient")
-Set cs = client.Connect(PipeName)
-cs.WriteText "from vbscript"
-
-For i = 1 To 50
-  If gotEvent Then Exit For
-  WScript.Sleep 100
-Next
-
-If gotEvent Then
-  WScript.Echo "EVENT-OK:" & gotText
-Else
-  WScript.Echo "NO-EVENT"
-End If
-listener.Close
-
-Sub L_ConnectionReceived(stream)
-  gotText = stream.ReadText(64)
-  gotEvent = True
-End Sub
-"#
-    );
-
-    let path = std::env::temp_dir().join(format!("comio_event_{}.vbs", std::process::id()));
-    std::fs::write(&path, script).expect("write script");
-    let out = std::process::Command::new("cscript.exe")
-        .args(["//nologo", "//E:vbscript"])
-        .arg(&path)
-        .output()
-        .expect("spawn cscript");
-    let _ = std::fs::remove_file(&path);
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success() && stdout.contains("EVENT-OK:from vbscript"),
-        "the sink was never called, or got the wrong stream.\nstatus: {:?}\nstdout: {}\nstderr: {}",
-        out.status,
-        stdout,
-        String::from_utf8_lossy(&out.stderr)
+    assert_eq!(
+        unsafe {
+            get_factory(
+                core::mem::ManuallyDrop::new(HSTRING::from("Rustwinui3loop.NamedPipeConnector")),
+                core::ptr::null_mut(),
+            )
+        },
+        E_INVALIDARG
     );
 }
+
+/// REGDB_E_CLASSNOTREG, as `DllGetActivationFactory` documents it.
+const REGDB_E_CLASSNOTREG: HRESULT = HRESULT(0x80040154u32 as i32);

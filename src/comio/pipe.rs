@@ -1,13 +1,12 @@
-//! Named-pipe transport: `NamedPipeListener`/`NamedPipeClient` produce
-//! `OverlappedDuplexStream`s (via `stream::from_reg`) over Win32 named
+//! Named-pipe transport: `NamedPipeListener`/`NamedPipeConnector` produce
+//! `TransportStream`s (via `stream::from_reg`) over Win32 named
 //! pipes, the first end-to-end transport built on the `comio` overlapped-IO
 //! engine.
 
-use super::connector::{
-    INamedPipeConnector, INamedPipeConnector_Impl, IStreamConnector, IStreamConnector_Impl,
-    out_operation, out_transport,
+use super::bindings;
+use super::bindings::Rustwinui3loop::{
+    INamedPipeConnector_Impl, IStreamConnector_Impl, TransportStream,
 };
-use super::dispatch;
 use super::stream;
 use super::tpio::{self, IoReg, Issue, OpHandle};
 use super::waitop::await_io;
@@ -40,7 +39,7 @@ impl NamedPipeListener {
     /// Creates a new instance of the named pipe and asynchronously waits for
     /// a client to connect, returning the connected instance as a duplex
     /// WinRT stream.
-    pub async fn accept(&self) -> Result<windows_core::IInspectable> {
+    pub async fn accept(&self) -> Result<TransportStream> {
         let handle = unsafe {
             CreateNamedPipeW(
                 &self.name,
@@ -176,22 +175,20 @@ pub(crate) fn arm_accept(
 
 /// Client side of a named pipe.
 #[windows_core::implement(
-    IStreamConnector,
-    INamedPipeConnector,
-    windows::Win32::System::Com::IDispatch
+    bindings::Rustwinui3loop::NamedPipeConnector,
+    bindings::Rustwinui3loop::INamedPipeConnector
 )]
-pub struct NamedPipeClient;
+pub struct NamedPipeConnector;
 
-/// The one spelling of this transport's name, shared by the vtable's
-/// `Transport` and the dispatch member of the same name so the two cannot
-/// drift apart.
+/// The one spelling of this transport's name, as the vtable's `Transport`
+/// reports it.
 const TRANSPORT: &str = "namedpipe";
 
-impl NamedPipeClient {
+impl NamedPipeConnector {
     /// Opens the client end of an existing named pipe. If every server
     /// instance is momentarily busy (`ERROR_PIPE_BUSY`), waits via
     /// `WaitNamedPipeW` for one to free up and retries once.
-    pub async fn connect(name: &str) -> Result<windows_core::IInspectable> {
+    pub async fn connect(name: &str) -> Result<TransportStream> {
         let wname = HSTRING::from(name);
         let handle = match Self::open(&wname) {
             Ok(h) => h,
@@ -218,7 +215,7 @@ impl NamedPipeClient {
 
     /// One synchronous open attempt, with no `ERROR_PIPE_BUSY` wait: the
     /// caller decides whether to wait and on whose thread.
-    pub(crate) fn try_open(wname: &HSTRING) -> Result<windows_core::IInspectable> {
+    pub(crate) fn try_open(wname: &HSTRING) -> Result<TransportStream> {
         let handle = Self::open(wname)?;
         match IoReg::register(handle, false) {
             Ok(reg) => Ok(stream::from_reg(reg)),
@@ -248,11 +245,11 @@ impl NamedPipeClient {
     }
 }
 
-impl NamedPipeClient {
+impl NamedPipeConnector {
     /// Creates the connector. It holds no state; connecting is what it does.
     #[allow(clippy::new_without_default)]
-    pub fn new() -> windows_core::ComObject<NamedPipeClient> {
-        windows_core::ComObject::new(NamedPipeClient)
+    pub fn new() -> windows_core::ComObject<NamedPipeConnector> {
+        windows_core::ComObject::new(NamedPipeConnector)
     }
 
     /// Typed Rust mirror of the vtable's `ConnectAsync`.
@@ -265,7 +262,7 @@ impl NamedPipeClient {
     pub fn connect_async(
         &self,
         name: &windows_core::HSTRING,
-    ) -> windows_future::IAsyncOperation<windows_core::IInspectable> {
+    ) -> windows_future::IAsyncOperation<TransportStream> {
         match Self::try_open(name) {
             Ok(stream) => windows_future::IAsyncOperation::ready(Ok(stream)),
             Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
@@ -279,55 +276,20 @@ impl NamedPipeClient {
     }
 }
 
-impl IStreamConnector_Impl for NamedPipeClient_Impl {
-    unsafe fn Transport(
-        &self,
-        result: *mut core::mem::ManuallyDrop<windows_core::HSTRING>,
-    ) -> windows_core::HRESULT {
-        out_transport(TRANSPORT, result)
+impl IStreamConnector_Impl for NamedPipeConnector_Impl {
+    fn Transport(&self) -> Result<HSTRING> {
+        Ok(HSTRING::from(TRANSPORT))
     }
 }
 
-impl INamedPipeConnector_Impl for NamedPipeClient_Impl {
-    unsafe fn ConnectAsync(
+impl INamedPipeConnector_Impl for NamedPipeConnector_Impl {
+    fn ConnectAsync(
         &self,
-        name: core::mem::ManuallyDrop<windows_core::HSTRING>,
-        result: *mut *mut core::ffi::c_void,
-    ) -> windows_core::HRESULT {
-        out_operation(self.connect_async(&name), result)
+        name: &HSTRING,
+    ) -> Result<windows_future::IAsyncOperation<TransportStream>> {
+        Ok(self.connect_async(name))
     }
 }
-
-/// The late-bound surface: `Transport` as the vtable has it, and `Connect`
-/// as the blocking shape of `ConnectAsync` — see `dispatch`'s module docs
-/// for why a script gets the second rather than the first.
-impl dispatch::Dispatchable for NamedPipeClient {
-    const DISPINTERFACE: windows_core::GUID = super::typelib::IID_DNAMED_PIPE_CLIENT;
-
-    const MEMBERS: &'static [dispatch::Member] = &[
-        dispatch::member!("Transport", 1, () -> Text),
-        dispatch::member!("Connect", 2, ("Name": Text) -> Object),
-    ];
-
-    fn invoke_member(
-        &self,
-        dispid: i32,
-        args: &[windows::Win32::System::Variant::VARIANT],
-    ) -> windows_core::Result<windows::Win32::System::Variant::VARIANT> {
-        match dispid {
-            1 => Ok(dispatch::bstr(TRANSPORT)),
-            2 => {
-                let name = windows_core::HSTRING::from(dispatch::as_string(&args[0])?);
-                dispatch::object(&self.connect_async(&name).join()?)
-            }
-            _ => Err(windows_core::Error::from_hresult(
-                windows::Win32::Foundation::DISP_E_MEMBERNOTFOUND,
-            )),
-        }
-    }
-}
-
-dispatch::impl_dispatch!(NamedPipeClient, NamedPipeClient_Impl);
 
 #[cfg(test)]
 mod tests {
@@ -360,7 +322,7 @@ mod tests {
             n
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let client = block_on(NamedPipeClient::connect(&name)).unwrap();
+        let client = block_on(NamedPipeConnector::connect(&name)).unwrap();
         let c_out: IOutputStream = client.cast().unwrap();
         let c_in: IInputStream = client.cast().unwrap();
         let wbuf = new_buffer(5).unwrap();
@@ -420,7 +382,7 @@ mod tests {
             )
         };
         assert!(!handle.is_invalid());
-        let client = block_on(NamedPipeClient::connect(&name)).unwrap();
+        let client = block_on(NamedPipeConnector::connect(&name)).unwrap();
         // Now build a listener bound to the SAME already-connected instance
         // by registering the handle we created above directly, bypassing
         // `CreateNamedPipeW` inside `accept` (which would create a *new*,

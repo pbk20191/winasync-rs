@@ -1,0 +1,21 @@
+[package]
+name = "winmdgen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Kept out of the main crate's dependency graph on purpose. `windows-rdl`
+# pulls syn/quote and is only ever run by hand, so making it a
+# `build-dependency` of the library would slow every ordinary build for an
+# artifact that changes perhaps twice a month. The `.winmd` and the generated
+# bindings are checked in instead, which is also what `windows-rs` itself does.
+
+[dependencies]
+# Writes ECMA-335. Only published at 0.100, which is fine: it emits a binary
+# `.winmd`, so its version has nothing to do with the `windows` crate we build
+# against.
+windows-rdl = "0.100"
+# This one DOES have to match: it generates Rust that calls `windows-core`.
+# Pinned to the 0.62 line alongside `windows`/`windows-core` in the root
+# manifest. Verified to read a 0.100-produced `.winmd` without complaint.
+windows-bindgen = "0.62"

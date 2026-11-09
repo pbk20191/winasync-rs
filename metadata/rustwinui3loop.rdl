@@ -1,0 +1,145 @@
+// The WinRT surface of `comio`, as metadata.
+//
+// This file is the source of truth for the ABI: `tools/winmdgen` compiles it
+// to `rustwinui3loop.winmd` with `windows-rdl`, then runs `windows-bindgen`
+// over that to produce `src/comio/bindings.rs`. The Rust interfaces are
+// *generated from here*, not described by it — which is the whole reason this
+// file exists. A hand-written `#[interface]` cannot be a WinRT interface:
+// `windows-interface` emits `Parent_Vtbl::new::<Identity, OFFSET>` and needs a
+// `Parent_Impl` trait, and `IInspectable` has neither (its `new` takes three
+// type parameters and there is no `IInspectable_Impl`). So every interface
+// here derives from `IUnknown` three slots in, where a projection expects
+// `IInspectable` six slots in. Only bindgen emits the latter.
+//
+// IIDs are **derived**, not chosen. `windows-rdl` hashes each interface's
+// signature with the midlrt algorithm, exactly as MIDL 3.0 would, so an
+// independent consumer that recomputes them agrees. That is also why the
+// frozen GUIDs from the `#[interface]` era are gone: these interfaces inherit
+// from `IInspectable` and carry different members, so reusing an old IID for a
+// different vtable would be the one unforgivable COM error.
+//
+// The namespace is `Rustwinui3loop` because `Windows.` is reserved for the
+// `windows` crate (microsoft/win32metadata#998). It is also, deliberately, the
+// same string already registered as each class's ProgID.
+
+use Windows::Foundation::Metadata::*;
+
+#[winrt]
+mod Rustwinui3loop {
+    // ---------------------------------------------------------------------
+    // The stream
+    //
+    // What every transport hands back, on both ends. It owns no interface of
+    // its own: it *is* a WinRT stream, so it implements the ones WinRT already
+    // declares and nothing more. Not activatable — a stream only ever comes
+    // from a connect or an accept, never from `new`.
+    // ---------------------------------------------------------------------
+
+    class TransportStream {
+        Windows::Storage::Streams::IInputStream,
+        Windows::Storage::Streams::IOutputStream,
+        Windows::Foundation::IClosable,
+    }
+
+    // ---------------------------------------------------------------------
+    // Listeners
+    // ---------------------------------------------------------------------
+
+    // The members every listener shares, whatever it is bound to.
+    //
+    // The sender type parameter is this interface rather than any one class,
+    // which is what lets all three listeners raise the same event. Binding is
+    // deliberately absent: each transport is addressed differently, and one
+    // shared bind would have to erase the address and reject the wrong shapes
+    // at run time.
+    interface IConnectionListener {
+        event ConnectionReceived: Windows::Foundation::TypedEventHandler<IConnectionListener, ConnectionReceivedArgs>;
+        #[get] Information: String;
+    }
+
+    // One accepted connection.
+    class ConnectionReceivedArgs {
+        IConnectionReceivedArgs,
+    }
+
+    interface IConnectionReceivedArgs {
+        #[get] Stream: TransportStream;
+        #[get] RemoteEndpoint: String;
+    }
+
+    interface INamedPipeListenerBind {
+        fn BindAsync(&self, name: String) -> Windows::Foundation::IAsyncAction;
+    }
+
+    interface IUnixListenerBind {
+        fn BindAsync(&self, path: String) -> Windows::Foundation::IAsyncAction;
+    }
+
+    // GUIDs rather than a `HostName` because WinRT cannot spell this
+    // endpoint: `HostNameType` is `DomainName | Ipv4 | Ipv6 | Bluetooth`.
+    interface IHyperVListenerBind {
+        fn BindEndpointAsync(&self, vmId: GUID, serviceId: GUID) -> Windows::Foundation::IAsyncAction;
+        fn BindServiceNameAsync(&self, serviceId: GUID) -> Windows::Foundation::IAsyncAction;
+    }
+
+    #[Activatable(1)]
+    class NamedPipeConnectionListener {
+        IConnectionListener,
+        INamedPipeListenerBind,
+        Windows::Foundation::IClosable,
+    }
+
+    #[Activatable(1)]
+    class UnixConnectionListener {
+        IConnectionListener,
+        IUnixListenerBind,
+        Windows::Foundation::IClosable,
+    }
+
+    #[Activatable(1)]
+    class HyperVConnectionListener {
+        IConnectionListener,
+        IHyperVListenerBind,
+        Windows::Foundation::IClosable,
+    }
+
+    // ---------------------------------------------------------------------
+    // Connectors
+    // ---------------------------------------------------------------------
+
+    // Identity, not behaviour: a caller holding an unknown object can ask
+    // "is this a connector, and of what?" in one `QueryInterface`.
+    interface IStreamConnector {
+        #[get] Transport: String;
+    }
+
+    interface INamedPipeConnector {
+        fn ConnectAsync(&self, name: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+    }
+
+    interface IUnixConnector {
+        fn ConnectAsync(&self, path: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+    }
+
+    interface IHyperVConnector {
+        fn ConnectAsync(&self, vmId: GUID, serviceId: GUID) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+    }
+
+    #[Activatable(1)]
+    class NamedPipeConnector {
+        IStreamConnector,
+        INamedPipeConnector,
+    }
+
+    #[Activatable(1)]
+    class UnixConnector {
+        IStreamConnector,
+        IUnixConnector,
+    }
+
+    #[Activatable(1)]
+    class HyperVConnector {
+        IStreamConnector,
+        IHyperVConnector,
+    }
+}

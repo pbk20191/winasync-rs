@@ -6,14 +6,16 @@
 //! each carrying the connect its addressing supports, because a pipe name, a
 //! filesystem path and a pair of GUIDs cannot share one signature.
 //!
-//! There is deliberately no common connector interface. The listeners share
-//! one because they share real behaviour — handler registration, the accept
-//! chain, close. A connector has exactly one method, and that method is the
-//! part that differs, so a shared interface would carry nothing.
+//! The interfaces themselves are no longer declared here. They live in
+//! `metadata/rustwinui3loop.rdl` and are generated into [`super::bindings`],
+//! because a hand-written `#[interface]` cannot derive from `IInspectable`
+//! and so cannot be a WinRT interface at all. What stays in this module is
+//! the part metadata cannot express: the operation object behind every
+//! `ConnectAsync`.
 //!
 //! # No blocked threads
 //!
-//! Each `ConnectAsync` returns an `IAsyncOperation<IInspectable>` whose
+//! Each `ConnectAsync` returns an `IAsyncOperation<TransportStream>` whose
 //! result is delivered **from the overlapped completion**, not by running the
 //! connect to completion on a thread. AF_UNIX and AF_HYPERV arm a `ConnectEx`
 //! through `tpio::submit` and fill the operation from its callback — the same
@@ -27,102 +29,35 @@
 //! Only `ERROR_PIPE_BUSY` has something to wait for, and that wait is handed
 //! to the thread pool rather than to the caller.
 
-// PascalCase members are the COM ABI convention these interfaces are shaped
-// to, not Rust naming slips; `#[interface]` rejects an attribute of its own,
-// so the allow lives here, as in `listener`.
+// PascalCase members are the COM ABI convention the generated traits are
+// shaped to, not Rust naming slips.
 #![allow(non_snake_case)]
 
-use core::ffi::c_void;
 use std::sync::Mutex;
-use windows_core::{
-    implement, interface, ComObject, HRESULT, HSTRING, IInspectable, IUnknown, IUnknownImpl,
-    IUnknown_Vtbl, Interface, Result,
-};
+use windows_core::{ComObject, HRESULT, IUnknownImpl, Result, implement};
 use windows_future::{
     AsyncOperationCompletedHandler, AsyncStatus, IAsyncInfo_Impl, IAsyncOperation,
     IAsyncOperation_Impl,
 };
 
+use super::bindings::Rustwinui3loop::TransportStream;
 use super::tpio::OpHandle;
 
-/// E_POINTER — a null out-parameter from a COM caller.
-pub(crate) const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
-
-/// What every connector here shares. GUID frozen — do not change or reuse.
-///
-/// `ConnectAsync` is deliberately **not** on it. The three take different
-/// addresses — a pipe name, a filesystem path, a pair of GUIDs — and the only
-/// way to put them on one signature is to erase the address into a variant
-/// and reject the wrong shapes at run time, which is exactly the
-/// `E_INVALIDARG` design the listeners were just freed from.
-///
-/// What it does carry is identity: a COM caller holding an unknown object can
-/// ask "is this a connector, and of what?" in one `QueryInterface` instead of
-/// trying each transport's interface in turn. The answer is also what to put
-/// in a log line.
-#[interface("6ec93a18-74d2-41b5-9c08-3f5ab0e712d6")]
-pub unsafe trait IStreamConnector: IUnknown {
-    /// A stable, lowercase transport name: `namedpipe`, `unix`, `hyperv`.
-    pub fn Transport(&self, result: *mut core::mem::ManuallyDrop<HSTRING>) -> HRESULT;
-}
-
-/// Connects to a named pipe. GUID frozen — do not change or reuse.
-#[interface("8d3f21b6-0c47-4e95-a1d8-6b92f05c7e34")]
-pub unsafe trait INamedPipeConnector: IUnknown {
-    pub fn ConnectAsync(
-        &self,
-        name: core::mem::ManuallyDrop<HSTRING>,
-        result: *mut *mut c_void,
-    ) -> HRESULT;
-}
-
-/// Connects to an AF_UNIX socket. GUID frozen.
-#[interface("2b70e4c9-5a16-43d8-9f02-c7e418a6d35f")]
-pub unsafe trait IUnixConnector: IUnknown {
-    pub fn ConnectAsync(
-        &self,
-        path: core::mem::ManuallyDrop<HSTRING>,
-        result: *mut *mut c_void,
-    ) -> HRESULT;
-}
-
-/// Connects to a Hyper-V socket. GUID frozen.
-#[interface("f51a8d02-9e3b-4c67-85a4-1d60b7f293ce")]
-pub unsafe trait IHyperVConnector: IUnknown {
-    pub fn ConnectAsync(
-        &self,
-        vm_id: *const windows_core::GUID,
-        service_id: *const windows_core::GUID,
-        result: *mut *mut c_void,
-    ) -> HRESULT;
-}
-
-/// Hands an `IAsyncOperation` back through a vtable out-parameter.
-pub(crate) fn out_operation(op: IAsyncOperation<IInspectable>, result: *mut *mut c_void) -> HRESULT {
-    if result.is_null() {
-        return E_POINTER;
-    }
-    // Transfer the reference to the caller.
-    unsafe { *result = core::mem::ManuallyDrop::new(op).as_raw() };
-    HRESULT(0)
-}
-
-
-/// An `IAsyncOperation<IInspectable>` whose result arrives from an overlapped
+/// An `IAsyncOperation<TransportStream>` whose result arrives from an overlapped
 /// completion rather than from a closure run to completion on a thread.
 ///
 /// The same state machine as `super::asyncop::IoAsyncOp`, which does this for
-/// reads and writes; this one is fixed to `IAsyncOperation<IInspectable>`,
+/// reads and writes; this one is fixed to `IAsyncOperation<TransportStream>`,
 /// the shape a connect returns. `IAsyncInfo::Cancel` cancels the in-flight
 /// `ConnectEx`.
 struct ConnectState {
-    result: Option<Result<IInspectable>>,
-    completed: Option<AsyncOperationCompletedHandler<IInspectable>>,
+    result: Option<Result<TransportStream>>,
+    completed: Option<AsyncOperationCompletedHandler<TransportStream>>,
     completed_assigned: bool,
     op: Option<OpHandle>,
 }
 
-#[implement(IAsyncOperation<IInspectable>, windows_future::IAsyncInfo)]
+#[implement(IAsyncOperation<TransportStream>, windows_future::IAsyncInfo)]
 struct ConnectOp(Mutex<ConnectState>);
 
 // SAFETY: the only non-`Send` data (the pending handler) lives behind the
@@ -135,7 +70,7 @@ unsafe impl Sync for ConnectOp {}
 impl ConnectOp_Impl {
     /// Stores the outcome and fires `Completed` if one is already assigned.
     /// Runs on the thread-pool completion thread.
-    fn complete(&self, res: Result<IInspectable>) {
+    fn complete(&self, res: Result<TransportStream>) {
         let (status, completed) = {
             let mut g = self.0.lock().unwrap();
             debug_assert!(g.result.is_none());
@@ -144,7 +79,7 @@ impl ConnectOp_Impl {
         };
         // Outside the lock: the handler may re-enter to read Status/GetResults.
         if let Some(completed) = completed {
-            let sender: IAsyncOperation<IInspectable> = self.to_interface();
+            let sender: IAsyncOperation<TransportStream> = self.to_interface();
             let _ = completed.Invoke(&sender, status);
         }
     }
@@ -184,10 +119,10 @@ impl IAsyncInfo_Impl for ConnectOp_Impl {
     }
 }
 
-impl IAsyncOperation_Impl<IInspectable> for ConnectOp_Impl {
+impl IAsyncOperation_Impl<TransportStream> for ConnectOp_Impl {
     fn SetCompleted(
         &self,
-        handler: windows_core::Ref<'_, AsyncOperationCompletedHandler<IInspectable>>,
+        handler: windows_core::Ref<'_, AsyncOperationCompletedHandler<TransportStream>>,
     ) -> Result<()> {
         let (fire, status) = {
             let mut g = self.0.lock().unwrap();
@@ -206,13 +141,13 @@ impl IAsyncOperation_Impl<IInspectable> for ConnectOp_Impl {
             }
         };
         if let Some(h) = fire {
-            let sender: IAsyncOperation<IInspectable> = self.to_interface();
+            let sender: IAsyncOperation<TransportStream> = self.to_interface();
             let _ = h.Invoke(&sender, status);
         }
         Ok(())
     }
 
-    fn Completed(&self) -> Result<AsyncOperationCompletedHandler<IInspectable>> {
+    fn Completed(&self) -> Result<AsyncOperationCompletedHandler<TransportStream>> {
         self.0
             .lock()
             .unwrap()
@@ -221,7 +156,7 @@ impl IAsyncOperation_Impl<IInspectable> for ConnectOp_Impl {
             .ok_or_else(|| windows_core::Error::from_hresult(E_ILLEGAL_METHOD_CALL))
     }
 
-    fn GetResults(&self) -> Result<IInspectable> {
+    fn GetResults(&self) -> Result<TransportStream> {
         match &self.0.lock().unwrap().result {
             Some(r) => r.clone(),
             None => Err(windows_core::Error::from_hresult(E_ILLEGAL_METHOD_CALL)),
@@ -237,8 +172,8 @@ const E_ILLEGAL_DELEGATE_ASSIGNMENT: HRESULT = HRESULT(0x80000018u32 as i32);
 /// Builds an operation and arms `start`, which must deliver exactly one
 /// result through the callback it is given.
 pub(crate) fn connect_op(
-    start: impl FnOnce(Box<dyn FnOnce(Result<IInspectable>) + Send>) -> Result<OpHandle>,
-) -> IAsyncOperation<IInspectable> {
+    start: impl FnOnce(Box<dyn FnOnce(Result<TransportStream>) + Send>) -> Result<OpHandle>,
+) -> IAsyncOperation<TransportStream> {
     let op: ComObject<ConnectOp> = ComObject::new(ConnectOp(Mutex::new(ConnectState {
         result: None,
         completed: None,
@@ -256,27 +191,15 @@ pub(crate) fn connect_op(
     }
 }
 
-/// Fills `IStreamConnector::Transport`.
-pub(crate) fn out_transport(
-    name: &str,
-    result: *mut core::mem::ManuallyDrop<HSTRING>,
-) -> HRESULT {
-    if result.is_null() {
-        return E_POINTER;
-    }
-    unsafe { *result = core::mem::ManuallyDrop::new(HSTRING::from(name)) };
-    HRESULT(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comio::listener::{
-        IConnectionListener, INamedPipeListenerBind, NamedPipeConnectionListener,
-    };
+    // Every interface under test now comes from metadata.
+    use crate::comio::bindings::Rustwinui3loop::*;
+    use crate::comio::listener::{ConnectionHandler, NamedPipeConnectionListener};
+    use core::ffi::c_void;
     use std::sync::mpsc;
-    use windows::Foundation::TypedEventHandler;
-    use windows_core::Interface;
+    use windows_core::{HSTRING, Interface};
 
     /// The AF_UNIX connector, whose result arrives from the `ConnectEx`
     /// completion rather than from a blocked thread. Exercises the
@@ -284,7 +207,8 @@ mod tests {
     /// then `GetResults` after.
     #[test]
     fn unix_connector_completes_from_the_overlapped_callback() {
-        use crate::comio::listener::{IUnixListenerBind, UnixConnectionListener};
+        use crate::comio::bindings::Rustwinui3loop::IUnixListenerBind;
+        use crate::comio::listener::UnixConnectionListener;
 
         let path = std::env::temp_dir()
             .join(format!("comio_conn_{}.sock", std::process::id()))
@@ -294,43 +218,21 @@ mod tests {
 
         let listener = UnixConnectionListener::new();
         let (accepted_tx, accepted_rx) = mpsc::channel::<()>();
-        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, _a| {
+        let handler = ConnectionHandler::new(move |_s, _a| {
             let _ = accepted_tx.send(());
             Ok(())
         });
         {
             let b: IUnixListenerBind = listener.cast().unwrap();
-            let mut action = core::ptr::null_mut();
-            unsafe {
-                b.BindAsync(
-                    core::mem::ManuallyDrop::new(HSTRING::from(&path)),
-                    &mut action,
-                )
-                .ok()
-                .expect("BindAsync");
-                drop(windows_future::IAsyncAction::from_raw(action));
-            }
+            b.BindAsync(&HSTRING::from(&path)).expect("BindAsync");
         }
         let l: IConnectionListener = listener.cast().unwrap();
-        let mut token = 0i64;
-        unsafe {
-            l.ConnectionReceived(handler.as_raw(), &mut token)
-                .ok()
-                .expect("ConnectionReceived");
-        }
+        l.ConnectionReceived(&handler).expect("ConnectionReceived");
 
-        let connector = crate::comio::UnixStreamSocket::new();
+        let connector = crate::comio::UnixConnector::new();
         let c: IUnixConnector = connector.cast().unwrap();
-        let op: IAsyncOperation<IInspectable> = unsafe {
-            let mut raw = core::ptr::null_mut();
-            c.ConnectAsync(
-                core::mem::ManuallyDrop::new(HSTRING::from(&path)),
-                &mut raw,
-            )
-            .ok()
-            .expect("ConnectAsync");
-            IAsyncOperation::from_raw(raw)
-        };
+        let op: IAsyncOperation<TransportStream> =
+            c.ConnectAsync(&HSTRING::from(&path)).expect("ConnectAsync");
 
         // Register a Completed handler the way a COM caller would, rather
         // than blocking: this is the path that would never fire if the
@@ -368,58 +270,31 @@ mod tests {
 
         let listener = NamedPipeConnectionListener::new();
         let (tx, rx) = mpsc::channel::<usize>();
-        let handler = TypedEventHandler::<IInspectable, IInspectable>::new(move |_s, args| {
-            let a = args.as_ref().unwrap();
-            let cra: crate::comio::IConnectionReceivedArgs = a.cast().unwrap();
-            let raw = unsafe {
-                let mut raw = core::ptr::null_mut();
-                cra.Stream(&mut raw).ok()?;
-                raw as usize
-            };
-            let _ = tx.send(raw);
+        let handler = ConnectionHandler::new(move |_s, args| {
+            let stream = args.as_ref().unwrap().Stream()?;
+            let _ = tx.send(stream.into_raw() as usize);
             Ok(())
         });
 
         // Bind and register through the listener's vtables.
         let bind: INamedPipeListenerBind = listener.cast().unwrap();
-        let mut action = core::ptr::null_mut();
-        unsafe {
-            bind.BindAsync(
-                core::mem::ManuallyDrop::new(HSTRING::from(&name)),
-                &mut action,
-            )
-            .ok()
-            .expect("BindAsync");
-            drop(windows_future::IAsyncAction::from_raw(action));
-        }
+        bind.BindAsync(&HSTRING::from(&name)).expect("BindAsync");
         let l: IConnectionListener = listener.cast().unwrap();
-        let mut token = 0i64;
-        unsafe {
-            l.ConnectionReceived(handler.as_raw(), &mut token)
-                .ok()
-                .expect("ConnectionReceived");
-        }
+        l.ConnectionReceived(&handler).expect("ConnectionReceived");
 
         // Connect through the connector's vtable.
-        let connector = crate::comio::NamedPipeClient::new();
+        let connector = crate::comio::NamedPipeConnector::new();
         let c: INamedPipeConnector = connector.cast().unwrap();
-        let client: IInspectable = unsafe {
-            let mut op = core::ptr::null_mut();
-            c.ConnectAsync(
-                core::mem::ManuallyDrop::new(HSTRING::from(&name)),
-                &mut op,
-            )
-            .ok()
-            .expect("ConnectAsync");
-            IAsyncOperation::<IInspectable>::from_raw(op)
-        }
-        .join()
-        .expect("connect result");
+        let client = c
+            .ConnectAsync(&HSTRING::from(&name))
+            .expect("ConnectAsync")
+            .join()
+            .expect("connect result");
 
         let server_raw = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("no ConnectionReceived");
-        let server = unsafe { IInspectable::from_raw(server_raw as *mut c_void) };
+        let server = unsafe { TransportStream::from_raw(server_raw as *mut c_void) };
 
         // Both ends are real duplex streams.
         assert!(server.cast::<windows::Storage::Streams::IInputStream>().is_ok());
@@ -439,14 +314,12 @@ mod tests {
     #[test]
     fn every_client_reports_its_transport_through_the_shared_interface() {
         fn transport_of(c: &IStreamConnector) -> String {
-            let mut s = core::mem::ManuallyDrop::new(HSTRING::new());
-            unsafe { c.Transport(&mut s).ok().expect("Transport") };
-            core::mem::ManuallyDrop::into_inner(s).to_string()
+            c.Transport().expect("Transport").to_string()
         }
 
-        let pipe: IStreamConnector = crate::comio::NamedPipeClient::new().cast().unwrap();
-        let unix: IStreamConnector = crate::comio::UnixStreamSocket::new().cast().unwrap();
-        let hv: IStreamConnector = crate::comio::HvStreamSocket::new().cast().unwrap();
+        let pipe: IStreamConnector = crate::comio::NamedPipeConnector::new().cast().unwrap();
+        let unix: IStreamConnector = crate::comio::UnixConnector::new().cast().unwrap();
+        let hv: IStreamConnector = crate::comio::HyperVConnector::new().cast().unwrap();
 
         assert_eq!(transport_of(&pipe), "namedpipe");
         assert_eq!(transport_of(&unix), "unix");

@@ -126,7 +126,7 @@ fn dq_demo() {
 
     let (spawned, slept_ms, echoed) = DispatcherRuntime::run(async move {
         use comio::buffer::{buffer_ptr, new_buffer};
-        use comio::NamedPipeClient;
+        use comio::NamedPipeConnector;
         use windows::Storage::Streams::{IBuffer, IInputStream, IOutputStream, InputStreamOptions};
         use windows_core::Interface;
 
@@ -141,7 +141,7 @@ fn dq_demo() {
         let slept_ms = start.elapsed().as_millis();
 
         // Named-pipe echo round-trip, connecting to the server thread above.
-        let c = NamedPipeClient::connect(&name).await.unwrap();
+        let c = NamedPipeConnector::connect(&name).await.unwrap();
         let o: IOutputStream = c.cast().unwrap();
         let i: IInputStream = c.cast().unwrap();
 

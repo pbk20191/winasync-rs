@@ -134,9 +134,9 @@ impl NamedPipeListener {
 }
 
 /// Client side.
-pub struct NamedPipeClient;
+pub struct NamedPipeConnector;
 
-impl NamedPipeClient {
+impl NamedPipeConnector {
     /// Opens the client end of an existing named pipe, waiting once via
     /// `WaitNamedPipeW` if every instance is momentarily busy.
     pub fn connect(rt: &Runtime, name: &str) -> windows_core::Result<NamedPipeStream> {
@@ -195,7 +195,7 @@ mod tests {
             n
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let client = NamedPipeClient::connect(&rt, &name).unwrap();
+        let client = NamedPipeConnector::connect(&rt, &name).unwrap();
         block_on(client.write(b"hello".to_vec())).0.unwrap();
         let (n, b) = block_on(client.read(vec![0u8; 16]));
         assert_eq!(&b[..n.unwrap()], b"hello");

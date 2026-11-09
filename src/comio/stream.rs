@@ -1,4 +1,4 @@
-//! `OverlappedDuplexStream`: a COM object implementing WinRT
+//! `TransportStream`: a COM object implementing WinRT
 //! `IInputStream`/`IOutputStream`/`IClosable` over a Win32 `HANDLE`/`SOCKET`
 //! registered with `super::tpio::IoReg`. `ReadAsync`/`WriteAsync` start
 //! overlapped IO via `super::asyncop::IoAsyncOp` and return the same WinRT
@@ -8,11 +8,12 @@
 
 use super::asyncop::IoAsyncOp;
 use super::buffer::buffer_ptr;
+use super::bindings;
 use super::tpio::{IoReg, Issue};
 use std::sync::Arc;
 use windows::Foundation::IClosable_Impl;
 use windows::Storage::Streams::{
-    IBuffer, IInputStream, IInputStream_Impl, IOutputStream, IOutputStream_Impl,
+    IBuffer, IInputStream_Impl, IOutputStream, IOutputStream_Impl,
     InputStreamOptions,
 };
 use windows::Win32::Foundation::ERROR_IO_PENDING;
@@ -57,29 +58,35 @@ impl Drop for AcceptSockGuard {
 unsafe impl Send for AcceptSockGuard {}
 
 /// A duplex WinRT stream over one overlapped-registered handle/socket.
+///
+/// `Rustwinui3loop.TransportStream` in metadata; the generated class type
+/// leads the list so `GetRuntimeClassName` reports it, and because its
+/// `Interface::Vtable` *is* `IInputStream_Vtbl` — the class's default
+/// interface — nothing about the vtable changes by naming it here.
 #[implement(
-    IInputStream,
+    bindings::Rustwinui3loop::TransportStream,
     IOutputStream,
-    windows::Foundation::IClosable,
-    windows::Win32::System::Com::IDispatch
+    windows::Foundation::IClosable
 )]
-pub struct OverlappedDuplexStream {
+pub struct TransportStream {
     reg: Arc<IoReg>,
     closed: std::sync::atomic::AtomicBool,
 }
 
 /// Wraps an already-registered handle/socket as a WinRT stream object.
-/// Callers `.cast()` the returned `IInspectable` to `IInputStream` and/or
-/// `IOutputStream` as needed.
-pub(crate) fn from_reg(reg: Arc<IoReg>) -> windows_core::IInspectable {
-    ComObject::new(OverlappedDuplexStream {
+///
+/// Returns the projected class rather than an `IInspectable`: it is what the
+/// metadata says a connect or an accept produces, and a caller that wants
+/// `IInputStream`/`IOutputStream` can `.cast()` from it as before.
+pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Rustwinui3loop::TransportStream {
+    ComObject::new(TransportStream {
         reg,
         closed: std::sync::atomic::AtomicBool::new(false),
     })
     .to_interface()
 }
 
-impl IClosable_Impl for OverlappedDuplexStream_Impl {
+impl IClosable_Impl for TransportStream_Impl {
     /// Releases this stream's own reference to the underlying registration;
     /// it does NOT force-cancel in-flight reads/writes. Each in-flight op
     /// (`IoAsyncOp`, via `tpio::submit`) holds its own `Arc<IoReg>`, so the
@@ -99,7 +106,7 @@ impl IClosable_Impl for OverlappedDuplexStream_Impl {
     }
 }
 
-impl IInputStream_Impl for OverlappedDuplexStream_Impl {
+impl IInputStream_Impl for TransportStream_Impl {
     fn ReadAsync(
         &self,
         buffer: Ref<IBuffer>,
@@ -156,7 +163,7 @@ impl IInputStream_Impl for OverlappedDuplexStream_Impl {
     }
 }
 
-impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
+impl IOutputStream_Impl for TransportStream_Impl {
     fn WriteAsync(&self, buffer: Ref<IBuffer>) -> Result<IAsyncOperationWithProgress<u32, u32>> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(windows_core::Error::from_hresult(
@@ -198,90 +205,8 @@ impl IOutputStream_Impl for OverlappedDuplexStream_Impl {
     }
 }
 
-/// The late-bound surface, which is what makes the rest of the dispatch
-/// layer worth anything: `Connect` and `Accept` hand a script one of these,
-/// and without members it could call, it would be holding an opaque object.
-///
-/// Text rather than bytes. A script's natural argument is a string, and
-/// binary would mean `SAFEARRAY` of `VT_UI1` on both sides — worth adding
-/// when something needs it, but every protocol these transports are reached
-/// with from a script so far is line-oriented. `ReadText` decodes lossily
-/// for the same reason: a script has no way to act on a decode error, and
-/// failing the call would lose the bytes that did arrive.
-///
-/// Implemented on the generated wrapper, not on `OverlappedDuplexStream`:
-/// `ReadAsync`/`WriteAsync`/`Close` are trait impls that live there.
-impl crate::comio::dispatch::Dispatchable for OverlappedDuplexStream_Impl {
-    const DISPINTERFACE: windows_core::GUID = crate::comio::typelib::IID_DSTREAM;
-
-    const MEMBERS: &'static [crate::comio::dispatch::Member] = &[
-        crate::comio::dispatch::member!("WriteText", 1, ("Text": Text) -> Count),
-        crate::comio::dispatch::member!("ReadText", 2, ("MaxBytes": Count) -> Text),
-        crate::comio::dispatch::member!("Close", 3, () -> None),
-    ];
-
-    fn invoke_member(
-        &self,
-        dispid: i32,
-        args: &[windows::Win32::System::Variant::VARIANT],
-    ) -> Result<windows::Win32::System::Variant::VARIANT> {
-        use crate::comio::buffer::{buffer_ptr, new_buffer};
-        use crate::comio::dispatch;
-        use windows::Storage::Streams::{IBuffer, InputStreamOptions};
-        use windows_core::Interface;
-
-        match dispid {
-            // WriteText(text) -> bytes written
-            1 => {
-                let bytes = dispatch::as_string(&args[0])?.into_bytes();
-                let len = u32::try_from(bytes.len()).map_err(|_| {
-                    windows_core::Error::from_hresult(
-                        windows::Win32::Foundation::E_INVALIDARG,
-                    )
-                })?;
-                let buf = new_buffer(len.max(1))?;
-                let ib: IBuffer = buf.cast()?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer_ptr(&ib)?, bytes.len())
-                };
-                ib.SetLength(len)?;
-                let wrote = IOutputStream_Impl::WriteAsync(self, (&ib).into())?.join()?;
-                Ok(dispatch::i32v(wrote as i32))
-            }
-            // ReadText(maxBytes) -> what arrived, possibly fewer bytes
-            2 => {
-                let max = dispatch::as_u32(&args[0])?.max(1);
-                let buf = new_buffer(max)?;
-                let ib: IBuffer = buf.cast()?;
-                let got = IInputStream_Impl::ReadAsync(
-                    self,
-                    (&ib).into(),
-                    max,
-                    InputStreamOptions(0),
-                )?
-                .join()?;
-                let n = got.Length()? as usize;
-                let text = unsafe {
-                    String::from_utf8_lossy(std::slice::from_raw_parts(buffer_ptr(&got)?, n))
-                        .into_owned()
-                };
-                Ok(dispatch::bstr(&text))
-            }
-            3 => {
-                IClosable_Impl::Close(self)?;
-                Ok(dispatch::empty())
-            }
-            _ => Err(windows_core::Error::from_hresult(
-                windows::Win32::Foundation::DISP_E_MEMBERNOTFOUND,
-            )),
-        }
-    }
-}
-
-crate::comio::dispatch::impl_dispatch!(wrapper OverlappedDuplexStream_Impl);
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::comio::buffer::{buffer_ptr, new_buffer};
     use crate::comio::tpio::IoReg;
@@ -366,9 +291,12 @@ mod tests {
     }
 
     /// Creates a connected overlapped named-pipe pair and wraps each end as
-    /// a WinRT stream `IInspectable`, mirroring the setup in
+    /// a `Rustwinui3loop.TransportStream`, mirroring the setup in
     /// `stream_read_write_roundtrip`. Returns `(server, client)`.
-    pub(crate) fn pipe_pair() -> (windows_core::IInspectable, windows_core::IInspectable) {
+    pub(crate) fn pipe_pair() -> (
+        bindings::Rustwinui3loop::TransportStream,
+        bindings::Rustwinui3loop::TransportStream,
+    ) {
         let name = format!(
             r"\\.\pipe\comio_stream_{}_{}",
             std::process::id(),

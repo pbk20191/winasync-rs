@@ -3,6 +3,14 @@ name = "rustwinui3loop"
 version = "0.1.0"
 edition = "2024"
 
+# `tools/winmdgen` compiles the RDL in `metadata/` into the published `.winmd`
+# and regenerates `src/comio/bindings.rs`. A workspace member rather than a
+# build-dependency: it is run by hand (`cargo run -p winmdgen`), its outputs
+# are checked in, and keeping `windows-rdl` out of the library's graph is what
+# stops an ordinary build from paying for it.
+[workspace]
+members = ["tools/winmdgen"]
+
 # `cdylib` builds the same library a second time as a DLL, which is the form
 # COM can load: `comio::activation` exports `DllGetClassObject` and friends
 # from it, so the transports are reachable by `CoCreateInstance` from any
@@ -85,9 +93,6 @@ comio = [
     "windows/Win32_System_Com",
     "windows/Win32_System_Registry",
     "windows/Win32_System_LibraryLoader",
-    # The late-binding path: IDispatch and the VARIANTs it speaks in.
-    "windows/Win32_System_Ole",
-    "windows/Win32_System_Variant",
 ]
 
 # DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.

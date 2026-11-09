@@ -59,7 +59,7 @@ pub use io::net::{
     TransmitPackets, UdpSocket,
 };
 #[allow(unused_imports)]
-pub use io::pipe::{NamedPipeClient, NamedPipeListener, NamedPipeStream};
+pub use io::pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeStream};
 #[allow(unused_imports)]
 pub use io::unix::{UnixListener, UnixStream};
 #[allow(unused_imports)]

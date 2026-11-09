@@ -676,7 +676,7 @@ mod run_tests {
 /// plain `std::thread` and drives its half with `tp::block_on` (`comio` is
 /// runtime-agnostic, per its own module docs); the client is the `run` root
 /// future itself and drives its half via plain `.await` on the WinRT async
-/// operations `NamedPipeClient`/`ReadAsync`/`WriteAsync` return — exercising
+/// operations `NamedPipeConnector`/`ReadAsync`/`WriteAsync` return — exercising
 /// the executor/waker bridge against a real overlapped-IO completion
 /// (delivered from a thread-pool callback) rather than the synthetic
 /// `IAsyncOperation::spawn` used by `cross_thread_wake_resumes_on_dq_thread`
@@ -730,13 +730,13 @@ mod integration {
 
         let echoed = DispatcherRuntime::run(async move {
             use crate::comio::buffer::{buffer_ptr, new_buffer};
-            use crate::comio::NamedPipeClient;
+            use crate::comio::NamedPipeConnector;
             use windows::Storage::Streams::{
                 IBuffer, IInputStream, IOutputStream, InputStreamOptions,
             };
             use windows_core::Interface;
 
-            let c = NamedPipeClient::connect(&name).await.unwrap();
+            let c = NamedPipeConnector::connect(&name).await.unwrap();
             let o: IOutputStream = c.cast().unwrap();
             let i: IInputStream = c.cast().unwrap();
 

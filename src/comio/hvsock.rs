@@ -1,6 +1,6 @@
 //! Hyper-V socket (AF_HYPERV) transport: `HvStreamListener` (`AcceptEx`) and
-//! `HvStreamSocket` (`ConnectEx` fetched via `WSAIoctl`), producing
-//! `OverlappedDuplexStream`s (via `stream::from_reg`) registered as sockets
+//! `HyperVConnector` (`ConnectEx` fetched via `WSAIoctl`), producing
+//! `TransportStream`s (via `stream::from_reg`) registered as sockets
 //! (`is_socket = true`), so `ReadAsync`/`WriteAsync` drive `WSARecv`/`WSASend`.
 //!
 //! This is a **pillar-3 gap filler**, not a WinRT duplicate: `Windows.Networking.Sockets`
@@ -19,12 +19,11 @@
 use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
-use super::connector::{
-    E_POINTER, IHyperVConnector, IHyperVConnector_Impl, IStreamConnector, IStreamConnector_Impl,
-    connect_op, out_operation, out_transport,
-};
-use super::dispatch;
+use super::bindings;
+use super::bindings::Rustwinui3loop::{IHyperVConnector_Impl, IStreamConnector_Impl};
+use super::connector::connect_op;
 use super::listener::Accepted;
+use super::bindings::Rustwinui3loop::TransportStream;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
@@ -41,7 +40,7 @@ use windows::Win32::Networking::WinSock::{
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
     WSASocketW, WSA_FLAG_OVERLAPPED,
 };
-use windows_core::{Error, HSTRING, IInspectable, Result, HRESULT};
+use windows_core::{Error, HSTRING, Result, HRESULT};
 
 /// Creates an AF_HYPERV stream socket. Fails with `WSAEAFNOSUPPORT` (10047)
 /// where the Hyper-V socket provider is not present.
@@ -103,7 +102,7 @@ impl HvStreamListener {
     }
 
     /// Accepts one connection, returning it as a duplex WinRT stream.
-    pub async fn accept(&self) -> Result<IInspectable> {
+    pub async fn accept(&self) -> Result<TransportStream> {
         let accept_sock = new_socket()?;
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
         let mut guard = AcceptSockGuard(accept_sock);
@@ -133,7 +132,7 @@ impl HvStreamListener {
         result?;
 
         let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
-        let finish = || -> Result<IInspectable> {
+        let finish = || -> Result<TransportStream> {
             let listen_val = listen_sock.0.to_ne_bytes();
             sock_check(unsafe {
                 setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
@@ -228,19 +227,18 @@ impl HvStreamListener {
 
 /// Client side of a Hyper-V socket connection.
 #[windows_core::implement(
-    IStreamConnector,
-    IHyperVConnector,
-    windows::Win32::System::Com::IDispatch
+    bindings::Rustwinui3loop::HyperVConnector,
+    bindings::Rustwinui3loop::IHyperVConnector
 )]
-pub struct HvStreamSocket;
+pub struct HyperVConnector;
 
-/// The one spelling of this transport's name, shared by the vtable's
-/// `Transport` and the dispatch member of the same name.
+/// The one spelling of this transport's name, as the vtable's `Transport`
+/// reports it.
 const TRANSPORT: &str = "hyperv";
 
-impl HvStreamSocket {
+impl HyperVConnector {
     /// Connects to `addr`, returning the connection as a duplex WinRT stream.
-    pub async fn connect(addr: HvSocketAddr) -> Result<IInspectable> {
+    pub async fn connect(addr: HvSocketAddr) -> Result<TransportStream> {
         let sock = new_socket()?;
         let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket; the
@@ -296,7 +294,7 @@ impl HvStreamSocket {
     /// that could be dropped first.
     pub(crate) fn arm_connect(
         addr: HvSocketAddr,
-        on_result: Box<dyn FnOnce(Result<IInspectable>) + Send>,
+        on_result: Box<dyn FnOnce(Result<TransportStream>) + Send>,
     ) -> Result<OpHandle> {
         let sock = new_socket()?;
         let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
@@ -355,11 +353,11 @@ impl HvStreamSocket {
 
 }
 
-impl HvStreamSocket {
+impl HyperVConnector {
     /// Creates the connector. It holds no state; connecting is what it does.
     #[allow(clippy::new_without_default)]
-    pub fn new() -> windows_core::ComObject<HvStreamSocket> {
-        windows_core::ComObject::new(HvStreamSocket)
+    pub fn new() -> windows_core::ComObject<HyperVConnector> {
+        windows_core::ComObject::new(HyperVConnector)
     }
 
     /// Typed Rust mirror of the vtable's `ConnectAsync`; the result arrives
@@ -372,68 +370,28 @@ impl HvStreamSocket {
         &self,
         vm_id: &windows_core::GUID,
         service_id: &windows_core::GUID,
-    ) -> windows_future::IAsyncOperation<windows_core::IInspectable> {
+    ) -> windows_future::IAsyncOperation<TransportStream> {
         let addr = HvSocketAddr::new(*vm_id, *service_id);
         connect_op(move |sink| Self::arm_connect(addr, sink))
     }
 }
 
-impl IStreamConnector_Impl for HvStreamSocket_Impl {
-    unsafe fn Transport(
-        &self,
-        result: *mut core::mem::ManuallyDrop<windows_core::HSTRING>,
-    ) -> windows_core::HRESULT {
-        out_transport(TRANSPORT, result)
+impl IStreamConnector_Impl for HyperVConnector_Impl {
+    fn Transport(&self) -> Result<HSTRING> {
+        Ok(HSTRING::from(TRANSPORT))
     }
 }
 
-impl IHyperVConnector_Impl for HvStreamSocket_Impl {
-    unsafe fn ConnectAsync(
+#[allow(non_snake_case)]
+impl IHyperVConnector_Impl for HyperVConnector_Impl {
+    // Null checks are gone: the generated binding takes `&GUID`, so a null
+    // can no longer reach here at all.
+    fn ConnectAsync(
         &self,
-        vm_id: *const windows_core::GUID,
-        service_id: *const windows_core::GUID,
-        result: *mut *mut core::ffi::c_void,
-    ) -> windows_core::HRESULT {
-        if vm_id.is_null() || service_id.is_null() {
-            return E_POINTER;
-        }
-        out_operation(
-            self.connect_async(unsafe { &*vm_id }, unsafe { &*service_id }),
-            result,
-        )
+        vmId: &windows_core::GUID,
+        serviceId: &windows_core::GUID,
+    ) -> Result<windows_future::IAsyncOperation<TransportStream>> {
+        Ok(self.connect_async(vmId, serviceId))
     }
 }
 
-/// The late-bound surface: `Transport` as the vtable has it, and `Connect`
-/// as the blocking shape of `ConnectAsync` — see `dispatch`'s module docs
-/// for why a script gets the second rather than the first.
-impl dispatch::Dispatchable for HvStreamSocket {
-    const DISPINTERFACE: windows_core::GUID = super::typelib::IID_DHV_SOCKET;
-
-    const MEMBERS: &'static [dispatch::Member] = &[
-        dispatch::member!("Transport", 1, () -> Text),
-        dispatch::member!("Connect", 2, ("VmId": Guid, "ServiceId": Guid) -> Object),
-    ];
-
-    fn invoke_member(
-        &self,
-        dispid: i32,
-        args: &[windows::Win32::System::Variant::VARIANT],
-    ) -> windows_core::Result<windows::Win32::System::Variant::VARIANT> {
-        match dispid {
-            1 => Ok(dispatch::bstr(TRANSPORT)),
-            2 => {
-                // Two GUIDs, which a script writes as strings — braced
-                // or bare, both accepted.
-                let vm = dispatch::as_guid(&args[0])?;
-                let service = dispatch::as_guid(&args[1])?;
-                dispatch::object(&self.connect_async(&vm, &service).join()?)
-            }
-            _ => Err(windows_core::Error::from_hresult(
-                windows::Win32::Foundation::DISP_E_MEMBERNOTFOUND,
-            )),
-        }
-    }
-}
-
-dispatch::impl_dispatch!(HvStreamSocket, HvStreamSocket_Impl);

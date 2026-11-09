@@ -9,7 +9,7 @@
 이 결정이 정하는 것:
 
 - **`.winmd`가 메인 산출물이다.** 옵션이 아니다.
-- **`.tlb` + IDispatch는 동결된 호환 레이어다.** 지우지 않되 투자하지 않는다. tlbimp으로 뚫은 PowerShell 경로도 여기 묶인다.
+- **`.tlb` + IDispatch는 삭제했다** (2026-11-09). 처음엔 "동결"로 뒀다가 같은 날 지웠다 — 아래 "삭제한 것" 절.
 - **클래식 스크립트 호스트는 범위 밖이다.** VBScript/WSH, VBA, Office 매크로는 WinRT보다 먼저 만들어졌고 동결돼 IDispatch만 안다. "레거시 COM을 버린다"와 "그 호스트들을 버린다"는 같은 문장이다.
 - **폐기된 작업 둘**: 오퍼레이션 객체(상관 토큰), tlbimp interop 통합 테스트. 아래 "폐기" 절 참조.
 
@@ -17,62 +17,112 @@
 
 ## 현재 상태
 
-comio의 객체는 **WinRT ABI로 구현된 클래식 COM 컴포넌트**다. 아래 네 겹이 모두 동작하며, 각각 다른 청중을 위한 것이다.
+**`.winmd`가 생겼고, 인터페이스가 거기서 생성된다** (2026-11-09).
 
-| 겹 | 무엇을 하나 | 모듈 |
+| 겹 | 무엇을 하나 | 위치 |
 | --- | --- | --- |
-| 활성화 | CLSID/ProgID로 `CoCreateInstance`. `DllRegisterServer`가 HKCU에 per-user 등록 (승격 불필요) | `activation.rs` |
-| IDispatch | 스크립트용 늦은 바인딩. 블로킹 모양 — `Connect` / `Accept(ms)` / `WriteText` / `ReadText` | `dispatch.rs` |
-| 타입 라이브러리 | dispatch 테이블에서 `.tlb`를 **생성**. 이른 바인딩 + coclass의 `[default, source]` | `typelib.rs` |
-| 커넥션 포인트 | `IConnectionPointContainer` + `IProvideClassInfo2`. 싱크에 `ConnectionReceived` 전달 | `connpt.rs` |
+| 메타데이터 | 17개 타입(클래스 8 + 인터페이스 9)의 단일 출처 | `metadata/rustwinui3loop.rdl` |
+| 생성기 | RDL → `.winmd` → Rust 바인딩. 손으로 돌린다 | `tools/winmdgen` (`cargo run -p winmdgen`) |
+| 산출물 | 소비자가 프로젝션을 만들 때 쓰는 파일 | `metadata/rustwinui3loop.winmd` |
+| 바인딩 | `_Impl` 트레이트 + vtable. 체크인됨 | `src/comio/bindings.rs` |
+| 구현 | 위 트레이트를 구현 | `listener.rs` / `connector.rs` / `pipe.rs` / `unix.rs` / `hvsock.rs` / `stream.rs` |
+| 활성화 | CLSID/ProgID로 `CoCreateInstance`, HKCU per-user | `activation.rs` |
 
-`.tlb`를 IDL이 아니라 기존 테이블에서 생성하므로, 이른 바인딩과 늦은 바인딩이 멤버를 다르게 기술하는 일이 **구조적으로 불가능**하고 빌드에 `midl.exe`가 필요 없다.
+### 왜 메타데이터가 먼저여야 했나
 
-빠져 있는 것은 WinRT 쪽 윗겹이다: `.winmd` 메타데이터가 없고, 활성화도 `RoActivateInstance`가 아니라 `CoCreateInstance`다. 그래서 vtable의 `IAsyncOperation` 비동기 모양은 Rust 외의 언어에서 읽을 방법이 없다.
+**손으로 쓴 `#[interface]`는 WinRT 인터페이스가 될 수 없다.** 측정해서 확인했다:
 
-## 호스트별 도달 범위
+```rust
+#[interface("…")] pub unsafe trait IFoo: IInspectable { … }
+// error[E0405]: cannot find trait `IInspectable_Impl` in this scope
+```
 
-스크립트 호스트는 이벤트까지 전부 도달하고, 비동기 vtable은 Rust만 읽는다.
+`windows-interface`는 자식 vtable을 `Parent_Vtbl::new::<Identity, OFFSET>`로 만들고 `Parent_Impl` 트레이트를 요구하는데, `IInspectable`은 둘 다 없다 (`new`가 타입 파라미터를 **셋** 받고, `IInspectable_Impl`은 존재하지 않는다). 그래서 손으로 쓴 인터페이스는 vtable 슬롯 3개 뒤에서 시작하고, 프로젝션은 6개 뒤를 기대한다. `windows-bindgen --implement`만 후자를 낸다:
 
-| 호스트 | 객체 생성 | 메서드 호출 | 이벤트 | `IAsyncOperation` |
-| --- | --- | --- | --- | --- |
-| WSH / VBScript | 검증 | 검증 | **검증** (`WScript.ConnectObject`) | 불가 |
-| PowerShell 7 | 검증 | 검증 | **검증** — tlbimp interop 필요 | 불가 |
-| C# / .NET | 됨 (tlbimp) | 됨 | 됨 — 같은 interop 경로 | 불가 (`.winmd` 없음) |
-| C++ | 됨 (`#import` / vtable) | 됨 | 됨 | 수동 선언하면 |
-| VBA | 됨 | 됨 | 같은 탐색 경로 (미검증) | 불가 |
-| Rust | 직접 | 직접 | 직접 | **직접** |
+```rust
+base__: windows_core::IInspectable_Vtbl::new::<Identity, IConnectionReceivedArgs, OFFSET>()
+```
 
-"검증"은 실제로 돌리고 출력을 확인한 것이다. VBA는 WSH와 **동일한 탐색 경로**(class info → default source → `FindConnectionPoint`)를 쓰지만 직접 돌려보지는 않았다.
+즉 `.winmd`는 기존 표면을 **기술**하는 물건이 아니라 인터페이스가 거기서 **생성되는** 출처다. `connector.rs` / `listener.rs`의 `#[interface]` 선언 9개는 사라졌다.
 
-이 표는 **현재 도달 범위이지 목표가 아니다.** 위 "방향"대로 위쪽 세 줄(WSH/VBScript, VBA, 그리고 `.tlb` 경유 PowerShell)은 동결된 레이어에 속한다.
+### 확인된 것 (측정)
 
-### PowerShell 레시피
+- **`windows-bindgen` 0.62.1이 0.100으로 만든 `.winmd`를 경고 없이 읽는다.** 버전 스큐 없음. `windows-rdl`/`windows-metadata`는 0.100에만 있지만 바이너리 `.winmd`를 낼 뿐이라 상관없다. 맞아야 하는 건 `windows-core`에 대고 코드를 생성하는 bindgen뿐이고, 0.62 라인이 있다.
+- **`.winmd`가 독립 리더로 왕복한다.** `windows_rdl::writer()`로 되읽으면 이벤트·프로퍼티·제네릭 인스턴스화·`Activatable` 속성까지 그대로 복원된다.
+- **IID는 유도된다.** midlrt 해시(UUIDv5)를 RDL이 계산한다 — MIDL 3.0과 같은 알고리즘이라 독립 소비자가 다시 계산해도 일치한다.
 
-`Register-ObjectEvent`는 `Type.GetEvent`로 이름을 찾는데 `System.__ComObject`는 답할 게 없다. interop 어셈블리가 그걸 메운다.
+### IID가 전부 바뀌었다
+
+필연이다. 새 인터페이스는 `IInspectable`을 상속하고 멤버 모양도 다르다. **다른 vtable에 옛 IID를 재사용하는 것은 COM에서 유일하게 용서받지 못하는 실수**이므로, "GUID frozen" 주석과 함께 옛 GUID는 폐기했다.
+
+### 이름 정리 (2026-11-09)
+
+메타데이터에 들어가는 순간 공개 표면이 되므로 지금 맞췄다.
+
+| 전 | 후 | 이유 |
+| --- | --- | --- |
+| `OverlappedDuplexStream` | `TransportStream` | `overlapped`는 Win32 구현 세부사항이다 |
+| `NamedPipeClient` | `NamedPipeConnector` | 세 커넥터가 세 가지 작명법이었다 |
+| `UnixStreamSocket` | `UnixConnector` | 〃 — 리스너 쪽 `<Transport>ConnectionListener`와 짝이 맞는다 |
+| `HvStreamSocket` | `HyperVConnector` | 〃 (`Hv` / `HyperV` 혼용도 정리) |
+
+`src/comio/runtimeclass.rs`는 **삭제했다** — bindgen이 같은 모양의 클래스 타입을 직접 생성하므로 손으로 쓴 이름 캐리어가 필요 없어졌다.
+
+### RDL에서 겪은 것 (문서에 없음)
+
+1. `rdl.md`는 `#[activatable(1)]`로 적어 뒀지만 조회는 말 그대로 `{Name}Attribute`라 **`#[Activatable(1)]`**이어야 한다.
+2. `use`는 `mod` 안이 아니라 **파일 스코프**에 둔다.
+3. `///` 문서 주석은 `#[doc]`으로 파싱돼 깨진다. `//`를 쓴다.
+4. **`--reference windows,skip-root,Windows`를 빠뜨리면 bindgen이 `TypedEventHandler`/`IAsyncOperation`을 언급한 멤버를 조용히 전부 버린다.** `winmdgen`에 assert를 걸어 뒀다.
+
+### 구현이 짧아졌다
+
+생성된 `_Impl` 트레이트가 `Result<T>`와 `&HSTRING`을 쓰므로 raw 포인터 out-param, `ManuallyDrop`, 손으로 쓴 `HRESULT`, null 체크가 전부 사라졌다.
+
+```rust
+fn ConnectAsync(&self, name: &HSTRING) -> Result<IAsyncOperation<TransportStream>>;
+```
+
+## 삭제한 것: IDispatch · 타입 라이브러리 · 커넥션 포인트 (2026-11-09)
+
+`dispatch.rs` / `typelib.rs` / `connpt.rs` 세 파일과, 모든 `#[implement]` 목록의 `IDispatch` · `IConnectionPointContainer` · `IProvideClassInfo{,2}`, `.tlb` 생성·등록, `Win32_System_Ole`/`Win32_System_Variant` 피처가 함께 나갔다. 단위 테스트 11건, 통합 테스트 2건(`powershell_round_trip`, `wsh_event_round_trip`)도 같이 간다.
+
+**왜.** 그 레이어가 기술할 수 있는 건 이 표면의 **블로킹 번역본**뿐이다. 오토메이션에는 파라미터화 인터페이스가 없어서 `IAsyncOperation<T>`는 타입 라이브러리에 **아예 등장할 수 없고**, 스크립트는 vtable이 await 가능한 자리에서 `Accept(timeoutMs)` + 큐를 받았다. 모든 멤버에 대해 모양이 다른 두 번째 기술을 들고 다니는 비용은 WinRT를 영영 소비할 수 없는 호스트를 위해서만 값을 한다. 그 호스트들은 범위 밖이라고 이미 정했으므로, 청중이 남아 있지 않았다.
+
+**동작했었다.** 지운 게 안 되던 코드라서가 아니다. PowerShell/VBScript/WSH에서 전부 돌려보고 출력까지 확인했었다. 기록으로만 남긴다:
 
 ```text
 regsvr32 /s rustwinui3loop.dll
-TlbImp.exe "%LOCALAPPDATA%\rustwinui3loop\rustwinui3loop.tlb" ^
+TlbImp.exe "%LOCALAPPDATA%
+ustwinui3loop
+ustwinui3loop.tlb" ^
     /out:Rustwinui3loop.Interop.dll /namespace:Rustwinui3loop
 ```
 
 ```powershell
 Add-Type -Path .\Rustwinui3loop.Interop.dll
-# -ComObject 가 아니라 interop coclass 여야 한다
-$l = New-Object Rustwinui3loop.NamedPipeConnectionListenerClass
+$l = New-Object Rustwinui3loop.NamedPipeConnectionListenerClass   # -ComObject 아님
 Register-ObjectEvent -InputObject $l -EventName ConnectionReceived -SourceIdentifier conn -Action {
     $EventArgs.ReadText(64)
 }
 $l.Bind($name)
 ```
 
-주의 두 가지.
+**같이 사라진 것 하나 — `CoIncrementMTAUsage`.** `SinkSet::advise`가 첫 `Advise` 때 불러서 프로세스에 MTA가 살아 있게 했다. 아래 "측정으로 밝혀진 것"의 `CO_E_NOTINITIALIZED`가 그 이야기인데, 지금은 아파트먼트를 넘는 콜백 경로가 없어서 필요가 없다. `.winmd` 이벤트 경로가 아파트먼트를 다시 넘게 되면 **같은 문제가 같은 모양으로 돌아온다**. 그때 다시 만들 것.
 
-- `ComEventsHelper.Combine`으로 내려가면 advise는 성공하지만 **싱크가 runspace 없는 스레드에서 scriptblock을 불러 죽는다**. `Register-ObjectEvent`만 동작한다.
-- 전달은 **협조적**이다. PowerShell이 이벤트를 자기 큐에 넣고 파이프라인 스레드의 문장 경계에서 실행하므로, 메인이 긴 호출 하나에 막히면 제 핸들러도 지연된다. 그럴 땐 `Start-ThreadJob` 안의 블로킹 `Accept`가 맞다.
+**낡은 등록.** 이전 빌드로 등록한 적이 있으면 `Interface\{…}`와 `TypeLib` 키가 레지스트리에 남는다. 지금 바이너리는 그 IID들을 모르므로 지우지 못한다. 무해하다 — 옛 바이너리로 `regsvr32 /u` 하거나 그냥 둬도 된다.
 
-tlbimp은 .NET Framework SDK 도구다. **빌드 단계에 넣지 않는다** — midl을 피한 이유를 그대로 되살리게 된다. 소비자 쪽 선택적 단계로 둔다.
+## 호스트별 도달 범위
+
+| 호스트 | 객체 생성 | 메서드 호출 | 이벤트 | `IAsyncOperation` |
+| --- | --- | --- | --- | --- |
+| Rust | 직접 | 직접 | 직접 | **직접** |
+| C++ | 됨 (`CoCreateInstance` + vtable) | 됨 | 됨 (`TypedEventHandler`) | 수동 선언하면 |
+| C# / .NET | CLSID로는 됨 | 인터페이스 재선언 필요 | 재선언 필요 | `.winmd` 전엔 불가 |
+| Python / Node | **불가** | — | — | — |
+| WSH / VBScript / VBA | **불가** (2026-11-09 이전엔 됐다) | — | — | — |
+
+목표는 4번째 줄을 `.winmd` + 프로젝션으로 전부 "직접"으로 바꾸는 것이다. 5번째 줄은 돌아오지 않는다.
 
 ## 측정으로 밝혀진 것
 
@@ -89,39 +139,53 @@ tlbimp은 .NET Framework SDK 도구다. **빌드 단계에 넣지 않는다** �
 
 > MS 문서의 "WinRT를 쓰면 `CoInitializeEx` 대신 `Windows::Foundation::Initialize`"는 **내가 소유한 스레드를 초기화할 때**의 이야기다. 우리 콜백 스레드는 WinRT 클래스를 **활성화하지 않고** 이미 존재하는 인터페이스 포인터로 메서드만 부르므로, 아파트먼트만 필요하고 WinRT 초기화는 불필요하다. (`listener.rs:42` 참조 — 객체는 Rust 팩토리에서 오지 `RoActivateInstance`가 아니다.)
 
-### `TYPE_E_LIBNOTREGISTERED` — 타입 라이브러리 LCID
+> 이 수정(`connpt.rs`의 `CoIncrementMTAUsage`)은 그 파일과 함께 삭제됐다. 교훈만 남긴다 — `.winmd` 이벤트 경로가 아파트먼트를 다시 넘는 순간 똑같이 필요해진다.
 
-`CreateTypeLib2`가 라이브러리 LCID를 **사용자 기본값**(여기선 412, ko-KR)으로 잡아 그 아래 등록했고, `LoadRegTypeLib`는 중립 0으로 찾아 못 찾았다. `SetLcid(0)`으로 고정. 언어 설정이 다른 장비에서만 재현되었을 버그다. `unregister`는 이제 `TypeLib\{libid}` 서브트리 전체를 지워 낡은 LCID 등록이 살아남지 못하게 한다.
+### `TYPE_E_LIBNOTREGISTERED` — 타입 라이브러리 LCID *(삭제된 레이어)*
 
-### PowerShell 이벤트 — 틀리게 문서화했던 것
+`CreateTypeLib2`가 라이브러리 LCID를 **사용자 기본값**(여기선 412, ko-KR)으로 잡아 그 아래 등록했고, `LoadRegTypeLib`는 중립 0으로 찾아 못 찾았다. `SetLcid(0)`으로 고정했었다. 언어 설정이 다른 장비에서만 재현되었을 버그다. **일반적인 교훈**: 사용자 로케일을 기본값으로 읽는 Win32 API는 개발 장비가 en-US면 영영 안 터진다.
 
-"PowerShell은 이 이벤트를 받을 수 없다"고 적었는데, 그건 **타입 라이브러리를 만들기 전 기준**이었다. `.tlb`를 추가한 순간 tlbimp이 필요한 글루(`DListenerEvents_EventProvider`, 싱크 헬퍼, 각 coclass의 .NET `ConnectionReceived` 이벤트)를 전부 생성할 수 있게 됐는데, 그걸 다시 확인하지 않았다. 문서는 수정했다.
+### PowerShell 이벤트 — 틀리게 문서화했던 것 *(삭제된 레이어)*
 
-## 막힌 것: `IInspectable`이 비어 있다
+"PowerShell은 이 이벤트를 받을 수 없다"고 적었는데, 그건 **타입 라이브러리를 만들기 전 기준**이었다. `.tlb`를 추가한 순간 tlbimp이 필요한 글루를 전부 생성할 수 있게 됐는데, 그걸 다시 확인하지 않았다. **일반적인 교훈**: 측정해서 적은 사실에는 측정 시점이 붙어 있다. 전제를 바꾸는 커밋은 그 사실을 다시 재야 한다.
 
-우리 객체는 진짜로 `IInspectable`이다 — `IClosable`, `IInputStream`, `IOutputStream`이 전부 WinRT 인터페이스라 QI가 성공한다. 그런데 세 메서드가 전부 `S_OK`로 **빈 값**을 돌려준다. "모른다"가 아니라 "없다"고 자신 있게 답하는 것이라 더 나쁘다.
+## `IInspectable` — 이름은 풀렸다 (2026-11-09), `GetIids`는 남았다
 
-| 메서드 | 실제 응답 | 어디서 결정되나 | 훅 |
+우리 객체는 진짜로 `IInspectable`이다 — `IClosable`, `IInputStream`, `IOutputStream`이 전부 WinRT 인터페이스라 QI가 성공한다. 세 메서드 중 **이름은 고쳤고**, `GetIids`는 그대로 비어 있다.
+
+| 메서드 | 지금 응답 | 어디서 결정되나 | 훅 |
 | --- | --- | --- | --- |
+| `GetRuntimeClassName` | `"Rustwinui3loop.<클래스>"` | `#[implement]` 목록 **첫 타입**의 `RuntimeName::NAME` | **있다** — 첫 줄을 런타임 클래스 타입으로 바꾸면 끝 |
 | `GetIids` | `count=0`, `values=null` | `IInspectable_Vtbl::new`가 설치하는 **자유 함수**에 하드코딩 | **없음** — 타입 파라미터를 아예 안 받음 |
-| `GetRuntimeClassName` | `""` | `#[implement]` 목록의 **첫 인터페이스**의 `RuntimeName::NAME` | 없음 — `#[interface]`가 빈 impl을 자동 생성해 덮어쓰면 충돌 |
-| `GetTrustLevel` | `0` (BaseTrust) | 매크로가 직접 넣음 | 없음 — 속성 파서가 인터페이스 경로만 읽음 |
+| `GetTrustLevel` | `0` (BaseTrust) | 매크로가 `TrustLevel=` 속성값을 직접 넣음 | 있다 (`Partial`/`Full`). `BaseTrust`가 맞는 답이라 안 쓴다 |
 
-근본 원인은 identity vtable이 생성된 `_Impl` 타입의 **연관 상수**고, `QueryInterface`가 `IID_IInspectable`을 가장 먼저 거기로 보낸다는 것이다. 끼어들 틈이 없다. `windows-implement` 0.100도 구조가 같아 업그레이드로 풀릴 문제가 아니다.
+### 이름을 어떻게 고쳤나 — `comio::runtimeclass`
 
-### 반쪽 수정을 안 한 이유
+훅은 좁고 문서화돼 있지 않다. `IInspectable_Vtbl::new::<Identity, Name, OFFSET>`이 `GetRuntimeClassName::<Name>`을 설치하고, `#[implement]`가 **목록의 첫 타입**을 그 `Name`으로 넘긴다 (`windows-implement-0.60.2/src/gen.rs:142`, 주석이 그렇게 적혀 있다).
 
-`GetRuntimeClassName`만은 편법이 있다 — `RuntimeName`을 손으로 단 마커 인터페이스를 `#[implement]` 첫 줄에 넣으면 된다. 안 했다.
+전에 첫 줄은 늘 우리 `#[interface]` 트레이트였고, `#[interface]`는 `impl RuntimeName for X {}` — 기본값 `""` — 를 자동 생성한다 (`windows-interface-0.59.3/src/lib.rs:110`). 그래서 빈 문자열이었다. 유일한 예외가 `OverlappedDuplexStream`으로, 첫 줄이 `IInputStream`이라 `"Windows.Storage.Streams.IInputStream"`을 돌려주고 있었다 — 빈 문자열보다 나쁘다. MS **인터페이스** 이름을 자기 **클래스** 이름이라고 답한 것이다.
 
-**런타임 클래스 이름은 "이 이름이 WinRT 메타데이터로 해석된다"는 약속이다.** `.winmd`를 안 내놓으니 `RoGetActivationFactory`는 여전히 실패한다. 이름을 채우면 객체의 주장이 **더 그럴듯해질 뿐 참이 되지는 않는다**. 빈 문자열이 차라리 "해석될 것처럼 생긴 거짓말"은 아니다. 그리고 `GetIids`는 어차피 못 고친다.
+`src/comio/runtimeclass.rs`가 클래스마다 타입 하나를 둔다. `windows-bindgen`이 런타임 클래스를 뽑아내는 모양 그대로다 — `IUnknown`의 transparent 래퍼에, `Interface::Vtable`/`IID`는 그 클래스의 **디폴트 인터페이스**에서 그대로 빌리고, `RuntimeName`만 자기가 갖는다. `windows-0.62.2`의 `Windows::Storage::Streams::Buffer`와 비교하면 똑같다. 이걸 `#[implement]` 첫 줄에 넣으면 COM이 보는 vtable은 **하나도 안 바뀌고**(그 vtable이 곧 디폴트 인터페이스니까) 이름만 사실이 된다.
 
-즉 이 둘을 정직하게 만드는 일은 **`.winmd` 작업의 일부**이지 그보다 먼저 할 수 있는 단계가 아니다.
+이름은 전부 이미 등록돼 있던 ProgID 문자열 그대로다. 거꾸로 `activation::CLASSES`가 `progid`를 **여기서 읽어간다**(`class_name::<T>()`). COM 이름과 WinRT 이름이 같은 문자열임이 구조적으로 보장되고, 한쪽만 리네임되는 일이 불가능하다.
 
-다만 `.winmd`를 내놓는 것만으로 저절로 고쳐지지도 않는다 — `#[implement]`가 막고 있는 건 그대로다. 위 "비용 3"이 그 이야기이고, 다음 작업 1번이 그걸 확인한다.
+비활성 클래스 둘(`ConnectionReceivedArgs`, `OverlappedDuplexStream`)도 이름을 받았다. 핸들러가 받아든 객체가 자기가 뭔지 답할 수 있어야 하는 건 마찬가지다.
 
-### 대신 한 것
+### 이름을 안 준 것
 
-`comio::tests::iinspectable_is_shaped_but_hollow` — characterisation 테스트로 현재 응답을 못 박았다. **컨트롤**로 진짜 WinRT 클래스(`Windows.Storage.Streams.Buffer`)를 같은 코드 경로로 통과시켜 `GetIids`가 0이 아니고 이름도 비어 있지 않음을 확인한다. 이게 없으면 "빈 응답"이 호출 방식 탓일 수도 있다. `windows-rs`를 올렸을 때 이게 바뀌면 조용히 지나가지 않고 테스트가 깨진다.
+`asyncop::IoAsyncOp`와 `connector`의 `ConnectOp`. 첫 인터페이스가 **제네릭** WinRT 인터페이스인데 `RuntimeName::NAME`은 타입 인자를 실을 수 없는 `&'static str`이다 (`windows-core-0.62.2/src/runtime_name.rs:3`의 TODO가 바로 이 이야기다). 프로젝션은 async op을 이름이 아니라 `IAsyncInfo` + 오퍼레이션 인터페이스로 찾으니, 여기서는 빈 문자열이 정직한 답이다.
+
+### `GetIids`는 왜 못 고치나
+
+`IInspectable_Vtbl::new`가 설치하는 `GetIids`는 타입 파라미터가 **하나도 없는** 자유 함수다. 이름과 달리 비집고 들어갈 틈 자체가 없다. 고치려면 `#[implement]`가 생성하는 identity vtable을 손으로 쓰는 수밖에 없다. `windows-implement` 0.100도 구조가 같아 업그레이드로 풀릴 문제가 아니다.
+
+### 이름이 정직해진 것 ≠ 런타임 클래스가 된 것
+
+런타임 클래스 이름은 "이 이름이 WinRT 메타데이터로 **해석된다**"는 약속이기도 하다. `.winmd`를 아직 안 내놓으니 `RoGetActivationFactory`는 여전히 실패한다. 그러니 지금 이름은 **메타데이터가 지켜야 할 약속을 코드에 먼저 적어둔 것**이다 — 생성기가 읽을 단일 출처가 생겼고, 두 번째 목록을 따로 관리할 필요가 없어졌다.
+
+### 못 박아 둔 것
+
+`comio::tests::iinspectable_is_shaped_but_hollow` — characterisation 테스트. 이름은 이제 `runtimeclass`가 정의한 상수와 **정확히 일치**하는지 비교하고(ProgID와 같은 상수라 한쪽만 바뀌면 깨진다), `GetIids`/`GetTrustLevel`은 여전히 현재 응답을 못 박는다. **컨트롤**로 진짜 WinRT 클래스(`Windows.Storage.Streams.Buffer`)를 같은 코드 경로로 통과시켜, 빈 `GetIids`가 호출 방식 탓이 아니라 객체의 답임을 보인다.
 
 ## `.winmd`로 가는 길
 
@@ -147,41 +211,47 @@ tlbimp은 .NET Framework SDK 도구다. **빌드 단계에 넣지 않는다** �
 
 선택지: RDL 파일을 소스 오브 트루스로 두거나, `windows-metadata` 라이터로 테이블에서 직접 방출하거나.
 
-### 비용 3 — `IInspectable`이 블로커일 수 있다 (미확인)
+### 비용 3 — `IInspectable` (대부분 해소됨, 2026-11-09)
 
-제대로 된 WinRT 런타임 클래스는 `GetRuntimeClassName`으로 자기 이름을 돌려줘야 하는데, 위 "막힌 것" 절대로 `windows-rs`의 `#[implement]`로는 **불가능하다**. `.winmd`를 내놓아도 이건 그대로 남는다.
+여기 "`GetRuntimeClassName`은 `#[implement]`로는 불가능하다"고 적혀 있었다. **틀렸다.** 훅이 있었고 (`#[implement]` 목록의 첫 타입이 `RuntimeName`을 공급한다), 위 절에서 그걸 썼다. 이 방향의 블로커였던 것이 블로커가 아니다.
 
-프로젝션이 실제로 그걸 부르는지가 관건이다. 정적으로 프로젝션된 호출 경로는 안 부를 수도 있지만, 박싱/언박싱이나 `object` → 구체 타입 해석에서는 쓰인다. **부른다면 `windows-rs`의 identity vtable 문제를 먼저 풀어야 한다**(`windows-implement` 포크, 또는 identity를 손으로 작성). 이게 이 방향의 유일한 미확인 블로커다.
+남은 건 `GetIids`뿐인데, 이건 프로젝션이 요구하지 않는다 — 타입 해석은 이름으로 한다. 요구하는 소비자가 실제로 나타나면 그때 identity vtable을 손으로 쓰면 된다. **`.winmd` 트랙의 선행 조건이 아니다.**
 
 ## 다음 작업
 
-`.winmd` 트랙이 주 경로다. 1번이 블로커 확인이라 먼저 간다 — 결과에 따라 2번의 크기가 달라진다.
+`.winmd` 트랙이 주 경로다. 이름이 풀렸으므로 1번은 더 이상 "할 수 있나"가 아니라 "메타데이터가 코드의 이름과 맞물리나"의 확인이다.
 
-1. **프로젝션이 `GetRuntimeClassName`을 부르는가** · 작음 · **블로커 확인**
-   위 "비용 3". `windows-rs`의 `#[implement]`로는 정직한 답을 못 내놓으므로, 프로젝션이 이걸 요구하면 identity vtable 문제를 먼저 풀어야 한다. 손으로 만든 최소 `.winmd` 하나 + PyWinRT 또는 CsWinRT로 확인하는 게 가장 빠르다.
+1. ~~최소 `.winmd`로 확인~~ · **완료** — RDL 트랙으로 정했고 전체 표면을 기술했다.
 
-2. **`.winmd` 생성 + `DllGetActivationFactory` + HKLM 등록** · 큼
-   먼저 "비용 2"의 선택(RDL vs 직접 방출)을 정한다. 1번 결과에 따라 identity vtable 작업이 여기 붙는다.
+2. ~~`DllGetActivationFactory` + `IActivationFactory`~~ · **완료** (2026-11-09)
+   `DllGetClassObject` 옆에 export 하나. `IActivationFactory::ActivateInstance`는 IID도 aggregation outer도 받지 않고 `IInspectable`을 그냥 돌려주므로 `IClassFactory`보다 단순하다. 여섯 클래스 전부 기본 생성 가능해서 `IXxxFactory`는 필요 없다. 반환값은 문서화된 계약 그대로 — 인자가 null이면 `E_INVALIDARG`, 모르는 클래스면 `REGDB_E_CLASSNOTREG`.
 
-3. **Python end-to-end 검증** · 중간 · **수용 테스트**
+   `class_for_name`이 `CLASSES`를 런타임 클래스 이름으로 찾는다. ProgID와 같은 상수이므로 **COM 활성화와 WinRT 활성화가 같은 테이블 하나를 읽는다.**
+
+   통합 테스트가 `RoActivateInstance`가 아니라 **export를 직접 호출**한다 — HKLM 등록(아래 3번)이 아직 없기 때문이고, 그 덕에 "팩토리가 동작한다"와 "레지스트리가 우리를 가리킨다"가 분리된다. 활성화된 객체에게 `GetRuntimeClassName`을 다시 물어 **요청한 이름과 일치하는지** 확인하므로, 한쪽만 리네임되면 깨진다. 비활성 클래스(`TransportStream`, `ConnectionReceivedArgs`)와 모르는 이름은 `REGDB_E_CLASSNOTREG`로 거절되는 것까지 확인한다.
+
+3. **HKLM `ActivatableClassId` 등록** · 작음 · **다음**
+   `DllPath` / `ActivationType=0` / `Threading` / `TrustLevel`. 이름은 `bindings`가 단일 출처다. 승격 필요(개발 중엔 OK로 합의). 이것만 쓰면 `RoActivateInstance`가 동작한다.
+
+4. **Python end-to-end 검증** · 중간 · **수용 테스트**
    PyWinRT로 프로젝션을 생성하고, Python 스크립트가 리스너를 만들어 `AcceptAsync`를 await 한다. 이게 되면 목표 달성이다.
 
-4. **hvsock TLS** · 중간 · *독립 트랙*
-   메모리에 "진짜 gap"으로 남은 유일한 항목(2026-11-08 보류). WinRT의 TLS는 `StreamSocket`의 `SocketProtectionLevel`에만 있고, hvsock은 **host↔guest 신뢰 경계**를 넘으므로 여기서만 실제 필요하다(로컬 파이프엔 무의미). Schannel을 `OverlappedDuplexStream` 위에 얹으면 `IInputStream`/`IOutputStream` 모양이 유지된다. `.winmd` 트랙과 겹치지 않으니 언제 해도 된다.
+5. **hvsock TLS** · 중간 · *독립 트랙*
+   메모리에 "진짜 gap"으로 남은 유일한 항목(2026-11-08 보류). WinRT의 TLS는 `StreamSocket`의 `SocketProtectionLevel`에만 있고, hvsock은 **host↔guest 신뢰 경계**를 넘으므로 여기서만 실제 필요하다(로컬 파이프엔 무의미). Schannel을 `TransportStream` 위에 얹으면 `IInputStream`/`IOutputStream` 모양이 유지된다. `.winmd` 트랙과 겹치지 않으니 언제 해도 된다.
 
-5. **out-of-process 활성화** · 중간 · *나중*
+6. **out-of-process 활성화** · 중간 · *나중*
    WinRT에도 `OutOfProcessServer` 모델이 있다. 마샬링·아파트먼트·수명을 전부 강제로 통과시키는 값은 그대로지만, in-proc으로 3번을 먼저 끝내는 편이 낫다.
 
 ### 폐기 (2026-11-09 방향 결정에 따라)
 
 - **오퍼레이션 객체(상관 토큰)** — IDispatch에서 비동기를 흉내 내려던 물건이다. WinRT 소비자는 `IAsyncOperation`을 그대로 받으므로 만들 이유가 사라졌다.
-- **tlbimp interop 통합 테스트** — 동결된 레이어를 위해 .NET Framework SDK 의존을 테스트에 들이는 건 잘못된 투자다. 레시피는 위 "PowerShell 레시피"에 남겨 둔다.
+- **tlbimp interop 통합 테스트** — 레이어 자체가 삭제됐으니 자동으로 사라졌다. 레시피는 "삭제한 것" 절에 기록으로 남겼다.
 - **`IAsyncOperation` 교차 아파트먼트 마샬링 측정** — `.winmd` 판단 근거로 필요했던 것인데 판단이 끝났다. 메타데이터를 내놓으면 자연히 답이 나온다.
 
 ### 가치 낮음
 
 - **`DllCanUnloadNow` 객체 카운팅** — 지금 무조건 `S_FALSE`. 이유는 `activation.rs` 문서에 있고, 고치면 `CoFreeUnusedLibraries`가 동작. 위험 대비 이득 작음.
-- **`EnumConnectionPoints` / `EnumConnections`** — 디자인타임 브라우저 전용. **권장하지 않음**, 소비자가 없다. 동결 레이어이기도 하다.
+- ~~`EnumConnectionPoints` / `EnumConnections`~~ — 커넥션 포인트와 함께 삭제됐다.
 
 ### 위생
 
@@ -192,12 +262,20 @@ tlbimp은 .NET Framework SDK 도구다. **빌드 단계에 넣지 않는다** �
 
 | 커밋 | 내용 |
 | --- | --- |
+| `eee9b30` | IDispatch 레이어 동결 표시 |
+| `c2d5572` | 방향을 WinRT로, 폐기 항목 정리 |
+| `ea0d115` | 이 문서 |
+| `7aab8c7` | 타입 라이브러리 이후 서술 교정 + `IInspectable` 테스트 |
 | `ace1f38` | 타입 라이브러리와 커넥션 포인트 |
 | `c483249` | IDispatch |
 | `abdb902` | 활성화 |
 | `aa05a16` | 클라이언트 타입을 COM 커넥터로 |
 
-**미커밋** (워킹 트리): `src/comio/activation.rs`, `src/comio/connpt.rs`, `src/comio/mod.rs` — 문서 교정 + `iinspectable_is_shaped_but_hollow` 테스트.
+**이번 세션 (2026-11-09)** — 중간 상태를 커밋해 두지 않아 앞 단계들은 하나로 합쳐 들어간다. 런타임 클래스 이름 작업(`runtimeclass.rs`)은 bindgen 출력으로 **대체되며 사라졌으므로** 따로 커밋할 산출물이 없고, IDispatch 삭제는 `.winmd` 전환과 같은 파일들을 건드려 분리하려면 `listener.rs` 800줄을 손으로 복원해야 한다:
+
+- IDispatch 레이어 삭제 + `.winmd` + 생성 바인딩 전환 + 클래스 리네임 + `DllGetActivationFactory`
+
+검증: `cargo test --all-features` 140 + 1 통과, `cargo doc` 경고 0, clippy 24건(전부 기존 `tp`/`rio`/`main.rs`).
 
 ### 재현
 
@@ -211,4 +289,4 @@ cargo test --all-features
 cargo clippy --all-targets --all-features
 ```
 
-타입 라이브러리는 `DllRegisterServer`가 `%LOCALAPPDATA%\rustwinui3loop\rustwinui3loop.tlb`에 쓴다.
+`DllRegisterServer`가 쓰는 것은 이제 CLSID/ProgID 키뿐이다 — `.tlb`도, `Interface\{…}` 프록시 등록도 없다.

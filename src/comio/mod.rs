@@ -7,64 +7,73 @@
 //! named-pipe, AF_UNIX or AF_HYPERV support, and `HostName` cannot even name
 //! those endpoints.
 //!
+//! # Where the interfaces come from
+//!
+//! Not from this module. `metadata/rustwinui3loop.rdl` describes the whole
+//! WinRT surface, `tools/winmdgen` compiles it to the `.winmd` this component
+//! publishes and runs `windows-bindgen` over that, and the result is
+//! [`bindings`]. Everything here implements those generated traits.
+//!
+//! That inversion is forced, not stylistic. A hand-written `#[interface]`
+//! cannot derive from `IInspectable`: `windows-interface` emits
+//! `Parent_Vtbl::new::<Identity, OFFSET>` and needs a `Parent_Impl` trait,
+//! and `IInspectable` has neither — its `new` takes three type parameters and
+//! `IInspectable_Impl` does not exist. So a hand-written interface always
+//! starts three vtable slots in, where a projection expects six. Only bindgen
+//! emits the latter, which means metadata has to come first.
+//!
 //! # What `IInspectable` answers here, and what it does not
 //!
-//! Every object in this module is reachable as an `IInspectable`: the WinRT
-//! interfaces they implement — `IClosable`, `IInputStream`, `IOutputStream`,
-//! `IAsyncOperationWithProgress` — all derive from it, so `QueryInterface`
-//! succeeds. The ABI really is the WinRT one. What the three `IInspectable`
-//! methods *say*, though, is fixed by `windows-rs` and is not the truth about
-//! these objects:
-//!
+//! * `GetRuntimeClassName` reports the class's name. The hook is narrow and
+//!   undocumented: the method returns `RuntimeName::NAME` of the **first**
+//!   type named in `#[implement]`, so each object names its generated *class*
+//!   type there rather than an interface. [`activation::CLASSES`] keys its
+//!   WinRT activation off those same constants, so an object has one name
+//!   whichever world asks.
 //! * `GetIids` reports an empty set. `IInspectable_Vtbl::new` installs a free
-//!   function that writes `count = 0`, `values = null` and returns `S_OK`. It
-//!   takes no type parameter at all, so there is no point at which an object's
-//!   real interface chains could reach it.
-//! * `GetRuntimeClassName` reports the empty string. It returns
-//!   `RuntimeName::NAME` of the **first** interface named in `#[implement]`,
-//!   and `#[interface]` generates `impl RuntimeName for X {}` — taking the
-//!   default, `""` — for every interface this crate declares.
-//! * `GetTrustLevel` is the one that reaches our code, and the macro hardcodes
-//!   it to `0`, `BaseTrust`.
+//!   function that writes `count = 0`, `values = null` and returns `S_OK`.
+//!   Unlike the name it takes no type parameter at all, so there is no point
+//!   at which an object's real interface chains could reach it — short of
+//!   hand-writing the identity vtable that `#[implement]` generates. A
+//!   consumer doing type discovery is told "no interfaces" rather than "I
+//!   cannot say", which is a confident wrong answer; no projection asks, so
+//!   it is not on the critical path.
+//! * `GetTrustLevel` does reach our code, through `IUnknownImpl`, but the
+//!   macro hardcodes what it returns to `0`, `BaseTrust`. The attribute does
+//!   accept `TrustLevel = Partial | Full`; `BaseTrust` is what these objects
+//!   are, so nothing passes it.
 //!
-//! All three return `S_OK`, so a consumer doing WinRT type discovery is told
-//! "no interfaces, no name, base trust" rather than "I cannot say" — a
-//! confident wrong answer instead of an honest refusal. None of it is
-//! reachable from here: `#[implement]` parses only a list of interfaces, and
-//! the identity vtable it builds is an associated constant on the generated
-//! `_Impl` type.
-//!
-//! That is a gap in what these objects *are*, not a defect to paper over.
-//! They are not WinRT runtime classes; they are COM classes that implement
-//! WinRT interfaces, activated by CLSID ([`activation`]) and described by a
-//! type library ([`typelib`]). A runtime class name is a promise that the
-//! name resolves through WinRT metadata, and nothing here publishes any — so
-//! inventing a non-empty name would make the claim more *credible* without
-//! making it true, which is worse than the empty string.
-//!
-//! Publishing a `.winmd` is what would give these objects a name worth
-//! reporting — but note that it does **not** on its own make them report it.
-//! Metadata settles what the name means; `#[implement]` still decides what
-//! the vtable says, and it says nothing. The two are separate problems, and
-//! a conforming runtime class needs both solved. `docs/comio-com-winrt-status.md`
-//! tracks that as the open blocker on the WinRT direction.
-//!
-//! `tests::iinspectable_is_shaped_but_hollow` pins the current answers, so a
+//! `tests::iinspectable_is_shaped_but_hollow` pins all three answers, so a
 //! `windows-rs` upgrade that changes any of them shows up as a failure rather
 //! than a silent shift.
+//!
+//! # What is no longer here
+//!
+//! Until 2026-11-09 this module also carried an automation layer: `IDispatch`
+//! on every class, a generated `.tlb`, and connection points delivering
+//! `ConnectionReceived` to `IDispatch` sinks. It worked, and it was measured
+//! working from PowerShell, VBScript and WSH. It is gone.
+//!
+//! It could only ever describe a *blocking translation* of this surface.
+//! Automation has no parameterized interfaces, so `IAsyncOperation<T>` could
+//! not appear in a type library at all; a script got `Accept(timeoutMs)` and a
+//! queue where the vtable has an awaitable. Carrying a second, differently
+//! shaped description of every member — and the drift risk that comes with it
+//! — is only worth it for hosts that can never consume WinRT. Those hosts are
+//! out of scope (see `docs/comio-com-winrt-status.md`), so the layer had no
+//! audience left. Scripts come back through the `.winmd` and a projection,
+//! with the async model intact rather than translated away.
 #![allow(dead_code)]
 
 pub mod activation;
 pub mod asyncop;
+pub mod bindings;
 pub mod buffer;
 pub mod connector;
-pub mod connpt;
-pub mod dispatch;
 pub mod hvsock;
 pub mod listener;
 pub mod pipe;
 pub mod stream;
-pub mod typelib;
 pub mod tpio;
 pub mod unix;
 pub mod waitop;
@@ -74,20 +83,23 @@ pub mod waitop;
 // `#[allow(unused_imports)]` alongside the module's existing
 // `#![allow(dead_code)]` — both are re-export/API-shape warnings, not bugs.
 #[allow(unused_imports)]
-pub use pipe::{NamedPipeClient, NamedPipeListener};
+pub use pipe::{NamedPipeConnector, NamedPipeListener};
 // The WinRT-native, `StreamSocketListener`-shaped surface (`listener.rs`):
 // one shared interface, one concrete type per transport, so each exposes only
 // the bind its addressing supports.
 #[allow(unused_imports)]
 pub use listener::{
-    HyperVConnectionListener, IConnectionListener, IConnectionReceivedArgs, IHyperVListenerBind,
-    INamedPipeListenerBind, IUnixListenerBind, NamedPipeConnectionListener, UnixConnectionListener,
+    HyperVConnectionListener, NamedPipeConnectionListener, UnixConnectionListener,
 };
-// The client half's interfaces. The connectors themselves are the existing
-// client types — `NamedPipeClient`, `UnixStreamSocket`, `HvStreamSocket` —
-// which now implement these, rather than three more types wrapping them.
+// The listener-side interfaces now come from metadata; see [`bindings`].
 #[allow(unused_imports)]
-pub use connector::{
+pub use bindings::Rustwinui3loop::{
+    IConnectionListener, IConnectionReceivedArgs, IHyperVListenerBind, INamedPipeListenerBind,
+    IUnixListenerBind,
+};
+// The client half's interfaces now come from metadata; see [`bindings`].
+#[allow(unused_imports)]
+pub use bindings::Rustwinui3loop::{
     IHyperVConnector, INamedPipeConnector, IStreamConnector, IUnixConnector,
 };
 // `stream::from_reg` takes/returns crate-private types (`Arc<tpio::IoReg>`),
@@ -98,15 +110,15 @@ pub use connector::{
 #[allow(unused_imports)]
 pub(crate) use stream::from_reg;
 #[allow(unused_imports)]
-pub use unix::{UnixStreamListener, UnixStreamSocket};
+pub use unix::{UnixConnector, UnixStreamListener};
 #[allow(unused_imports)]
-pub use hvsock::{HvStreamListener, HvStreamSocket};
+pub use hvsock::{HvStreamListener, HyperVConnector};
 
 pub(crate) use crate::common::check::check;
 
 #[cfg(test)]
 mod tests {
-    use super::pipe::{NamedPipeClient, NamedPipeListener};
+    use super::pipe::{NamedPipeConnector, NamedPipeListener};
     use crate::comio::buffer::new_buffer;
     use crate::common::block_on;
     use std::future::IntoFuture;
@@ -118,7 +130,7 @@ mod tests {
     use windows_future::IAsyncInfo;
 
     /// (a) `DataReader`/`DataWriter` interop over our stream: proves
-    /// `OverlappedDuplexStream` is a real, drop-in WinRT `IInputStream`/
+    /// `TransportStream` is a real, drop-in WinRT `IInputStream`/
     /// `IOutputStream` — not just something our own `ReadAsync`/`WriteAsync`
     /// tests happen to exercise correctly. Reuses the exact named-pipe
     /// server/client setup from `pipe::tests::named_pipe_echo`: the server
@@ -143,7 +155,7 @@ mod tests {
         // `ConnectNamedPipe` before the client dials in (same margin as
         // `named_pipe_echo`).
         std::thread::sleep(Duration::from_millis(100));
-        let client = block_on(NamedPipeClient::connect(&name)).unwrap();
+        let client = block_on(NamedPipeConnector::connect(&name)).unwrap();
         let output: IOutputStream = client.cast().unwrap();
         let writer = DataWriter::CreateDataWriter(&output).unwrap();
 
@@ -189,7 +201,7 @@ mod tests {
             let _ = done_rx.recv();
         });
         std::thread::sleep(Duration::from_millis(100));
-        let client = block_on(NamedPipeClient::connect(&name)).unwrap();
+        let client = block_on(NamedPipeConnector::connect(&name)).unwrap();
         let input: IInputStream = client.cast().unwrap();
 
         for _ in 0..1000 {
@@ -237,9 +249,14 @@ mod tests {
     /// or changes it some other way — that is a failure to read rather than
     /// a silent shift under a design decision which cited it.
     ///
+    /// Half of it is no longer hollow: the generated class types in
+    /// [`bindings`] carry a `RuntimeName`, so `GetRuntimeClassName` is
+    /// checked against the string the metadata defines rather than against
+    /// `""`. `GetIids` is what is left, and it has no seam at all.
+    ///
     /// A real WinRT class goes through the same calls as a control. Without
     /// it, "empty" could just as well mean the test is calling the vtable
-    /// wrong; with it, the empty answers are demonstrably the object's.
+    /// wrong; with it, the empty answer is demonstrably the object's.
     #[test]
     fn iinspectable_is_shaped_but_hollow() {
         use windows_core::{IInspectable, IInspectable_Vtbl};
@@ -276,8 +293,15 @@ mod tests {
         let (count, values_null) = get_iids("listener", &ours);
         assert_eq!(count, 0, "GetIids reported interfaces");
         assert!(values_null, "GetIids returned a non-null array");
+        // Not merely non-empty: the exact name, and the same constant the
+        // `activation::CLASSES` keys activation off, so a rename cannot land
+        // in one world and not the other.
         let name = ours.GetRuntimeClassName().expect("GetRuntimeClassName");
-        assert!(name.is_empty(), "GetRuntimeClassName said {name:?}");
+        assert_eq!(
+            name.to_string(),
+            <crate::comio::bindings::Rustwinui3loop::NamedPipeConnectionListener as windows_core::RuntimeName>::NAME,
+            "GetRuntimeClassName said {name:?}"
+        );
         assert_eq!(
             ours.GetTrustLevel().expect("GetTrustLevel"),
             0,

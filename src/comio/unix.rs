@@ -1,6 +1,6 @@
 //! AF_UNIX (Unix domain socket) transport: `UnixStreamListener` (`AcceptEx`)
-//! and `UnixStreamSocket` (`ConnectEx` fetched via `WSAIoctl`), producing
-//! `OverlappedDuplexStream`s (via `stream::from_reg`) registered as
+//! and `UnixConnector` (`ConnectEx` fetched via `WSAIoctl`), producing
+//! `TransportStream`s (via `stream::from_reg`) registered as
 //! sockets (`is_socket = true`), so `ReadAsync`/`WriteAsync` drive
 //! `WSARecv`/`WSASend`. Mirrors `src/tp/io/net.rs`'s AF_INET
 //! `TcpListener`/`TcpStream`, but with `AF_UNIX`/`SOCKADDR_UN` addressing and
@@ -15,12 +15,11 @@
 use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
-use super::connector::{
-    IStreamConnector, IStreamConnector_Impl, IUnixConnector, IUnixConnector_Impl, connect_op,
-    out_operation, out_transport,
-};
-use super::dispatch;
+use super::bindings;
+use super::bindings::Rustwinui3loop::{IStreamConnector_Impl, IUnixConnector_Impl};
+use super::connector::connect_op;
 use super::listener::Accepted;
+use super::bindings::Rustwinui3loop::TransportStream;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
@@ -33,7 +32,7 @@ use windows::Win32::Networking::WinSock::{
     SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
     SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSASocketW, WSA_FLAG_OVERLAPPED,
 };
-use windows_core::{Error, IInspectable, Result, HRESULT};
+use windows_core::{Error, Result, HRESULT};
 
 fn new_socket() -> Result<SOCKET> {
     wsa_init();
@@ -115,7 +114,7 @@ impl UnixStreamListener {
     }
 
     /// Accepts one connection, returning it as a duplex WinRT stream.
-    pub async fn accept(&self) -> Result<IInspectable> {
+    pub async fn accept(&self) -> Result<TransportStream> {
         let accept_sock = new_socket()?;
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
         let mut guard = AcceptSockGuard(accept_sock);
@@ -157,7 +156,7 @@ impl UnixStreamListener {
         // Success: take the socket out of the guard so its `Drop` no longer
         // closes it (`IoReg::register` owns it from here).
         let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
-        let finish = || -> Result<IInspectable> {
+        let finish = || -> Result<TransportStream> {
             // Until `SO_UPDATE_ACCEPT_CONTEXT` (value = the listen socket)
             // the accepted socket is half-configured.
             let listen_val = listen_sock.0.to_ne_bytes();
@@ -222,7 +221,7 @@ impl UnixStreamListener {
                     drop(addr_buf);
                     let res = if ioresult == 0 {
                         let listen_val = listen_sock.0.to_ne_bytes();
-                        let finish = || -> Result<IInspectable> {
+                        let finish = || -> Result<TransportStream> {
                             sock_check(setsockopt(
                                 accept_sock,
                                 SOL_SOCKET,
@@ -267,20 +266,19 @@ impl UnixStreamListener {
 
 /// Client side of an AF_UNIX connection.
 #[windows_core::implement(
-    IStreamConnector,
-    IUnixConnector,
-    windows::Win32::System::Com::IDispatch
+    bindings::Rustwinui3loop::UnixConnector,
+    bindings::Rustwinui3loop::IUnixConnector
 )]
-pub struct UnixStreamSocket;
+pub struct UnixConnector;
 
-/// The one spelling of this transport's name, shared by the vtable's
-/// `Transport` and the dispatch member of the same name.
+/// The one spelling of this transport's name, as the vtable's `Transport`
+/// reports it.
 const TRANSPORT: &str = "unix";
 
-impl UnixStreamSocket {
+impl UnixConnector {
     /// Connects to the AF_UNIX socket bound at `path`, returning the
     /// connection as a duplex WinRT stream.
-    pub async fn connect(path: &str) -> Result<IInspectable> {
+    pub async fn connect(path: &str) -> Result<TransportStream> {
         let sock = new_socket()?;
         let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
@@ -341,7 +339,7 @@ impl UnixStreamSocket {
     /// that could be dropped first.
     pub(crate) fn arm_connect(
         path: &str,
-        on_result: Box<dyn FnOnce(Result<IInspectable>) + Send>,
+        on_result: Box<dyn FnOnce(Result<TransportStream>) + Send>,
     ) -> Result<OpHandle> {
         let sock = new_socket()?;
         let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
@@ -400,11 +398,11 @@ impl UnixStreamSocket {
 
 }
 
-impl UnixStreamSocket {
+impl UnixConnector {
     /// Creates the connector. It holds no state; connecting is what it does.
     #[allow(clippy::new_without_default)]
-    pub fn new() -> windows_core::ComObject<UnixStreamSocket> {
-        windows_core::ComObject::new(UnixStreamSocket)
+    pub fn new() -> windows_core::ComObject<UnixConnector> {
+        windows_core::ComObject::new(UnixConnector)
     }
 
     /// Typed Rust mirror of the vtable's `ConnectAsync`; the result arrives
@@ -412,61 +410,26 @@ impl UnixStreamSocket {
     pub fn connect_async(
         &self,
         path: &windows_core::HSTRING,
-    ) -> windows_future::IAsyncOperation<windows_core::IInspectable> {
+    ) -> windows_future::IAsyncOperation<TransportStream> {
         let path = path.to_string();
         connect_op(move |sink| Self::arm_connect(&path, sink))
     }
 }
 
-impl IStreamConnector_Impl for UnixStreamSocket_Impl {
-    unsafe fn Transport(
-        &self,
-        result: *mut core::mem::ManuallyDrop<windows_core::HSTRING>,
-    ) -> windows_core::HRESULT {
-        out_transport(TRANSPORT, result)
+impl IStreamConnector_Impl for UnixConnector_Impl {
+    fn Transport(&self) -> Result<windows_core::HSTRING> {
+        Ok(windows_core::HSTRING::from(TRANSPORT))
     }
 }
 
-impl IUnixConnector_Impl for UnixStreamSocket_Impl {
-    unsafe fn ConnectAsync(
+impl IUnixConnector_Impl for UnixConnector_Impl {
+    fn ConnectAsync(
         &self,
-        path: core::mem::ManuallyDrop<windows_core::HSTRING>,
-        result: *mut *mut core::ffi::c_void,
-    ) -> windows_core::HRESULT {
-        out_operation(self.connect_async(&path), result)
+        path: &windows_core::HSTRING,
+    ) -> Result<windows_future::IAsyncOperation<TransportStream>> {
+        Ok(self.connect_async(path))
     }
 }
-
-/// The late-bound surface: `Transport` as the vtable has it, and `Connect`
-/// as the blocking shape of `ConnectAsync` — see `dispatch`'s module docs
-/// for why a script gets the second rather than the first.
-impl dispatch::Dispatchable for UnixStreamSocket {
-    const DISPINTERFACE: windows_core::GUID = super::typelib::IID_DUNIX_SOCKET;
-
-    const MEMBERS: &'static [dispatch::Member] = &[
-        dispatch::member!("Transport", 1, () -> Text),
-        dispatch::member!("Connect", 2, ("Path": Text) -> Object),
-    ];
-
-    fn invoke_member(
-        &self,
-        dispid: i32,
-        args: &[windows::Win32::System::Variant::VARIANT],
-    ) -> windows_core::Result<windows::Win32::System::Variant::VARIANT> {
-        match dispid {
-            1 => Ok(dispatch::bstr(TRANSPORT)),
-            2 => {
-                let path = windows_core::HSTRING::from(dispatch::as_string(&args[0])?);
-                dispatch::object(&self.connect_async(&path).join()?)
-            }
-            _ => Err(windows_core::Error::from_hresult(
-                windows::Win32::Foundation::DISP_E_MEMBERNOTFOUND,
-            )),
-        }
-    }
-}
-
-dispatch::impl_dispatch!(UnixStreamSocket, UnixStreamSocket_Impl);
 
 #[cfg(test)]
 mod tests {
@@ -544,7 +507,7 @@ mod tests {
             block_on(output.WriteAsync(&got).unwrap().into_future()).unwrap();
         });
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let c = block_on(UnixStreamSocket::connect(&p)).unwrap();
+        let c = block_on(UnixConnector::connect(&p)).unwrap();
         let c_out: IOutputStream = c.cast().unwrap();
         let c_in: IInputStream = c.cast().unwrap();
         let wbuf = new_buffer(4).unwrap();
@@ -649,7 +612,7 @@ mod tests {
         });
 
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let c = block_on(UnixStreamSocket::connect(&p)).unwrap();
+        let c = block_on(UnixConnector::connect(&p)).unwrap();
         let c_out: IOutputStream = c.cast().unwrap();
         let c_in: IInputStream = c.cast().unwrap();
 
@@ -746,7 +709,7 @@ mod tests {
         let listener = UnixStreamListener::bind(&p).unwrap();
 
         for _ in 0..200 {
-            issue_then_drop(UnixStreamSocket::connect(&p));
+            issue_then_drop(UnixConnector::connect(&p));
         }
         drop(listener);
 
