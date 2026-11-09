@@ -1,0 +1,19 @@
+[package]
+name = "winasync-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The out-of-process activation server for winasync's WinRT component."
+
+# The executable a class's `LocalServer32` key names. COM starts it when a
+# client asks for an object with `CLSCTX_LOCAL_SERVER`; it serves until the
+# last reference is released and then exits. Everything it does is
+# `winasync::comio::server::run`, for the same reason `dll/` is thin: the
+# logic stays testable in the library.
+[[bin]]
+name = "winasync-server"
+path = "src/main.rs"
+
+[dependencies]
+# `server` is set here and nowhere else, as `dylib` is set only by `dll/`.
+library = { package = "winasync", path = "..", default-features = false, features = ["server"] }

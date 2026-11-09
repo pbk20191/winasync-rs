@@ -208,6 +208,40 @@ pub const CLSID_NAMED_PIPE_CONNECTOR: GUID = GUID::from_u128(0x2ad42747_717e_499
 pub const CLSID_UNIX_CONNECTOR: GUID = GUID::from_u128(0xdb436265_333f_4f3e_a7fd_a3f842a639d4);
 pub const CLSID_HYPER_V_CONNECTOR: GUID = GUID::from_u128(0xbe6a6ff1_e2b8_4014_b608_168668baf43d);
 
+/// The proxy/stub in `winasync_ps.dll`: what each of [`PROXIED_IIDS`] names
+/// as its `ProxyStubClsid32`. Frozen, like the class CLSIDs. Defined for the C
+/// build in `ps/build.rs`; `tests/oop.rs` proves the two agree.
+pub const CLSID_PROXY_STUB: GUID = GUID::from_u128(0xa59f0ba5_0111_463b_b1db_109943a63f74);
+
+/// Every interface the proxy/stub DLL marshals, which is every interface an
+/// installer must point at [`CLSID_PROXY_STUB`] for the out-of-process server
+/// to work.
+///
+/// Ours, plus the three parameterized instances the surface uses -- each of
+/// which is a distinct interface with its own IID, and none of which Windows
+/// registers a proxy for, because nothing in Windows uses them. The system
+/// interfaces the surface also crosses (`IInputStream`, `IAsyncAction`,
+/// `IAsyncOperationWithProgress<IBuffer, UInt32>`, ...) are absent on
+/// purpose: Windows registers their proxies, and overwriting those keys would
+/// break every other component on the machine.
+///
+/// Data, not a registry writer, for the reason this module gives at the top.
+pub static PROXIED_IIDS: &[GUID] = &[
+    rc::ITransport::IID,
+    rc::ITransportStream::IID,
+    rc::IConnectionListener::IID,
+    rc::IConnectionReceivedArgs::IID,
+    rc::INamedPipeBind::IID,
+    rc::IUnixBind::IID,
+    rc::IHyperVBind::IID,
+    rc::INamedPipeConnector::IID,
+    rc::IUnixConnector::IID,
+    rc::IHyperVConnector::IID,
+    <windows_future::IAsyncOperation<rc::ITransportStream> as Interface>::IID,
+    <windows_future::AsyncOperationCompletedHandler<rc::ITransportStream> as Interface>::IID,
+    <windows::Foundation::TypedEventHandler<rc::IConnectionListener, rc::IConnectionReceivedArgs> as Interface>::IID,
+];
+
 /// The runtime class name `C` answers `GetRuntimeClassName` with.
 ///
 /// A `const fn` so [`CLASSES`] can be a `static`: `RuntimeName` is the trait
@@ -299,8 +333,17 @@ pub unsafe fn dll_get_class_object(
     let Some(class) = class_for(unsafe { &*clsid }) else {
         return CLASS_E_CLASSNOTAVAILABLE;
     };
-    let factory: IClassFactory = ClassFactory(class, ModuleRef::new()).into();
+    let factory: IClassFactory = ClassFactory(class, ModuleRef::factory()).into();
     unsafe { factory.query(iid, object) }
+}
+
+/// The class object for `class`, for `CoRegisterClassObject`.
+///
+/// The same factory `DllGetClassObject` hands out, so the in-process and
+/// out-of-process servers cannot disagree about how an instance is made.
+#[cfg(feature = "server")]
+pub(crate) fn class_object(class: &'static ComClass) -> IUnknown {
+    ClassFactory(class, ModuleRef::factory()).into()
 }
 
 /// REGDB_E_CLASSNOTREG — the documented answer when this module does not
@@ -379,7 +422,7 @@ pub unsafe fn dll_get_activation_factory(
     let Some(class) = class_for_name(&name.to_string()) else {
         return REGDB_E_CLASSNOTREG;
     };
-    let activation: IActivationFactory = ActivationFactory(class, ModuleRef::new()).into();
+    let activation: IActivationFactory = ActivationFactory(class, ModuleRef::factory()).into();
     unsafe { *factory = activation.into_raw() };
     S_OK
 }

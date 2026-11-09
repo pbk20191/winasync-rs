@@ -15,7 +15,7 @@ repository = "https://github.com/pbk20191/winasync-rs"
 # are checked in, and keeping `windows-rdl` out of the library's graph is what
 # stops an ordinary build from paying for it.
 [workspace]
-members = ["dll", "ps", "tools/winmdgen"]
+members = ["dll", "ps", "server", "tools/winmdgen"]
 
 # No `[lib] crate-type` here: this package is an rlib and nothing else.
 #
@@ -60,7 +60,12 @@ features = []
 [dev-dependencies.windows]
 version = "0.62.2"
 default-features = false
-features = ["Win32_System_ApplicationInstallationAndServicing"]
+features = [
+    "Win32_System_ApplicationInstallationAndServicing",
+    # `tests/oop.rs` finds the server process it did not start -- COM did --
+    # by walking the process list.
+    "Win32_System_Diagnostics_ToolHelp",
+]
 
 [dependencies.windows-future]
 version = "0.3.2"
@@ -150,6 +155,19 @@ counters = []
 # changed is that the feature no longer has to stand in for "this compile is
 # the DLL": the separate package says that structurally.
 dylib = ["comio", "counters"]
+
+# Compiled for the out-of-process server executable. **Do not enable this
+# yourself** -- `server/` (package `winasync-server`) enables it, as `dll/`
+# enables `dylib`.
+#
+# It adds `comio::server`, and with it a process-wide "serving" flag that
+# makes every `ModuleRef` hold a COM server-process reference while
+# `comio::server::run` is serving. The flag is a run-time switch rather than
+# the feature itself because cargo unifies features: `cargo build --workspace`
+# compiles this library once, with `dylib` *and* `server`, for both packages.
+# So the two must coexist, and "is this process the server" is answered by
+# whether `run` was called, not by how the library was compiled.
+server = ["comio"]
 
 # DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.
 dq = [

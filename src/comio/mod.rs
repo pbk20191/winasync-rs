@@ -74,6 +74,8 @@ pub mod hvsock;
 pub mod listener;
 pub mod pipe;
 pub(crate) mod pool;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod settled;
 pub mod stream;
 pub mod tpio;
