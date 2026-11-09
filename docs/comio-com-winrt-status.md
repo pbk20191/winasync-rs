@@ -262,8 +262,50 @@ $l.Bind($name)
 
    `register_winrt_under`는 남긴다 — 키 자체는 맞고, TrustedInstaller 권한으로 도는 인스톨러라면 쓸 수 있다. `DllRegisterServer`는 계속 호출하고 거부되면 `S_FALSE`를 돌려준다(= 사실상 항상).
 
-4. **Python end-to-end 검증** · 중간 · **수용 테스트**
-   PyWinRT로 프로젝션을 생성하고, Python 스크립트가 리스너를 만들어 `AcceptAsync`를 await 한다. 이게 되면 목표 달성이다.
+4. ~~Python end-to-end 검증~~ · **완료** (2026-11-09) — **수용 기준 달성**
+
+   ```text
+   listening on \.\pipe\comio_py_29588
+   connector transport = namedpipe
+   client connected
+   accepted from '\.\pipe\comio_py_29588'
+   server read 'hello from python'
+   ROUND-TRIP-OK
+   ```
+
+   Python 스크립트가 **레지스트리도 승격도 C++ 빌드도 없이** 우리 Rust 객체를 WinRT 프로젝션으로 돌렸다. `python/` 참조.
+
+   - `await listener.bind_async(...)` — 진짜 `IAsyncAction`을 asyncio가 await
+   - `add_connection_received(...)` — Rust 스레드풀 스레드가 Python 함수를 호출, `call_soon_threadsafe`로 루프 복귀
+   - `await connector.connect_async(...)` — 진짜 `IAsyncOperation<TransportStream>`
+   - `DataWriter`/`DataReader` — **윈도우 자신의** 스트림 클래스가 우리 스트림을 읽고 썼다. `TransportStream`이 진짜 `IInputStream`/`IOutputStream`이 아니면 불가능하다.
+
+   **PyWinRT는 우리 winmd를 그대로 먹었다.** 걱정했던 `[ContractVersion]`/`[Version]` 부재는 문제가 아니었다. 8 클래스 + 9 인터페이스 전부 생성됐고, 파라미터화 IID도 정확하다 — `AsyncOperationCompletedHandler<TransportStream>`의 시그니처가 `rc(Rustwinui3loop.TransportStream;{905a0fe2-...})`로 나왔는데 저 GUID가 우리가 선언한 디폴트 인터페이스 `IInputStream`이다.
+
+   ### 걸린 것 1 — `windows-rdl`은 클래스 생성자를 못 낸다
+
+   `windows-rdl`의 클래스 인코더는 TypeDef + InterfaceImpl + 애트리뷰트만 쓰고 **MethodDef를 하나도 안 쓴다**(`reader/class.rs`). 그래서 클래스에 `.ctor` 행이 없고, PyWinRT는 `__new__` 없는 클래스를 낸다. 인스턴스 멤버는 멀쩡하다 — PyWinRT가 인터페이스에서(`declaring=`) 읽기 때문이다.
+
+   애트리뷰트 문제가 **아니다**. 먼저 그쪽을 의심해서 SDK와 똑같이 `Activatable(65536, "...UniversalApiContract")` + `ContractVersion`까지 맞춰봤지만 변화 없었고, SDK의 `InMemoryRandomAccessStream`(팩토리 인터페이스 없는 activatable)이 `.ctor` 행만 있으면 된다는 것을 보여준다. 그 실험은 되돌렸다 — UniversalApiContract 소속을 주장하는 건 거짓이므로.
+
+   우회는 `python/activate_instance.py`: 프로젝션이 이미 찾을 줄 아는 액티베이션 팩토리에 `IActivationFactory::ActivateInstance`를 직접 부른다.
+
+   ### 걸린 것 2 — Hyper-V 멤버는 호출이 안 된다
+
+   ```text
+   warning: the shape census has no callback for slot 6 with the ABI call shape
+     ({u4u2u2u1u1u1u1u1u1u1u1}{u4u2u2u1u1u1u1u1u1u1u1}p)
+   ```
+
+   `(GUID, GUID) -> 포인터` 모양이 PyWinRT의 ABI 호출 모양 census에 없다. `IHyperVConnector::ConnectAsync`와 `IHyperVListenerBind::BindEndpointAsync`가 그것이다 — 투영은 되지만 호출하면 raise한다. 네임드 파이프와 AF_UNIX는 무관하다. 해결은 업스트림(testwinrt에 그 모양 추가)이거나 저 둘의 시그니처 변경.
+
+   ### 파이프라인
+
+   ```text
+   metadata/*.rdl --winmdgen--> *.winmd --pywinrt--> _table.pywinrt.txt
+                                                   --winrt.table--> _table.pywinrt
+   ```
+   PyWinRT는 텍스트 테이블을 내고 런타임은 바이너리를 읽는다. `winrt-table-compiler`(PyPI)가 그 사이를 잇는다 — 이게 없어서 한참 헤맸다.
 
 5. **hvsock TLS** · 중간 · *독립 트랙*
    메모리에 "진짜 gap"으로 남은 유일한 항목(2026-11-08 보류). WinRT의 TLS는 `StreamSocket`의 `SocketProtectionLevel`에만 있고, hvsock은 **host↔guest 신뢰 경계**를 넘으므로 여기서만 실제 필요하다(로컬 파이프엔 무의미). Schannel을 `TransportStream` 위에 얹으면 `IInputStream`/`IOutputStream` 모양이 유지된다. `.winmd` 트랙과 겹치지 않으니 언제 해도 된다.
@@ -305,7 +347,8 @@ $l.Bind($name)
 - `ed43ce9` — IDispatch 레이어 삭제 + `.winmd` + 생성 바인딩 전환 + 클래스 리네임 + `DllGetActivationFactory`
 - `17d6263` — ProgID 키 제거
 - `1a3dc0e` — WinRT 활성화 등록 (HKLM 시도)
-- reg-free 매니페스트로 전환 (미커밋)
+- `43a4750` — reg-free 매니페스트로 전환
+- Python 수용 테스트 `python/` (미커밋)
 
 검증: `cargo test --all-features` 140 + 1 통과, `cargo doc` 경고 0, clippy 24건(전부 기존 `tp`/`rio`/`main.rs`).
 
