@@ -5,7 +5,7 @@
 
 use super::bindings;
 use super::bindings::Rustwinui3loop::{
-    INamedPipeConnector_Impl, IStreamConnector_Impl, TransportStream,
+    INamedPipeConnector_Impl, ITransport_Impl, TransportStream,
 };
 use super::stream;
 use super::tpio::{self, IoReg, Issue, OpHandle};
@@ -182,7 +182,7 @@ pub struct NamedPipeConnector;
 
 /// The one spelling of this transport's name, as the vtable's `Transport`
 /// reports it.
-const TRANSPORT: &str = "namedpipe";
+pub(crate) const TRANSPORT: &str = "namedpipe";
 
 impl NamedPipeConnector {
     /// Opens the client end of an existing named pipe. If every server
@@ -276,7 +276,7 @@ impl NamedPipeConnector {
     }
 }
 
-impl IStreamConnector_Impl for NamedPipeConnector_Impl {
+impl ITransport_Impl for NamedPipeConnector_Impl {
     fn Transport(&self) -> Result<HSTRING> {
         Ok(HSTRING::from(TRANSPORT))
     }

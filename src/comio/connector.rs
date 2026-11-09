@@ -207,7 +207,7 @@ mod tests {
     /// then `GetResults` after.
     #[test]
     fn unix_connector_completes_from_the_overlapped_callback() {
-        use crate::comio::bindings::Rustwinui3loop::IUnixListenerBind;
+        use crate::comio::bindings::Rustwinui3loop::IUnixBind;
         use crate::comio::listener::UnixConnectionListener;
 
         let path = std::env::temp_dir()
@@ -223,7 +223,7 @@ mod tests {
             Ok(())
         });
         {
-            let b: IUnixListenerBind = listener.cast().unwrap();
+            let b: IUnixBind = listener.cast().unwrap();
             b.BindAsync(&HSTRING::from(&path)).expect("BindAsync");
         }
         let l: IConnectionListener = listener.cast().unwrap();
@@ -277,7 +277,7 @@ mod tests {
         });
 
         // Bind and register through the listener's vtables.
-        let bind: INamedPipeListenerBind = listener.cast().unwrap();
+        let bind: INamedPipeBind = listener.cast().unwrap();
         bind.BindAsync(&HSTRING::from(&name)).expect("BindAsync");
         let l: IConnectionListener = listener.cast().unwrap();
         l.ConnectionReceived(&handler).expect("ConnectionReceived");
@@ -305,7 +305,7 @@ mod tests {
     }
 
     /// The one interface all three clients share. A caller that holds an
-    /// `IStreamConnector` learns which transport it has from `Transport`,
+    /// `ITransport` learns which transport it has from `Transport`,
     /// then asks for that transport's connect interface by `QueryInterface`
     /// — the discovery step that replaces a connect member here.
     ///
@@ -313,13 +313,13 @@ mod tests {
     /// so it needs no listener, no pipe and no Hyper-V provider.
     #[test]
     fn every_client_reports_its_transport_through_the_shared_interface() {
-        fn transport_of(c: &IStreamConnector) -> String {
+        fn transport_of(c: &ITransport) -> String {
             c.Transport().expect("Transport").to_string()
         }
 
-        let pipe: IStreamConnector = crate::comio::NamedPipeConnector::new().cast().unwrap();
-        let unix: IStreamConnector = crate::comio::UnixConnector::new().cast().unwrap();
-        let hv: IStreamConnector = crate::comio::HyperVConnector::new().cast().unwrap();
+        let pipe: ITransport = crate::comio::NamedPipeConnector::new().cast().unwrap();
+        let unix: ITransport = crate::comio::UnixConnector::new().cast().unwrap();
+        let hv: ITransport = crate::comio::HyperVConnector::new().cast().unwrap();
 
         assert_eq!(transport_of(&pipe), "namedpipe");
         assert_eq!(transport_of(&unix), "unix");

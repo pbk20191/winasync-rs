@@ -16,7 +16,7 @@ use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
 use super::bindings;
-use super::bindings::Rustwinui3loop::{IStreamConnector_Impl, IUnixConnector_Impl};
+use super::bindings::Rustwinui3loop::{ITransport_Impl, IUnixConnector_Impl};
 use super::connector::connect_op;
 use super::listener::Accepted;
 use super::bindings::Rustwinui3loop::TransportStream;
@@ -273,7 +273,7 @@ pub struct UnixConnector;
 
 /// The one spelling of this transport's name, as the vtable's `Transport`
 /// reports it.
-const TRANSPORT: &str = "unix";
+pub(crate) const TRANSPORT: &str = "unix";
 
 impl UnixConnector {
     /// Connects to the AF_UNIX socket bound at `path`, returning the
@@ -416,7 +416,7 @@ impl UnixConnector {
     }
 }
 
-impl IStreamConnector_Impl for UnixConnector_Impl {
+impl ITransport_Impl for UnixConnector_Impl {
     fn Transport(&self) -> Result<windows_core::HSTRING> {
         Ok(windows_core::HSTRING::from(TRANSPORT))
     }

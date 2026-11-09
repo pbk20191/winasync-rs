@@ -94,13 +94,13 @@ pub use listener::{
 // The listener-side interfaces now come from metadata; see [`bindings`].
 #[allow(unused_imports)]
 pub use bindings::Rustwinui3loop::{
-    IConnectionListener, IConnectionReceivedArgs, IHyperVListenerBind, INamedPipeListenerBind,
-    IUnixListenerBind,
+    IConnectionListener, IConnectionReceivedArgs, IHyperVBind, INamedPipeBind,
+    IUnixBind,
 };
 // The client half's interfaces now come from metadata; see [`bindings`].
 #[allow(unused_imports)]
 pub use bindings::Rustwinui3loop::{
-    IHyperVConnector, INamedPipeConnector, IStreamConnector, IUnixConnector,
+    IHyperVConnector, INamedPipeConnector, ITransport, IUnixConnector,
 };
 // `stream::from_reg` takes/returns crate-private types (`Arc<tpio::IoReg>`),
 // so it stays `pub(crate)` here rather than `pub` (the latter would be a hard

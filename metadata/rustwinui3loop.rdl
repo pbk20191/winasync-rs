@@ -26,6 +26,33 @@ use Windows::Foundation::Metadata::*;
 
 #[winrt]
 mod Rustwinui3loop {
+    // Identity, not behaviour: a caller holding an unknown object can ask
+    // "which transport is this?" in one `QueryInterface`.
+    //
+    // Deliberately not named for any role. Connectors and listeners both
+    // answer it, and so would a datagram socket -- binding, connecting and
+    // listening are three things one transport does, not three transports.
+    #[guid(auto)]
+    interface ITransport {
+        #[get] Transport: String;
+    }
+
+    // The shape to keep in mind when adding one: AF_UNIX datagram, which is
+    // a real gap -- `DatagramSocket` is IP-only. WinRT's own datagram model
+    // is bind, a `MessageReceived` event, and `GetOutputStreamAsync(dest)`
+    // for sending, so the class would be
+    //
+    //     class UnixDatagramSocket { IUnixDatagramSocket, IUnixBind, IClosable }
+    //
+    // reusing `IUnixBind` unchanged and answering `ITransport` like everything
+    // else. That is why neither of those is named for listening: the names
+    // here were `IStreamConnector` and `I*ListenerBind`, and a datagram socket
+    // would have had to either implement something it is not or duplicate the
+    // member. `Information` is deliberately *not* hoisted alongside them --
+    // WinRT itself repeats it on `StreamSocketListener` and `DatagramSocket`
+    // rather than sharing, and a connector binds to nothing, so it would have
+    // only an empty string to report.
+
     // ---------------------------------------------------------------------
     // The stream
     //
@@ -70,12 +97,12 @@ mod Rustwinui3loop {
     }
 
     #[guid(auto)]
-    interface INamedPipeListenerBind {
+    interface INamedPipeBind {
         fn BindAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncAction;
     }
 
     #[guid(auto)]
-    interface IUnixListenerBind {
+    interface IUnixBind {
         fn BindAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncAction;
     }
 
@@ -91,7 +118,7 @@ mod Rustwinui3loop {
     // exact inverses, so nothing is lost: a caller may always spell either
     // half as a plain GUID. Rust callers keep the typed entry points.
     #[guid(auto)]
-    interface IHyperVListenerBind {
+    interface IHyperVBind {
         fn BindEndpointAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncAction;
         fn BindServiceNameAsync(&self, #[in] serviceName: String) -> Windows::Foundation::IAsyncAction;
     }
@@ -99,34 +126,30 @@ mod Rustwinui3loop {
     #[Activatable(1)]
     class NamedPipeConnectionListener {
         IConnectionListener,
-        INamedPipeListenerBind,
+        ITransport,
+        INamedPipeBind,
         Windows::Foundation::IClosable,
     }
 
     #[Activatable(1)]
     class UnixConnectionListener {
         IConnectionListener,
-        IUnixListenerBind,
+        ITransport,
+        IUnixBind,
         Windows::Foundation::IClosable,
     }
 
     #[Activatable(1)]
     class HyperVConnectionListener {
         IConnectionListener,
-        IHyperVListenerBind,
+        ITransport,
+        IHyperVBind,
         Windows::Foundation::IClosable,
     }
 
     // ---------------------------------------------------------------------
     // Connectors
     // ---------------------------------------------------------------------
-
-    // Identity, not behaviour: a caller holding an unknown object can ask
-    // "is this a connector, and of what?" in one `QueryInterface`.
-    #[guid(auto)]
-    interface IStreamConnector {
-        #[get] Transport: String;
-    }
 
     #[guid(auto)]
     interface INamedPipeConnector {
@@ -145,19 +168,19 @@ mod Rustwinui3loop {
 
     #[Activatable(1)]
     class NamedPipeConnector {
-        IStreamConnector,
+        ITransport,
         INamedPipeConnector,
     }
 
     #[Activatable(1)]
     class UnixConnector {
-        IStreamConnector,
+        ITransport,
         IUnixConnector,
     }
 
     #[Activatable(1)]
     class HyperVConnector {
-        IStreamConnector,
+        ITransport,
         IHyperVConnector,
     }
 }

@@ -346,6 +346,24 @@ $l.Bind($name)
 - 테스트 2곳의 `CoInitializeEx` → `RoInitialize`. 깨끗한 프로세스 3개로 재본 결과 **동작 차이는 없다**(초기화 없음 / `CoInitializeEx(MTA)` / `RoInitialize(MULTITHREADED)` 모두 WinRT 활성화·vtable 호출·`GetRuntimeClassName`·async op 동일). 버그 수정이 아니라 의도 표현이다. `Win32_System_WinRT` 피처가 필요하다.
 - 기존 clippy 경고 24건 (`tp` / `rio` / `main.rs` / `listener.rs`). 이번 작업과 무관한 기존 것들.
 
+## ABI 다듬기 (2026-11-09) — AF_UNIX 데이터그램을 미리 염두에 두고
+
+지금은 전부 연결 지향이다. 만약 AF_UNIX **데이터그램**을 넣는다면(WinRT에 없는 진짜 gap — `DatagramSocket`은 IP 전용) WinRT 자신의 모델은 *bind + `MessageReceived` 이벤트 + `GetOutputStreamAsync(목적지)`*다. 그 모양을 옆에 놓고 보니 현재 ABI에 세 군데가 어색했고, **소비자가 없는 지금** 고쳤다. 의미 변화는 없는 순수 개명 + 비대칭 하나.
+
+| 전 | 후 | 이유 |
+| --- | --- | --- |
+| `IStreamConnector` | `ITransport` | `Transport` 하나만 들고 있고 스트림적인 구석이 없다. 데이터그램 소켓도 같은 질문에 답한다 |
+| (리스너는 미구현) | 리스너도 `ITransport` | **지금 있던 비대칭**이다 — 커넥터에겐 "어떤 전송이냐"를 물을 수 있는데 리스너에겐 못 물었다 |
+| `I*ListenerBind` | `I*Bind` | 바인드는 역할이 아니라 주소 지정이다. 데이터그램 소켓은 `IUnixBind`를 그대로 재사용한다 |
+
+리스너의 `Transport`는 커넥터와 **같은 상수**(`pipe::TRANSPORT` 등)에서 답한다 — 한 전송의 두 반쪽이 이름을 두고 엇갈릴 수 없게.
+
+**`Information`은 일부러 안 뺐다.** WinRT 자신이 `StreamSocketListener`와 `DatagramSocket`에 각각 중복으로 둔다. 게다가 커넥터는 바인드하지 않으니 공용으로 빼면 빈 문자열을 돌려주는 거짓말이 된다.
+
+### 이 과정에서 잡은 것
+
+RDL에 `ITransport`를 추가하고 Rust `#[implement]`에는 안 넣었더니 **컴파일이 멀쩡히 통과했다.** 메타데이터는 "이 인터페이스를 구현한다"고 선언하는데 객체는 QI에서 거절하는 상태 — 소비자가 처음 시도할 때까지 아무도 모른다. `com_vtable_surface_works_for_every_transport`가 이제 `ITransport` QI를 단언한다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

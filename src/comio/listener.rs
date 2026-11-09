@@ -15,14 +15,14 @@ use windows_future::IAsyncAction;
 use super::bindings;
 use super::bindings::Rustwinui3loop::{
     ConnectionReceivedArgs as ConnectionReceivedArgsClass, IConnectionListener,
-    IConnectionListener_Impl, IConnectionReceivedArgs_Impl, IHyperVListenerBind_Impl,
-    INamedPipeListenerBind_Impl, IUnixListenerBind_Impl, TransportStream,
+    IConnectionListener_Impl, IConnectionReceivedArgs_Impl, ITransport_Impl, IHyperVBind_Impl,
+    INamedPipeBind_Impl, IUnixBind_Impl, TransportStream,
 };
 // Queried for by the tests below, which check that each listener exposes only
 // the bind its addressing supports.
 #[cfg(test)]
 use super::bindings::Rustwinui3loop::{
-    IConnectionReceivedArgs, IHyperVListenerBind, INamedPipeListenerBind, IUnixListenerBind,
+    IConnectionReceivedArgs, IHyperVBind, INamedPipeBind, ITransport, IUnixBind,
 };
 use super::tpio::OpHandle;
 use crate::common::hvaddr::{HvSocketAddr, HV_GUID_WILDCARD};
@@ -423,7 +423,8 @@ macro_rules! listener_impls {
 /// `ConnectionReceived` handler.
 #[implement(
     bindings::Rustwinui3loop::NamedPipeConnectionListener,
-    bindings::Rustwinui3loop::INamedPipeListenerBind,
+    bindings::Rustwinui3loop::ITransport,
+    bindings::Rustwinui3loop::INamedPipeBind,
     windows::Foundation::IClosable
 )]
 pub struct NamedPipeConnectionListener {
@@ -436,7 +437,8 @@ pub struct NamedPipeConnectionListener {
 /// nothing on disk.
 #[implement(
     bindings::Rustwinui3loop::UnixConnectionListener,
-    bindings::Rustwinui3loop::IUnixListenerBind,
+    bindings::Rustwinui3loop::ITransport,
+    bindings::Rustwinui3loop::IUnixBind,
     windows::Foundation::IClosable
 )]
 pub struct UnixConnectionListener {
@@ -448,23 +450,47 @@ pub struct UnixConnectionListener {
 /// The listen socket is created on the first accept, as for AF_UNIX.
 #[implement(
     bindings::Rustwinui3loop::HyperVConnectionListener,
-    bindings::Rustwinui3loop::IHyperVListenerBind,
+    bindings::Rustwinui3loop::ITransport,
+    bindings::Rustwinui3loop::IHyperVBind,
     windows::Foundation::IClosable
 )]
 pub struct HyperVConnectionListener {
     core: ListenerCore,
 }
 
+// Which transport this listener is, answered from the same constant its
+// connector answers with -- so the two halves of one transport cannot
+// disagree about what it is called. The metadata puts this on `ITransport`
+// rather than on anything named for a role, because binding, connecting and
+// listening are three things one transport does.
+impl ITransport_Impl for NamedPipeConnectionListener_Impl {
+    fn Transport(&self) -> Result<HSTRING> {
+        Ok(HSTRING::from(super::pipe::TRANSPORT))
+    }
+}
+
+impl ITransport_Impl for UnixConnectionListener_Impl {
+    fn Transport(&self) -> Result<HSTRING> {
+        Ok(HSTRING::from(super::unix::TRANSPORT))
+    }
+}
+
+impl ITransport_Impl for HyperVConnectionListener_Impl {
+    fn Transport(&self) -> Result<HSTRING> {
+        Ok(HSTRING::from(super::hvsock::TRANSPORT))
+    }
+}
+
 // Each listener's own bind, as metadata declares it. One interface per
 // transport rather than one shared bind: the addressing genuinely differs,
 // and this is what lets each listener offer only the bind it has.
-impl INamedPipeListenerBind_Impl for NamedPipeConnectionListener_Impl {
+impl INamedPipeBind_Impl for NamedPipeConnectionListener_Impl {
     fn BindAsync(&self, name: &HSTRING) -> Result<IAsyncAction> {
         self.bind(name)
     }
 }
 
-impl IUnixListenerBind_Impl for UnixConnectionListener_Impl {
+impl IUnixBind_Impl for UnixConnectionListener_Impl {
     fn BindAsync(&self, path: &HSTRING) -> Result<IAsyncAction> {
         self.bind(path)
     }
@@ -474,7 +500,7 @@ impl IUnixListenerBind_Impl for UnixConnectionListener_Impl {
 // why this endpoint crosses a projection as text rather than as the pair of
 // GUIDs the transport takes. A malformed endpoint is `E_INVALIDARG`: the
 // caller passed something that is not an address, which is exactly that.
-impl IHyperVListenerBind_Impl for HyperVConnectionListener_Impl {
+impl IHyperVBind_Impl for HyperVConnectionListener_Impl {
     fn BindEndpointAsync(&self, endpoint: &HSTRING) -> Result<IAsyncAction> {
         let addr: HvSocketAddr = endpoint.to_string().parse().map_err(invalid_endpoint)?;
         self.bind_endpoint(&addr.vm_id, &addr.service_id)
@@ -1005,8 +1031,18 @@ mod listener_tests {
     /// they could not have caught a broken vtable.
     #[test]
     fn com_vtable_surface_works_for_every_transport() {
-        fn exercise(obj: windows_core::IUnknown, expect_endpoint: &str) {
+        fn exercise(obj: windows_core::IUnknown, expect_endpoint: &str, expect_transport: &str) {
             let l: IConnectionListener = obj.cast().expect("QI IConnectionListener");
+
+            // The metadata says every listener answers `ITransport`. Asserting
+            // it here is the point: declaring an interface in the `.winmd` and
+            // forgetting it in `#[implement]` compiles perfectly and fails only
+            // at `QueryInterface`, in whatever consumer tries it first.
+            let t: ITransport = obj.cast().expect("QI ITransport");
+            assert_eq!(
+                t.Transport().expect("Transport").to_string(),
+                expect_transport
+            );
 
             let (tx, _rx) = mpsc::channel::<()>();
             let handler = ConnectionHandler::new(move |_, _| {
@@ -1042,10 +1078,10 @@ mod listener_tests {
         // the listener.
         let pipe = NamedPipeConnectionListener::new();
         {
-            let b: INamedPipeListenerBind = pipe.cast().expect("QI INamedPipeListenerBind");
+            let b: INamedPipeBind = pipe.cast().expect("QI INamedPipeBind");
             b.BindAsync(&HSTRING::from(&pipe_name)).expect("vtable BindAsync");
         }
-        exercise(pipe.cast().unwrap(), &pipe_name);
+        exercise(pipe.cast().unwrap(), &pipe_name, "namedpipe");
 
         let unix = UnixConnectionListener::new();
         let path = std::env::temp_dir()
@@ -1054,10 +1090,10 @@ mod listener_tests {
             .into_owned();
         let _ = std::fs::remove_file(&path);
         {
-            let b: IUnixListenerBind = unix.cast().expect("QI IUnixListenerBind");
+            let b: IUnixBind = unix.cast().expect("QI IUnixBind");
             b.BindAsync(&HSTRING::from(&path)).expect("vtable BindAsync");
         }
-        exercise(unix.cast().unwrap(), &path);
+        exercise(unix.cast().unwrap(), &path, "unix");
         let _ = std::fs::remove_file(&path);
 
         let hv = HyperVConnectionListener::new();
@@ -1066,12 +1102,12 @@ mod listener_tests {
         // takes the *service* half alone, not a whole `hv://` endpoint.
         let svc = crate::common::hvaddr::vsock_service_id(54_321);
         let hv_bound = {
-            let b: IHyperVListenerBind = hv.cast().expect("QI IHyperVListenerBind");
+            let b: IHyperVBind = hv.cast().expect("QI IHyperVBind");
             b.BindServiceNameAsync(&HSTRING::from("vsock:54321")).is_ok()
         };
         if hv_bound {
             let label = HvSocketAddr::new(HV_GUID_WILDCARD, svc).to_string();
-            exercise(hv.cast().unwrap(), &label);
+            exercise(hv.cast().unwrap(), &label, "hyperv");
         } else {
             eprintln!("skipped Hyper-V leg: AF_HYPERV unavailable");
         }

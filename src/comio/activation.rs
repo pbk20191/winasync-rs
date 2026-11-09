@@ -75,7 +75,7 @@
 //! Whether a given *interface* on them can leave the apartment it was created
 //! in is a separate question, and today the answer is no. Every interface here
 //! is one this crate declares itself — `IConnectionListener`, the
-//! `*ListenerBind` pair, `IStreamConnector` — with no registered proxy/stub
+//! `*Bind` pair, `ITransport` — with no registered proxy/stub
 //! and no metadata describing it, so COM has nothing to marshal them with.
 //! Use them inside one apartment. (Until 2026-11-09 the dispinterfaces did
 //! marshal, through oleaut32's dispatch proxy; that layer is gone. Publishing
@@ -811,13 +811,13 @@ mod tests {
         type Identified = (GUID, fn(&IUnknown) -> bool);
         let expected: &[Identified] = &[
             (CLSID_NAMED_PIPE_CONNECTION_LISTENER, |u| {
-                u.cast::<super::super::INamedPipeListenerBind>().is_ok()
+                u.cast::<super::super::INamedPipeBind>().is_ok()
             }),
             (CLSID_UNIX_CONNECTION_LISTENER, |u| {
-                u.cast::<super::super::IUnixListenerBind>().is_ok()
+                u.cast::<super::super::IUnixBind>().is_ok()
             }),
             (CLSID_HYPER_V_CONNECTION_LISTENER, |u| {
-                u.cast::<super::super::IHyperVListenerBind>().is_ok()
+                u.cast::<super::super::IHyperVBind>().is_ok()
             }),
             (CLSID_NAMED_PIPE_CONNECTOR, |u| {
                 u.cast::<super::super::INamedPipeConnector>().is_ok()

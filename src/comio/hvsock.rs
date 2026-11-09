@@ -20,7 +20,7 @@ use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
 };
 use super::bindings;
-use super::bindings::Rustwinui3loop::{IHyperVConnector_Impl, IStreamConnector_Impl};
+use super::bindings::Rustwinui3loop::{IHyperVConnector_Impl, ITransport_Impl};
 use super::connector::connect_op;
 use super::listener::Accepted;
 use super::bindings::Rustwinui3loop::TransportStream;
@@ -234,7 +234,7 @@ pub struct HyperVConnector;
 
 /// The one spelling of this transport's name, as the vtable's `Transport`
 /// reports it.
-const TRANSPORT: &str = "hyperv";
+pub(crate) const TRANSPORT: &str = "hyperv";
 
 impl HyperVConnector {
     /// Connects to `addr`, returning the connection as a duplex WinRT stream.
@@ -376,7 +376,7 @@ impl HyperVConnector {
     }
 }
 
-impl IStreamConnector_Impl for HyperVConnector_Impl {
+impl ITransport_Impl for HyperVConnector_Impl {
     fn Transport(&self) -> Result<HSTRING> {
         Ok(HSTRING::from(TRANSPORT))
     }

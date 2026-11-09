@@ -18,8 +18,8 @@ use rustwinui3loop::comio::activation::{
     CLSID_NAMED_PIPE_CONNECTOR, CLSID_NAMED_PIPE_CONNECTION_LISTENER,
 };
 use rustwinui3loop::comio::bindings::Rustwinui3loop::{
-    ConnectionReceivedArgs, IConnectionListener, INamedPipeConnector, INamedPipeListenerBind,
-    IStreamConnector, TransportStream,
+    ConnectionReceivedArgs, IConnectionListener, INamedPipeConnector, INamedPipeBind,
+    ITransport, TransportStream,
 };
 use std::sync::mpsc;
 use windows::Foundation::TypedEventHandler;
@@ -215,7 +215,7 @@ fn com_activation_round_trip_through_the_registered_dll() {
         },
     );
 
-    let bind: INamedPipeListenerBind = listener.cast().expect("QI INamedPipeListenerBind");
+    let bind: INamedPipeBind = listener.cast().expect("QI INamedPipeBind");
     bind.BindAsync(&HSTRING::from(&name)).expect("BindAsync");
 
     let events: IConnectionListener = listener.cast().expect("QI IConnectionListener");
@@ -242,7 +242,7 @@ fn com_activation_round_trip_through_the_registered_dll() {
             .expect("CoCreateInstance(client)");
 
     // The shared interface answers for a COM-activated object too.
-    let connector: IStreamConnector = client.cast().expect("QI IStreamConnector");
+    let connector: ITransport = client.cast().expect("QI ITransport");
     assert_eq!(
         connector.Transport().expect("Transport").to_string(),
         "namedpipe"
@@ -453,11 +453,11 @@ fn ro_activate_instance_reg_free(dll: &Path) {
     }
 
     // And it is the real object, not merely something named right.
-    let connector: IStreamConnector =
+    let connector: ITransport =
         unsafe { RoActivateInstance(&HSTRING::from(NAMES[0])) }
             .expect("RoActivateInstance")
             .cast()
-            .expect("QI IStreamConnector");
+            .expect("QI ITransport");
     assert_eq!(
         connector.Transport().expect("Transport").to_string(),
         "namedpipe"
