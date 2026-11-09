@@ -221,7 +221,6 @@ mod tests {
         let _ = done_tx.send(());
         server.join().unwrap();
 
-        #[cfg(debug_assertions)]
         {
             use std::sync::atomic::Ordering;
             // Cancellation completions are delivered asynchronously by the

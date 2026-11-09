@@ -511,7 +511,6 @@ mod tests {
             }
         });
         drop(rt);
-        #[cfg(debug_assertions)]
         {
             // Completions drain quickly once the pool is gone. LIVE_OPS is
             // process-global, so wait out ops from concurrently running tests.

@@ -973,7 +973,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "tp", debug_assertions))]
+#[cfg(all(test, feature = "tp"))]
 mod finalization_timing {
     use super::*;
     use crate::tp::Runtime;

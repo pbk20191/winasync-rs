@@ -1236,7 +1236,6 @@ mod listener_tests {
         let closable: IClosable = listener.cast().unwrap();
         closable.Close().unwrap();
         assert_eq!(listener.information().unwrap_err().code(), RO_E_CLOSED);
-        #[cfg(debug_assertions)]
         {
             for _ in 0..500 {
                 if crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -1268,7 +1267,6 @@ mod listener_tests {
         // without it, this drop would leak the state, the in-flight
         // overlapped op, and leave the chain able to keep re-arming forever.
         drop(listener);
-        #[cfg(debug_assertions)]
         {
             let mut live = crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed);
             for _ in 0..500 {

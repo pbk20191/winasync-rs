@@ -475,7 +475,6 @@ mod tests {
         drop(fut);
     }
 
-    #[cfg(debug_assertions)]
     fn assert_no_live_ops(msg: &str) {
         use std::sync::atomic::Ordering;
         for _ in 0..500 {
@@ -694,7 +693,6 @@ mod tests {
         }
         drop(listener);
 
-        #[cfg(debug_assertions)]
         assert_no_live_ops("op blocks leaked after accept() cancel storm");
         let _ = std::fs::remove_file(&path);
     }
@@ -720,7 +718,6 @@ mod tests {
         }
         drop(listener);
 
-        #[cfg(debug_assertions)]
         assert_no_live_ops("op blocks leaked after connect() cancel storm");
         let _ = std::fs::remove_file(&path);
     }

@@ -13,7 +13,7 @@
 //! until completion. Invariants preserved from the two cores this replaces:
 //! refcount starts at 2 (caller + kernel), freed exactly once; `StartThreadpoolIo`
 //! balanced 1:1 by a completion or `CancelThreadpoolIo` on sync failure; no panic
-//! crosses the completion FFI boundary; `LIVE_OPS` tracks live blocks in debug.
+//! crosses the completion FFI boundary; `LIVE_OPS` tracks live blocks in test builds and under `counters`.
 
 use core::ffi::c_void;
 use std::any::Any;

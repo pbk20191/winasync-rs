@@ -175,7 +175,6 @@ mod tests {
             let _ = server; let _ = client;
         }
 
-        #[cfg(debug_assertions)]
         {
             for _ in 0..500 {
                 if LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
