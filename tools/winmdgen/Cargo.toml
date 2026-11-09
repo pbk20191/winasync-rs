@@ -35,3 +35,10 @@ windows-rdl = { git = "https://github.com/microsoft/windows-rs", rev = "7f3b5242
 # Pinned to the 0.62 line alongside `windows`/`windows-core` in the root
 # manifest. Verified to read a 0.100-produced `.winmd` without complaint.
 windows-bindgen = "0.62"
+# Not to compile anything: `cc::windows_registry::find_tool` is the one
+# maintained piece of code that locates Visual Studio *and* the Windows SDK
+# the way a build does, and hands back the environment (`PATH`, `INCLUDE`)
+# that `midl` needs to find `cl.exe` for preprocessing. The SDK root and
+# version are read back out of that `INCLUDE`, so the tools this step runs
+# always come from the same SDK the C compiler would use.
+cc = "1.2"

@@ -1,5 +1,6 @@
 //! Compiles `metadata/Pbk20191.WinAsync.Comio.rdl` into the `.winmd` this component
-//! publishes, then generates the Rust bindings the crate implements against.
+//! publishes, then generates the Rust bindings the crate implements against
+//! and the C proxy/stub that carries its interfaces between processes.
 //!
 //! Run from the repository root:
 //!
@@ -21,6 +22,11 @@ const RDL: &str = "metadata/Pbk20191.WinAsync.Comio.rdl";
 const WINMD: &str = "metadata/Pbk20191.WinAsync.Comio.winmd";
 /// Generated; do not edit. Lives beside the module that implements it.
 const BINDINGS: &str = "src/comio/bindings.rs";
+/// The proxy/stub C sources, one subdirectory per target architecture.
+/// Generated; do not edit. Compiled by `ps/build.rs`.
+const PROXY_DIR: &str = "ps/generated";
+
+mod proxy;
 
 fn main() {
     let root = repo_root();
@@ -72,6 +78,12 @@ fn main() {
     );
 
     println!("wrote {}", bindings.display());
+
+    for arch in proxy::ARCHES {
+        let dir = root.join(PROXY_DIR).join(arch.dir);
+        proxy::generate(&winmd, &dir, arch);
+        println!("wrote {}", dir.display());
+    }
 }
 
 /// The repository root, derived from this tool's own manifest rather than the

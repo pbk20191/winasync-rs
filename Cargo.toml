@@ -15,7 +15,7 @@ repository = "https://github.com/pbk20191/winasync-rs"
 # are checked in, and keeping `windows-rdl` out of the library's graph is what
 # stops an ordinary build from paying for it.
 [workspace]
-members = ["dll", "tools/winmdgen"]
+members = ["dll", "ps", "tools/winmdgen"]
 
 # No `[lib] crate-type` here: this package is an rlib and nothing else.
 #
