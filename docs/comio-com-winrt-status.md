@@ -427,6 +427,25 @@ $l.Bind($name)
 
    `DllMain`이 export 테이블에 올라가는 건 막지 못했다. rustc는 cdylib에서 `no_mangle` 심볼을 **`pub` 여부와 무관하게** 전부 내보낸다. 대안인 `.CRT$XLB` TLS 콜백은 export되지 않고 같은 알림을 받지만, 링커가 `_tls_used`를 떨구면 **조용히** 안 돈다. 안 돌지도 모르는 진단보다 보이는 export가 낫다.
 
+   **전역 상태 정리 (2026-11-09).** 위의 카운터들을 만들면서 크레이트 전체의 `static`을 전수 조사했다. 발견: **변경 가능한 전역은 거의 전부 테스트만 읽고 있었다.**
+
+   | | 조치 |
+   | --- | --- |
+   | `tp::pool::CANCELED_CALLBACKS` | **삭제** — 쓰기만 하고 읽는 곳이 없었다 |
+   | `dq::timer::NEXT_TIMER_ID` | **thread_local 안으로** — `TIMERS`가 thread_local인데 id는 프로세스 전역이라 **범위가 맵보다 넓었다.** 이제 같다 |
+   | `LIVE_OPS` · `INLINE_COMPLETIONS` · `PUMP_RELEASES` | `#[cfg(any(test, feature = "counters"))]` — **static 자체가 존재하지 않는다**, 갱신만 끄는 게 아니라 |
+   | `comio::unload::{OUTSTANDING, LOCKS, IN_DLL}` | `#[cfg(feature = "dylib")]` |
+   | `winsock::WSA_UP` | 〃 — 읽는 곳이 `can_unload` 하나뿐이다 |
+
+   `counters` 피처가 생겼고 `dylib`이 끌어온다. 기본은 꺼짐이고 **꺼짐이 요점이다**: 관측할 수 없는 카운터도 프로세스의 모든 소비자와 병렬 실행되는 모든 테스트가 공유하는 가변 상태다. 크레이트 자신의 단위 테스트는 `cfg(test)`로 켜지므로, 피처는 **릴리스 빌드에서 진단용으로 되켜는** 경우를 위해 있다.
+
+   남겨둔 것과 이유:
+
+   - **`PTR: OnceLock<usize>` 7개** + `rio::table::TABLE` — `WSAIoctl`로 받은 `ConnectEx`/`AcceptEx` 주소 캐시다. 캐시하는 대상 자체가 프로세스 전역(프로바이더 소유)이라 소켓마다로 내리면 **소켓당 ioctl 하나를 더 내고 얻는 게 없다** — `WSACleanup`을 할 게 아니라면. 그건 안 하기로 했다(위).
+   - **`winsock::INIT: Once`** — `WSAStartup`이 정의상 프로세스 전역이다.
+   - **`buffer::PAGE`, `dq::SDK`** — 각각 시스템 페이지 크기와 App SDK 부트스트랩. 초기화 후 불변이라 상태라기보다 사실이다.
+   - **thread_local 4개**(`dq::CURRENT`, `DEDICATED_ANCHOR`, `TIMERS`, `rio::IN_PUMP`) — 전역이 아니라 **스레드별** 실행기 컨텍스트다. 없애려면 모든 API에 컨텍스트 인자를 꿰어야 한다.
+
    남은 export — `dylib` 켰을 때:
 
    ```text

@@ -36,7 +36,6 @@ use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -50,17 +49,6 @@ use winui3::Microsoft::UI::Dispatching::DispatcherQueueTimer;
 fn to_timespan(dur: Duration) -> TimeSpan {
     let ticks = (dur.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64;
     TimeSpan { Duration: ticks }
-}
-
-/// Process-wide unique ids for timers registered in `TIMERS`. A plain
-/// `AtomicU64` (rather than a thread-local counter) keeps id allocation
-/// trivial; only uniqueness matters here, not ordering, and ids are cheap
-/// enough (a `u64` never realistically wraps) that a global counter is
-/// simpler than threading a thread-local one through `register_timer`.
-static NEXT_TIMER_ID: AtomicU64 = AtomicU64::new(0);
-
-fn next_timer_id() -> u64 {
-    NEXT_TIMER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Shared state between a timer's `Tick` handler and the `Sleep`/`Tick`
@@ -83,20 +71,40 @@ impl TimerState {
     }
 }
 
+/// A DQ thread's timers, and the counter that names them.
+///
+/// The counter used to be a process-wide `AtomicU64`, on the reasoning that
+/// only uniqueness matters and a global one is simpler than threading a
+/// thread-local through `register_timer`. True as far as it went, but it made
+/// the id's scope *wider than the map's*: ids were unique across the process
+/// while the only thing that ever looked one up was this thread's map. The
+/// id and the map it indexes now have the same scope, and the crate has one
+/// less mutable global.
+///
+/// Still a `u64`, so it still never realistically wraps -- a thread would
+/// have to create a timer every nanosecond for several hundred years.
+#[derive(Default)]
+struct TimerRegistry {
+    next_id: u64,
+    live: HashMap<u64, Rc<RefCell<TimerState>>>,
+}
+
 thread_local! {
-    /// DQ-thread-local map from timer id -> shared tick state; see the
-    /// module doc comment for why this indirection exists.
-    static TIMERS: RefCell<HashMap<u64, Rc<RefCell<TimerState>>>> =
-        RefCell::new(HashMap::new());
+    /// DQ-thread-local timers; see the module doc comment for why this
+    /// indirection exists.
+    static TIMERS: RefCell<TimerRegistry> = RefCell::new(TimerRegistry::default());
 }
 
 /// Allocates a fresh id and shared state, and registers the pair in `TIMERS`
 /// so the (`Send`-only-capturing) `Tick` handler can find it later.
 fn register_timer() -> (u64, Rc<RefCell<TimerState>>) {
-    let id = next_timer_id();
     let state = Rc::new(RefCell::new(TimerState::new()));
-    TIMERS.with(|t| {
-        t.borrow_mut().insert(id, state.clone());
+    let id = TIMERS.with(|t| {
+        let mut t = t.borrow_mut();
+        let id = t.next_id;
+        t.next_id += 1;
+        t.live.insert(id, state.clone());
+        id
     });
     (id, state)
 }
@@ -107,7 +115,7 @@ fn register_timer() -> (u64, Rc<RefCell<TimerState>>) {
 /// entire lifetime.
 fn unregister_timer(id: u64) {
     TIMERS.with(|t| {
-        t.borrow_mut().remove(&id);
+        t.borrow_mut().live.remove(&id);
     });
 }
 
@@ -131,7 +139,7 @@ fn on_tick(id: u64) {
     // that gap symmetrically with `drain_ready` and `LocalTask::poll_task`.
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let waker = TIMERS.with(|t| {
-            t.borrow().get(&id).map(|state| {
+            t.borrow().live.get(&id).map(|state| {
                 let mut state = state.borrow_mut();
                 state.ticks += 1;
                 state.waker.take()

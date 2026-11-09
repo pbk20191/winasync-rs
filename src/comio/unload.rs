@@ -77,13 +77,27 @@
 //! `S_OK` is the crash; returning a false `S_FALSE` only costs a resident
 //! module until the next sweep.
 
+//! # Nothing here exists without `dylib`
+//!
+//! Every static below is gated on the feature, not merely left unread
+//! without it. A count nobody can observe is still process-wide mutable
+//! state shared by every consumer in the process, and `ModuleRef` is a
+//! zero-sized no-op in that build — the field the twelve `#[implement]` types
+//! carry compiles to nothing, so the gating costs no `cfg` at any of them.
+
+#[cfg(feature = "dylib")]
 use crate::common::overlapped::LIVE_OPS;
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "dylib")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "dylib")]
+use std::sync::atomic::AtomicUsize;
 
 /// Everything live that is not an in-flight op.
+#[cfg(feature = "dylib")]
 static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
 
 /// Server locks held through `IClassFactory::LockServer`.
+#[cfg(feature = "dylib")]
 static LOCKS: AtomicUsize = AtomicUsize::new(0);
 
 /// Takes or releases one server lock.
@@ -94,13 +108,8 @@ static LOCKS: AtomicUsize = AtomicUsize::new(0);
 /// took, and the subtraction has to survive that. `saturating_sub` is why: a
 /// wrapped count would read `usize::MAX` and pin the module loaded for the
 /// life of the process, turning somebody else's imbalance into our leak.
+#[cfg(feature = "dylib")]
 pub(crate) fn lock_server(lock: bool) {
-    if !cfg!(feature = "dylib") {
-        // Nothing reads the count, so taking one would only be a leak of
-        // bookkeeping. `LockServer` still succeeds -- a caller locking a
-        // server that cannot be unloaded anyway has lost nothing.
-        return;
-    }
     if lock {
         LOCKS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -109,6 +118,11 @@ pub(crate) fn lock_server(lock: bool) {
         });
     }
 }
+
+/// `LockServer` still succeeds without the feature: a caller locking a server
+/// that never offers to unload has lost nothing.
+#[cfg(not(feature = "dylib"))]
+pub(crate) fn lock_server(_lock: bool) {}
 
 /// One reason this module must stay loaded.
 ///
@@ -156,12 +170,8 @@ impl Drop for ModuleRef {
 /// an op completes between the two loads the answer is a spurious "no", and a
 /// spurious "no" costs nothing. The reverse ordering could see both counters
 /// at zero in a state where neither was.
+#[cfg(feature = "dylib")]
 pub fn can_unload() -> bool {
-    // Without the counters there is no evidence, and absence of evidence is
-    // not an answer COM may act on. See the `dylib` feature in Cargo.toml.
-    if !cfg!(feature = "dylib") {
-        return false;
-    }
     // The flag first: it is the cheapest, it is one-way, and once it is set
     // no amount of releasing objects will make the answer yes again.
     !crate::common::winsock::wsa_initialized()
@@ -178,11 +188,13 @@ pub fn can_unload() -> bool {
 /// process-wide counter needs a process of its own — `tests/unload.rs` is an
 /// integration test for exactly that reason. As a unit test it would race
 /// every other test in the crate that builds an object.
+#[cfg(feature = "dylib")]
 pub fn outstanding() -> usize {
     OUTSTANDING.load(Ordering::Acquire)
 }
 
 /// Server locks currently held. See [`outstanding`] for why this is public.
+#[cfg(feature = "dylib")]
 pub fn locks_held() -> usize {
     LOCKS.load(Ordering::Acquire)
 }
@@ -280,6 +292,7 @@ fn on_forced_unload() {}
 /// alternative — `GetModuleHandleExW(FROM_ADDRESS)` compared against the
 /// executable's handle — is a loader call to learn something the loader
 /// already told us.
+#[cfg(feature = "dylib")]
 static IN_DLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether this code is running from the server DLL rather than linked into
@@ -289,6 +302,7 @@ static IN_DLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// compile time by the `dylib` feature, because a runtime guard on an
 /// object-construction path costs an atomic load to save an atomic
 /// increment.
+#[cfg(feature = "dylib")]
 pub fn in_dll() -> bool {
     IN_DLL.load(std::sync::atomic::Ordering::Acquire)
 }

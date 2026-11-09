@@ -103,6 +103,20 @@ comio = [
     "windows/Win32_System_LibraryLoader",
 ]
 
+# Diagnostic counters: live op blocks, inline completions, pump releases.
+#
+# Off by default, and off is the point. Each one is a process-wide mutable
+# static — the kind of state a library should not carry unasked, because it is
+# shared by every consumer in the process and by every test running in
+# parallel. The crate's own unit tests switch them on through `cfg(test)`, so
+# this feature exists for the other case: turning them back on in a release
+# build to diagnose something.
+#
+# `dylib` implies the one it needs. `LIVE_OPS` is not only a diagnostic there:
+# `comio::unload::can_unload` reads it to decide whether an operation is still
+# in flight, and a counter that does not exist cannot answer that.
+counters = []
+
 # This build is the in-process server DLL.
 #
 # Deliberately not in `default`, and deliberately a feature rather than a
@@ -119,7 +133,7 @@ comio = [
 # `DllGetClassObject` and `DllGetActivationFactory` are *not* gated on this.
 # They are cold entry points with no per-operation cost, and leaving them
 # present keeps a plain `cargo build` producing a DLL that still activates.
-dylib = ["comio"]
+dylib = ["comio", "counters"]
 
 # DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.
 dq = [

@@ -59,17 +59,16 @@ unsafe extern "system" fn finalize_ctx(_: PTP_CALLBACK_INSTANCE, ctx: *mut c_voi
     unsafe { (*(ctx as *const CtxHeader)).release(ctx) }
 }
 
-#[cfg(debug_assertions)]
-pub(crate) static CANCELED_CALLBACKS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 // Invoked by CloseThreadpoolCleanupGroupMembers(fCancelPendingCallbacks=TRUE)
 // for each pending callback it cancels. Contexts are released by finalize_ctx
-// when the member object itself is finalized, so this only observes.
-unsafe extern "system" fn on_group_cancel(_object_ctx: *mut c_void, _cleanup_ctx: *mut c_void) {
-    #[cfg(debug_assertions)]
-    CANCELED_CALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
+// when the member object itself is finalized, so there is nothing to do here
+// -- but the cleanup group requires a callback to be registered, and
+// registering one is how we assert that.
+//
+// It used to bump a `CANCELED_CALLBACKS` counter. That counter was removed on
+// 2026-11-09: nothing ever read it, so it was a process-wide mutable static
+// that existed only to be written.
+unsafe extern "system" fn on_group_cancel(_object_ctx: *mut c_void, _cleanup_ctx: *mut c_void) {}
 
 /// Owns a `TP_POOL`, its cleanup group, and one callback environment per
 /// [`Priority`], all sharing the pool and group. Environments are boxed so

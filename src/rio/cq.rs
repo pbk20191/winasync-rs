@@ -31,7 +31,10 @@
 //! reads as four billion results.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+// Only `PUMP_RELEASES` needs it, and it is gated on its readers.
+#[cfg(any(test, feature = "counters"))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Networking::WinSock::{
@@ -166,17 +169,21 @@ unsafe impl Sync for PoolPump {}
 /// The single release path for a pump context, run by the environment's
 /// finalization callback when the TP_WAIT is closed.
 unsafe fn release_pump(ctx: *mut core::ffi::c_void) {
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, feature = "counters"))]
     PUMP_RELEASES.fetch_add(1, Ordering::Relaxed);
     unsafe { drop(Arc::from_raw(ctx as *const PoolPump)) }
 }
 
-/// Pump contexts released, by either path (debug builds).
+/// Pump contexts released, by either path.
 ///
 /// Exists to pin down *when* the environment's finalization callback runs:
 /// `Drop`'s correctness argument assumes `CloseThreadpoolWait` has already
 /// released the context by the time it returns.
-#[cfg(debug_assertions)]
+///
+/// Gated on its readers rather than on `debug_assertions`, so that turning
+/// `counters` on in a release build actually produces one -- which is the
+/// only reason a released build would want this.
+#[cfg(any(test, feature = "counters"))]
 pub(crate) static PUMP_RELEASES: AtomicUsize = AtomicUsize::new(0);
 
 /// A RIO completion queue.

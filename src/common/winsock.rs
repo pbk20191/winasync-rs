@@ -49,11 +49,17 @@ pub fn wsa_init() {
         let mut data = WSADATA::default();
         let r = WSAStartup(0x0202, &mut data);
         assert_eq!(r, 0, "WSAStartup failed: {r}");
+        #[cfg(feature = "dylib")]
         WSA_UP.store(true, core::sync::atomic::Ordering::Release);
     });
 }
 
 /// Set once [`wsa_init`] has run, and never cleared.
+///
+/// Gated on `dylib` because `comio::unload::can_unload` is its only reader,
+/// and that is the only build with a `DllCanUnloadNow` to answer. A library
+/// consumer linking the rlib carries no flag for a question nobody asks.
+#[cfg(feature = "dylib")]
 static WSA_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether this module has called `WSAStartup`.
@@ -61,6 +67,7 @@ static WSA_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::
 /// Read by `comio::unload::can_unload`. Deliberately a plain flag rather than
 /// a count: there is no release path for it to balance against, which is the
 /// whole point — see [`wsa_init`].
+#[cfg(feature = "dylib")]
 pub fn wsa_initialized() -> bool {
     WSA_UP.load(core::sync::atomic::Ordering::Acquire)
 }

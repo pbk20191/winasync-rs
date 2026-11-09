@@ -13,6 +13,7 @@ use windows::Win32::System::IO::OVERLAPPED;
 pub(crate) use crate::common::overlapped::Issue;
 // Leak counter reached by comio's tests as `tpio::LIVE_OPS`.
 #[allow(unused_imports)]
+#[cfg(any(test, feature = "counters"))]
 pub(crate) use crate::common::overlapped::LIVE_OPS;
 
 /// A handle registered on the **default process pool** (`pcbe = NULL`). Newtype

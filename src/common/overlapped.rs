@@ -31,30 +31,35 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
-/// Number of live op blocks — leak tests assert this settles back to 0.
+/// Number of live op blocks -- leak tests assert this settles back to 0, and
+/// `comio::unload::can_unload` refuses to unload the module while it is
+/// nonzero.
 ///
-/// Maintained in every profile. It was debug-only until 2026-11-09, on the
-/// reasoning that a release build should not pay an atomic per operation for
-/// a diagnostic. The counter stopped being a diagnostic when
-/// `comio::unload::can_unload` started reading it: an op block holds a
-/// completion callback that is a function pointer into the module, so a count
-/// that is pinned at 0 in release would tell `DllCanUnloadNow` it may unload
-/// a module with I/O in flight. The cost is one relaxed `fetch_add` against a
-/// submission that also performs `StartThreadpoolIo` and a syscall.
+/// **The static does not exist** without `counters` (which `dylib` pulls in)
+/// or `cfg(test)`. It was unconditional until 2026-11-09, and before that
+/// debug-only on the reasoning that a release build should not pay an atomic
+/// per operation for a diagnostic. Both were half right. It stopped being
+/// only a diagnostic when `can_unload` started reading it -- an op block holds
+/// a completion callback that is a function pointer into the module, so a
+/// count pinned at 0 would say the module may unload with I/O in flight --
+/// but this module is on the submission path of `comio`, `rio` and `tp`
+/// alike, and only a `dylib` build has that question to answer.
 ///
-/// The leak assertions that read it are still `#[cfg(debug_assertions)]`, so
-/// they did not change behaviour here — but they could now be ungated and
-/// would mean something, which they could not before.
+/// So the condition names its readers rather than a profile. A build with
+/// neither carries no counter, no atomic, and no process-wide mutable state
+/// it has no use for.
+#[cfg(any(test, feature = "counters"))]
 pub static LIVE_OPS: AtomicUsize = AtomicUsize::new(0);
 
 /// Ops finished inline because their handle had opted out of the completion
 /// packet. Without this a skip-mode handle whose flag silently failed to take
-/// effect would behave identically — correct, just not faster — so tests
+/// effect would behave identically -- correct, just not faster -- so tests
 /// assert this actually moves.
 ///
-/// Updated in debug builds only, which [`LIVE_OPS`] no longer is: nothing
-/// reads this one for correctness, so it keeps the rule they used to share.
-/// The assertion that it moves is gated to debug builds to match.
+/// Purely a diagnostic, unlike [`LIVE_OPS`]: nothing in the library reads it.
+/// Same gate, minus the reason `LIVE_OPS` has for being on in a `dylib`
+/// build.
+#[cfg(any(test, feature = "counters"))]
 pub static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// A handle registered with a pool's TP_IO; owns the kernel handle + TP_IO.
@@ -213,7 +218,7 @@ unsafe fn release_op<P>(op: *mut c_void) {
     // Release, not Relaxed, for the same reason `Arc` uses it on the way
     // down: a thread that observes this counter at zero and acts on it (see
     // `comio::unload`) must see everything this op did.
-    #[cfg(any(debug_assertions, feature = "dylib"))]
+    #[cfg(any(test, feature = "counters"))]
     LIVE_OPS.fetch_sub(1, Ordering::Release);
     unsafe { drop(Box::from_raw(op as *mut Op<P>)) }
 }
@@ -318,7 +323,7 @@ pub unsafe fn submit<P>(
         },
         payload: UnsafeCell::new(Some(payload)),
     }));
-    #[cfg(any(debug_assertions, feature = "dylib"))]
+    #[cfg(any(test, feature = "counters"))]
     LIVE_OPS.fetch_add(1, Ordering::Relaxed);
 
     unsafe { StartThreadpoolIo(reg.io) };
@@ -335,7 +340,7 @@ pub unsafe fn submit<P>(
         // handle that opted out needs finishing here.
         Issue::SyncSuccess if !reg.skips_completion_on_success() => None,
         Issue::SyncSuccess => {
-            #[cfg(debug_assertions)]
+            #[cfg(any(test, feature = "counters"))]
             INLINE_COMPLETIONS.fetch_add(1, Ordering::Relaxed);
             // The kernel wrote Internal/InternalHigh before returning, so the
             // transferred count is readable without waiting.
