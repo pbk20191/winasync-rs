@@ -62,7 +62,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: features-${{ matrix.features }}
+          # Not the feature list itself: rust-cache rejects a key with commas.
+          key: features-${{ strategy.job-index }}
       - if: contains(matrix.features, 'dq')
         uses: ./.github/actions/windows-app-runtime
       - shell: bash
