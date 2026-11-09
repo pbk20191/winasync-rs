@@ -24,6 +24,14 @@
 // is what makes it collision-free without a registry; `Windows.` itself is
 // reserved for the `windows` crate (microsoft/win32metadata#998).
 //
+// Every type carries `#[Version(1)]`. Nothing at run time reads it, and it is
+// not part of any IID -- adding it on 2026-11-09 left `bindings.rs` byte for
+// byte unchanged. It is there because `midl /winrt` refuses a Windows Runtime
+// type with neither a version nor a contract (MIDL4072), and midl is what
+// turns this metadata into the proxy/stub that carries these interfaces
+// across a process boundary (`ps/`). A type added without it fails
+// `cargo run -p winmdgen` at that step, not silently.
+//
 // It is also the file name of this file and of the `.winmd` beside it, which
 // is the convention every WinRT toolchain assumes when it looks for metadata
 // by name.
@@ -44,6 +52,7 @@ mod Pbk20191 {
             // Deliberately not named for any role. Connectors and listeners both
             // answer it, and so would a datagram socket -- binding, connecting and
             // listening are three things one transport does, not three transports.
+            #[Version(1)]
             #[guid(auto)]
             interface ITransport {
                 #[get] Transport: String;
@@ -101,6 +110,7 @@ mod Pbk20191 {
             // registered service id. On the host side HCS can restrict that per
             // process, through `BindSecurityDescriptor`/`ConnectSecurityDescriptor`,
             // but that is configured where the VM is configured, not from here.
+            #[Version(1)]
             #[guid(auto)]
             interface ITransportStream:
                 Windows::Storage::Streams::IInputStream
@@ -108,6 +118,7 @@ mod Pbk20191 {
                 + Windows::Foundation::IClosable {
             }
 
+            #[Version(1)]
             class TransportStream {
                 ITransportStream,
                 Windows::Storage::Streams::IInputStream,
@@ -129,6 +140,7 @@ mod Pbk20191 {
             // deliberately absent: each transport is addressed differently, and one
             // shared bind would have to erase the address and reject the wrong shapes
             // at run time.
+            #[Version(1)]
             #[guid(auto)]
             interface IConnectionListener {
                 event ConnectionReceived: Windows::Foundation::TypedEventHandler<IConnectionListener, IConnectionReceivedArgs>;
@@ -136,21 +148,25 @@ mod Pbk20191 {
             }
 
             // One accepted connection.
+            #[Version(1)]
             class ConnectionReceivedArgs {
                 IConnectionReceivedArgs,
             }
 
+            #[Version(1)]
             #[guid(auto)]
             interface IConnectionReceivedArgs {
                 #[get] Stream: ITransportStream;
                 #[get] RemoteEndpoint: String;
             }
 
+            #[Version(1)]
             #[guid(auto)]
             interface INamedPipeBind {
                 fn BindAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncAction;
             }
 
+            #[Version(1)]
             #[guid(auto)]
             interface IUnixBind {
                 fn BindAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncAction;
@@ -167,12 +183,14 @@ mod Pbk20191 {
             // where two raw GUIDs are not. `HvSocketAddr`'s `Display`/`FromStr` are
             // exact inverses, so nothing is lost: a caller may always spell either
             // half as a plain GUID. Rust callers keep the typed entry points.
+            #[Version(1)]
             #[guid(auto)]
             interface IHyperVBind {
                 fn BindEndpointAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncAction;
                 fn BindServiceNameAsync(&self, #[in] serviceName: String) -> Windows::Foundation::IAsyncAction;
             }
 
+            #[Version(1)]
             #[Activatable(1)]
             class NamedPipeConnectionListener {
                 IConnectionListener,
@@ -181,6 +199,7 @@ mod Pbk20191 {
                 Windows::Foundation::IClosable,
             }
 
+            #[Version(1)]
             #[Activatable(1)]
             class UnixConnectionListener {
                 IConnectionListener,
@@ -189,6 +208,7 @@ mod Pbk20191 {
                 Windows::Foundation::IClosable,
             }
 
+            #[Version(1)]
             #[Activatable(1)]
             class HyperVConnectionListener {
                 IConnectionListener,
@@ -201,33 +221,39 @@ mod Pbk20191 {
             // Connectors
             // ---------------------------------------------------------------------
 
+            #[Version(1)]
             #[guid(auto)]
             interface INamedPipeConnector {
                 fn ConnectAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
             }
 
+            #[Version(1)]
             #[guid(auto)]
             interface IUnixConnector {
                 fn ConnectAsync(&self, #[in] path: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
             }
 
+            #[Version(1)]
             #[guid(auto)]
             interface IHyperVConnector {
                 fn ConnectAsync(&self, #[in] endpoint: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
             }
 
+            #[Version(1)]
             #[Activatable(1)]
             class NamedPipeConnector {
                 ITransport,
                 INamedPipeConnector,
             }
 
+            #[Version(1)]
             #[Activatable(1)]
             class UnixConnector {
                 ITransport,
                 IUnixConnector,
             }
 
+            #[Version(1)]
             #[Activatable(1)]
             class HyperVConnector {
                 ITransport,
