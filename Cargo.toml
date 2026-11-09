@@ -2,6 +2,12 @@
 name = "winasync"
 version = "0.1.0"
 edition = "2024"
+description = "Windows async engine concepts: the Win32 thread pool, DispatcherQueue, Registered I/O, and a WinRT component for the transports WinRT has no class for."
+# The crate is `winasync`; the repository carries the `-rs` suffix the Rust
+# ecosystem uses to disambiguate a language binding from the thing it binds
+# (`windows-rs`, `serde-rs`). crates.io and GitHub name things separately and
+# there is no reason to force them together.
+repository = "https://github.com/pbk20191/winasync-rs"
 
 # `tools/winmdgen` compiles the RDL in `metadata/` into the published `.winmd`
 # and regenerates `src/comio/bindings.rs`. A workspace member rather than a
