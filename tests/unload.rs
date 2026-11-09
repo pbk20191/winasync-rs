@@ -23,7 +23,7 @@
 #![cfg(all(feature = "comio", feature = "dylib"))]
 
 use winasync::comio::NamedPipeConnector;
-use winasync::comio::activation::{CLSID_NAMED_PIPE_CONNECTOR, DllGetClassObject};
+use winasync::comio::activation::{CLSID_NAMED_PIPE_CONNECTOR, dll_get_class_object};
 use winasync::comio::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
 use winasync::comio::unload::{can_unload, locks_held, outstanding, release_process_state};
 use winasync::common::winsock::wsa_initialized;
@@ -57,13 +57,13 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
     // Through the real class factory, not the counter's own back door.
     let factory: IClassFactory = unsafe {
         let mut raw = core::ptr::null_mut();
-        DllGetClassObject(
+        dll_get_class_object(
             &CLSID_NAMED_PIPE_CONNECTOR,
             &IClassFactory::IID,
             &mut raw,
         )
         .ok()
-        .expect("DllGetClassObject");
+        .expect("dll_get_class_object");
         IClassFactory::from_raw(raw)
     };
     // The factory is itself an object of ours, so it counts too.
@@ -77,7 +77,7 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
 
     unsafe {
         let mut raw = core::ptr::null_mut();
-        DllGetClassObject(&CLSID_NAMED_PIPE_CONNECTOR, &IClassFactory::IID, &mut raw)
+        dll_get_class_object(&CLSID_NAMED_PIPE_CONNECTOR, &IClassFactory::IID, &mut raw)
             .ok()
             .unwrap();
         let f = IClassFactory::from_raw(raw);

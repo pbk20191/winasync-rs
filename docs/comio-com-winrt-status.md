@@ -463,15 +463,34 @@ $l.Bind($name)
    - **`buffer::PAGE`, `dq::SDK`** — 각각 시스템 페이지 크기와 App SDK 부트스트랩. 초기화 후 불변이라 상태라기보다 사실이다.
    - **thread_local 4개**(`dq::CURRENT`, `DEDICATED_ANCHOR`, `TIMERS`, `rio::IN_PUMP`) — 전역이 아니라 **스레드별** 실행기 컨텍스트다. 없애려면 모든 API에 컨텍스트 인자를 꿰어야 한다.
 
-   남은 export — `dylib` 켰을 때:
+   **그리고 구조로 강제했다 (2026-11-09).** `dylib` 피처는 "이 컴파일은 DLL이다"의 *대체물*이었다 — cdylib 여부를 볼 방법이 없어서. 확인해 보니 정말 없다: crate-type용 `cfg`는 rustc에 없고, `required-features`는 `[lib]`에 못 붙고, build.rs는 crate-type을 못 본다. 원인은 `crate-type = ["lib", "cdylib"]`이 rustc **한 번**으로 둘을 낸다는 것이라, **강제하는 유일한 방법은 그 모호함을 없애는 것**이었다.
+
+   서버를 별도 패키지 `dll/`(`winasync-dll`)로 뺐다. crate-type이 `cdylib` **하나뿐**이라 이걸 컴파일하는 게 곧 서버 빌드다.
+
+   | | 전 | 후 |
+   | --- | --- | --- |
+   | 루트 패키지 | `["lib", "cdylib"]` | rlib만. export·`DllMain`·`no_mangle` **하나도 없음** |
+   | `Dll*` 진입점 | 라이브러리의 `extern "system"` | 라이브러리는 `pub fn dll_*` 본문만, `dll/`가 얇은 shim |
+   | `dylib` 피처를 켜는 곳 | 기억해야 함 | `dll/`의 의존성 선언 **한 곳** |
+   | DLL의 피처 | 테스트 하네스 cfg에서 재구성 | `comio` + `dylib` 고정 — 테스트하는 DLL이 곧 배포하는 DLL |
+   | `.def` | 피처에 따라 build.rs가 생성 | 체크인된 `dll/exports.def` (export 목록이 이제 고정) |
+
+   DLL 크레이트는 `windows-core` 하나만 의존한다 — shim이 `GUID`/`HRESULT`/`HSTRING`을 라이브러리 함수에 그대로 넘길 뿐이고, `IClassFactory`/`IActivationFactory`는 라이브러리 안에 남는다. lib 이름을 `winasync`로 둬서 산출물이 여전히 `winasync.dll`이고, 매니페스트의 `<file name>`과 양쪽 프로젝션이 그대로 동작한다. `tp`/`dq`/`rio`는 서버에 안 넣었다 — 컴포넌트는 `comio`이고, `rio`는 넣으면 Winsock teardown을 pin한다.
+
+   **남는 틈 하나는 cargo의 것이다:** 한 빌드 안에서 피처는 통합된다. `cargo build --workspace`는 라이브러리를 `dylib` 켠 채로 한 번 컴파일해서 모든 멤버에 쓴다. 서버는 `-p winasync-dll`로, 소비자는 따로 빌드하면 각자 요청한 것을 받는다.
+
+   덤으로 하나: `comio` **단독** 테스트 빌드가 원래부터 깨져 있었다. `tests/activation.rs`가 `CreateActCtxW`를 쓰는데 그 `windows` 피처를 `tp`/`dq`가 우연히 켜주고 있었다. 라이브러리는 그 API를 안 쓰므로 `comio`가 아니라 **dev-dependency**로 옮겼다.
+
+   `winasync.dll`(`dll/`)의 export — 이제 피처와 무관하게 항상:
 
    ```text
    1  DllCanUnloadNow
    2  DllGetActivationFactory
    3  DllGetClassObject
+   4  DllMain          (export될 이유는 없지만 막을 수 없다 — 위)
    ```
 
-   끄면 둘(`DllGetActivationFactory`, `DllGetClassObject`)이다. `DllMain`도 테이블에 보인다.
+   라이브러리 단독 빌드는 DLL 자체를 만들지 않는다.
 
    *후속 (쉬움):* `LIVE_OPS`를 읽는 누수 단언들이 아직 `#[cfg(debug_assertions)]`다. 카운터가 정확해졌으니 이제 게이트를 풀면 릴리스에서도 의미가 생긴다 — tp/rio까지 번지는 별개 작업이라 미뤘다.
 

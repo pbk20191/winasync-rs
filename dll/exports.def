@@ -1,0 +1,18 @@
+; Export list for winasync.dll.
+;
+; Listing a name here does not make it exported: `no_mangle` alone does that.
+; What this file is for is PRIVATE, which keeps these out of the generated
+; import library so nothing binds to them statically. Without it MSVC warns
+; LNK4104 on each one. A loader reaches them by `GetProcAddress`, never by
+; linking.
+;
+; Checked in rather than generated, as it was while the root package doubled
+; as the DLL: that package's export list depended on its feature set, and this
+; one's does not. This crate always enables `dylib`, so all three always exist.
+;
+; `DllMain` is absent on purpose. It is exported anyway -- see src/lib.rs --
+; but it is not part of the interface, so it is not listed as if it were.
+EXPORTS
+    DllGetActivationFactory PRIVATE
+    DllGetClassObject       PRIVATE
+    DllCanUnloadNow         PRIVATE

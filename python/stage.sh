@@ -19,9 +19,9 @@ NAMESPACE="Pbk20191.WinAsync.Comio"
 # as a path-list separator. A relative path sidesteps both.
 WINMD="../metadata/$NAMESPACE.winmd"
 
-# The cdylib is what the runtime loads, and the integration test is what
-# writes the reg-free manifest out of `activation::manifest()`.
-(cd "$REPO" && cargo build --lib --all-features && cargo test --all-features --test activation)
+# The server DLL is its own package, `dll/`; the integration test is what
+# writes the reg-free manifest out of `activation::manifest()` beside it.
+(cd "$REPO" && cargo build -p winasync-dll && cargo test --all-features --test activation)
 
 # winmd -> Python projection. `--component-dlls` says the component ships
 # inside the package, which is what the copy below arranges.

@@ -1,11 +1,10 @@
 //! The activation path with the COM loader actually in it.
 //!
-//! `comio::activation`'s own unit tests call `DllGetClassObject` directly,
+//! `comio::activation`'s own unit tests call `dll_get_class_object` directly,
 //! which covers the class factories but skips the half that only exists
 //! outside the process: the registry lookup, `LoadLibrary` on the path it
 //! found, and `GetProcAddress` for the entry point. Those need a real DLL,
-//! so they live here, where the crate has been built as a `cdylib` as well
-//! as an rlib.
+//! so they live here, against the server DLL that `dll/` builds.
 //!
 //! What this proves that nothing else can: a caller holding only a CLSID and
 //! `CoCreateInstance` — which is every COM-capable language — gets working
@@ -30,9 +29,7 @@ use winasync::comio::bindings::Pbk20191::WinAsync::Comio::{
 };
 use std::sync::mpsc;
 use windows::Foundation::TypedEventHandler;
-use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE};
-#[cfg(feature = "dylib")]
-use windows::Win32::Foundation::S_FALSE;
+use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE, S_FALSE};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW,
@@ -66,58 +63,41 @@ fn profile_dir() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// Builds the cdylib, because `cargo test` does not.
+/// Builds the server DLL, because `cargo test` does not.
 ///
-/// Nothing in the dependency graph links the DLL — the test harness uses the
-/// rlib — so cargo has no reason to produce it, and a plain `cargo test` on
-/// a clean tree would otherwise fail here for a reason that has nothing to
-/// do with the code under test. One nested `cargo build --lib` fixes that;
-/// cargo releases its lock on the target directory before running test
-/// binaries, so this does not deadlock, and on an already-built tree it is
-/// a no-op costing a fraction of a second.
+/// The DLL is its own package now (`dll/`, `winasync-dll`), and nothing this
+/// test links depends on it -- the harness uses the library rlib -- so cargo
+/// has no reason to produce it. One nested `cargo build -p winasync-dll`
+/// fixes that; cargo releases its lock on the target directory before
+/// running test binaries, so this does not deadlock, and on an already-built
+/// tree it is a no-op costing a fraction of a second.
 ///
-/// The feature list is reconstructed from this crate's own `cfg`s rather
-/// than hardcoded: features are package-wide, so building the library with a
-/// different set than the test was compiled against would make cargo rebuild
-/// it on every alternating run.
+/// No feature list is passed, and that is the point of the package split.
+/// This used to rebuild the *library* as a cdylib with a feature set
+/// reconstructed from this test's own `cfg`s, so that the DLL under test had
+/// whatever the harness had. The server's features are now fixed by its own
+/// manifest -- `comio` plus `dylib`, nothing else -- so the DLL tested here is
+/// the DLL that ships, whatever features the harness was built with.
 fn ensure_dll() -> std::path::PathBuf {
     let dir = profile_dir();
-    let mut features = vec!["comio"];
-    for (on, name) in [
-        (cfg!(feature = "dylib"), "dylib"),
-        (cfg!(feature = "tp"), "tp"),
-        (cfg!(feature = "dq"), "dq"),
-        (cfg!(feature = "rio"), "rio"),
-        (cfg!(feature = "futures-io"), "futures-io"),
-    ] {
-        if on {
-            features.push(name);
-        }
-    }
 
     let mut cmd = std::process::Command::new(env!("CARGO"));
-    cmd.args([
-        "build",
-        "--lib",
-        "--no-default-features",
-        "--features",
-        &features.join(","),
-    ])
-    .current_dir(env!("CARGO_MANIFEST_DIR"));
+    cmd.args(["build", "-p", "winasync-dll"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
     if dir.file_name().is_some_and(|n| n == "release") {
         cmd.arg("--release");
     }
     let out = cmd.output().expect("spawn cargo build");
     assert!(
         out.status.success(),
-        "building the cdylib failed:\n{}",
+        "building the server DLL failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
 
     let path = dir.join("winasync.dll");
     assert!(
         path.exists(),
-        "{} missing after a successful build — is `crate-type` still [\"lib\", \"cdylib\"]?",
+        "{} missing after a successful build -- is `dll/`'s lib still named `winasync`?",
         path.display()
     );
     path
@@ -125,15 +105,17 @@ fn ensure_dll() -> std::path::PathBuf {
 
 /// The DLL's own `DllCanUnloadNow`, reached the way COM reaches it.
 ///
-/// Only a `dylib` build exports it; see the feature's entry in Cargo.toml.
+/// Not gated on any feature of this harness. It used to be `dylib`-only,
+/// because the DLL was this package rebuilt with the harness's features; now
+/// the DLL is `dll/`, which always enables `dylib`, so it always exports this
+/// -- and a harness built without `dylib` is exactly the case worth checking.
 ///
 /// # Safety
 ///
-/// `module` must be this crate's loaded cdylib.
-#[cfg(feature = "dylib")]
+/// `module` must be the loaded server DLL.
 unsafe fn can_unload_now(module: HMODULE) -> HRESULT {
     let addr = unsafe { GetProcAddress(module, PCSTR(c"DllCanUnloadNow".as_ptr().cast())) }
-        .expect("DllCanUnloadNow not exported -- is the `dylib` feature on?");
+        .expect("DllCanUnloadNow not exported by the server DLL");
     let f: unsafe extern "system" fn() -> HRESULT = unsafe { core::mem::transmute(addr) };
     unsafe { f() }
 }
@@ -276,7 +258,6 @@ fn com_activation_round_trip_through_the_registered_dll() {
     // counters; this is the DLL's copy, incremented by an object the COM
     // runtime just built. That the module loaded at all is the other half:
     // `LoadLibraryW` fails if `DllMain` returns anything but TRUE.
-    #[cfg(feature = "dylib")]
     assert_eq!(
         unsafe { can_unload_now(module) },
         S_FALSE,

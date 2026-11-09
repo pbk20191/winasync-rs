@@ -228,44 +228,32 @@ pub fn locks_held() -> usize {
     LOCKS.load(Ordering::Acquire)
 }
 
-/// The module's own load/unload notifications.
+/// The body of the server DLL's `DllMain`.
 ///
-/// Defining `DllMain` in a Rust cdylib works because the MSVC CRT's
-/// `_DllMainCRTStartup` calls whichever `DllMain` the module links, and
-/// `std` does not define one on this target — it hangs thread-local
-/// destructors off `.CRT$XL*` TLS callbacks instead, which this does not
-/// disturb. It is compiled into the rlib too, where nothing calls it.
+/// Lives here, not in the DLL crate, because it reads this module's counters.
+/// The `winasync-dll` package forwards to it from the one `DllMain` there is;
+/// this library defines no `DllMain` of its own and no exported symbol of any
+/// kind, which is what makes "only the cdylib has these" a fact about the
+/// build rather than a convention.
 ///
 /// It exists for one job, and only in debug builds: **catching a module that
 /// was unloaded while it still owned something.** `DllCanUnloadNow` is
-/// advisory, so a host is free to `FreeLibrary` this module without asking,
+/// advisory, so a host is free to `FreeLibrary` the module without asking,
 /// and if it does so while an object or an operation is live the failure is a
 /// jump into freed code somewhere else entirely, minutes later, with no trace
 /// back to here. Checking at the moment of detach turns that into a message
 /// naming the counts.
 ///
 /// There is deliberately no cleanup here. `DllMain` runs under the loader
-/// lock, where the useful things — `WSACleanup`, waiting on thread-pool
-/// callbacks, anything that could load or unload a module — are exactly what
-/// must not be called. Observing is safe; acting is not.
+/// lock, where the useful things -- `WSACleanup`, waiting on thread-pool
+/// callbacks, anything that could load or unload a module -- are exactly what
+/// must not be called. Observing is safe; acting is not. Cleanup happens in
+/// [`release_process_state`], from `DllCanUnloadNow`.
 ///
-/// `DisableThreadLibraryCalls` is not called either. It would save two empty
-/// calls per thread and it interacts badly with static TLS, which this module
-/// has by way of `std`.
-///
-/// It lands in the module's export table, which it has no business being in:
-/// rustc exports every `no_mangle` symbol from a cdylib, and `pub` is not the
-/// lever — dropping it changes nothing. The alternative is a `.CRT$XLB` TLS
-/// callback, which is not exported and gets the same notifications, but which
-/// fails *silently* if the linker drops `_tls_used`. A visible export beats a
-/// diagnostic that might not be running, so this stays.
-#[cfg(all(feature = "dylib", windows))]
-#[unsafe(no_mangle)]
-extern "system" fn DllMain(
-    _instance: *mut core::ffi::c_void,
-    reason: u32,
-    reserved: *mut core::ffi::c_void,
-) -> i32 {
+/// Returns the `BOOL` `DllMain` must return; anything but TRUE fails the
+/// load.
+#[cfg(feature = "dylib")]
+pub fn dll_main(reason: u32, reserved: *mut core::ffi::c_void) -> i32 {
     const DLL_PROCESS_DETACH: u32 = 0;
     const DLL_PROCESS_ATTACH: u32 = 1;
 
@@ -280,22 +268,27 @@ extern "system" fn DllMain(
         DLL_PROCESS_DETACH if reserved.is_null() => on_forced_unload(),
         _ => {}
     }
-    1 // TRUE; anything else fails the load.
+    1
 }
 
 /// Reports a module that is being unloaded with work outstanding.
 ///
-/// Split out of `DllMain` rather than written inline so the release build is
-/// an empty call instead of a `cfg`-gated branch inside a match arm.
-#[cfg(all(feature = "dylib", windows, debug_assertions))]
+/// Split out of [`dll_main`] rather than written inline so the release build
+/// is an empty call instead of a `cfg`-gated branch inside a match arm.
+#[cfg(all(feature = "dylib", debug_assertions))]
 fn on_forced_unload() {
     if can_unload() {
         return;
     }
-    // Not a panic: this is an `extern "system"` frame under the loader lock,
-    // where unwinding is the one thing worse than the bug being reported.
+    // Not a panic: this runs in an `extern "system"` frame under the loader
+    // lock, where unwinding is the one thing worse than the bug being
+    // reported.
     eprintln!(
-        "FATAL: {} unloaded with work outstanding --          {} object(s), {} server lock(s), {} operation(s) in flight{}.          Any interface the host still holds now points into freed code.",
+        concat!(
+            "FATAL: {} unloaded with work outstanding -- {} object(s), ",
+            "{} server lock(s), {} operation(s) in flight{}. Any interface ",
+            "the host still holds now points into freed code.",
+        ),
         env!("CARGO_PKG_NAME"),
         OUTSTANDING.load(Ordering::Acquire),
         LOCKS.load(Ordering::Acquire),
@@ -311,10 +304,10 @@ fn on_forced_unload() {
 
 /// Release builds make no claim about this; `DllCanUnloadNow` is advisory and
 /// a host that ignores it is not doing anything the API forbids.
-#[cfg(all(feature = "dylib", windows, not(debug_assertions)))]
+#[cfg(all(feature = "dylib", not(debug_assertions)))]
 fn on_forced_unload() {}
 
-/// Set by [`DllMain`] on attach. False in the rlib, where no loader ever
+/// Set by [`dll_main`] on attach. False in the rlib, where no loader ever
 /// calls it.
 ///
 /// This is the "am I the cdylib?" answer, arrived at the cheap way. The

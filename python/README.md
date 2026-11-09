@@ -26,7 +26,7 @@ python -m pip install winrt-runtime winrt-Windows.Foundation \
 python accept.py
 ```
 
-`stage.sh` builds the cdylib, runs `cargo test --test activation` (which
+`stage.sh` builds the server DLL (`cargo build -p winasync-dll`), runs `cargo test --test activation` (which
 writes the reg-free manifest out of `activation::manifest()`), generates the
 projection from `metadata/Pbk20191.WinAsync.Comio.winmd`, compiles the projection
 table, and copies the DLL and manifest into the package.

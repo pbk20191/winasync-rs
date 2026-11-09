@@ -14,8 +14,8 @@
 //!
 //! # Two activation models, one table
 //!
-//! [`DllGetActivationFactory`] hands the Windows Runtime an
-//! `IActivationFactory` for a runtime class name; [`DllGetClassObject`] hands
+//! `DllGetActivationFactory` hands the Windows Runtime an
+//! `IActivationFactory` for a runtime class name; `DllGetClassObject` hands
 //! COM an `IClassFactory` for a CLSID. Both read the same [`CLASSES`] table,
 //! whose names come from the generated class types in [`super::bindings`].
 //! One object, one name, two front doors.
@@ -65,7 +65,7 @@
 //! own application manifest, or loads it at run time with `CreateActCtx` +
 //! `ActivateActCtx`. The second form is what a shared interpreter like
 //! `python.exe` needs, since its manifest is not ours to edit. Either way the
-//! runtime calls [`DllGetActivationFactory`] here, against the same metadata.
+//! runtime calls `DllGetActivationFactory` here, against the same metadata.
 //!
 //! `threadingModel="both"` says the objects are safe to use from an STA or
 //! the MTA. They are: every one of them is `Send + Sync` and already delivers
@@ -129,7 +129,7 @@ pub struct ComClass {
     /// Frozen. Changing one breaks every caller that already compiled it in.
     pub clsid: GUID,
     /// The runtime class name: what `RoActivateInstance` is given, what
-    /// `GetRuntimeClassName` answers, and the key [`DllGetActivationFactory`]
+    /// `GetRuntimeClassName` answers, and the key `DllGetActivationFactory`
     /// looks up.
     ///
     /// Always taken from [`super::bindings`] via `class_name`, never
@@ -143,7 +143,7 @@ pub struct ComClass {
     /// object it has successfully created and cannot call a single method on.
     /// Advertising the name was worse than not advertising it. A compiled
     /// caller uses the CLSID, and a WinRT caller uses this name through
-    /// [`DllGetActivationFactory`].
+    /// `DllGetActivationFactory`.
     pub name: &'static str,
     /// Human-readable. Nothing here consumes it: it is carried for whoever
     /// writes the CLSID key, where it is the conventional default value.
@@ -264,7 +264,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
     }
 
     /// Honoured: a lock is a caller saying "keep this module loaded even
-    /// with no objects out", and [`DllCanUnloadNow`] now has an answer that
+    /// with no objects out", and `DllCanUnloadNow` now has an answer that
     /// can change, so the claim has somewhere to land.
     ///
     /// It used to be accepted and ignored, which was sound only because the
@@ -284,8 +284,7 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 /// # Safety
 ///
 /// Called by the COM runtime with a valid CLSID, IID and out-pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn DllGetClassObject(
+pub unsafe fn dll_get_class_object(
     clsid: *const GUID,
     iid: *const GUID,
     object: *mut *mut c_void,
@@ -346,7 +345,7 @@ impl IActivationFactory_Impl for ActivationFactory_Impl {
 
 /// Hands the Windows Runtime the activation factory for `name`.
 ///
-/// The WinRT sibling of [`DllGetClassObject`], and the export that makes the
+/// The WinRT sibling of `DllGetClassObject`, and the export that makes the
 /// published `.winmd` mean something: a projection reads the metadata, calls
 /// `RoActivateInstance`, and the runtime loads this module and calls here.
 /// Without it the metadata describes classes nothing can create.
@@ -361,8 +360,7 @@ impl IActivationFactory_Impl for ActivationFactory_Impl {
 /// string stays the caller's: it arrives by value as a borrowed handle, which
 /// is why it is taken as a `ManuallyDrop` rather than an owned `HSTRING` that
 /// would be released on return.
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn DllGetActivationFactory(
+pub unsafe fn dll_get_activation_factory(
     name: core::mem::ManuallyDrop<HSTRING>,
     factory: *mut *mut c_void,
 ) -> HRESULT {
@@ -401,8 +399,7 @@ pub unsafe extern "system" fn DllGetActivationFactory(
 /// the answer comes from. Without the export COM never asks, which is the
 /// same outcome as an unconditional `S_FALSE` — see [`super::unload`].
 #[cfg(feature = "dylib")]
-#[unsafe(no_mangle)]
-pub extern "system" fn DllCanUnloadNow() -> HRESULT {
+pub fn dll_can_unload_now() -> HRESULT {
     if !super::unload::can_unload() {
         return S_FALSE;
     }
@@ -428,7 +425,7 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 /// application manifest or by loading it at run time with `CreateActCtx` +
 /// `ActivateActCtx`. The second form is what a shared interpreter like
 /// `python.exe` needs, since its manifest is not ours to edit. Nothing else
-/// changes: the runtime still calls [`DllGetActivationFactory`] in this
+/// changes: the runtime still calls `DllGetActivationFactory` in this
 /// module, and the metadata is the same metadata.
 ///
 /// `<file name>` carries no path. It resolves against the directory holding
@@ -515,7 +512,7 @@ mod tests {
         for (clsid, is_right_class) in expected {
             let factory: IClassFactory = unsafe {
                 let mut raw = core::ptr::null_mut();
-                DllGetClassObject(clsid, &IClassFactory::IID, &mut raw)
+                dll_get_class_object(clsid, &IClassFactory::IID, &mut raw)
                     .ok()
                     .expect("DllGetClassObject");
                 IClassFactory::from_raw(raw)
@@ -543,7 +540,7 @@ mod tests {
         // to go on looking elsewhere rather than failing the activation.
         let stranger = GUID::from_u128(0x00000000_0000_0000_0000_0000000000ff);
         assert_eq!(
-            unsafe { DllGetClassObject(&stranger, &IClassFactory::IID, &mut raw) },
+            unsafe { dll_get_class_object(&stranger, &IClassFactory::IID, &mut raw) },
             CLASS_E_CLASSNOTAVAILABLE
         );
         assert!(raw.is_null());
@@ -551,7 +548,7 @@ mod tests {
         // An interface the class object does not have.
         assert!(
             unsafe {
-                DllGetClassObject(
+                dll_get_class_object(
                     &CLSID_NAMED_PIPE_CONNECTOR,
                     &super::super::IUnixConnector::IID,
                     &mut raw,
@@ -564,7 +561,7 @@ mod tests {
         // Aggregation, which these objects cannot support.
         let factory: IClassFactory = unsafe {
             let mut f = core::ptr::null_mut();
-            DllGetClassObject(&CLSID_UNIX_CONNECTOR, &IClassFactory::IID, &mut f)
+            dll_get_class_object(&CLSID_UNIX_CONNECTOR, &IClassFactory::IID, &mut f)
                 .ok()
                 .unwrap();
             IClassFactory::from_raw(f)

@@ -1,0 +1,33 @@
+[package]
+name = "winasync-dll"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The in-process activation server for winasync's WinRT component."
+
+# This package exists so that "built as the DLL" is a fact cargo knows rather
+# than a convention the root package hoped for. Its only crate type is
+# `cdylib`, so compiling it *is* building the server, and the things only the
+# server should have -- the `Dll*` exports, `DllMain`, the module-lifetime
+# counters -- are reachable from nowhere else.
+[lib]
+# Named `winasync` so the artifact is `winasync.dll`, which is what the
+# reg-free manifest's `<file name>` and both projections already expect.
+name = "winasync"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# Renamed so the extern name cannot be confused with this crate's own lib
+# name. `dylib` is set here and nowhere else: it compiles the counters
+# `DllCanUnloadNow` answers from, and this is the only build that has a
+# `DllCanUnloadNow` to answer.
+#
+# Deliberately not `tp`, `dq` or `rio`. The server is the WinRT component,
+# and the component is `comio`; the other pillars would be dead weight in the
+# DLL and, in `rio`'s case, would pin Winsock against teardown.
+library = { package = "winasync", path = "..", default-features = false, features = ["dylib"] }
+# Must resolve to the same `windows-core` as the library: the entry points
+# forward `GUID`, `HRESULT` and `HSTRING` straight into its functions, so a
+# second copy would be a second, incompatible set of types.
+windows-core = "0.62.2"

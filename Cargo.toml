@@ -15,16 +15,18 @@ repository = "https://github.com/pbk20191/winasync-rs"
 # are checked in, and keeping `windows-rdl` out of the library's graph is what
 # stops an ordinary build from paying for it.
 [workspace]
-members = ["tools/winmdgen"]
+members = ["dll", "tools/winmdgen"]
 
-# `cdylib` builds the same library a second time as a DLL, which is the form
-# COM can load: `comio::activation` exports `DllGetClassObject` and friends
-# from it, so the transports are reachable by `CoCreateInstance` from any
-# language, not only by linking this crate. `lib` stays first — Rust callers,
-# the demo bin and the test harness all use the rlib, and nothing about the
-# cdylib changes what they see.
-[lib]
-crate-type = ["lib", "cdylib"]
+# No `[lib] crate-type` here: this package is an rlib and nothing else.
+#
+# It used to be `["lib", "cdylib"]`, which made one rustc invocation emit both
+# the library and the COM server DLL. That left nothing to tell them apart --
+# there is no `cfg` for crate type, `required-features` does not apply to
+# `[lib]`, and build scripts cannot see it -- so "only the DLL has the
+# exports" and "only the DLL keeps the unload counts" were conventions. The
+# server now lives in `dll/` (package `winasync-dll`), whose only crate type is
+# `cdylib`. Building it is the only way to get the exports, which turns the
+# convention into a fact about the build.
 
 # Renamed off the package name because the cdylib now claims
 # `winasydylib-featuredylib-featurenc.pdb`, which a bin of the same name would also emit —
@@ -46,6 +48,19 @@ version = "0.2"
 version = "0.62.2"
 default-features = false
 features = []
+
+# Test-only Windows APIs, scoped here so the library never carries them.
+#
+# `tests/activation.rs` loads the reg-free manifest with `CreateActCtxW` /
+# `ActivateActCtx`, the run-time form a host like `python.exe` needs. The
+# library itself never calls them -- the manifest is something a *consumer*
+# activates -- so the feature has no business on `comio`. It used to arrive
+# by accident through `tp` and `dq`, which left a `comio`-only test build
+# unable to compile.
+[dev-dependencies.windows]
+version = "0.62.2"
+default-features = false
+features = ["Win32_System_ApplicationInstallationAndServicing"]
 
 [dependencies.windows-future]
 version = "0.3.2"
@@ -117,22 +132,21 @@ comio = [
 # in flight, and a counter that does not exist cannot answer that.
 counters = []
 
-# This build is the in-process server DLL.
+# Compiled for the in-process server DLL. **Do not enable this yourself** --
+# `dll/` (package `winasync-dll`) enables it through its dependency
+# declaration, and that is the only place it should come from.
 #
-# Deliberately not in `default`, and deliberately a feature rather than a
-# `cfg`: `crate-type = ["lib", "cdylib"]` is one rustc invocation emitting two
-# artifacts, so nothing distinguishes them at compile time. Declaring it is
-# the honest substitute.
+# What it turns on is the module-lifetime accounting `DllCanUnloadNow`
+# answers from: live objects, server locks, in-flight operations, and whether
+# this module took a Winsock reference it must give back. A consumer linking
+# the rlib has no `DllCanUnloadNow` and should not carry the counters --
+# `common::overlapped` is on the submission path of `rio` and `tp` as well.
 #
-# What it turns on is the module-lifetime accounting that `DllCanUnloadNow`
-# needs -- a count of live objects, server locks and in-flight operations.
-# A consumer linking the rlib never calls that export and should not pay for
-# the counters, and `common::overlapped` is on the submission path of `rio`
-# and `tp` as well, neither of which has the question to answer.
-#
-# `DllGetClassObject` and `DllGetActivationFactory` are *not* gated on this.
-# They are cold entry points with no per-operation cost, and leaving them
-# present keeps a plain `cargo build` producing a DLL that still activates.
+# It stays a feature because the counters live in this library (twelve
+# `#[implement]` types carry a `ModuleRef`, and `LIVE_OPS` sits in
+# `common::overlapped`), and only a feature can compile them in or out. What
+# changed is that the feature no longer has to stand in for "this compile is
+# the DLL": the separate package says that structurally.
 dylib = ["comio", "counters"]
 
 # DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.

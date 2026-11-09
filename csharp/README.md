@@ -16,7 +16,7 @@ CS-ROUND-TRIP-OK
 ## Running it
 
 ```bash
-cargo build --lib --all-features        # the component
+cargo build -p winasync-dll             # the component
 cargo test --all-features --test activation   # writes the reg-free manifest
 dotnet run --project csharp/accept.csproj
 ```
