@@ -26,7 +26,7 @@
 | 산출물 | 소비자가 프로젝션을 만들 때 쓰는 파일 | `metadata/rustwinui3loop.winmd` |
 | 바인딩 | `_Impl` 트레이트 + vtable. 체크인됨 | `src/comio/bindings.rs` |
 | 구현 | 위 트레이트를 구현 | `listener.rs` / `connector.rs` / `pipe.rs` / `unix.rs` / `hvsock.rs` / `stream.rs` |
-| 활성화 | CLSID로 `CoCreateInstance` (HKCU per-user) + `DllGetActivationFactory` | `activation.rs` |
+| 활성화 | CLSID로 `CoCreateInstance`(HKCU) + 런타임 클래스 이름으로 `RoActivateInstance`(HKLM) | `activation.rs` |
 
 ### 왜 메타데이터가 먼저여야 했나
 
@@ -237,8 +237,22 @@ $l.Bind($name)
 
    **CLSID / `InprocServer32` / `DllGetClassObject`는 남긴다.** HKCU `regsvr32`는 승격이 필요 없고 HKLM WinRT 등록은 필요하므로, 3번이 끝나고 PyWinRT로 검증되기 전까지 **이게 유일하게 동작하는 활성화 경로**다. 4번까지 통과하면 그때 다시 본다.
 
-3. **HKLM `ActivatableClassId` 등록** · 작음 · **다음**
-   `DllPath` / `ActivationType=0` / `Threading` / `TrustLevel`. 이름은 `bindings`가 단일 출처다. 승격 필요(개발 중엔 OK로 합의). 이것만 쓰면 `RoActivateInstance`가 동작한다.
+3. ~~HKLM `ActivatableClassId` 등록~~ · **완료** (2026-11-09, 승격 검증만 남음)
+   클래스마다 `DllPath`(REG_SZ) + `ActivationType` / `Threading` / `TrustLevel`(DWORD). 값은 SDK의 `activationregistration.h`에서 가져왔다:
+
+   | 값 | 뜻 | 주의 |
+   | --- | --- | --- |
+   | `ActivationType = 0` | `InProcess` | |
+   | `Threading = 0` | `ThreadingType::BOTH` | **`ThreadingModel` 애트리뷰트 enum이 아니다.** 그쪽은 `Both = 3`이다. 헷갈려서 3을 쓰면 STA 전용 클래스로 등록된다 |
+   | `TrustLevel = 0` | `BaseTrust` | `GetTrustLevel`이 답하는 값과 같다 |
+
+   **HKCU는 안 된다 — 측정했다.** 같은 키를 `HKCU` 밑에 쓰고 `RoActivateInstance`를 부르면 `REGDB_E_CLASSNOTREG`다. 비패키지 컴포넌트의 per-user 경로는 없다. 그래서 HKLM이고, 승격이 필요하다.
+
+   `DllRegisterServer`는 이제 **양쪽을 다 쓴다**. COM은 HKCU(승격 불필요), WinRT는 HKLM(승격 필요). 승격 없이 돌리면 HKLM이 거부되는데, 이때 **에러가 아니라 `S_FALSE`를 돌려준다** — `regsvr32`는 성공으로 보고 에러 대화상자를 안 띄우고, COM 활성화는 멀쩡히 동작하며, 반쯤 쓰인 상태도 남지 않는다. 승격하면 `S_OK`. 통합 테스트가 **돌아온 코드와 레지스트리 실제 상태가 일치하는지** 단언하므로 조용한 반쪽 등록은 통과하지 못한다.
+
+   `DllUnregisterServer`는 반대로 **HKLM 거부를 무시**한다. 쓸 수 없는 하이브는 쓴 적도 없는 하이브이므로, 거부를 보고하면 COM 쪽을 정상적으로 지운 비승격 `regsvr32 /u`가 전부 실패처럼 보인다.
+
+   **남은 것**: 승격해서 `RoActivateInstance`가 실제로 도는지 확인. 통합 테스트에 조건부로 들어 있다 — HKLM 키가 있으면 돌리고, 없으면 "skipped" 한 줄 찍는다.
 
 4. **Python end-to-end 검증** · 중간 · **수용 테스트**
    PyWinRT로 프로젝션을 생성하고, Python 스크립트가 리스너를 만들어 `AcceptAsync`를 await 한다. 이게 되면 목표 달성이다.
@@ -281,16 +295,22 @@ $l.Bind($name)
 **이번 세션 (2026-11-09)** — 중간 상태를 커밋해 두지 않아 앞 단계들은 하나로 합쳐 들어간다. 런타임 클래스 이름 작업(`runtimeclass.rs`)은 bindgen 출력으로 **대체되며 사라졌으므로** 따로 커밋할 산출물이 없고, IDispatch 삭제는 `.winmd` 전환과 같은 파일들을 건드려 분리하려면 `listener.rs` 800줄을 손으로 복원해야 한다:
 
 - `ed43ce9` — IDispatch 레이어 삭제 + `.winmd` + 생성 바인딩 전환 + 클래스 리네임 + `DllGetActivationFactory`
-- ProgID 키 제거 (이 커밋)
+- `17d6263` — ProgID 키 제거
+- HKLM `ActivatableClassId` 등록 (미커밋)
 
 검증: `cargo test --all-features` 140 + 1 통과, `cargo doc` 경고 0, clippy 24건(전부 기존 `tp`/`rio`/`main.rs`).
 
 ### 재현
 
 ```powershell
-# 등록 / 해제 (HKCU, 승격 불필요)
+# COM만 (HKCU, 승격 불필요) — DllRegisterServer가 S_FALSE를 돌려준다
 Start-Process regsvr32 -ArgumentList '/s', 'target\debug\rustwinui3loop.dll' -Wait
-Start-Process regsvr32 -ArgumentList '/s', '/u', 'target\debug\rustwinui3loop.dll' -Wait
+
+# COM + WinRT (HKLM, 승격 필요) — S_OK, 이후 RoActivateInstance 동작
+Start-Process regsvr32 -Verb RunAs -ArgumentList '/s', 'target\debug\rustwinui3loop.dll' -Wait
+
+# 해제
+Start-Process regsvr32 -Verb RunAs -ArgumentList '/s', '/u', 'target\debug\rustwinui3loop.dll' -Wait
 
 # 전체 검증
 cargo test --all-features

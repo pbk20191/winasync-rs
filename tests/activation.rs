@@ -23,8 +23,13 @@ use rustwinui3loop::comio::bindings::Rustwinui3loop::{
 };
 use std::sync::mpsc;
 use windows::Foundation::TypedEventHandler;
-use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE};
-use windows::Win32::System::WinRT::IActivationFactory;
+use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HMODULE, S_FALSE, S_OK};
+use windows::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
+};
+use windows::Win32::System::WinRT::{
+    IActivationFactory, RO_INIT_MULTITHREADED, RoActivateInstance, RoInitialize,
+};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CLSIDFromProgID, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
@@ -151,10 +156,22 @@ fn com_activation_round_trip_through_the_registered_dll() {
         .expect("CoInitializeEx");
 
     let module = unsafe { LoadLibraryW(&HSTRING::from(path.as_os_str())) }.expect("LoadLibraryW");
-    unsafe { call_entry(module, b"DllRegisterServer\0") }
-        .ok()
-        .expect("DllRegisterServer");
+    // `S_OK` means both halves registered; `S_FALSE` means the machine-wide
+    // WinRT half was denied because this run is not elevated, leaving only
+    // the per-user COM half in place. Both are successes, and which one came
+    // back has to agree with what is actually in the registry — so a silent
+    // half-registration cannot pass.
+    let registered = unsafe { call_entry(module, b"DllRegisterServer\0") };
+    assert!(
+        registered == S_OK || registered == S_FALSE,
+        "DllRegisterServer: {registered:?}"
+    );
     let _registered = Registered(module);
+    assert_eq!(
+        winrt_key_present("Rustwinui3loop.NamedPipeConnector"),
+        registered == S_OK,
+        "DllRegisterServer said {registered:?} but the registry disagrees"
+    );
 
     // --- The listener, created the way any COM caller would ---------------
     let listener: IUnknown =
@@ -240,6 +257,7 @@ fn com_activation_round_trip_through_the_registered_dll() {
 
     // --- And the WinRT half of activation --------------------------------
     winrt_activation_factory(module);
+    ro_activate_instance_if_registered();
 
     // The module stays loaded on purpose: `DllCanUnloadNow` returns S_FALSE,
     // and objects created above are still alive in this scope. Dropping the
@@ -344,6 +362,65 @@ fn winrt_activation_factory(module: HMODULE) {
         },
         E_INVALIDARG
     );
+}
+
+/// The last step of the WinRT path: `RoActivateInstance` by name, with the
+/// runtime doing the registry read and the `LoadLibrary` itself.
+///
+/// Conditional, because `DllRegisterServer` writes the `ActivatableClassId`
+/// keys to `HKEY_LOCAL_MACHINE` and that needs elevation — there is no
+/// per-user alternative for a non-packaged component, which was measured
+/// rather than assumed: the same keys under `HKEY_CURRENT_USER` leave
+/// `RoActivateInstance` answering `REGDB_E_CLASSNOTREG`.
+///
+/// So a non-elevated run says it skipped, and an elevated one proves the
+/// whole chain. The condition is the registry key itself rather than an
+/// elevation check, because that is the thing the result actually depends
+/// on — if the key is there, activation has no excuse.
+fn ro_activate_instance_if_registered() {
+    const NAME: &str = "Rustwinui3loop.NamedPipeConnector";
+
+    if !winrt_key_present(NAME) {
+        eprintln!(
+            "skipped: {NAME} is not registered under HKLM\\{WINRT_ROOT} (run `regsvr32` elevated to cover this step)"
+        );
+        return;
+    }
+
+    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.expect("RoInitialize");
+
+    let instance = unsafe { RoActivateInstance(&HSTRING::from(NAME)) }
+        .unwrap_or_else(|e| panic!("RoActivateInstance({NAME}): {e:?}"));
+
+    assert_eq!(
+        instance
+            .GetRuntimeClassName()
+            .expect("GetRuntimeClassName")
+            .to_string(),
+        NAME
+    );
+    // And it is the real object, not merely something named right.
+    let connector: IStreamConnector = instance.cast().expect("QI IStreamConnector");
+    assert_eq!(
+        connector.Transport().expect("Transport").to_string(),
+        "namedpipe"
+    );
+}
+
+const WINRT_ROOT: &str = "SOFTWARE\\Microsoft\\WindowsRuntime\\ActivatableClassId";
+
+/// Whether the machine registration for `name` exists, read directly rather
+/// than inferred from an elevation check.
+fn winrt_key_present(name: &str) -> bool {
+    unsafe {
+        let mut key = HKEY::default();
+        let path = HSTRING::from(format!("{WINRT_ROOT}\\{name}"));
+        let opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE, &path, None, KEY_READ, &mut key).is_ok();
+        if opened {
+            let _ = RegCloseKey(key);
+        }
+        opened
+    }
 }
 
 /// REGDB_E_CLASSNOTREG, as `DllGetActivationFactory` documents it.

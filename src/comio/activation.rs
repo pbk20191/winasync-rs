@@ -25,13 +25,25 @@
 //! No ProgIDs are registered. They existed for script hosts reaching these
 //! classes through `IDispatch`, and that layer is gone — see [`ComClass`].
 //!
-//! What is still missing is the WinRT counterpart of the registry keys below.
-//! `RoActivateInstance` finds this module through
-//! `HKLM\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId`, and that is
-//! machine-wide: third-party WinRT activation outside a package is either
-//! `HKEY_LOCAL_MACHINE` or a manifest on the *consuming* executable, which is
-//! not an option for a shared interpreter like `python.exe`. So the
-//! elevation-free `regsvr32` below does not carry over to the WinRT half.
+//! # One `regsvr32`, two hives, two privilege levels
+//!
+//! [`DllRegisterServer`] writes both registrations, and they do not live
+//! in the same place. The COM half goes to
+//! `HKEY_CURRENT_USER\Software\Classes` and needs no elevation. The WinRT
+//! half goes under `HKEY_LOCAL_MACHINE` (see `WINRT_ROOT`) and always does:
+//! for a non-packaged component the only alternatives are that hive or a
+//! manifest on the *consuming* executable, and the latter is not an option
+//! for a shared interpreter like `python.exe`.
+//!
+//! The per-user branch of the WinRT path is read for packaged apps only.
+//! That was measured, not assumed: the same keys written under
+//! `HKEY_CURRENT_USER` leave `RoActivateInstance` answering
+//! `REGDB_E_CLASSNOTREG`.
+//!
+//! So a non-elevated `regsvr32` can only do half the job, and that half is
+//! worth doing: it reports `S_FALSE` rather than an error, leaves
+//! `CoCreateInstance` working, and writes nothing partial. Elevated, it
+//! reports `S_OK` and `RoActivateInstance` works too.
 //! `docs/comio-com-winrt-status.md` has the reasoning.
 //!
 //! Until those keys exist, `DllGetActivationFactory` is reachable by calling
@@ -107,8 +119,8 @@
 use core::ffi::c_void;
 use super::bindings::Rustwinui3loop as rc;
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, HMODULE, S_FALSE,
-    S_OK,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_ACCESSDENIED, E_FAIL, E_INVALIDARG,
+    HMODULE, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::IClassFactory;
 use windows::Win32::System::Com::IClassFactory_Impl;
@@ -118,7 +130,7 @@ use windows::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleExW,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
 };
 use windows_core::{
@@ -409,8 +421,25 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 /// rebuild at a new path is picked up.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllRegisterServer() -> HRESULT {
-    match unsafe { register_under(HKEY_CURRENT_USER, CLASSES_ROOT) } {
+    // COM first, into the per-user hive, which never needs elevation. It is
+    // written whatever happens next, so a non-elevated `regsvr32` still
+    // leaves `CoCreateInstance` working.
+    if let Err(e) = unsafe { register_under(HKEY_CURRENT_USER, CLASSES_ROOT) } {
+        return e.code();
+    }
+    // Then WinRT, into the machine hive, which always does.
+    //
+    // A denial there is reported as `S_FALSE`, not as an error. The two
+    // halves have different privilege requirements and only one of them can
+    // be met without elevation, so "COM registered, WinRT did not" is a
+    // real and useful outcome rather than a failure: `CoCreateInstance`
+    // works, `RoActivateInstance` does not, and nothing is left half-written.
+    // `S_FALSE` is how COM spells that — `regsvr32` treats it as success and
+    // shows no error, while a caller that wants both can test for `S_OK`
+    // exactly. Any other failure is a real one and is returned as such.
+    match unsafe { register_winrt_under(HKEY_LOCAL_MACHINE, WINRT_ROOT) } {
         Ok(()) => S_OK,
+        Err(e) if e.code() == E_ACCESSDENIED => S_FALSE,
         Err(e) => e.code(),
     }
 }
@@ -418,7 +447,20 @@ pub extern "system" fn DllRegisterServer() -> HRESULT {
 /// Removes everything [`DllRegisterServer`] wrote. What `regsvr32 /u` calls.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllUnregisterServer() -> HRESULT {
-    match unsafe { unregister_under(HKEY_CURRENT_USER, CLASSES_ROOT) } {
+    let com = unsafe { unregister_under(HKEY_CURRENT_USER, CLASSES_ROOT) };
+    let winrt = unsafe { unregister_winrt_under(HKEY_LOCAL_MACHINE, WINRT_ROOT) };
+    // The asymmetry with [`DllRegisterServer`] is deliberate. Registering is
+    // a request to put the machine into a state, so failing to reach it
+    // should be visible. Unregistering is a request to remove state, and a
+    // hive the caller cannot write is a hive they cannot have written — so a
+    // denied WinRT delete means there was nothing of ours there, not that
+    // cleanup failed. Reporting it would make every non-elevated
+    // `regsvr32 /u` look broken while it correctly removed the COM half.
+    let winrt = match winrt {
+        Err(e) if e.code() == E_ACCESSDENIED => Ok(()),
+        other => other,
+    };
+    match com.and(winrt) {
         Ok(()) => S_OK,
         Err(e) => e.code(),
     }
@@ -454,6 +496,82 @@ pub(crate) unsafe fn register_under(root: HKEY, base: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Where the Windows Runtime looks up a non-packaged component's classes.
+///
+/// Machine-wide, and there is no per-user alternative for a non-packaged
+/// component: the HKCU branch of this path is read for packaged apps.
+/// `register_under`'s elevation-free `HKEY_CURRENT_USER\Software\Classes`
+/// trick has no counterpart here.
+const WINRT_ROOT: &str = "SOFTWARE\\Microsoft\\WindowsRuntime\\ActivatableClassId";
+
+// The three DWORDs each class key carries. Values are from
+// `activationregistration.h` in the Windows SDK, not from the
+// `Windows.Foundation.Metadata.ThreadingModel` attribute enum — those are
+// different enums that both spell "threading", and the attribute one numbers
+// `Both` as 3.
+//
+// `enum ActivationType { InProcess, OutOfProcess, RemoteProcess }`
+const ACTIVATION_TYPE_IN_PROCESS: u32 = 0;
+// `enum ThreadingType { BOTH, STA, MTA }`
+const THREADING_TYPE_BOTH: u32 = 0;
+// `enum TrustLevel { BaseTrust, PartialTrust, FullTrust }` — and the same
+// answer `GetTrustLevel` gives, which `#[implement]` hardcodes to BaseTrust.
+const TRUST_LEVEL_BASE: u32 = 0;
+
+/// Writes the keys `RoActivateInstance` reads, the WinRT counterpart of
+/// [`register_under`].
+///
+/// `base` is parameterised for the same reason: the round-trip test writes to
+/// a scratch key rather than to the live machine registration.
+///
+/// # Safety
+///
+/// `root` must be a live registry key the caller may write to.
+pub(crate) unsafe fn register_winrt_under(root: HKEY, base: &str) -> Result<()> {
+    let module = unsafe { module_path()? };
+    for class in CLASSES {
+        let key = unsafe { create_key(root, &format!("{base}\\{}", class.name))? };
+        let r = (|| unsafe {
+            // The path the runtime loads and calls `DllGetActivationFactory`
+            // in. Absolute, and recorded by the module that is running —
+            // see `module_path`.
+            set_value(key, "DllPath", &module.to_string())?;
+            set_dword(key, "ActivationType", ACTIVATION_TYPE_IN_PROCESS)?;
+            set_dword(key, "Threading", THREADING_TYPE_BOTH)?;
+            set_dword(key, "TrustLevel", TRUST_LEVEL_BASE)
+        })();
+        close(key);
+        r?;
+    }
+    Ok(())
+}
+
+/// Removes what [`register_winrt_under`] wrote.
+///
+/// Like its COM counterpart it deletes every class before reporting the first
+/// failure, so a partial registration is cleaned up as far as it can be.
+///
+/// # Safety
+///
+/// `root` must be a live registry key the caller may write to.
+pub(crate) unsafe fn unregister_winrt_under(root: HKEY, base: &str) -> Result<()> {
+    let mut first_error = None;
+    for class in CLASSES {
+        let path = format!("{base}\\{}", class.name);
+        let status = unsafe { RegDeleteTreeW(root, &HSTRING::from(&path)) };
+        if status.is_err()
+            && status != windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
+            && first_error.is_none()
+        {
+            first_error = Some(HRESULT::from_win32(status.0));
+        }
+    }
+    match first_error {
+        None => Ok(()),
+        Some(e) => Err(windows_core::Error::from_hresult(e)),
+    }
 }
 
 /// The body of [`DllUnregisterServer`].
@@ -562,6 +680,27 @@ unsafe fn create_key(root: HKEY, path: &str) -> Result<HKEY> {
 /// `key` must be a live registry key opened for writing.
 unsafe fn set_default(key: HKEY, value: &str) -> Result<()> {
     unsafe { set_raw(key, PCWSTR::null(), value) }
+}
+
+/// # Safety
+/// `key` must be a live registry key opened for writing.
+unsafe fn set_dword(key: HKEY, name: &str, value: u32) -> Result<()> {
+    let name = HSTRING::from(name);
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            PCWSTR(name.as_ptr()),
+            None,
+            REG_DWORD,
+            Some(&value.to_le_bytes()),
+        )
+    };
+    if status.is_err() {
+        return Err(windows_core::Error::from_hresult(HRESULT::from_win32(
+            status.0,
+        )));
+    }
+    Ok(())
 }
 
 /// # Safety
@@ -715,7 +854,7 @@ mod tests {
                 let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(&self.0)) };
             }
         }
-        let _scrub = Scrub("Software\\rustwinui3loop_test".to_string());
+        let _scrub = Scrub(base.clone());
 
         unsafe { register_under(HKEY_CURRENT_USER, &base) }.expect("register");
 
@@ -766,6 +905,103 @@ mod tests {
     fn the_shipped_registration_is_per_user() {
         assert_eq!(CLASSES_ROOT, "Software\\Classes");
         assert_eq!(DllCanUnloadNow(), S_FALSE);
+    }
+
+    /// The WinRT half of what `DllRegisterServer` writes, against a scratch
+    /// key for the same reason as the COM half — except that here the
+    /// scratch key is also what makes the test runnable at all. The shipped
+    /// call writes to `HKEY_LOCAL_MACHINE`, which needs elevation; the key
+    /// layout does not care which hive it is in, so this proves the layout
+    /// without proving the hive.
+    ///
+    /// The three DWORDs are checked by value, not merely present. They are
+    /// the ones it would be easy to get wrong: `ThreadingType::BOTH` is `0`
+    /// here, while the `ThreadingModel` *attribute* enum numbers `Both` as
+    /// `3`, and reaching for the wrong one registers an STA-only class that
+    /// then deadlocks or marshals unexpectedly.
+    #[test]
+    fn winrt_registration_writes_then_removes_every_class() {
+        let base = format!(
+            "Software\\rustwinui3loop_test\\winrt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Scrub(String);
+        impl Drop for Scrub {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(&self.0));
+                }
+            }
+        }
+        let _scrub = Scrub(base.clone());
+
+        unsafe { register_winrt_under(HKEY_CURRENT_USER, &base) }.expect("register winrt");
+
+        let module = unsafe { module_path() }.expect("module_path").to_string();
+        for class in CLASSES {
+            let key = format!("{base}\\{}", class.name);
+            assert_eq!(
+                read_value(&key, "DllPath").as_deref(),
+                Some(module.as_str()),
+                "{} DllPath",
+                class.name
+            );
+            // In-process, agile, base trust — the same three claims the COM
+            // registration and `GetTrustLevel` make, spelled in the enums
+            // `activationregistration.h` defines.
+            assert_eq!(read_dword(&key, "ActivationType"), Some(0), "{} ActivationType", class.name);
+            assert_eq!(read_dword(&key, "Threading"), Some(0), "{} Threading", class.name);
+            assert_eq!(read_dword(&key, "TrustLevel"), Some(0), "{} TrustLevel", class.name);
+        }
+
+        unsafe { unregister_winrt_under(HKEY_CURRENT_USER, &base) }.expect("unregister winrt");
+        for class in CLASSES {
+            assert_eq!(
+                read_value(&format!("{base}\\{}", class.name), "DllPath"),
+                None,
+                "{} survived unregister",
+                class.name
+            );
+        }
+
+        // Removing what is already gone is success, as for the COM half.
+        unsafe { unregister_winrt_under(HKEY_CURRENT_USER, &base) }.expect("second unregister");
+    }
+
+    fn read_dword(path: &str, name: &str) -> Option<u32> {
+        unsafe {
+            let mut key = HKEY::default();
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                &HSTRING::from(path),
+                None,
+                KEY_READ,
+                &mut key,
+            )
+            .ok()
+            .ok()?;
+            let mut value = 0u32;
+            let mut bytes = 4u32;
+            // Bound to a local: `PCWSTR(HSTRING::from(name).as_ptr())` would
+            // drop the string at the end of the statement and hand the call
+            // a dangling pointer.
+            let name = HSTRING::from(name);
+            let status = RegQueryValueExW(
+                key,
+                PCWSTR(name.as_ptr()),
+                None,
+                None,
+                Some(&raw mut value as *mut u8),
+                Some(&mut bytes),
+            );
+            close(key);
+            status.ok().ok()?;
+            Some(value)
+        }
     }
 
     fn read_default(path: &str) -> Option<String> {
