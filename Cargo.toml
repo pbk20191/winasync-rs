@@ -99,7 +99,9 @@ tp = [
 # WinRT-shaped COM streams over overlapped IO.
 comio = [
     "dep:windows-future",
-    "dep:windows-threading",
+    # No `windows-threading`: its `submit` queues with a null callback
+    # environment and no count, and `comio::pool::submit` replaced it so that
+    # every work item is both counted and pinned in the server DLL.
     "windows/Foundation",
     "windows/Storage_Streams",
     "windows/Win32_Foundation",

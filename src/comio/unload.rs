@@ -253,13 +253,19 @@ pub fn locks_held() -> usize {
 /// Returns the `BOOL` `DllMain` must return; anything but TRUE fails the
 /// load.
 #[cfg(feature = "dylib")]
-pub fn dll_main(reason: u32, reserved: *mut core::ffi::c_void) -> i32 {
+pub fn dll_main(
+    instance: *mut core::ffi::c_void,
+    reason: u32,
+    reserved: *mut core::ffi::c_void,
+) -> i32 {
     const DLL_PROCESS_DETACH: u32 = 0;
     const DLL_PROCESS_ATTACH: u32 = 1;
 
     match reason {
         DLL_PROCESS_ATTACH => {
-            IN_DLL.store(true, Ordering::Release);
+            // Before anything else in the module can run, so every reader of
+            // `module()` -- `pool::callback_env` above all -- sees it set.
+            MODULE.store(instance, Ordering::Release);
         }
         // `reserved` is null when the module is being unloaded by
         // `FreeLibrary`, and non-null when the process is exiting. Only the
@@ -307,24 +313,27 @@ fn on_forced_unload() {
 #[cfg(all(feature = "dylib", not(debug_assertions)))]
 fn on_forced_unload() {}
 
-/// Set by [`dll_main`] on attach. False in the rlib, where no loader ever
-/// calls it.
+/// This module's handle, recorded by [`dll_main`] on attach. Null in the
+/// rlib, where no loader ever calls it.
 ///
-/// This is the "am I the cdylib?" answer, arrived at the cheap way. The
-/// alternative — `GetModuleHandleExW(FROM_ADDRESS)` compared against the
-/// executable's handle — is a loader call to learn something the loader
-/// already told us.
+/// A handle rather than a flag because `pool::callback_env` needs it: it is
+/// the `RaceDll` the thread pool pins while our callbacks are outstanding.
+/// The loader hands it over for free on attach, which beats asking for it
+/// later with `GetModuleHandleExW(FROM_ADDRESS)`.
 #[cfg(feature = "dylib")]
-static IN_DLL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MODULE: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// This module's `HMODULE`, or null when the code is not running from the
+/// server DLL.
+#[cfg(feature = "dylib")]
+pub(crate) fn module() -> *mut core::ffi::c_void {
+    MODULE.load(Ordering::Acquire)
+}
 
 /// Whether this code is running from the server DLL rather than linked into
-/// an executable.
-///
-/// Diagnostic only. Nothing branches on it: the counting is settled at
-/// compile time by the `dylib` feature, because a runtime guard on an
-/// object-construction path costs an atomic load to save an atomic
-/// increment.
+/// an executable. Diagnostic only; nothing branches on it.
 #[cfg(feature = "dylib")]
 pub fn in_dll() -> bool {
-    IN_DLL.load(std::sync::atomic::Ordering::Acquire)
+    !module().is_null()
 }

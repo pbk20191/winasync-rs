@@ -481,6 +481,38 @@ $l.Bind($name)
 
    덤으로 하나: `comio` **단독** 테스트 빌드가 원래부터 깨져 있었다. `tests/activation.rs`가 `CreateActCtxW`를 쓰는데 그 `windows` 피처를 `tp`/`dq`가 우연히 켜주고 있었다. 라이브러리는 그 API를 안 쓰므로 `comio`가 아니라 **dev-dependency**로 옮겼다.
 
+   **`SetThreadpoolCallbackLibrary` (2026-11-09) — 그리고 앞선 감사에서 놓친 두 경로.** 이 API를 걸려면 comio가 스레드풀에 콜백을 거는 길을 전부 우리 환경으로 모아야 했고, 세어 보니 셋이었다: TP_IO 등록(환경 `NULL`), `listener.rs`의 `windows_threading::submit`, `pipe.rs`의 `IAsyncOperation::spawn`. 그 과정에서 **이전 감사가 틀렸던 게 드러났다.**
+
+   - `NamedPipeConnector::ConnectAsync`가 `windows_future::IAsyncOperation::ready(...)`를 그대로 ABI 밖으로 내보내고 있었다. 앞서 "ABI를 넘는 windows-future 객체는 세 곳, 전부 교체"라고 했는데, grep이 `_Impl` 본문만 봤고 이건 `self.connect_async()`로 한 단계 위임돼 있어 빠졌다. 하필 Python·C#이 둘 다 쓰는 **가장 흔한 경로**라 성공한 파이프 연결마다 카운트 안 되는 객체가 하나씩 나갔다.
+   - 대기 중·실행 중인 `submit` 작업 항목은 이 모듈 코드를 돌리는데 객체 카운트에도 `LIVE_OPS`에도 안 잡혔다.
+
+   그래서 "센 것이 남아 있으면 `S_OK`는 안 나간다"는 참이었지만 "실행될 수 있는 건 전부 센다"는 **거짓이었다.**
+
+   | 고친 것 | 방법 |
+   | --- | --- |
+   | 풀 진입점 | `comio::pool` 하나로. `submit`은 잡 안에 `ModuleRef`를 들고 가서 큐에 있는 동안·도는 동안 카운트된다. `windows-threading`은 comio 피처에서 빠졌다 |
+   | 파이프 connect | `connector::finished` / `connector::spawned` — 둘 다 카운트되는 `ConnectOp` |
+   | 환경 | `pool::callback_env()` — `RaceDll` = 우리 모듈. 모듈 핸들은 `DllMain` attach에서 받는다(`IN_DLL` 플래그가 핸들로 바뀜) |
+
+   `tests/unload.rs`의 새 2b단계가 놓친 걸 잡는다: 파이프 connect는 객체를 **둘**(operation + 그 안의 stream) 늘려야 한다. 옛 코드로 되돌려 돌리면 정확히 그 단언에서 2 대신 1로 실패하는 것까지 확인했다.
+
+   **`RaceDll`이 실제로 하는 일 — 측정해 보니 통념과 달랐다.** "I/O가 남아 있는 동안 DLL을 붙잡아 둔다"로 읽기 쉽고, `tp::pool`의 기존 문서도 그렇게 적혀 있었고, 나도 그렇게 썼다. 그 가정으로 테스트를 짰더니 debug `DllMain`이 detach에서 이렇게 잡았다:
+
+   ```text
+   FATAL: winasync unloaded with work outstanding -- 1 object(s), 0 server lock(s), 1 operation(s) in flight.
+   ```
+
+   release(detach가 abort하지 않음)에서 같은 시나리오를 `RaceDll` 유무만 바꿔 돌렸다:
+
+   | | 읽기 대기 중 `FreeLibrary` | 나중에 읽기 완료 |
+   | --- | --- | --- |
+   | `RaceDll` 없음 | 언매핑 | **`STATUS_ACCESS_VIOLATION`**, 프로세스 사망 |
+   | `RaceDll` 있음 | 언매핑 | **생존** — 풀이 사라진 모듈로 호출하지 않는다 |
+
+   즉 **DLL을 붙잡지 않는다.** 이름 그대로 콜백과 언로드 사이의 *경합*을 정리할 뿐이다 — 사라진 모듈로는 호출을 거절하고 op 블록을 누수한다. 프로토콜을 이미 어긴 호스트에게는 맞는 거래다. 이미 *실행 중인* 콜백이 언로드를 만나면 반환까지 붙잡을 것으로 보이는데(경합 없이 거절하려면 호출을 가로질러 참조를 쥐어야 하므로), 그건 **추론이지 측정이 아니다**라고 문서에 구분해 적었다. 코드 주석 전부와 `tp::pool`의 `race_dll` 문서를 측정치로 고쳤다.
+
+   `tests/racedll.rs`는 **release 전용**이다. debug DLL은 바로 이 호스트 행동을 버그로 보고 detach에서 abort한다 — 개발 중엔 시끄럽게, 배포에선 살아남게. 측정 중 한 번 헷갈린 것도 적어 둔다: 대조군 뒤 `mv`로 파일을 복구했더니 mtime이 빌드보다 오래돼 cargo가 재빌드하지 않았고, `RaceDll` 있는 코드인데 대조군 DLL로 돌아 크래시가 났다. `touch` 후 재빌드하니 3/3 통과.
+
    `winasync.dll`(`dll/`)의 export — 이제 피처와 무관하게 항상:
 
    ```text

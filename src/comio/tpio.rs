@@ -33,8 +33,12 @@ impl IoReg {
         handle: windows::Win32::Foundation::HANDLE,
         is_socket: bool,
     ) -> windows_core::Result<Arc<Self>> {
-        // Default pool (None env), no keepalive — comio ops are standalone.
-        Ok(Arc::new(IoReg(CoreReg::register(handle, is_socket, None, None)?)))
+        // Default pool, no keepalive -- comio ops are standalone. The
+        // environment is the process default everywhere but the server DLL,
+        // where it sets `RaceDll` so a completion arriving after a forced
+        // unload is not called into freed code; see `comio::pool`.
+        let env = super::pool::callback_env();
+        Ok(Arc::new(IoReg(CoreReg::register(handle, is_socket, env, None)?)))
     }
 }
 

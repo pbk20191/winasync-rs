@@ -29,6 +29,11 @@ use winasync::comio::unload::{can_unload, locks_held, outstanding, release_proce
 use winasync::common::winsock::wsa_initialized;
 use std::time::{Duration, Instant};
 use windows::Storage::Streams::{Buffer, IInputStream, InputStreamOptions};
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX,
+};
+use windows::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE};
 use windows::Win32::System::Com::IClassFactory;
 use windows_core::{IUnknown, Interface};
 
@@ -51,6 +56,50 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
 
     drop(object);
     assert_eq!(outstanding(), 0, "releasing an object did not clear it");
+    assert!(can_unload());
+
+    // --- 2b. A connect's operation object is counted ---------------------
+    // The case an earlier audit missed. `NamedPipeConnector::ConnectAsync`
+    // handed back `windows_future::IAsyncOperation::ready(...)`: an object
+    // whose vtable is in this module and which nothing counted. The stream
+    // inside it was counted, so the total still moved -- by one, not two --
+    // which is exactly what this assertion distinguishes.
+    //
+    // The server end is the test's own `CreateNamedPipeW`, not a listener, so
+    // no accept fires on a pool thread to move the count underneath us.
+    let pipe = format!(r"\\.\pipe\comio_unload_op_{}", std::process::id());
+    let server = unsafe {
+        CreateNamedPipeW(
+            &windows_core::HSTRING::from(&pipe),
+            FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0),
+            PIPE_TYPE_BYTE,
+            1,
+            4096,
+            4096,
+            0,
+            None,
+        )
+    };
+    assert!(!server.is_invalid(), "CreateNamedPipeW failed");
+    let connector = NamedPipeConnector::new();
+    let typed: winasync::comio::bindings::Pbk20191::WinAsync::Comio::INamedPipeConnector =
+        connector.cast().expect("QI INamedPipeConnector");
+    let before = outstanding();
+    let op = typed
+        .ConnectAsync(&windows_core::HSTRING::from(&pipe))
+        .expect("ConnectAsync");
+    assert_eq!(
+        outstanding(),
+        before + 2,
+        "a connect should add two objects -- the operation and the stream it \
+         carries. One means the operation is not ours and goes uncounted."
+    );
+    drop(op);
+    assert_eq!(outstanding(), before, "the operation outlived its last reference");
+    drop(typed);
+    drop(connector);
+    unsafe { CloseHandle(server) }.expect("CloseHandle");
+    assert_eq!(outstanding(), 0);
     assert!(can_unload());
 
     // --- 3. A server lock holds the module on its own --------------------

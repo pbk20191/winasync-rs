@@ -73,6 +73,7 @@ pub mod connector;
 pub mod hvsock;
 pub mod listener;
 pub mod pipe;
+pub(crate) mod pool;
 pub mod settled;
 pub mod stream;
 pub mod tpio;

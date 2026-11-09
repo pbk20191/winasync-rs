@@ -690,7 +690,7 @@ fn release_running(state: &Arc<ListenerState>) -> bool {
 /// was requested in the meantime (the add-races-stop handoff), the loop simply
 /// re-iterates instead of re-entering itself. `try_arm` likewise never calls
 /// back into `drive`, and `on_result`'s re-arm is handed to a *fresh* pool stack
-/// via `windows_threading::submit` — so chain depth is O(1) regardless of how
+/// via `comio::pool::submit` — so chain depth is O(1) regardless of how
 /// large a synchronous connect backlog is (a burst of already-connected clients
 /// becomes a long *sequence* of pool callbacks, never a deep stack; a Rust stack
 /// overflow would be an immediate process `abort`).
@@ -815,7 +815,10 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
                 // backlog case); `drive` itself parks the chain if it is no
                 // longer wanted.
                 let next = state_cb.clone();
-                windows_threading::submit(move || {
+                // `comio::pool::submit`, not `windows_threading::submit`: the
+                // queued re-arm is code in this module that will run, so it is
+                // counted until it has, and the module is pinned while it does.
+                super::pool::submit(move || {
                     let _ = drive(next, true);
                 });
             }

@@ -75,8 +75,10 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
     activation::dll_can_unload_now()
 }
 
-/// Load and unload notifications. Observes only; see `unload::dll_main`.
+/// Load and unload notifications. Records this module's handle on attach
+/// -- the `RaceDll` the thread pool pins -- and observes on detach; see
+/// `unload::dll_main`.
 #[unsafe(no_mangle)]
-pub extern "system" fn DllMain(_instance: *mut c_void, reason: u32, reserved: *mut c_void) -> i32 {
-    unload::dll_main(reason, reserved)
+pub extern "system" fn DllMain(instance: *mut c_void, reason: u32, reserved: *mut c_void) -> i32 {
+    unload::dll_main(instance, reason, reserved)
 }

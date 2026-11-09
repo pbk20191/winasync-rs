@@ -268,15 +268,16 @@ impl NamedPipeConnector {
         &self,
         name: &windows_core::HSTRING,
     ) -> windows_future::IAsyncOperation<ITransportStream> {
+        // Every arm builds a `ConnectOp`, never a `windows_future` object:
+        // this is the vtable's `ConnectAsync`, so whatever comes back crosses
+        // the ABI, and only our own type is counted by `DllCanUnloadNow`.
         match Self::try_open(name) {
-            Ok(stream) => windows_future::IAsyncOperation::ready(Ok(stream)),
+            Ok(stream) => super::connector::finished(Ok(stream)),
             Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
                 let name = name.to_string();
-                windows_future::IAsyncOperation::spawn(move || {
-                    crate::common::block_on(Self::connect(&name))
-                })
+                super::connector::spawned(move || crate::common::block_on(Self::connect(&name)))
             }
-            Err(e) => windows_future::IAsyncOperation::ready(Err(e)),
+            Err(e) => super::connector::finished(Err(e)),
         }
     }
 }

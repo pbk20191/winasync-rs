@@ -170,12 +170,11 @@ const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
 /// E_ILLEGAL_DELEGATE_ASSIGNMENT — `Completed` set twice.
 const E_ILLEGAL_DELEGATE_ASSIGNMENT: HRESULT = HRESULT(0x80000018u32 as i32);
 
-/// Builds an operation and arms `start`, which must deliver exactly one
-/// result through the callback it is given.
-pub(crate) fn connect_op(
-    start: impl FnOnce(Box<dyn FnOnce(Result<ITransportStream>) + Send>) -> Result<OpHandle>,
-) -> IAsyncOperation<ITransportStream> {
-    let op: ComObject<ConnectOp> = ComObject::new(ConnectOp(
+/// A fresh, unfinished operation. Counted from here on: `ConnectOp` carries a
+/// `ModuleRef`, which is the point of building every connect result through
+/// this type rather than through `windows_future`.
+fn new_op() -> ComObject<ConnectOp> {
+    ComObject::new(ConnectOp(
         Mutex::new(ConnectState {
             result: None,
             completed: None,
@@ -183,7 +182,15 @@ pub(crate) fn connect_op(
             op: None,
         }),
         ModuleRef::new(),
-    ));
+    ))
+}
+
+/// Builds an operation and arms `start`, which must deliver exactly one
+/// result through the callback it is given.
+pub(crate) fn connect_op(
+    start: impl FnOnce(Box<dyn FnOnce(Result<ITransportStream>) + Send>) -> Result<OpHandle>,
+) -> IAsyncOperation<ITransportStream> {
+    let op = new_op();
     let sink = op.clone();
     match start(Box::new(move |res| sink.complete(res))) {
         Ok(handle) => {
@@ -198,6 +205,35 @@ pub(crate) fn connect_op(
             op.to_interface()
         }
     }
+}
+
+/// An operation that already has its result.
+///
+/// What `windows_future::IAsyncOperation::ready` would give, except that the
+/// object is ours and therefore counted. A named-pipe connect is a plain
+/// synchronous `CreateFileW`, so this is the shape of nearly every pipe
+/// connect there is -- which is why handing out the uncounted kind here was
+/// the largest hole in `DllCanUnloadNow`'s answer.
+pub(crate) fn finished(res: Result<ITransportStream>) -> IAsyncOperation<ITransportStream> {
+    let op = new_op();
+    op.complete(res);
+    op.to_interface()
+}
+
+/// An operation whose result `f` produces on the thread pool.
+///
+/// What `windows_future::IAsyncOperation::spawn` would give, with both of its
+/// gaps closed: the object is counted, and the work item goes through
+/// `comio::pool::submit`, so it is counted while queued and the module is
+/// pinned while it runs. `Cancel` does nothing, as with `spawn`: there is no
+/// overlapped operation to cancel, only a closure already on its way.
+pub(crate) fn spawned(
+    f: impl FnOnce() -> Result<ITransportStream> + Send + 'static,
+) -> IAsyncOperation<ITransportStream> {
+    let op = new_op();
+    let sink = op.clone();
+    super::pool::submit(move || sink.complete(f()));
+    op.to_interface()
 }
 
 #[cfg(test)]

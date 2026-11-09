@@ -279,8 +279,14 @@ impl PoolBuilder {
         self
     }
 
-    /// Pins `module` in memory while callbacks are pending (`RaceDll`),
-    /// preventing the DLL hosting the callback code from unloading under them.
+    /// Sets `RaceDll` to `module`: the DLL that holds the callback code.
+    ///
+    /// This used to say it pins the module in memory while callbacks are
+    /// pending. Measured (`tests/racedll.rs`), it does not: a `FreeLibrary`
+    /// with I/O outstanding unmaps the module either way. What it does is
+    /// stop the pool calling into a module that has been unloaded -- without
+    /// it, the late completion is an access violation; with it, the pool
+    /// declines the call and the process survives.
     pub fn race_dll(mut self, module: HMODULE) -> Self {
         self.race_dll = module.0;
         self
