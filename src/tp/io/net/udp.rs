@@ -1,6 +1,7 @@
 //! UDP over TP_IO: `UdpSocket` (WSARecvFrom / WSASendTo, plus connected-mode
 //! WSARecv / WSASend) and control messages (WSARecvMsg / WSASendMsg, IP_PKTINFO).
 
+use crate::common::winsock::ExtFnCache;
 use super::*;
 
 /// Payload of a WSARecvFrom: the buffer, the flags word, and the source
@@ -352,7 +353,7 @@ type WsaRecvMsgFn = unsafe extern "system" fn(
 /// `WSARecvMsg` for the TCP/IP provider. (`WSASendMsg` *is* a direct export,
 /// so it needs no lookup.)
 fn get_wsarecvmsg(sock: SOCKET) -> windows_core::Result<WsaRecvMsgFn> {
-    static PTR: OnceLock<usize> = OnceLock::new();
+    static PTR: ExtFnCache = ExtFnCache::new();
     unsafe { extension_fn(sock, &WSAID_WSARECVMSG, &PTR) }
 }
 

@@ -16,9 +16,10 @@
 //! differ; see [`crate::common::hvaddr`] for the addressing, shared with
 //! `tp`'s Hyper-V transport.
 
+use crate::common::winsock::ExtFnCache;
 use crate::comio::unload::ModuleRef;
 use crate::common::winsock::{
-    classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
+    classify_wsa_overlapped, connectex, sock_check, ConnectExFn,
 };
 use super::bindings;
 use super::bindings::Pbk20191::WinAsync::Comio::{IHyperVConnector_Impl, ITransport_Impl};
@@ -33,37 +34,27 @@ use crate::common::hvaddr::{
 };
 use core::ffi::c_void;
 use std::mem;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, AF_HYPERV, INVALID_SOCKET,
     SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
-    WSASocketW, WSA_FLAG_OVERLAPPED,
 };
 use windows_core::{Error, HSTRING, Result, HRESULT};
 
 /// Creates an AF_HYPERV stream socket. Fails with `WSAEAFNOSUPPORT` (10047)
 /// where the Hyper-V socket provider is not present.
 fn new_socket() -> Result<SOCKET> {
-    wsa_init();
-    unsafe {
-        WSASocketW(
-            AF_HYPERV as i32,
-            SOCK_STREAM.0,
-            HV_PROTOCOL_RAW,
-            None,
-            0,
-            WSA_FLAG_OVERLAPPED,
-        )
-    }
+    // See `unix::new_socket` for why this is not `wsa_init()` + `WSASocketW`.
+    crate::common::winsock::socket(AF_HYPERV as i32, SOCK_STREAM.0, HV_PROTOCOL_RAW, 0)
 }
 
 /// `ConnectEx` for the **HvSocket** provider. The signature lives in
 /// `common::winsock`; only this cache is local, because the pointer belongs
 /// to the provider.
 fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
-    static PTR: OnceLock<usize> = OnceLock::new();
+    static PTR: ExtFnCache = ExtFnCache::new();
     connectex(sock, &PTR)
 }
 

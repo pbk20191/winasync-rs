@@ -25,9 +25,10 @@
 use winasync::comio::NamedPipeConnector;
 use winasync::comio::activation::{CLSID_NAMED_PIPE_CONNECTOR, DllGetClassObject};
 use winasync::comio::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
-use winasync::comio::unload::{can_unload, locks_held, outstanding};
+use winasync::comio::unload::{can_unload, locks_held, outstanding, release_process_state};
+use winasync::common::winsock::wsa_initialized;
 use std::time::{Duration, Instant};
-use windows::Storage::Streams::{Buffer, IInputStream, IOutputStream, InputStreamOptions};
+use windows::Storage::Streams::{Buffer, IInputStream, InputStreamOptions};
 use windows::Win32::System::Com::IClassFactory;
 use windows_core::{IUnknown, Interface};
 
@@ -147,32 +148,68 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
          gated to debug builds again"
     );
 
-    // --- 6. Process-global state is one-way ------------------------------
-    // Everything above used named pipes, which never touch Winsock. The
-    // moment a socket transport exists the module has raised the process's
-    // Winsock reference and has no safe way to lower it, so the answer
-    // becomes a permanent no — see `comio::unload` for why a matching
-    // `WSACleanup` would be worse than the leak.
+    // --- 6. Process-global state is given back, not kept -----------------
+    // Everything above used named pipes, which never touch Winsock. A socket
+    // transport raises the process's Winsock reference, and the module used
+    // to answer a permanent "no" from that point on because the cached
+    // provider pointers could not be retired. They can now, so the reference
+    // is returnable and the answer goes back to yes -- once somebody asks.
     assert!(can_unload(), "precondition: still unloadable before any socket");
 
-    // Constructing the connector is not enough — `wsa_init` runs when a
+    // Constructing the connector is not enough -- Winsock comes up when a
     // socket is actually created. A connect to a path nothing is listening
     // on creates one and then fails, which is all this needs.
     let unix = winasync::comio::UnixConnector::new();
     let typed: winasync::comio::bindings::Pbk20191::WinAsync::Comio::IUnixConnector =
         unix.cast().expect("QI IUnixConnector");
     let path = std::env::temp_dir().join(format!("comio_unload_{}.sock", std::process::id()));
-    let _ = typed
-        .ConnectAsync(&windows_core::HSTRING::from(path.to_string_lossy().as_ref()))
-        .and_then(|op| op.join());
+    let endpoint = windows_core::HSTRING::from(path.to_string_lossy().as_ref());
+    let _ = typed.ConnectAsync(&endpoint).and_then(|op| op.join());
     drop(typed);
     drop(unix);
+
     assert_eq!(outstanding(), 0, "the connector outlived its reference");
     assert!(
-        !can_unload(),
-        "the module offered to unload after taking a Winsock reference it \
-         cannot give back"
+        wsa_initialized(),
+        "a socket was created without bringing Winsock up"
     );
+    assert!(
+        can_unload(),
+        "objects are gone, so the module should be willing to unload"
+    );
+
+    // The release is what `DllCanUnloadNow` performs just before saying yes.
+    assert!(
+        release_process_state(),
+        "nothing was released, but Winsock was up"
+    );
+    assert!(
+        !wsa_initialized(),
+        "the Winsock reference was not given back"
+    );
+    assert!(
+        !release_process_state(),
+        "a second release claimed to have done something"
+    );
+
+    // And the module still works afterwards. This is the half that the
+    // cached `ConnectEx` / `AcceptEx` pointers used to make unsound: they
+    // were fetched under the old Winsock and would survive a teardown that
+    // could have unloaded the provider. Each now carries the teardown count
+    // it was fetched under, so this connect re-fetches rather than calling
+    // through a stale address.
+    let again = winasync::comio::UnixConnector::new();
+    let typed: winasync::comio::bindings::Pbk20191::WinAsync::Comio::IUnixConnector =
+        again.cast().expect("QI IUnixConnector");
+    let _ = typed.ConnectAsync(&endpoint).and_then(|op| op.join());
+    drop(typed);
+    drop(again);
+    assert!(
+        wsa_initialized(),
+        "Winsock did not come back up for a socket created after teardown"
+    );
+    assert_eq!(outstanding(), 0);
+    assert!(release_process_state(), "the second reference was not released");
 }
 
 /// A listener bound to a fresh pipe name, plus that name.
@@ -212,10 +249,4 @@ fn connect(name: &str) -> ITransportStream {
         .expect("ConnectAsync")
         .join()
         .expect("connect result")
-}
-
-/// Silences the unused-import warning when the write half is not exercised.
-#[allow(dead_code)]
-fn _assert_output_stream_is_reachable(s: &ITransportStream) -> IOutputStream {
-    s.cast().unwrap()
 }

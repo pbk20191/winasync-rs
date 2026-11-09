@@ -60,6 +60,12 @@ pub(crate) fn rio_table() -> windows_core::Result<&'static RioTable> {
         return Ok(t);
     }
     let fetched = fetch()?;
+    // These are provider-owned function pointers handed out as `&'static`,
+    // so there is no way to retire them if Winsock is torn down and the
+    // provider goes with it. Say so, and `winsock::wsa_shutdown` will refuse
+    // for the life of the process. `rio` is not part of the `dylib` server
+    // build, so in practice this vetoes nothing that was going to happen.
+    crate::common::winsock::pin();
     // A racing thread may have published first; either table is equally valid.
     let _ = TABLE.set(fetched);
     Ok(TABLE.get().expect("table published above"))

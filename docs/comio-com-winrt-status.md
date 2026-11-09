@@ -401,11 +401,28 @@ $l.Bind($name)
 
    **구멍 하나를 메워야 했다.** `windows-future`가 만드는 객체는 vtable이 우리 DLL 안인데(Rust 의존성이라 여기로 모노모픽된다) **Drop 훅이 없다.** ABI를 넘는 곳이 셋이었고 전부 *이미 끝난* 결과라, 우리 타입으로 바꿨다 — `comio::settled`의 `SettledAction`/`SettledOp<T>`, 그리고 connect 실패 경로는 기존 `ConnectOp`를 즉시 완료시킨다. 비동기 동작은 일부러 시시하다; **타입을 소유하는 것**이 `ModuleRef`를 살 수 있는 유일한 길이라서 존재한다.
 
-   **그리고 객체가 전부는 아니다.** 모듈이 설치한 **프로세스 전역 상태**도 돌려줘야 한다. `wsa_init()`이 첫 소켓에서 `WSAStartup`을 걸고 아무도 내리지 않는다. 그 상태로 언로드하면 참조가 영구히 남고, 다시 로드되면 새 모듈 인스턴스의 `Once`가 초기화돼 **또 `WSAStartup`**을 — 로드 주기마다 하나씩 쌓인다.
+   **그리고 객체가 전부는 아니다.** 모듈이 설치한 **프로세스 전역 상태**도 돌려줘야 한다. `wsa_init()`이 첫 소켓에서 `WSAStartup`을 걸고 아무도 내리지 않았다. 그 상태로 언로드하면 참조가 영구히 남고, 다시 로드되면 새 모듈 이미지가 **또 `WSAStartup`**을 — 로드 주기마다 하나씩 쌓인다.
 
-   기존 주석의 이유(*"라이브러리는 자기가 마지막 사용자인지 알 수 없다"*)는 API를 잘못 읽은 것이다. `WSAStartup`/`WSACleanup`은 refcount라서 **각자 자기 호출만 맞추면** 된다. 진짜 이유는 따로 있다: `unix.rs`/`hvsock.rs`가 `SIO_GET_EXTENSION_FUNCTION_POINTER`로 받은 `ConnectEx`/`AcceptEx` 주소를 `OnceLock`에 캐시하는데, 이건 **프로바이더 소유**다. refcount를 0으로 내리는 `WSACleanup`은 프로바이더를 내릴 수 있고, 그러면 리셋 불가능한 캐시가 해제된 코드를 가리킨다. **누수를 댕글링 호출과 바꾸는 건 방향이 거꾸로다.**
+   기존 주석의 이유(*"라이브러리는 자기가 마지막 사용자인지 알 수 없다"*)는 API를 잘못 읽은 것이다. `WSAStartup`/`WSACleanup`은 refcount라서 **각자 자기 호출만 맞추면** 된다.
 
-   그래서 `can_unload()`는 Winsock이 올라온 뒤로는 그냥 "아니오"다. 세는 일이 헛돌지는 않는다 — **네임드 파이프는 Winsock을 안 건드려서** 파이프 전용 세션은 언로드 가능하고, 그게 흔한 경우다. 제한을 풀려면 양쪽을 다 해야 한다: 균형 잡힌 `WSACleanup` **그리고** 재질의 가능한 프로바이더 포인터 캐시. 되찾는 게 수백 KB라 지금은 값을 못 한다.
+   **진짜 장애물은 `WSACleanup`이 아니라 포인터였다.** `unix.rs`/`hvsock.rs`가 `SIO_GET_EXTENSION_FUNCTION_POINTER`로 받은 `ConnectEx`/`AcceptEx` 주소를 `OnceLock`에 캐시하는데, 이건 **프로바이더 소유**다. refcount를 0으로 내리는 `WSACleanup`은 프로바이더를 내릴 수 있고, 그러면 리셋 불가능한 캐시가 해제된 코드를 가리킨다. 누수를 댕글링 호출과 바꾸는 건 방향이 거꾸로라, 한동안 `can_unload()`는 Winsock이 올라오면 그냥 "아니오"였다.
+
+   **고쳤다 (2026-11-09).** `common::winsock::ExtFnCache`가 `OnceLock<usize>` 8개를 대체한다. 각 항목이 **채워질 당시의 teardown 횟수**를 같이 들고 있어서, `WSACleanup` 한 번이 전부를 한꺼번에 퇴역시키고 다음 조회가 재질의한다. 캐시를 무효화할 수 있게 되자 참조도 돌려줄 수 있게 됐다.
+
+   | 조각 | 역할 |
+   | --- | --- |
+   | `STARTUP: Mutex<Startup>` | startup·teardown·**소켓 생성**을 서로 직렬화. 소켓 생성이 목록에 있는 게 핵심 — `wsa_init()` 후 별도 `WSASocketW`는 그 사이에 teardown이 끼어들 창을 남긴다. `winsock::socket()`이 둘을 잠금 아래 묶는다 |
+   | `TEARDOWNS: AtomicUsize` | 캐시 항목의 도장. 잠금 없이 읽힌다 |
+   | `winsock::pin()` | 회수 불가능한 프로바이더 상태를 쥔 모듈의 거부권. 유일한 호출자는 `rio::table` — RIO 함수 테이블을 `&'static`으로 내보내서 퇴역시킬 방법이 없다. rio는 `dylib` 빌드에 없으므로 실제로 막는 건 없다 |
+   | `unload::release_process_state()` | `DllCanUnloadNow`가 `S_OK` 직전에 호출. **다른 데서는 안 부른다** |
+
+   **왜 하필 거기인가.** 두 가지가 동시에 성립하는 유일한 지점이다 — ① `can_unload()`가 방금 "아무것도 안 살아 있음"을 확인했고, 우리 소켓은 전부 카운트되는 객체나 진행 중 op 안에 있으므로 **객체 0 + op 0 = 소켓 0**이다. ② `DllCanUnloadNow`는 `CoFreeUnusedLibraries`가 거는 평범한 호출이라 **로더 락 밖**이다. `DllMain`이었으면 `WSACleanup`이 프로바이더를 `FreeLibrary`할 수 있으니 바로 그 락이 막으려는 데드락이다. **`DllMain`은 관찰만 하고, 치우는 건 여기서 한다.**
+
+   질의에 부작용이 있는 건 흔치 않지만, 호스트가 결국 언로드하지 않아도 무해하도록 골랐다: 다음 소켓 생성자가 `WSAStartup`을 다시 걸고, 캐시는 도장이 어긋나 전부 재질의한다.
+
+   **App SDK는 치울 게 없었다** — `ensure_sdk`/`SdkGuard`가 `#[cfg(test)]`라 배포 DLL에 애초에 없다. 스레드풀 등록은 이미 카운트되는 객체가 `Drop`에서 닫는다.
+
+   `tests/unload.rs`가 전 과정을 증명한다: 소켓 생성 → Winsock 올라옴 → 객체 해제 후 **언로드 가능**(예전엔 영구히 불가) → 해제 → 두 번째 해제는 아무것도 안 함 → **그리고 다시 연결이 된다**, 즉 낡은 `ConnectEx`로 호출하지 않는다.
 
    **측정.** `tests/unload.rs`는 통합 테스트다 — 카운터가 프로세스 전역이라 **자기 프로세스가 필요**하고, 단위 테스트였으면 객체를 만드는 다른 모든 테스트와 레이스한다. 증명 순서: 새 프로세스는 언로드 가능 → 객체 하나가 막고 해제하면 풀림(QI는 두 번째 이유가 아님) → 서버 락이 객체 없이도 막음(진짜 `IClassFactory` 경유) → 그리고 **객체 0개인데 op이 떠 있는 상태를 실제로 관찰**한다. 마지막 단언은 그 상태를 못 봤으면 실패한다 — `LIVE_OPS`가 다시 debug로 묶이면 바로 잡힌다.
 

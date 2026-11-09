@@ -403,7 +403,14 @@ pub unsafe extern "system" fn DllGetActivationFactory(
 #[cfg(feature = "dylib")]
 #[unsafe(no_mangle)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if super::unload::can_unload() { S_OK } else { S_FALSE }
+    if !super::unload::can_unload() {
+        return S_FALSE;
+    }
+    // Saying yes is also the moment to give back what unloading would
+    // otherwise strand -- `WSAStartup`'s process reference. See
+    // `unload::release_process_state` for why here and nowhere else.
+    super::unload::release_process_state();
+    S_OK
 }
 
 /// The reg-free activation manifest for this component.

@@ -12,9 +12,10 @@
 //! memory alive until the op's real completion, not merely until the
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
+use crate::common::winsock::ExtFnCache;
 use crate::comio::unload::ModuleRef;
 use crate::common::winsock::{
-    classify_wsa_overlapped, connectex, sock_check, wsa_init, ConnectExFn,
+    classify_wsa_overlapped, connectex, sock_check, ConnectExFn,
 };
 use super::bindings;
 use super::bindings::Pbk20191::WinAsync::Comio::{ITransport_Impl, IUnixConnector_Impl};
@@ -26,18 +27,19 @@ use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use core::ffi::c_void;
 use std::mem;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
     SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
-    SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSASocketW, WSA_FLAG_OVERLAPPED,
+    SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
 };
 use windows_core::{Error, Result, HRESULT};
 
 fn new_socket() -> Result<SOCKET> {
-    wsa_init();
-    unsafe { WSASocketW(AF_UNIX as i32, SOCK_STREAM.0, 0, None, 0, WSA_FLAG_OVERLAPPED) }
+    // Through `winsock::socket` rather than `wsa_init()` + `WSASocketW`: the
+    // two-step form leaves a window for a teardown to land between them.
+    crate::common::winsock::socket(AF_UNIX as i32, SOCK_STREAM.0, 0, 0)
 }
 
 /// Builds a `SOCKADDR_UN` for `path`. `sun_path` holds the NUL-terminated
@@ -78,7 +80,7 @@ fn sockaddr_un_autobind() -> (SOCKADDR_UN, i32) {
 /// `common::winsock`; only this cache is local, because the pointer belongs
 /// to the provider.
 fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
-    static PTR: OnceLock<usize> = OnceLock::new();
+    static PTR: ExtFnCache = ExtFnCache::new();
     connectex(sock, &PTR)
 }
 

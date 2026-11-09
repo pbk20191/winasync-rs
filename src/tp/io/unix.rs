@@ -3,6 +3,7 @@
 //! `tp`'s `TcpListener`/`TcpStream` (AcceptEx / ConnectEx), with `SOCKADDR_UN`
 //! addressing; shares the socket helpers in `super::net`.
 
+use crate::common::winsock::ExtFnCache;
 use super::net::{
     classify_wsa_overlapped, new_socket, sock_check, AcceptPayload, RecvPayload,
     VectoredPayload, ADDR_SLOT,
@@ -13,7 +14,7 @@ use crate::tp::{Runtime, RuntimeInner};
 use crate::common::winsock::{connectex, ConnectExFn};
 use core::ffi::c_void;
 use std::mem;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
@@ -26,7 +27,7 @@ use windows_core::Error;
 /// `common::winsock`; only this cache is local, because the pointer belongs
 /// to the provider.
 fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
-    static PTR: OnceLock<usize> = OnceLock::new();
+    static PTR: ExtFnCache = ExtFnCache::new();
     connectex(sock, &PTR)
 }
 

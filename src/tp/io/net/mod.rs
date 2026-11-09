@@ -11,6 +11,7 @@
 //! passed through to/from the OS `sockaddr_in6` as-is (no byte-swap); only
 //! non-zero flow labels crossing to a differing stack would be affected.
 
+use crate::common::winsock::ExtFnCache;
 use super::file::File;
 use super::{submit, IoRes, OpFuture};
 use crate::common::buffer::{IoBuf, IoBufMut};
@@ -19,13 +20,13 @@ pub(crate) use crate::common::sockaddr::{
     addr_of_socket, family_of, peer_of_socket, read_sockaddr, wildcard, write_sockaddr,
 };
 pub(crate) use crate::common::winsock::{
-    classify_wsa_overlapped, connectex, extension_fn, sock_check, wsa_init, ConnectExFn,
+    classify_wsa_overlapped, connectex, extension_fn, sock_check, ConnectExFn,
 };
 use core::ffi::c_void;
 use std::mem;
 #[allow(unused_imports)]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, IPV6_DROP_MEMBERSHIP, IPV6_MREQ,
@@ -35,7 +36,7 @@ use windows::Win32::Networking::WinSock::{
     IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_UNBLOCK_SOURCE, SO_REUSEADDR,
     getsockopt,
     UDP_COALESCED_INFO, UDP_RECV_MAX_COALESCED_SIZE, UDP_SEND_MSG_SIZE,
-    bind, closesocket, connect, listen, setsockopt, shutdown, AcceptEx, WSARecv, WSARecvFrom, WSASend, WSASendTo, WSASocketW,
+    bind, closesocket, connect, listen, setsockopt, shutdown, AcceptEx, WSARecv, WSARecvFrom, WSASend, WSASendTo,
     ADDRESS_FAMILY, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
     IPPROTO, IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, SD_SEND, SOCKADDR,
     SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
@@ -43,7 +44,7 @@ use windows::Win32::Networking::WinSock::{
     TF_REUSE_SOCKET, TP_ELEMENT_FILE, TP_ELEMENT_MEMORY, TRANSMIT_PACKETS_ELEMENT,
     TRANSMIT_PACKETS_ELEMENT_0, TRANSMIT_PACKETS_ELEMENT_0_0, TransmitFile, WINSOCK_SOCKET_TYPE,
     WSABUF, WSAID_DISCONNECTEX, WSAID_TRANSMITPACKETS,
-    WSAID_WSARECVMSG, WSA_FLAG_OVERLAPPED, CMSGHDR, IN_PKTINFO, IPPROTO_IP,
+    WSAID_WSARECVMSG, CMSGHDR, IN_PKTINFO, IPPROTO_IP,
     IP_PKTINFO, LPWSAOVERLAPPED_COMPLETION_ROUTINE, WSAMSG, WSASendMsg,
 };
 
@@ -71,17 +72,9 @@ pub(crate) fn new_socket_with(
     proto: IPPROTO,
     extra_flags: u32,
 ) -> windows_core::Result<SOCKET> {
-    wsa_init();
-    unsafe {
-        WSASocketW(
-            family.0 as i32,
-            socktype.0,
-            proto.0,
-            None,
-            0,
-            WSA_FLAG_OVERLAPPED | extra_flags,
-        )
-    }
+    // See `comio::unix::new_socket` for why this is not `wsa_init()` plus a
+    // separate `WSASocketW`.
+    crate::common::winsock::socket(family.0 as i32, socktype.0, proto.0, extra_flags)
 }
 
 
@@ -89,7 +82,7 @@ pub(crate) fn new_socket_with(
 /// `common::winsock`; only this cache is local, because the pointer belongs
 /// to the provider.
 pub(super) fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
-    static PTR: OnceLock<usize> = OnceLock::new();
+    static PTR: ExtFnCache = ExtFnCache::new();
     connectex(sock, &PTR)
 }
 
@@ -104,7 +97,7 @@ type TransmitPacketsFn = unsafe extern "system" fn(
 
 /// `TransmitPackets` for the TCP/IP provider.
 fn get_transmitpackets(sock: SOCKET) -> windows_core::Result<TransmitPacketsFn> {
-    static PTR: OnceLock<usize> = OnceLock::new();
+    static PTR: ExtFnCache = ExtFnCache::new();
     unsafe { extension_fn(sock, &WSAID_TRANSMITPACKETS, &PTR) }
 }
 
@@ -143,7 +136,7 @@ type DisconnectExFn = unsafe extern "system" fn(
 
 /// `DisconnectEx` for the TCP/IP provider.
 fn get_disconnectex(sock: SOCKET) -> windows_core::Result<DisconnectExFn> {
-    static PTR: OnceLock<usize> = OnceLock::new();
+    static PTR: ExtFnCache = ExtFnCache::new();
     unsafe { extension_fn(sock, &WSAID_DISCONNECTEX, &PTR) }
 }
 
