@@ -185,7 +185,8 @@ impl HvStream {
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let sock = self.res.socket();
-        let fut = unsafe {
+        
+        unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let wsabuf = WSABUF {
                     len: IoBuf::len(buf) as u32,
@@ -194,8 +195,7 @@ impl HvStream {
                 let r = WSASend(sock, &[wsabuf], None, 0, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })
-        };
-        async move { fut.await }
+        }
     }
 
     /// Scatter-reads into `bufs` with one vectored `WSARecv`.
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn hv_peer_addr_identifies_the_partition() {
         let rt = Runtime::new();
-        let service = GUID::from_u128(0x41c7_9e03_6b52_4a18_bd74_2e1f05a63c90);
+        let service = GUID::from_u128(0x41c79e03_6b52_4a18_bd74_2e1f05a63c90);
         let listener = match HvListener::bind(&rt, HvSocketAddr::wildcard(service)) {
             Ok(l) => l,
             Err(e) => {
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn hv_addr_display_and_vsock_roundtrip() {
         assert_eq!(vsock_port_of(vsock_service_id(5000)), Some(5000));
-        assert_eq!(vsock_port_of(GUID::from_u128(0x1234_0000_0000_0000_0000_000000000000)), None);
+        assert_eq!(vsock_port_of(GUID::from_u128(0x12340000_0000_0000_0000_000000000000)), None);
         assert_eq!(
             HvSocketAddr::loopback(vsock_service_id(5000)).to_string(),
             "hv://loopback/vsock:5000"
@@ -421,7 +421,7 @@ mod tests {
             vsock_service_id(5000),
             GUID::from_u128(0x00001388_facb_11e6_bd58_64006a7986d3)
         );
-        assert_eq!(vsock_service_id(0).to_u128(), 0xfacb_11e6_bd58_64006a7986d3);
+        assert_eq!(vsock_service_id(0).to_u128(), 0x00000000_facb_11e6_bd58_64006a7986d3);
     }
 
     #[test]
@@ -430,7 +430,7 @@ mod tests {
         // A service GUID of our own; loopback still requires it to be
         // registered under GuestCommunicationServices, so bind/connect may
         // legitimately fail on an unprepared machine.
-        let service = GUID::from_u128(0x2fd1_0ba4_7e2f_4a3c_9d31_0f5a8c7b4e21);
+        let service = GUID::from_u128(0x2fd10ba4_7e2f_4a3c_9d31_0f5a8c7b4e21);
         let listener = match HvListener::bind(&rt, HvSocketAddr::wildcard(service)) {
             Ok(l) => l,
             Err(e) => {

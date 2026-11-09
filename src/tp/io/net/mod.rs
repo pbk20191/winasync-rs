@@ -47,9 +47,6 @@ use windows::Win32::Networking::WinSock::{
     IP_PKTINFO, LPWSAOVERLAPPED_COMPLETION_ROUTINE, WSAMSG, WSASendMsg,
 };
 
-/// Process-wide Winsock initialization; never torn down (`WSACleanup` is
-/// deliberately not called).
-
 /// Creates an overlapped socket of the given family/type/protocol. `WSASocketW`
 /// is wrapped by the `windows` crate to map `INVALID_SOCKET` to an `Err`.
 pub(super) fn new_socket(

@@ -148,6 +148,27 @@ impl Default for Runtime {
     }
 }
 
+/// Cooperatively yields once: wakes itself and returns `Pending` a single time.
+pub fn yield_now() -> impl Future<Output = ()> {
+    struct YieldNow(bool);
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if self.0 {
+                std::task::Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+    YieldNow(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,25 +193,4 @@ mod tests {
         let rt = Runtime::new();
         assert_eq!(rt.block_on(async { 20 + 22 }), 42);
     }
-}
-
-/// Cooperatively yields once: wakes itself and returns `Pending` a single time.
-pub fn yield_now() -> impl Future<Output = ()> {
-    struct YieldNow(bool);
-    impl Future for YieldNow {
-        type Output = ();
-        fn poll(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<()> {
-            if self.0 {
-                std::task::Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        }
-    }
-    YieldNow(false)
 }

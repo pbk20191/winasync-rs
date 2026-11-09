@@ -31,7 +31,8 @@ impl NamedPipeStream {
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let handle = self.res.handle;
-        let fut = unsafe {
+        
+        unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let slice =
                     core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::len(buf));
@@ -41,8 +42,7 @@ impl NamedPipeStream {
                     Err(e) => Issue::Failed(e.code()),
                 }
             })
-        };
-        async move { fut.await }
+        }
     }
 
     /// Writes `buf`; resolves to the byte count and hands the buffer back.
@@ -51,7 +51,8 @@ impl NamedPipeStream {
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let handle = self.res.handle;
-        let fut = unsafe {
+        
+        unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
                 match WriteFile(handle, Some(slice), None, Some(ovl)) {
@@ -60,8 +61,7 @@ impl NamedPipeStream {
                     Err(e) => Issue::Failed(e.code()),
                 }
             })
-        };
-        async move { fut.await }
+        }
     }
 }
 

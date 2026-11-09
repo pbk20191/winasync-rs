@@ -101,7 +101,7 @@ mod tests {
         let creg = IoReg::register(client, false).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        let wbuf = Box::new([b'Z']);
+        let wbuf = Box::new(*b"Z");
         let wptr = wbuf.as_ptr();
         let _wop = unsafe {
             submit(&sreg, Box::new(move |ioresult, bytes| { let _ = &wbuf; tx.send((ioresult, bytes)).unwrap(); }), |ovl| {

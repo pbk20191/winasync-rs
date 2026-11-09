@@ -185,7 +185,8 @@ impl UnixStream {
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let sock = self.res.socket();
-        let fut = unsafe {
+        
+        unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let wsabuf = WSABUF {
                     len: IoBuf::len(buf) as u32,
@@ -194,8 +195,7 @@ impl UnixStream {
                 let r = WSASend(sock, &[wsabuf], None, 0, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })
-        };
-        async move { fut.await }
+        }
     }
 }
 

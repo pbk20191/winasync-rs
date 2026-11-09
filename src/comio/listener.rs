@@ -804,11 +804,10 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
     // this arm (observed as wanted above, then made unwanted before the op was
     // stored) must still cancel the op just stored. The cancelled op's
     // `on_result` (Err) then runs the release/handoff.
-    if !want_running(state) {
-        if let Some(op) = state.current_op.lock().unwrap().take() {
+    if !want_running(state)
+        && let Some(op) = state.current_op.lock().unwrap().take() {
             op.cancel();
         }
-    }
 
     Ok(true)
 }
@@ -1097,7 +1096,7 @@ mod listener_tests {
         // A service GUID of our own. Host-to-host loopback needs no
         // GuestCommunicationServices registration; a machine with no Hyper-V
         // socket provider at all reports a skip instead of failing.
-        let service = windows_core::GUID::from_u128(0x5a83_c7e1_9b04_4d26_8f17_63ca0e2b95d8);
+        let service = windows_core::GUID::from_u128(0x5a83c7e1_9b04_4d26_8f17_63ca0e2b95d8);
 
         let listener = HyperVConnectionListener::new();
         let (tx, rx) = mpsc::channel::<(usize, HSTRING)>();

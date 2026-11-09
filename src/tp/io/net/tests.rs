@@ -570,7 +570,7 @@
             // up as mixed content rather than just a wrong length.
             let mut big = Vec::with_capacity(SEG * COUNT);
             for i in 0..COUNT {
-                big.extend(std::iter::repeat(b'a' + i as u8).take(SEG));
+                big.extend(std::iter::repeat_n(b'a' + i as u8, SEG));
             }
             let (n, _) = client.send_to(big, server_addr).await;
             assert_eq!(n.unwrap(), SEG * COUNT, "the send itself is one call");

@@ -208,7 +208,7 @@ fn main() {
         let queue = DispatcherQueue::GetForCurrentThread().unwrap();
         queue.TryEnqueue(&DispatcherQueueHandler::new(move || {
             // server.
-            return Ok(());
+            Ok(())
         })).unwrap();
         windows::Web::Http::HttpClient::new().unwrap().Close().unwrap();
         // server.TransferOwnership()
@@ -222,12 +222,12 @@ fn main() {
 // windows::Networking::Sockets::StreamSocketListener::new;
     ThreadPool::RunAsync(&WorkItemHandler::new(move |_x| {
 
-        return Ok(());
+        Ok(())
     })).unwrap();
     Pool::new().scope(|_pool| {
    //   pool.0;
 
-          ()
+          
     });
  //   winui3::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread().unwrap();
     dispatch_queue.TryEnqueue(&DispatcherQueueHandler::new(move || {
@@ -235,7 +235,7 @@ fn main() {
         let dispatch_queue = winui3::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread().unwrap();
         dispatch_queue.EnqueueEventLoopExit().unwrap();
 
-        return Ok(());
+        Ok(())
     })).unwrap();
     dispatch_queue.RunEventLoop().unwrap();
     controller.ShutdownQueue().unwrap();
@@ -250,7 +250,7 @@ fn main() {
         println!("Hello, world! next");
         let dispatch_queue = winui3::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread().unwrap();
         dispatch_queue.EnqueueEventLoopExit().unwrap();
-        return Ok(());
+        Ok(())
     })).unwrap();
     dispatch_queue.RunEventLoop().unwrap();
     drop(sdk);

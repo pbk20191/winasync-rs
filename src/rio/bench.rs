@@ -97,7 +97,7 @@ fn rio_rate(rt: &Runtime, depth: usize) -> f64 {
     let outstanding = depth.max(1) as u32;
     // sum(max_outstanding) over both sockets must fit the completion queue.
     let cq = RioCq::new(rt, (outstanding + 1) * 4).unwrap();
-    let pool = RioBufferPool::new(2048, (outstanding * 2 + 4) as u32).unwrap();
+    let pool = RioBufferPool::new(2048, outstanding * 2 + 4).unwrap();
     let rq = RqConfig {
         max_outstanding_recv: outstanding,
         max_outstanding_send: outstanding,

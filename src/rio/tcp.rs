@@ -353,16 +353,14 @@ mod tests {
         let mut ra = None;
         let mut rb = None;
         std::future::poll_fn(move |cx| {
-            if ra.is_none() {
-                if let Poll::Ready(v) = a.as_mut().poll(cx) {
+            if ra.is_none()
+                && let Poll::Ready(v) = a.as_mut().poll(cx) {
                     ra = Some(v);
                 }
-            }
-            if rb.is_none() {
-                if let Poll::Ready(v) = b.as_mut().poll(cx) {
+            if rb.is_none()
+                && let Poll::Ready(v) = b.as_mut().poll(cx) {
                     rb = Some(v);
                 }
-            }
             if ra.is_some() && rb.is_some() {
                 Poll::Ready((ra.take().unwrap(), rb.take().unwrap()))
             } else {
@@ -392,7 +390,7 @@ mod tests {
         let cq2 = cq.clone();
         rt.submit(move || {
             let r = listener.accept_blocking(&cq2, RqConfig::default());
-            let _ = tx.send(r.map(|s| Box::new(s)));
+            let _ = tx.send(r.map(Box::new));
         });
 
         let client = RioTcpStream::connect_blocking(&cq, addr, RqConfig::default())
