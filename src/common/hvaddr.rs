@@ -183,6 +183,73 @@ impl HvSocketAddr {
 
 /// `hv://<vm>/<service>`, with the well-known VM GUIDs and vsock-template
 /// service ids spelled out: `hv://loopback/vsock:5000`.
+/// The exact inverse of [`Display`](HvSocketAddr#impl-Display), so an
+/// endpoint can make the round trip through a string.
+///
+/// That matters because a string is the only shape this endpoint can take
+/// across a WinRT projection today: PyWinRT's ABI call shape census has no
+/// callback for a `(GUID, GUID) -> pointer` member, so the two-GUID form of
+/// `BindEndpointAsync`/`ConnectAsync` projects but raises when called. The
+/// string form also reads better from a script than two raw GUIDs would.
+///
+/// Both halves accept either the spelled-out name or a plain GUID, so a
+/// caller is never *forced* through the sugar:
+///
+/// ```text
+/// hv://loopback/vsock:5000
+/// hv://wildcard/00000000-0000-0000-0000-000000000000
+/// hv://9b6a1e00-1234-5678-9abc-def012345678/vsock:22
+/// ```
+impl core::str::FromStr for HvSocketAddr {
+    type Err = HvAddrParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let rest = s.strip_prefix("hv://").ok_or(HvAddrParseError)?;
+        // `split_once` rather than `split('/')`: a GUID contains no slash, so
+        // the first one is always the separator, and a trailing slash in the
+        // service half should fail rather than be silently trimmed.
+        let (vm, service) = rest.split_once('/').ok_or(HvAddrParseError)?;
+
+        let vm_id = match vm {
+            "wildcard" => HV_GUID_WILDCARD,
+            "broadcast" => HV_GUID_BROADCAST,
+            "children" => HV_GUID_CHILDREN,
+            "loopback" => HV_GUID_LOOPBACK,
+            "parent" => HV_GUID_PARENT,
+            "silohost" => HV_GUID_SILOHOST,
+            other => GUID::try_from(other).map_err(|_| HvAddrParseError)?,
+        };
+
+        Ok(Self::new(vm_id, service_id_from_str(service)?))
+    }
+}
+
+/// The service half of an endpoint on its own: `vsock:<port>` or a GUID.
+///
+/// Split out because a service id is also addressable by itself — binding a
+/// service on *any* partition names only this half, which is the AF_HYPERV
+/// counterpart of `StreamSocketListener::BindServiceNameAsync` taking a
+/// service name rather than a full endpoint.
+pub fn service_id_from_str(s: &str) -> Result<GUID, HvAddrParseError> {
+    match s.strip_prefix("vsock:") {
+        Some(port) => Ok(vsock_service_id(
+            port.parse::<u32>().map_err(|_| HvAddrParseError)?,
+        )),
+        None => GUID::try_from(s).map_err(|_| HvAddrParseError),
+    }
+}
+
+/// `hv://…` would not parse. Carries nothing: there is one way to spell an
+/// endpoint and a caller that got it wrong needs the format, not a position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvAddrParseError;
+
+impl core::fmt::Display for HvAddrParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("expected hv://<vm>/<service>, as `HvSocketAddr` renders it")
+    }
+}
+
 impl core::fmt::Display for HvSocketAddr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("hv://")?;
@@ -236,4 +303,70 @@ pub fn local_addr_of(sock: SOCKET) -> windows_core::Result<HvSocketAddr> {
     let mut len = size_of::<SockaddrHv>() as i32;
     sock_check(unsafe { getsockname(sock, &mut raw as *mut _ as *mut SOCKADDR, &mut len) })?;
     Ok(addr_from_raw(&raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every form `Display` can produce must parse back to the same address.
+    ///
+    /// Driven from the *rendered* string rather than from a table of literals,
+    /// so the two impls cannot drift: a change to either side fails here.
+    #[test]
+    fn endpoint_strings_round_trip() {
+        let cases = [
+            HvSocketAddr::wildcard(vsock_service_id(5000)),
+            HvSocketAddr::loopback(vsock_service_id(22)),
+            HvSocketAddr::parent(vsock_service_id(0)),
+            HvSocketAddr::new(HV_GUID_BROADCAST, HV_GUID_ZERO),
+            HvSocketAddr::new(HV_GUID_CHILDREN, HV_GUID_ZERO),
+            HvSocketAddr::new(HV_GUID_SILOHOST, HV_GUID_ZERO),
+            // Neither half well-known: both fall through to plain GUIDs.
+            HvSocketAddr::new(
+                GUID::from_u128(0x9b6a1e00_1234_5678_9abc_def012345678),
+                GUID::from_u128(0x0fedcba9_8765_4321_0fed_cba987654321),
+            ),
+        ];
+        for addr in cases {
+            let rendered = addr.to_string();
+            let parsed: HvSocketAddr = rendered.parse().unwrap_or_else(|e| {
+                panic!("{rendered} did not parse back: {e}");
+            });
+            assert_eq!(parsed, addr, "round trip changed {rendered}");
+        }
+    }
+
+    /// The sugar is optional: a caller may always spell a GUID out, and it
+    /// means the same endpoint as the name.
+    #[test]
+    fn plain_guids_mean_the_same_as_the_names() {
+        let sugared: HvSocketAddr = "hv://loopback/vsock:5000".parse().unwrap();
+        let spelled: HvSocketAddr =
+            "hv://e0e16197-dd56-4a10-9195-5ee7a155a838/00001388-facb-11e6-bd58-64006a7986d3"
+                .parse()
+                .unwrap();
+        assert_eq!(sugared, spelled);
+    }
+
+    #[test]
+    fn malformed_endpoints_are_refused() {
+        for bad in [
+            "",
+            "loopback/vsock:1",            // no scheme
+            "hv://loopback",               // no service
+            "hv://loopback/",              // empty service
+            "hv:///vsock:1",               // empty vm
+            "hv://nosuchvm/vsock:1",       // unknown name, not a GUID
+            "hv://loopback/vsock:",        // no port
+            "hv://loopback/vsock:notanum", // port is not a number
+            "hv://loopback/vsock:-1",      // ports are unsigned
+            "hv://loopback/not-a-guid",
+        ] {
+            assert!(
+                bad.parse::<HvSocketAddr>().is_err(),
+                "{bad:?} should not parse"
+            );
+        }
+    }
 }

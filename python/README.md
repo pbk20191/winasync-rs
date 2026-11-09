@@ -57,19 +57,29 @@ enough when the `.ctor` row exists. Those experiments were reverted, since
 claiming membership in `Windows.Foundation.UniversalApiContract` would be
 false.
 
-**The Hyper-V members cannot be called.** PyWinRT warns that its ABI call
-shape census has no callback for `(GUID, GUID) -> pointer`:
+**The Hyper-V members could not be called — fixed by reshaping them.**
+PyWinRT's ABI call shape census has no callback for `(GUID, GUID) -> pointer`:
 
 ```text
 warning: the shape census has no callback for slot 6 with the ABI call shape
   ({u4u2u2u1u1u1u1u1u1u1u1}{u4u2u2u1u1u1u1u1u1u1u1}p)
 ```
 
-That is `IHyperVConnector::ConnectAsync` and
-`IHyperVListenerBind::BindEndpointAsync`. They are projected but raise if
-called. Named pipe and AF_UNIX are unaffected. The fix is upstream — a member
-of that shape added to [testwinrt](https://github.com/pywinrt/testwinrt) — or
-reshaping those two signatures.
+That was `IHyperVConnector::ConnectAsync` and
+`IHyperVListenerBind::BindEndpointAsync` — which mattered more than it
+sounds, since hvsock is the transport with the strongest claim to this crate
+existing. Rather than wait on an upstream census entry, the metadata now
+takes the endpoint as a string:
+
+```python
+await listener.bind_service_name_async("vsock:54321")
+stream = await connector.connect_async("hv://loopback/vsock:54321")
+```
+
+Nothing is lost. `HvSocketAddr`'s `Display` and `FromStr` are exact inverses,
+tested as a round trip, and either half may still be spelled as a plain GUID.
+Rust callers keep the typed `&GUID` entry points. The projection now
+generates with no warnings at all.
 
 ## What this demonstrates
 

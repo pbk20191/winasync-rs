@@ -384,14 +384,19 @@ impl IStreamConnector_Impl for HyperVConnector_Impl {
 
 #[allow(non_snake_case)]
 impl IHyperVConnector_Impl for HyperVConnector_Impl {
-    // Null checks are gone: the generated binding takes `&GUID`, so a null
-    // can no longer reach here at all.
+    /// The string form the metadata declares; see the RDL for why. Rust
+    /// callers use [`HyperVConnector::connect_async`], which keeps the GUIDs.
     fn ConnectAsync(
         &self,
-        vmId: &windows_core::GUID,
-        serviceId: &windows_core::GUID,
+        endpoint: &HSTRING,
     ) -> Result<windows_future::IAsyncOperation<TransportStream>> {
-        Ok(self.connect_async(vmId, serviceId))
+        let addr: HvSocketAddr = endpoint
+            .to_string()
+            .parse()
+            .map_err(|e: crate::common::hvaddr::HvAddrParseError| {
+                windows_core::Error::new(windows::Win32::Foundation::E_INVALIDARG, e.to_string())
+            })?;
+        Ok(self.connect_async(&addr.vm_id, &addr.service_id))
     }
 }
 

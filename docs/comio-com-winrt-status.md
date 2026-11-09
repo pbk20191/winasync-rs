@@ -290,14 +290,31 @@ $l.Bind($name)
 
    우회는 `python/activate_instance.py`: 프로젝션이 이미 찾을 줄 아는 액티베이션 팩토리에 `IActivationFactory::ActivateInstance`를 직접 부른다.
 
-   ### 걸린 것 2 — Hyper-V 멤버는 호출이 안 된다
+   ### 걸린 것 2 — Hyper-V 멤버 → **해결** (시그니처 변경)
 
    ```text
    warning: the shape census has no callback for slot 6 with the ABI call shape
      ({u4u2u2u1u1u1u1u1u1u1u1}{u4u2u2u1u1u1u1u1u1u1u1}p)
    ```
 
-   `(GUID, GUID) -> 포인터` 모양이 PyWinRT의 ABI 호출 모양 census에 없다. `IHyperVConnector::ConnectAsync`와 `IHyperVListenerBind::BindEndpointAsync`가 그것이다 — 투영은 되지만 호출하면 raise한다. 네임드 파이프와 AF_UNIX는 무관하다. 해결은 업스트림(testwinrt에 그 모양 추가)이거나 저 둘의 시그니처 변경.
+   `(GUID, GUID) -> 포인터` 모양이 PyWinRT의 ABI 호출 모양 census에 없어서 `IHyperVConnector::ConnectAsync`와 `IHyperVListenerBind::BindEndpointAsync`가 투영은 되고 호출하면 raise했다. **하필 hvsock이 이 크레이트가 존재할 이유에 가장 가까운 전송**이라 그냥 둘 수 없었다 — host↔guest 신뢰 경계를 넘는 유일한 전송이고, WinRT가 이름조차 못 붙이는 유일한 전송이다.
+
+   업스트림(testwinrt에 모양 추가)을 기다리는 대신 **메타데이터가 엔드포인트를 문자열로 받게 바꿨다**:
+
+   ```python
+   await listener.bind_service_name_async("vsock:54321")
+   stream = await connector.connect_async("hv://loopback/vsock:54321")
+   ```
+
+   잃는 게 없다. `HvSocketAddr`의 `Display`/`FromStr`이 정확한 역함수이고(왕복 테스트로 고정), 양쪽 다 평범한 GUID로도 쓸 수 있다. Rust 호출자는 타입 있는 `&GUID` 진입점을 그대로 쓴다. 스크립트 입장에서도 raw GUID 두 개보다 `hv://loopback/vsock:5000`이 낫다.
+
+   결과: **프로젝션이 경고 0으로 생성되고, Python에서 실제 AF_HYPERV 왕복이 돈다.**
+
+   ```text
+   hyper-v listening on hv://wildcard/vsock:54321
+   hyper-v accepted
+   hyper-v server read 'hello over hvsock'
+   ```
 
    ### 파이프라인
 

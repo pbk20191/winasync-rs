@@ -57,8 +57,65 @@ async def main() -> int:
 
     listener.close()
     assert got == "hello from python", got
+
+    await hyperv_round_trip()
+
     print("ROUND-TRIP-OK")
     return 0
+
+
+async def hyperv_round_trip() -> None:
+    """The same round trip over an AF_HYPERV socket.
+
+    This is the transport with the strongest claim to this crate existing:
+    the only one crossing a host/guest trust boundary, and the only one WinRT
+    cannot even name -- `HostNameType` is DomainName, Ipv4, Ipv6, Bluetooth.
+
+    It is also the one that had to be reshaped to be reachable from here.
+    PyWinRT's ABI call shape census has no callback for a
+    `(GUID, GUID) -> pointer` member, so the typed form projected and then
+    raised; the metadata takes `hv://<vm>/<service>` instead. Nothing is lost
+    -- `HvSocketAddr`'s `Display` and `FromStr` are exact inverses, and either
+    half may still be spelled as a plain GUID.
+
+    Skips where the AF_HYPERV provider is absent, which is most machines
+    without Hyper-V enabled.
+    """
+    loop = asyncio.get_running_loop()
+    arrived: asyncio.Future = loop.create_future()
+    service = "vsock:54321"
+
+    listener = activate(rw.HyperVConnectionListener)
+    listener.add_connection_received(
+        lambda _s, args: loop.call_soon_threadsafe(
+            lambda: arrived.done() or arrived.set_result(args.stream)
+        )
+    )
+    try:
+        # Binding is lazy, so an absent provider surfaces here rather than
+        # at construction.
+        await listener.bind_service_name_async(service)
+    except OSError as e:
+        print(f"hyper-v skipped: {e}")
+        return
+    print(f"hyper-v listening on {listener.information}")
+
+    connector = activate(rw.HyperVConnector)
+    client = await connector.connect_async(f"hv://loopback/{service}")
+    server = await asyncio.wait_for(arrived, timeout=10)
+    print("hyper-v accepted")
+
+    writer = DataWriter(client)
+    writer.write_string("hello over hvsock")
+    await writer.store_async()
+    await writer.flush_async()
+
+    reader = DataReader(server)
+    n = await reader.load_async(64)
+    got = reader.read_string(n)
+    print(f"hyper-v server read {got!r}")
+    listener.close()
+    assert got == "hello over hvsock", got
 
 
 if __name__ == "__main__":

@@ -75,11 +75,20 @@ mod Rustwinui3loop {
         fn BindAsync(&self, path: String) -> Windows::Foundation::IAsyncAction;
     }
 
-    // GUIDs rather than a `HostName` because WinRT cannot spell this
+    // Strings rather than a `HostName`, because WinRT cannot spell this
     // endpoint: `HostNameType` is `DomainName | Ipv4 | Ipv6 | Bluetooth`.
+    //
+    // Strings rather than the pair of GUIDs the transport actually takes,
+    // for two reasons. A projection cannot call a `(GUID, GUID) -> pointer`
+    // member today — PyWinRT's ABI call shape census has no callback for
+    // that shape, so the typed form projects and then raises. And
+    // `hv://loopback/vsock:5000` is what a script wants to write anyway,
+    // where two raw GUIDs are not. `HvSocketAddr`'s `Display`/`FromStr` are
+    // exact inverses, so nothing is lost: a caller may always spell either
+    // half as a plain GUID. Rust callers keep the typed entry points.
     interface IHyperVListenerBind {
-        fn BindEndpointAsync(&self, vmId: GUID, serviceId: GUID) -> Windows::Foundation::IAsyncAction;
-        fn BindServiceNameAsync(&self, serviceId: GUID) -> Windows::Foundation::IAsyncAction;
+        fn BindEndpointAsync(&self, endpoint: String) -> Windows::Foundation::IAsyncAction;
+        fn BindServiceNameAsync(&self, serviceName: String) -> Windows::Foundation::IAsyncAction;
     }
 
     #[Activatable(1)]
@@ -122,7 +131,7 @@ mod Rustwinui3loop {
     }
 
     interface IHyperVConnector {
-        fn ConnectAsync(&self, vmId: GUID, serviceId: GUID) -> Windows::Foundation::IAsyncOperation<TransportStream>;
+        fn ConnectAsync(&self, endpoint: String) -> Windows::Foundation::IAsyncOperation<TransportStream>;
     }
 
     #[Activatable(1)]

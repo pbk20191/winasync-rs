@@ -470,18 +470,26 @@ impl IUnixListenerBind_Impl for UnixConnectionListener_Impl {
     }
 }
 
+// The string forms, which are what the metadata declares — see the RDL for
+// why this endpoint crosses a projection as text rather than as the pair of
+// GUIDs the transport takes. A malformed endpoint is `E_INVALIDARG`: the
+// caller passed something that is not an address, which is exactly that.
 impl IHyperVListenerBind_Impl for HyperVConnectionListener_Impl {
-    fn BindEndpointAsync(
-        &self,
-        vmId: &windows_core::GUID,
-        serviceId: &windows_core::GUID,
-    ) -> Result<IAsyncAction> {
-        self.bind_endpoint(vmId, serviceId)
+    fn BindEndpointAsync(&self, endpoint: &HSTRING) -> Result<IAsyncAction> {
+        let addr: HvSocketAddr = endpoint.to_string().parse().map_err(invalid_endpoint)?;
+        self.bind_endpoint(&addr.vm_id, &addr.service_id)
     }
 
-    fn BindServiceNameAsync(&self, serviceId: &windows_core::GUID) -> Result<IAsyncAction> {
-        self.bind_service_name(serviceId)
+    fn BindServiceNameAsync(&self, serviceName: &HSTRING) -> Result<IAsyncAction> {
+        let service = crate::common::hvaddr::service_id_from_str(&serviceName.to_string())
+            .map_err(invalid_endpoint)?;
+        self.bind_service_name(&service)
     }
+}
+
+/// E_INVALIDARG, carrying what the string should have looked like.
+fn invalid_endpoint(e: crate::common::hvaddr::HvAddrParseError) -> Error {
+    Error::new(windows::Win32::Foundation::E_INVALIDARG, e.to_string())
 }
 
 // The struct declarations stay out of the macro: `#[implement]` is a
@@ -1054,10 +1062,13 @@ mod listener_tests {
         let _ = std::fs::remove_file(&path);
 
         let hv = HyperVConnectionListener::new();
-        let svc = windows_core::GUID::from_u128(0x3b1f_0a27_55c4_4e8d_9a62_71d0e3f48b05);
+        // A vsock-template service id, so the bind below can be spelled with
+        // the `vsock:` sugar the string form accepts. `BindServiceNameAsync`
+        // takes the *service* half alone, not a whole `hv://` endpoint.
+        let svc = crate::common::hvaddr::vsock_service_id(54_321);
         let hv_bound = {
             let b: IHyperVListenerBind = hv.cast().expect("QI IHyperVListenerBind");
-            b.BindServiceNameAsync(svc).is_ok()
+            b.BindServiceNameAsync(&HSTRING::from("vsock:54321")).is_ok()
         };
         if hv_bound {
             let label = HvSocketAddr::new(HV_GUID_WILDCARD, svc).to_string();

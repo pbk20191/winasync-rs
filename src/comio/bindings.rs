@@ -130,16 +130,14 @@ pub mod Rustwinui3loop {
         }
         pub fn BindEndpointAsync(
             &self,
-            vmid: windows_core::GUID,
-            serviceid: windows_core::GUID,
+            endpoint: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncAction> {
             let this = &windows_core::Interface::cast::<IHyperVListenerBind>(self)?;
             unsafe {
                 let mut result__ = core::mem::zeroed();
                 (windows_core::Interface::vtable(this).BindEndpointAsync)(
                     windows_core::Interface::as_raw(this),
-                    vmid,
-                    serviceid,
+                    core::mem::transmute_copy(endpoint),
                     &mut result__,
                 )
                 .and_then(|| windows_core::Type::from_abi(result__))
@@ -147,14 +145,14 @@ pub mod Rustwinui3loop {
         }
         pub fn BindServiceNameAsync(
             &self,
-            serviceid: windows_core::GUID,
+            servicename: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncAction> {
             let this = &windows_core::Interface::cast::<IHyperVListenerBind>(self)?;
             unsafe {
                 let mut result__ = core::mem::zeroed();
                 (windows_core::Interface::vtable(this).BindServiceNameAsync)(
                     windows_core::Interface::as_raw(this),
-                    serviceid,
+                    core::mem::transmute_copy(servicename),
                     &mut result__,
                 )
                 .and_then(|| windows_core::Type::from_abi(result__))
@@ -200,16 +198,14 @@ pub mod Rustwinui3loop {
         }
         pub fn ConnectAsync(
             &self,
-            vmid: windows_core::GUID,
-            serviceid: windows_core::GUID,
+            endpoint: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>> {
             let this = &windows_core::Interface::cast::<IHyperVConnector>(self)?;
             unsafe {
                 let mut result__ = core::mem::zeroed();
                 (windows_core::Interface::vtable(this).ConnectAsync)(
                     windows_core::Interface::as_raw(this),
-                    vmid,
-                    serviceid,
+                    core::mem::transmute_copy(endpoint),
                     &mut result__,
                 )
                 .and_then(|| windows_core::Type::from_abi(result__))
@@ -509,7 +505,7 @@ pub mod Rustwinui3loop {
     windows_core::imp::define_interface!(
         IHyperVConnector,
         IHyperVConnector_Vtbl,
-        0x6fefe81e_d526_570c_aa02_d18bd044b5de
+        0xbd492f65_f1d3_5ed7_8d3b_26405b313fdf
     );
     impl windows_core::RuntimeType for IHyperVConnector {
         const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -523,16 +519,14 @@ pub mod Rustwinui3loop {
     impl IHyperVConnector {
         pub fn ConnectAsync(
             &self,
-            vmid: windows_core::GUID,
-            serviceid: windows_core::GUID,
+            endpoint: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>> {
             let this = self;
             unsafe {
                 let mut result__ = core::mem::zeroed();
                 (windows_core::Interface::vtable(this).ConnectAsync)(
                     windows_core::Interface::as_raw(this),
-                    vmid,
-                    serviceid,
+                    core::mem::transmute_copy(endpoint),
                     &mut result__,
                 )
                 .and_then(|| windows_core::Type::from_abi(result__))
@@ -545,8 +539,7 @@ pub mod Rustwinui3loop {
     pub trait IHyperVConnector_Impl: windows_core::IUnknownImpl {
         fn ConnectAsync(
             &self,
-            vmId: &windows_core::GUID,
-            serviceId: &windows_core::GUID,
+            endpoint: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncOperation<TransportStream>>;
     }
     impl IHyperVConnector_Vtbl {
@@ -556,18 +549,14 @@ pub mod Rustwinui3loop {
                 const OFFSET: isize,
             >(
                 this: *mut core::ffi::c_void,
-                vmid: windows_core::GUID,
-                serviceid: windows_core::GUID,
+                endpoint: *mut core::ffi::c_void,
                 result__: *mut *mut core::ffi::c_void,
             ) -> windows_core::HRESULT {
                 unsafe {
                     let this: &Identity =
                         &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                    match IHyperVConnector_Impl::ConnectAsync(
-                        this,
-                        core::mem::transmute(&vmid),
-                        core::mem::transmute(&serviceid),
-                    ) {
+                    match IHyperVConnector_Impl::ConnectAsync(this, core::mem::transmute(&endpoint))
+                    {
                         Ok(ok__) => {
                             result__.write(core::mem::transmute_copy(&ok__));
                             core::mem::forget(ok__);
@@ -593,15 +582,14 @@ pub mod Rustwinui3loop {
         pub base__: windows_core::IInspectable_Vtbl,
         pub ConnectAsync: unsafe extern "system" fn(
             *mut core::ffi::c_void,
-            windows_core::GUID,
-            windows_core::GUID,
+            *mut core::ffi::c_void,
             *mut *mut core::ffi::c_void,
         ) -> windows_core::HRESULT,
     }
     windows_core::imp::define_interface!(
         IHyperVListenerBind,
         IHyperVListenerBind_Vtbl,
-        0xa3aae04c_0539_5fed_8ba6_7d17c3443c10
+        0x572f1d69_1350_56fa_9eae_fbfb23896e72
     );
     impl windows_core::RuntimeType for IHyperVListenerBind {
         const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -615,16 +603,14 @@ pub mod Rustwinui3loop {
     impl IHyperVListenerBind {
         pub fn BindEndpointAsync(
             &self,
-            vmid: windows_core::GUID,
-            serviceid: windows_core::GUID,
+            endpoint: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncAction> {
             let this = self;
             unsafe {
                 let mut result__ = core::mem::zeroed();
                 (windows_core::Interface::vtable(this).BindEndpointAsync)(
                     windows_core::Interface::as_raw(this),
-                    vmid,
-                    serviceid,
+                    core::mem::transmute_copy(endpoint),
                     &mut result__,
                 )
                 .and_then(|| windows_core::Type::from_abi(result__))
@@ -632,14 +618,14 @@ pub mod Rustwinui3loop {
         }
         pub fn BindServiceNameAsync(
             &self,
-            serviceid: windows_core::GUID,
+            servicename: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncAction> {
             let this = self;
             unsafe {
                 let mut result__ = core::mem::zeroed();
                 (windows_core::Interface::vtable(this).BindServiceNameAsync)(
                     windows_core::Interface::as_raw(this),
-                    serviceid,
+                    core::mem::transmute_copy(servicename),
                     &mut result__,
                 )
                 .and_then(|| windows_core::Type::from_abi(result__))
@@ -652,12 +638,11 @@ pub mod Rustwinui3loop {
     pub trait IHyperVListenerBind_Impl: windows_core::IUnknownImpl {
         fn BindEndpointAsync(
             &self,
-            vmId: &windows_core::GUID,
-            serviceId: &windows_core::GUID,
+            endpoint: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncAction>;
         fn BindServiceNameAsync(
             &self,
-            serviceId: &windows_core::GUID,
+            serviceName: &windows_core::HSTRING,
         ) -> windows_core::Result<windows_future::IAsyncAction>;
     }
     impl IHyperVListenerBind_Vtbl {
@@ -667,8 +652,7 @@ pub mod Rustwinui3loop {
                 const OFFSET: isize,
             >(
                 this: *mut core::ffi::c_void,
-                vmid: windows_core::GUID,
-                serviceid: windows_core::GUID,
+                endpoint: *mut core::ffi::c_void,
                 result__: *mut *mut core::ffi::c_void,
             ) -> windows_core::HRESULT {
                 unsafe {
@@ -676,8 +660,7 @@ pub mod Rustwinui3loop {
                         &*((this as *const *const ()).offset(OFFSET) as *const Identity);
                     match IHyperVListenerBind_Impl::BindEndpointAsync(
                         this,
-                        core::mem::transmute(&vmid),
-                        core::mem::transmute(&serviceid),
+                        core::mem::transmute(&endpoint),
                     ) {
                         Ok(ok__) => {
                             result__.write(core::mem::transmute_copy(&ok__));
@@ -693,7 +676,7 @@ pub mod Rustwinui3loop {
                 const OFFSET: isize,
             >(
                 this: *mut core::ffi::c_void,
-                serviceid: windows_core::GUID,
+                servicename: *mut core::ffi::c_void,
                 result__: *mut *mut core::ffi::c_void,
             ) -> windows_core::HRESULT {
                 unsafe {
@@ -701,7 +684,7 @@ pub mod Rustwinui3loop {
                         &*((this as *const *const ()).offset(OFFSET) as *const Identity);
                     match IHyperVListenerBind_Impl::BindServiceNameAsync(
                         this,
-                        core::mem::transmute(&serviceid),
+                        core::mem::transmute(&servicename),
                     ) {
                         Ok(ok__) => {
                             result__.write(core::mem::transmute_copy(&ok__));
@@ -729,13 +712,12 @@ pub mod Rustwinui3loop {
         pub base__: windows_core::IInspectable_Vtbl,
         pub BindEndpointAsync: unsafe extern "system" fn(
             *mut core::ffi::c_void,
-            windows_core::GUID,
-            windows_core::GUID,
+            *mut core::ffi::c_void,
             *mut *mut core::ffi::c_void,
         ) -> windows_core::HRESULT,
         pub BindServiceNameAsync: unsafe extern "system" fn(
             *mut core::ffi::c_void,
-            windows_core::GUID,
+            *mut core::ffi::c_void,
             *mut *mut core::ffi::c_void,
         ) -> windows_core::HRESULT,
     }
