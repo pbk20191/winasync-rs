@@ -16,31 +16,8 @@ pub fn new_buffer(capacity: u32) -> windows_core::Result<Buffer> {
 /// Safe to call, but the returned pointer is only valid while `buf` lives,
 /// and only `Capacity()` bytes are addressable — `Length()` says how many
 /// currently hold data.
-///
-/// # A buffer without byte access
-///
-/// `E_INVALIDARG`, with a message, rather than the bare `E_NOINTERFACE` the
-/// cast fails with -- because the cause is almost never the buffer's
-/// implementation and almost always where it came from.
-///
-/// `IBufferByteAccess` is in-process only: it has no proxy, by design, since
-/// a raw pointer means nothing in another address space. A buffer reaches the
-/// out-of-process server (`comio::server`) with byte access only if it
-/// *marshals by value*, which the system `Buffer` does through the buffer
-/// marshaler (`RoGetBufferMarshaler`) and which is the Windows Runtime's
-/// contract for any `IBuffer` meant to cross processes. A buffer that does
-/// not arrives as a proxy, and there is no way to reach its bytes through the
-/// `IBuffer` members alone -- so this is an error to report, not a case to
-/// work around.
 pub fn buffer_ptr(buf: &IBuffer) -> windows_core::Result<*mut u8> {
-    let access: IBufferByteAccess = buf.cast().map_err(|_| {
-        windows_core::Error::new(
-            windows::Win32::Foundation::E_INVALIDARG,
-            "the IBuffer has no IBufferByteAccess; across a process boundary \
-             only a buffer that marshals by value (such as \
-             Windows.Storage.Streams.Buffer) carries its bytes",
-        )
-    })?;
+    let access: IBufferByteAccess = buf.cast()?;
     unsafe { access.Buffer() }
 }
 

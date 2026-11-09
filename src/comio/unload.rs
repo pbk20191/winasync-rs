@@ -109,14 +109,8 @@ static LOCKS: AtomicUsize = AtomicUsize::new(0);
 /// took, and the subtraction has to survive that. `saturating_sub` is why: a
 /// wrapped count would read `usize::MAX` and pin the module loaded for the
 /// life of the process, turning somebody else's imbalance into our leak.
-///
-/// In the out-of-process server the same lock holds the *process* instead;
-/// `comio::server` keeps that count, with the same tolerance for a caller's
-/// imbalance. Without either feature a lock is accepted and means nothing: a
-/// caller locking a server that never offers to go away has lost nothing.
-#[allow(unused_variables)]
+#[cfg(feature = "dylib")]
 pub(crate) fn lock_server(lock: bool) {
-    #[cfg(feature = "dylib")]
     if lock {
         LOCKS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -124,56 +118,28 @@ pub(crate) fn lock_server(lock: bool) {
             Some(n.saturating_sub(1))
         });
     }
-    #[cfg(feature = "server")]
-    super::server::lock(lock);
 }
+
+/// `LockServer` still succeeds without the feature: a caller locking a server
+/// that never offers to unload has lost nothing.
+#[cfg(not(feature = "dylib"))]
+pub(crate) fn lock_server(_lock: bool) {}
 
 /// One reason this module must stay loaded.
 ///
 /// Held as a field by every `#[implement]` type in `comio`, and by the guard
 /// `LockServer` keeps. Cloning makes a second reason rather than sharing one,
 /// which is what a field in a second object needs.
-///
-/// "This module" means whatever the code is running in. In the server DLL it
-/// is the DLL, counted for `DllCanUnloadNow`. In the out-of-process server it
-/// is the process, counted with `CoAddRefServerProcess` so the server exits
-/// when the last one goes (`comio::server`). In a plain rlib consumer nothing
-/// reads it and it compiles to nothing.
-pub(crate) struct ModuleRef {
-    /// Whether this reference took a server-process reference, and so must
-    /// give one back. Recorded rather than re-asked at drop, because the
-    /// server may start serving -- or finish -- between the two.
-    #[cfg(feature = "server")]
-    served: bool,
-}
+pub(crate) struct ModuleRef(());
 
 impl ModuleRef {
     pub(crate) fn new() -> Self {
-        Self::counted(true)
-    }
-
-    /// A reference held by a class object.
-    ///
-    /// Counted in the DLL like any other: a host holding our class factory
-    /// holds a vtable in the module. Not counted in the out-of-process server,
-    /// where the six factories are registered for the life of the process and
-    /// revoked only once the count reaches zero -- counting them would mean it
-    /// never could.
-    pub(crate) fn factory() -> Self {
-        Self::counted(false)
-    }
-
-    #[allow(unused_variables)]
-    fn counted(serves: bool) -> Self {
         // Relaxed is enough on the way up: the object being constructed is
         // not reachable by another thread until after this returns, so there
         // is nothing for this increment to be ordered against.
         #[cfg(feature = "dylib")]
         OUTSTANDING.fetch_add(1, Ordering::Relaxed);
-        Self {
-            #[cfg(feature = "server")]
-            served: serves && super::server::add_ref(),
-        }
+        Self(())
     }
 }
 
@@ -196,10 +162,6 @@ impl Drop for ModuleRef {
         // count at zero and unload the module.
         #[cfg(feature = "dylib")]
         OUTSTANDING.fetch_sub(1, Ordering::Release);
-        #[cfg(feature = "server")]
-        if self.served {
-            super::server::release();
-        }
     }
 }
 

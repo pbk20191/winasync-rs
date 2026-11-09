@@ -274,20 +274,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "winasync-ps"
-version = "0.1.0"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "winasync-server"
-version = "0.1.0"
-dependencies = [
- "winasync",
-]
-
-[[package]]
 name = "windows"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -535,7 +521,6 @@ dependencies = [
 name = "winmdgen"
 version = "0.1.0"
 dependencies = [
- "cc",
  "windows-bindgen",
  "windows-rdl",
 ]
