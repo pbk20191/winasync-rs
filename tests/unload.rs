@@ -152,7 +152,28 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
     // Connect, start a read nothing will answer, then drop every object.
     // The object count returns to zero while the operation is still armed,
     // and its completion callback still points into this module.
-    let client = connect(&pipe_name);
+    //
+    // The other end is a raw pipe this test holds, not one of the listener's
+    // streams. It used to be the listener's accepted end, which went with the
+    // listener: the read then ended with a broken pipe at a moment of the
+    // kernel's choosing, and a fast enough (release) run finished it before
+    // the object count reached zero -- so the state below was never seen.
+    // Holding the far end keeps the read pending until the test lets it go.
+    let far_name = format!(r"\\.\pipe\comio_unload_far_{}", std::process::id());
+    let far_end = unsafe {
+        CreateNamedPipeW(
+            &windows_core::HSTRING::from(&far_name),
+            FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0),
+            PIPE_TYPE_BYTE,
+            1,
+            4096,
+            4096,
+            0,
+            None,
+        )
+    };
+    assert!(!far_end.is_invalid(), "CreateNamedPipeW failed");
+    let client = connect(&far_name);
     let buffer = Buffer::Create(16).expect("Buffer::Create");
     let read = client
         .cast::<IInputStream>()
@@ -161,40 +182,36 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
         .expect("ReadAsync");
 
     // Everything the test holds goes, including the operation object. The
-    // read itself is still pending: nothing has been written.
+    // read itself is still pending: nothing has been written, and the far
+    // end is still open.
     drop(read);
     drop(client);
     drop(listener);
+    let _ = pipe_name;
 
-    // The accepted server end lives inside the listener's state, which the
-    // drop above released, so the pipe's other end is gone and the read will
-    // complete with a broken-pipe error rather than hanging. Either way it
-    // is the *operation* keeping the module loaded now, not an object.
+    // What keeps the module now is the read: its operation object, which the
+    // completion callback holds until the read ends, and the op block that
+    // `LIVE_OPS` counts. (There is no moment with the object gone and the op
+    // still armed long enough to observe: the callback releases the object
+    // as its last act. An earlier version waited for one and was flaky.)
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!can_unload(), "the module offered to unload with a read in flight");
+    assert!(
+        winasync::common::overlapped::LIVE_OPS.load(std::sync::atomic::Ordering::Acquire) > 0,
+        "a pending read is not counted in LIVE_OPS -- check that it is not          gated to debug builds again"
+    );
+
+    // Now let the read end: closing the far end fails it with a broken pipe,
+    // and once its completion has run the module may go.
+    unsafe { CloseHandle(far_end) }.expect("CloseHandle");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut saw_zero_objects_with_io_live = false;
-    while Instant::now() < deadline {
-        if outstanding() == 0 {
-            if !can_unload() {
-                saw_zero_objects_with_io_live = true;
-            }
-            if can_unload() {
-                break;
-            }
-        }
+    while !can_unload() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-
     assert_eq!(outstanding(), 0, "objects outlived the test");
     assert!(
         can_unload(),
         "the operation never settled; LIVE_OPS is still nonzero"
-    );
-    assert!(
-        saw_zero_objects_with_io_live,
-        "never observed the state this test exists for: zero objects and an \
-         operation still in flight. Either the read completed before the \
-         first poll, or LIVE_OPS is not being counted — check that it is not \
-         gated to debug builds again"
     );
 
     // --- 6. Process-global state is given back, not kept -----------------
