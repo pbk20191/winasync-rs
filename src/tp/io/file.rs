@@ -8,8 +8,9 @@ use crate::tp::Runtime;
 use core::ffi::c_void;
 use std::sync::Arc;
 use windows::Win32::Foundation::{
-    ERROR_HANDLE_EOF, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE,
+    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
 };
+use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, ReadFileScatter, WriteFile, WriteFileGather, CREATE_ALWAYS,
     FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_NO_BUFFERING,
@@ -452,9 +453,183 @@ impl File {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Byte-range locks (LockFileEx / UnlockFileEx)
+// ---------------------------------------------------------------------------
+
+/// A held byte-range lock; dropping it unlocks the range.
+///
+/// Windows ties a lock to the handle that took it, so this keeps the file's
+/// handle open until the range is unlocked.
+pub struct FileLock {
+    _state: Arc<LockState>,
+}
+
+/// One lock request, shared by its future and its completion. Whoever lets
+/// go last unlocks the range if it was granted -- which is what keeps a lock
+/// that is granted just as its future is dropped from being held forever:
+/// the completion still sees the grant, and nobody else is left to undo it.
+struct LockState {
+    res: Arc<IoRes>,
+    offset: u64,
+    len: u64,
+    granted: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for LockState {
+    fn drop(&mut self) {
+        if self.granted.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = unlock_range(self.res.handle, self.offset, self.len);
+        }
+    }
+}
+
+/// `UnlockFileEx`, waited for here. The handle is bound to the runtime's
+/// completion port, so the request carries an event with its low bit set:
+/// that keeps its completion off the port, where the pool would receive a
+/// packet for an `OVERLAPPED` it never issued.
+fn unlock_range(handle: HANDLE, offset: u64, len: u64) -> windows_core::Result<()> {
+    use windows::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows::Win32::System::IO::GetOverlappedResult;
+    use windows::Win32::System::Threading::CreateEventW;
+    let event = unsafe { CreateEventW(None, true, false, None)? };
+    let mut ovl = OVERLAPPED::default();
+    ovl.Anonymous.Anonymous.Offset = offset as u32;
+    ovl.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    ovl.hEvent = HANDLE((event.0 as usize | 1) as *mut c_void);
+    let issued = unsafe { UnlockFileEx(handle, None, len as u32, (len >> 32) as u32, &mut ovl) };
+    let result = match issued {
+        Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
+            let mut n = 0u32;
+            unsafe { GetOverlappedResult(handle, &ovl, &mut n, true) }
+        }
+        other => other,
+    };
+    unsafe {
+        let _ = CloseHandle(event);
+    }
+    result
+}
+
+impl File {
+    /// Locks `len` bytes at `offset`, waiting for anyone who holds an
+    /// overlapping lock; resolves to a guard that unlocks on drop.
+    ///
+    /// `exclusive` locks keep out every other lock on the range; shared
+    /// ones admit other shared ones. Windows enforces locks against reads
+    /// and writes through *other* handles. Dropping the future while it waits
+    /// cancels the request.
+    pub fn lock(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> impl Future<Output = windows_core::Result<FileLock>> + Send + use<> {
+        let attempt = self.lock_with(offset, len, exclusive, false);
+        async move { attempt.await.map(|lock| lock.expect("a waiting lock cannot be refused")) }
+    }
+
+    /// [`lock`](Self::lock), without waiting: `None` if an overlapping lock
+    /// is held.
+    pub fn try_lock(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+    ) -> impl Future<Output = windows_core::Result<Option<FileLock>>> + Send + use<> {
+        self.lock_with(offset, len, exclusive, true)
+    }
+
+    fn lock_with(
+        &self,
+        offset: u64,
+        len: u64,
+        exclusive: bool,
+        immediately: bool,
+    ) -> impl Future<Output = windows_core::Result<Option<FileLock>>> + Send + use<> {
+        use crate::common::overlapped::{self as ov, Completion};
+        use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_OPERATION_ABORTED, WIN32_ERROR};
+        use windows::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LOCK_FILE_FLAGS,
+        };
+        let state = Arc::new(LockState {
+            res: self.res.clone(),
+            offset,
+            len,
+            granted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (tx, rx) = crate::common::oneshot::channel::<windows_core::Result<()>>();
+        let completion_state = state.clone();
+        let on_complete: ov::CompleteFn = Box::new(move |c: Completion| {
+            let result = match c {
+                Completion::Done(0, _) => {
+                    completion_state
+                        .granted
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                }
+                Completion::Done(code, _) => {
+                    Err(windows_core::Error::from_hresult(WIN32_ERROR(code).to_hresult()))
+                }
+                Completion::SyncFail(hr) => Err(windows_core::Error::from_hresult(hr)),
+            };
+            let _ = tx.send(result);
+            // If the future is already gone, this was the last reference,
+            // and a granted lock is unlocked right here.
+            drop(completion_state);
+        });
+        let mut flags = LOCK_FILE_FLAGS(0);
+        if exclusive {
+            flags |= LOCKFILE_EXCLUSIVE_LOCK;
+        }
+        if immediately {
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+        }
+        let handle = self.res.handle;
+        let op = unsafe {
+            ov::submit(&self.res.inner, (), on_complete, move |ovl, _| {
+                (*ovl).Anonymous.Anonymous.Offset = offset as u32;
+                (*ovl).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+                match LockFileEx(handle, flags, None, len as u32, (len >> 32) as u32, ovl) {
+                    Ok(()) => Issue::SyncSuccess,
+                    Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                    // The exception to "a synchronous failure queues no
+                    // packet". Measured: a fail-immediately lock refused with
+                    // ERROR_LOCK_VIOLATION *also* queues a failed packet for
+                    // this OVERLAPPED. Treating it as a plain failure freed
+                    // the op block that packet then reached -- an access
+                    // violation. So it is pending: the packet carries it.
+                    Err(e) if e.code() == ERROR_LOCK_VIOLATION.to_hresult() => Issue::Pending,
+                    Err(e) => Issue::Failed(e.code()),
+                }
+            })
+        };
+        /// Cancels a lock request still waiting when its future is dropped.
+        struct CancelOnDrop(ov::OpHandle<()>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let op = CancelOnDrop(op);
+        async move {
+            let _op = op;
+            match rx.await {
+                Ok(Ok(())) => Ok(Some(FileLock { _state: state })),
+                Ok(Err(e)) if e.code() == ERROR_LOCK_VIOLATION.to_hresult() => Ok(None),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(windows_core::Error::from_hresult(
+                    ERROR_OPERATION_ABORTED.to_hresult(),
+                )),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::super::{block_on, Runtime};
+    use super::super::super::{block_on, timeout, Runtime};
+    use std::time::Duration;
     use super::*;
 
     fn temp_path(name: &str) -> String {
@@ -626,6 +801,94 @@ mod tests {
         let (n, _) = block_on(unsafe { file.read_at_unchecked(&mut part[..], 100) });
         assert_eq!(n.unwrap(), 0, "end of file is a zero-length read");
         drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two handles on one file: locks are per handle, so this is how they
+    /// conflict.
+    fn two_handles(rt: &Runtime, tag: &str) -> (String, File, File) {
+        let path = std::env::temp_dir()
+            .join(format!("tp_lock_{tag}_{}.bin", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+        let a = File::open(rt, &path).unwrap();
+        let b = File::open(rt, &path).unwrap();
+        (path, a, b)
+    }
+
+    #[test]
+    fn an_exclusive_lock_keeps_others_out_until_dropped() {
+        let rt = Runtime::new();
+        let (path, a, b) = two_handles(&rt, "excl");
+        let held = block_on(a.lock(0, 100, true)).unwrap();
+        assert!(block_on(b.try_lock(50, 10, false)).unwrap().is_none(), "overlap admitted");
+        assert!(block_on(b.try_lock(100, 10, true)).unwrap().is_some(), "a disjoint range was refused");
+
+        // A waiting lock gets the range once it is released.
+        let waiting = std::thread::spawn({
+            let rt = rt.clone();
+            move || {
+                let _ = &rt;
+                block_on(b.lock(0, 100, true)).map(|_| ())
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiting.is_finished(), "a lock went through an exclusive one");
+        drop(held);
+        waiting.join().unwrap().unwrap();
+        drop(a);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shared_locks_share() {
+        let rt = Runtime::new();
+        let (path, a, b) = two_handles(&rt, "shared");
+        let _one = block_on(a.lock(0, 64, false)).unwrap();
+        let two = block_on(b.try_lock(0, 64, false)).unwrap();
+        assert!(two.is_some(), "a shared lock refused another shared one");
+        drop((a, b));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A waiting request dropped by a timeout is withdrawn, not granted
+    /// later behind the caller's back.
+    #[test]
+    fn a_dropped_wait_is_withdrawn() {
+        let rt = Runtime::new();
+        let (path, a, b) = two_handles(&rt, "cancel");
+        let held = block_on(a.lock(0, 8, true)).unwrap();
+        let waited = block_on(timeout(&rt, Duration::from_millis(100), b.lock(0, 8, true)));
+        assert!(waited.is_err(), "the lock was granted while held");
+        drop(held);
+        std::thread::sleep(Duration::from_millis(100));
+        // Had the cancelled request been granted, `a` could not lock again.
+        assert!(block_on(a.try_lock(0, 8, true)).unwrap().is_some(), "the withdrawn request took the range");
+        drop((a, b));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A lock granted to a future nobody polls again is released, not
+    /// leaked: the completion sees the grant and, being the last owner,
+    /// unlocks.
+    #[test]
+    fn a_grant_nobody_collects_is_released() {
+        let rt = Runtime::new();
+        let (path, a, b) = two_handles(&rt, "orphan");
+        let held = block_on(a.lock(0, 8, true)).unwrap();
+        let orphan = b.lock(0, 8, true); // issued now, waiting in the kernel
+        drop(held); // granted to `orphan` ...
+        std::thread::sleep(Duration::from_millis(100));
+        drop(orphan); // ... which is dropped without ever seeing it
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut free = false;
+        while !free && std::time::Instant::now() < deadline {
+            free = block_on(a.try_lock(0, 8, true)).unwrap().is_some();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(free, "the orphaned grant was never released");
+        drop((a, b));
         let _ = std::fs::remove_file(&path);
     }
 }
