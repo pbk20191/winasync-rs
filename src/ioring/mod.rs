@@ -67,6 +67,7 @@
 //! completion queue would lose results. An operation created at that limit
 //! waits for room before it is built.
 
+use crate::common::pool::PoolRef;
 use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 use crate::common::tpctx::CtxHeader;
 use std::future::Future;
@@ -90,7 +91,6 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Threading::{
     CallbackMayRunLong, CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait,
     SetThreadpoolWait, WaitForThreadpoolWaitCallbacks, PTP_CALLBACK_INSTANCE, PTP_WAIT,
-    TP_CALLBACK_ENVIRON_V3,
 };
 use windows_core::{Error, HRESULT, HSTRING, Result};
 
@@ -473,32 +473,23 @@ impl IoRing {
     /// A ring with room for `entries` operations in each submission, pumped
     /// from the process default thread pool.
     pub fn new(entries: u32) -> Result<IoRing> {
-        Self::build(entries, Some(None), None)
+        Self::build(entries, Some(PoolRef::ProcessDefault))
     }
 
     /// [`new`](Self::new), with the pump on `rt`'s pool.
     #[cfg(feature = "tp")]
     pub fn with_runtime(rt: &crate::tp::Runtime, entries: u32) -> Result<IoRing> {
-        Self::build(
-            entries,
-            Some(Some(rt.inner.pool.default_env())),
-            Some(rt.inner.clone()),
-        )
+        Self::build(entries, Some(rt.inner.pool_ref()))
     }
 
     /// A ring with no pump: completions are delivered only when the caller
     /// calls [`drive`](Self::drive).
     pub fn manual(entries: u32) -> Result<IoRing> {
-        Self::build(entries, None, None)
+        Self::build(entries, None)
     }
 
-    /// `pump` is `None` for a manual ring, else the callback environment
-    /// (`None` inside for the process default pool).
-    fn build(
-        entries: u32,
-        pump: Option<Option<*const TP_CALLBACK_ENVIRON_V3>>,
-        keepalive: Option<Arc<dyn core::any::Any + Send + Sync>>,
-    ) -> Result<IoRing> {
+    /// `pump` is the pool to pump from; `None` for a manual ring.
+    fn build(entries: u32, pump: Option<PoolRef>) -> Result<IoRing> {
         let entries = entries.max(1);
         let capacity = entries.saturating_mul(2);
         let handle = unsafe {
@@ -539,8 +530,8 @@ impl IoRing {
             event,
             pump: Mutex::new(None),
         });
-        if let Some(env) = pump {
-            let pump = Pump::start(&inner, env, keepalive)?;
+        if let Some(pool) = pump {
+            let pump = Pump::start(&inner, pool)?;
             *inner.pump.lock().unwrap() = Some(pump);
         }
         Ok(IoRing { inner })
@@ -1560,8 +1551,8 @@ impl IoRing {
 /// The thread-pool wait that drains the ring when its event fires.
 struct Pump {
     wait: PTP_WAIT,
-    /// `Some` exactly when the callback environment is null: only an
-    /// environment carries a `FinalizationCallback` to release the context.
+    /// `Some` exactly when the environment has no `FinalizationCallback` to
+    /// release the context ([`PoolRef::finalizes`]).
     ctx_to_release: Option<*const PumpCtx>,
 }
 
@@ -1576,7 +1567,9 @@ struct PumpCtx {
     /// Weak: the ring's owners decide when it goes, not its pump.
     inner: Weak<Inner>,
     event: HANDLE,
-    _keepalive: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    /// The pool the wait lives in; released with the context, after the wait
+    /// is closed.
+    _pool: PoolRef,
 }
 
 unsafe impl Send for PumpCtx {}
@@ -1593,16 +1586,15 @@ thread_local! {
 }
 
 impl Pump {
-    fn start(
-        inner: &Arc<Inner>,
-        env: Option<*const TP_CALLBACK_ENVIRON_V3>,
-        keepalive: Option<Arc<dyn core::any::Any + Send + Sync>>,
-    ) -> Result<Pump> {
+    fn start(inner: &Arc<Inner>, pool: PoolRef) -> Result<Pump> {
+        // Read before the pool moves into the context.
+        let env = pool.env();
+        let release_ourselves = !pool.finalizes();
         let ctx = Arc::into_raw(Arc::new(PumpCtx {
             header: unsafe { CtxHeader::new(release_ctx) },
             inner: Arc::downgrade(inner),
             event: inner.event,
-            _keepalive: keepalive,
+            _pool: pool,
         }));
         let wait = match unsafe {
             CreateThreadpoolWait(Some(pump_callback), Some(ctx as *mut core::ffi::c_void), env)
@@ -1616,7 +1608,7 @@ impl Pump {
         unsafe { SetThreadpoolWait(wait, Some(inner.event), None) };
         Ok(Pump {
             wait,
-            ctx_to_release: env.is_none().then_some(ctx),
+            ctx_to_release: release_ourselves.then_some(ctx),
         })
     }
 

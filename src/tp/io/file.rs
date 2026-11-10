@@ -142,15 +142,8 @@ impl File {
                 None,
             )?
         };
-        match IoRes::register(&rt.inner, handle, false) {
-            Ok(res) => Ok(File { res }),
-            Err(e) => {
-                unsafe {
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
-                }
-                Err(e)
-            }
-        }
+        let res = IoRes::register(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(handle) })?;
+        Ok(File { res })
     }
 
     /// Opens an existing file for reading and writing.

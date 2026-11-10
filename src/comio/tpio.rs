@@ -5,7 +5,8 @@
 //! (no cancel-on-drop). The engine, op-block discipline, and `LIVE_OPS` live in
 //! the shared core.
 
-use crate::common::overlapped::{self as ov, Completion, IoReg as CoreReg};
+use crate::common::overlapped::{self as ov, Binding, Completion, IoReg as CoreReg};
+pub(crate) use crate::common::overlapped::IoHandle;
 use std::ops::Deref;
 use std::sync::Arc;
 use windows::Win32::System::IO::OVERLAPPED;
@@ -17,7 +18,7 @@ pub(crate) use crate::common::overlapped::Issue;
 pub(crate) use crate::common::overlapped::LIVE_OPS;
 
 /// A handle registered on the **default process pool** (`pcbe = NULL`). Newtype
-/// over the shared [`CoreReg`] so comio keeps its 2-arg `register`.
+/// over the shared [`CoreReg`], registered with comio's pool.
 pub(crate) struct IoReg(Arc<CoreReg>);
 
 impl Deref for IoReg {
@@ -28,36 +29,14 @@ impl Deref for IoReg {
 }
 
 impl IoReg {
-    /// Takes ownership of `handle` on success; on error the caller still owns it.
-    pub(crate) fn register(
-        handle: windows::Win32::Foundation::HANDLE,
-        is_socket: bool,
-    ) -> windows_core::Result<Arc<Self>> {
-        // Default pool, no keepalive -- comio ops are standalone. The
-        // environment is the process default everywhere but the server DLL,
-        // where it sets `RaceDll` so a completion arriving after a forced
+    /// Registers `io` with comio's pool. Takes `io` either way: a failed
+    /// registration closes it.
+    pub(crate) fn register(io: impl Into<IoHandle>) -> windows_core::Result<Arc<Self>> {
+        // The process default pool everywhere but the server DLL, where the
+        // environment sets `RaceDll` so a completion arriving after a forced
         // unload is not called into freed code; see `comio::pool`.
-        let env = super::pool::callback_env();
-        Ok(Arc::new(IoReg(CoreReg::register(handle, is_socket, env, None)?)))
-    }
-
-    /// [`register`](Self::register), also holding `extra` until after the
-    /// handle is closed -- a named-pipe instance's count, which must not drop
-    /// while the instance still exists. Taken only on success: on failure the
-    /// caller still owns both, and must close the handle before dropping it.
-    pub(crate) fn register_with(
-        handle: windows::Win32::Foundation::HANDLE,
-        is_socket: bool,
-        extra: &mut Option<Box<dyn std::any::Any + Send + Sync>>,
-    ) -> windows_core::Result<Arc<Self>> {
-        // Filled after the registration succeeds, so a failed one leaves
-        // `extra` with the caller. A `Mutex` only to make that late write
-        // `Sync`.
-        let keep = Arc::new(std::sync::Mutex::new(None::<Box<dyn std::any::Any + Send + Sync>>));
-        let env = super::pool::callback_env();
-        let reg = CoreReg::register(handle, is_socket, env, Some(keep.clone()))?;
-        *keep.lock().unwrap() = extra.take();
-        Ok(Arc::new(IoReg(reg)))
+        let binding = Binding::Pool(super::pool::pool_ref());
+        Ok(Arc::new(IoReg(CoreReg::register(io, binding)?)))
     }
 }
 
@@ -121,8 +100,8 @@ mod tests {
             CreateFileW(&wname, FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
         }.unwrap();
 
-        let sreg = IoReg::register(server, false).unwrap();
-        let creg = IoReg::register(client, false).unwrap();
+        let sreg = IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(server) }).unwrap();
+        let creg = IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(client) }).unwrap();
 
         let (tx, rx) = mpsc::channel();
         let wbuf = Box::new(*b"Z");
@@ -173,8 +152,8 @@ mod tests {
                 CreateFileW(&wname, FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, None)
             }.unwrap();
 
-            let sreg = IoReg::register(server, false).unwrap();
-            let creg = IoReg::register(client, false).unwrap();
+            let sreg = IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(server) }).unwrap();
+            let creg = IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(client) }).unwrap();
 
             let rbuf = Box::new([0u8; 1]);
             let rptr = rbuf.as_ptr() as *mut u8;

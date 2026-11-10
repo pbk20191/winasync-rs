@@ -15,7 +15,7 @@ use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 use crate::tp::Runtime;
 use std::path::PathBuf;
 use std::sync::Arc;
-use windows::Win32::Foundation::{CloseHandle, E_INVALIDARG, ERROR_IO_PENDING, ERROR_NOTIFY_ENUM_DIR};
+use windows::Win32::Foundation::{E_INVALIDARG, ERROR_IO_PENDING, ERROR_NOTIFY_ENUM_DIR};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_ACTION, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
     FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
@@ -215,19 +215,12 @@ impl DirectoryWatcher {
                 None,
             )?
         };
-        match IoRes::register(&rt.inner, handle, false) {
-            Ok(res) => Ok(DirectoryWatcher {
-                res,
-                recursive,
-                filter,
-            }),
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                Err(e)
-            }
-        }
+        let res = IoRes::register(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(handle) })?;
+        Ok(DirectoryWatcher {
+            res,
+            recursive,
+            filter,
+        })
     }
 
     /// Waits for changes and fills `buf` with them; resolves to the bytes

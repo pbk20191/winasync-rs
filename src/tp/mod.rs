@@ -98,6 +98,13 @@ pub(crate) struct RuntimeInner {
     pub(crate) pool: PoolInner,
 }
 
+impl RuntimeInner {
+    /// The pool's default environment, kept valid by this runtime.
+    pub(crate) fn pool_ref(self: &Arc<Self>) -> crate::common::pool::PoolRef {
+        crate::common::pool::PoolRef::Runtime(Runtime { inner: self.clone() })
+    }
+}
+
 impl Runtime {
     /// Creates a runtime with default pool settings.
     pub fn new() -> Self {

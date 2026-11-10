@@ -81,26 +81,17 @@ impl UdpSocket {
     ) -> windows_core::Result<UdpSocket> {
         let family = family_of(&addr);
         let sock = new_socket_with(family, SOCK_DGRAM, IPPROTO_UDP, options.wsa_flags)?;
-        let reuse_addr = options.reuse_address;
-        let register = || -> windows_core::Result<Arc<IoRes>> {
-            if reuse_addr {
-                let v: u32 = 1;
-                sock_check(unsafe {
-                    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, Some(&v.to_ne_bytes()))
-                })?;
-            }
-            let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
-            let len = write_sockaddr(&addr, &mut storage);
-            sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
-            IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
-        };
-        match register() {
-            Ok(res) => Ok(UdpSocket { res }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        if options.reuse_address {
+            let v: u32 = 1;
+            sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, Some(&v.to_ne_bytes())) })?;
         }
+        let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let len = write_sockaddr(&addr, &mut storage);
+        sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
+        let res = IoRes::register(&rt.inner, owned)?;
+        Ok(UdpSocket { res })
     }
 
     /// Skips the completion packet whenever an op on this handle completes

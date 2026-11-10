@@ -46,24 +46,18 @@ impl TcpListener {
         let extra_flags = options.for_tcp()?.wsa_flags;
         let family = family_of(&addr);
         let sock = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
-        let register = || -> windows_core::Result<Arc<IoRes>> {
-            let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
-            let len = write_sockaddr(&addr, &mut storage);
-            sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
-            sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
-            IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
-        };
-        match register() {
-            Ok(res) => Ok(TcpListener {
-                res,
-                family,
-                socket_flags: extra_flags,
-            }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let len = write_sockaddr(&addr, &mut storage);
+        sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
+        sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
+        let res = IoRes::register(&rt.inner, owned)?;
+        Ok(TcpListener {
+            res,
+            family,
+            socket_flags: extra_flags,
+        })
     }
 
     /// The locally bound address (useful after binding port 0).
@@ -102,23 +96,15 @@ impl TcpListener {
         let (result, mut payload) = fut.await;
         result?;
         let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
-        let finish = || -> windows_core::Result<TcpStream> {
-            // Until SO_UPDATE_ACCEPT_CONTEXT (value = the listen socket) the
-            // accepted socket is half-configured (shutdown/getsockname/
-            // getpeername fail).
-            let listen_val = listen_sock.0.to_ne_bytes();
-            sock_check(unsafe {
-                setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
-            })?;
-            TcpStream::from_socket(&self.res.rt, sock)
-        };
-        match finish() {
-            Ok(stream) => Ok(stream),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        // Until SO_UPDATE_ACCEPT_CONTEXT (value = the listen socket) the
+        // accepted socket is half-configured (shutdown/getsockname/
+        // getpeername fail).
+        let listen_val = listen_sock.0.to_ne_bytes();
+        sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
+        let stream = TcpStream::from_socket(&self.res.rt, owned)?;
+        Ok(stream)
     }
 
     /// Accepts one connection **and** its first segment in a single op, saving
@@ -173,20 +159,12 @@ impl TcpListener {
         let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
         let mut data = mem::take(&mut payload.buf);
         data.truncate(received.min(payload.recv_len));
-        let finish = || -> windows_core::Result<TcpStream> {
-            let listen_val = listen_sock.0.to_ne_bytes();
-            sock_check(unsafe {
-                setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
-            })?;
-            TcpStream::from_socket(&self.res.rt, sock)
-        };
-        match finish() {
-            Ok(stream) => Ok((stream, data)),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let listen_val = listen_sock.0.to_ne_bytes();
+        sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
+        let stream = TcpStream::from_socket(&self.res.rt, owned)?;
+        Ok((stream, data))
     }
 
     /// Accepts the next connection into a socket recycled from
@@ -263,14 +241,9 @@ impl TcpStream {
         crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
-    fn from_socket(rt: &Arc<RuntimeInner>, sock: SOCKET) -> windows_core::Result<TcpStream> {
-        match IoRes::register(rt, HANDLE(sock.0 as *mut c_void), true) {
-            Ok(res) => Ok(TcpStream { res }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+    fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<TcpStream> {
+        let res = IoRes::register(rt, sock)?;
+        Ok(TcpStream { res })
     }
 
     /// Connects to `addr` (IPv4 or IPv6), creating the socket as `options`
@@ -283,23 +256,14 @@ impl TcpStream {
         let extra_flags = options.for_tcp()?.wsa_flags;
         let family = family_of(&addr);
         let sock = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
-        let prepared = (|| -> windows_core::Result<(ConnectExFn, TcpStream)> {
-            // ConnectEx fails with WSAEINVAL on an unbound socket.
-            let mut local = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
-            let local_len = write_sockaddr(&wildcard(family), &mut local);
-            sock_check(unsafe {
-                bind(sock, &local as *const _ as *const SOCKADDR, local_len)
-            })?;
-            let connect_ex = get_connectex(sock)?;
-            Ok((connect_ex, TcpStream::from_socket(&rt.inner, sock)?))
-        })();
-        let (connect_ex, stream) = match prepared {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                return Err(e);
-            }
-        };
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        // ConnectEx fails with WSAEINVAL on an unbound socket.
+        let mut local = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let local_len = write_sockaddr(&wildcard(family), &mut local);
+        sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
+        let connect_ex = get_connectex(sock)?;
+        let stream = TcpStream::from_socket(&rt.inner, owned)?;
 
         let mut remote = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let remote_len = write_sockaddr(&addr, &mut remote);

@@ -18,7 +18,7 @@ pub mod unix;
 pub mod watch;
 
 use crate::common::buffer::{IoBuf, IoBufMut};
-use crate::common::overlapped::IoReg;
+use crate::common::overlapped::{Binding, IoHandle, IoReg};
 use crate::tp::RuntimeInner;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -48,34 +48,12 @@ impl Deref for IoRes {
 }
 
 impl IoRes {
-    /// Takes ownership of `handle` on success; on error the caller still owns it.
-    pub(crate) fn register(
-        rt: &Arc<RuntimeInner>,
-        handle: HANDLE,
-        is_socket: bool,
-    ) -> windows_core::Result<Arc<Self>> {
-        Self::register_with(rt, handle, is_socket, &mut None)
-    }
-
-    /// [`register`](Self::register), also holding `extra` until after the
-    /// handle is closed -- a named-pipe instance's count, which must not drop
-    /// while the instance still exists. Taken only on success: on failure the
-    /// caller still owns both, and must close the handle before dropping it.
-    pub(crate) fn register_with(
-        rt: &Arc<RuntimeInner>,
-        handle: HANDLE,
-        is_socket: bool,
-        extra: &mut Option<Box<dyn std::any::Any + Send + Sync>>,
-    ) -> windows_core::Result<Arc<Self>> {
-        // Keepalive = the pool-owning Arc, so the pool outlives in-flight ops and
-        // each TP_IO's `CloseThreadpoolIo` (in `IoReg::Drop`) runs before the
-        // pool's cleanup-group teardown.
-        let keep = Arc::new(Keep {
-            _rt: rt.clone(),
-            _extra: std::sync::Mutex::new(None),
-        });
-        let inner = IoReg::register(handle, is_socket, Some(rt.pool.default_env()), Some(keep.clone()))?;
-        *keep._extra.lock().unwrap() = extra.take();
+    /// Registers `io` with `rt`'s pool. Takes `io` either way: a failed
+    /// registration closes it.
+    pub(crate) fn register(rt: &Arc<RuntimeInner>, io: impl Into<IoHandle>) -> windows_core::Result<Arc<Self>> {
+        // The pool stays until the registration is gone, so each TP_IO is
+        // closed before the pool's cleanup-group teardown.
+        let inner = IoReg::register(io, Binding::Pool(rt.pool_ref()))?;
         Ok(Arc::new(Self {
             inner,
             rt: rt.clone(),
@@ -140,14 +118,6 @@ pub(crate) fn socket_ioctl<I: IoBuf, O: IoBufMut>(
         let output = crate::common::buffer::mark_read(n, p.output);
         (result, p.input, output)
     }
-}
-
-/// What a registration keeps alive until after its handle is closed.
-struct Keep {
-    _rt: Arc<RuntimeInner>,
-    // Filled after the registration succeeds, so a failed one leaves `extra`
-    // with the caller. A `Mutex` only to make that late write `Sync`.
-    _extra: std::sync::Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>,
 }
 
 /// Starts an overlapped op over the shared core, wrapping it in a `Future`.

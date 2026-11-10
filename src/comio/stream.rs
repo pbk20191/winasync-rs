@@ -390,8 +390,8 @@ pub(crate) mod tests {
             )
         }
         .unwrap();
-        let s = from_reg(IoReg::register(server, false).unwrap(), Peer::Opaque);
-        let c = from_reg(IoReg::register(client, false).unwrap(), Peer::Opaque);
+        let s = from_reg(IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(server) }).unwrap(), Peer::Opaque);
+        let c = from_reg(IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(client) }).unwrap(), Peer::Opaque);
         let s_out: IOutputStream = s.cast().unwrap();
         let c_in: IInputStream = c.cast().unwrap();
 
@@ -464,8 +464,8 @@ pub(crate) mod tests {
         }
         .unwrap();
         // Both ends stay open, so nothing but the cancel can end the read.
-        let _s = from_reg(IoReg::register(server, false).unwrap(), Peer::Opaque);
-        let c = from_reg(IoReg::register(client, false).unwrap(), Peer::Opaque);
+        let _s = from_reg(IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(server) }).unwrap(), Peer::Opaque);
+        let c = from_reg(IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(client) }).unwrap(), Peer::Opaque);
 
         let read = c
             .cast::<IInputStream>()
@@ -551,8 +551,8 @@ pub(crate) mod tests {
             )
         }
         .unwrap();
-        let s = from_reg(IoReg::register(server, false).unwrap(), Peer::Opaque);
-        let c = from_reg(IoReg::register(client, false).unwrap(), Peer::Opaque);
+        let s = from_reg(IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(server) }).unwrap(), Peer::Opaque);
+        let c = from_reg(IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(client) }).unwrap(), Peer::Opaque);
         (s, c)
     }
 

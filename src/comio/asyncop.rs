@@ -569,8 +569,8 @@ mod tests {
             )
         }
         .unwrap();
-        let sreg = IoReg::register(server, false).unwrap();
-        let creg = IoReg::register(client, false).unwrap();
+        let sreg = IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(server) }).unwrap();
+        let creg = IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(client) }).unwrap();
 
         // Server: async write "hi".
         let wbuf = new_buffer(2).unwrap();

@@ -96,6 +96,15 @@ pub(crate) fn callback_env() -> Option<*const TP_CALLBACK_ENVIRON_V3> {
     .map(|env| &env.0 as *const TP_CALLBACK_ENVIRON_V3)
 }
 
+/// [`callback_env`] as a [`PoolRef`], for creating TP objects in it.
+pub(crate) fn pool_ref() -> crate::common::pool::PoolRef {
+    match callback_env() {
+        // SAFETY: the environment is a process-lifetime static.
+        Some(env) => unsafe { crate::common::pool::PoolRef::from_static(env) },
+        None => crate::common::pool::PoolRef::ProcessDefault,
+    }
+}
+
 /// Not the server DLL: there is no module to pin.
 #[cfg(not(feature = "dylib"))]
 pub(crate) fn callback_env() -> Option<*const TP_CALLBACK_ENVIRON_V3> {

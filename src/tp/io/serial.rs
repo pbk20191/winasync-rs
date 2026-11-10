@@ -13,7 +13,7 @@ use super::{submit, IoRes, Issue};
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::Runtime;
 use std::sync::Arc;
-use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE};
+use windows::Win32::Foundation::{ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_MODE, OPEN_EXISTING,
 };
@@ -51,15 +51,8 @@ impl SerialPort {
                 None,
             )?
         };
-        match IoRes::register(&rt.inner, handle, false) {
-            Ok(res) => Ok(SerialPort { res }),
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                Err(e)
-            }
-        }
+        let res = IoRes::register(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(handle) })?;
+        Ok(SerialPort { res })
     }
 
     /// The line settings: baud rate, byte size, parity, stop bits, flow

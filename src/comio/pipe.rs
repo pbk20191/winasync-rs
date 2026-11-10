@@ -15,7 +15,7 @@ use super::bindings::Pbk20191::WinAsync::Comio::{
     INamedPipeConnector_Impl, ITransport_Impl, ITransportStream,
 };
 use super::stream;
-use super::tpio::{self, IoReg, Issue, OpHandle};
+use super::tpio::{self, IoHandle, IoReg, Issue, OpHandle};
 use super::waitop::await_io;
 pub use crate::common::pipe::NamedPipeOptions;
 use crate::common::pipe::{
@@ -25,7 +25,7 @@ use crate::common::security::PeerIdentity;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows::Win32::Foundation::{
-    CloseHandle, E_INVALIDARG, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
+    E_INVALIDARG, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
     ERROR_PIPE_CONNECTED,
 };
 use windows::Win32::System::Pipes::ConnectNamedPipe;
@@ -40,19 +40,7 @@ pub(crate) const SLOT_FREED: HRESULT = HRESULT(0x800700E7u32 as i32);
 /// Registers a created instance, handing its count to the registration so it
 /// outlives the handle.
 fn register(instance: Instance) -> Result<Arc<IoReg>> {
-    let handle = instance.handle;
-    let mut token: Option<Box<dyn std::any::Any + Send + Sync>> = Some(Box::new(instance.token));
-    match IoReg::register_with(handle, false, &mut token) {
-        Ok(reg) => Ok(reg),
-        Err(e) => {
-            // Handle first, then the count: see `common::pipe::InstanceToken`.
-            unsafe {
-                let _ = CloseHandle(handle);
-            }
-            drop(token);
-            Err(e)
-        }
-    }
+    IoReg::register(instance)
 }
 
 /// Server (listener) side of a named pipe. Each `accept()` waits for a
@@ -255,19 +243,8 @@ pub(crate) const TRANSPORT: &str = "namedpipe";
 
 /// Wraps an opened client end as a stream.
 fn client_stream(client: ClientEnd) -> Result<ITransportStream> {
-    match IoReg::register(client.handle, false) {
-        Ok(reg) => Ok(stream::from_reg_with_mode(
-            reg,
-            stream::Peer::PipeClient,
-            client.message_mode,
-        )),
-        Err(e) => {
-            unsafe {
-                let _ = CloseHandle(client.handle);
-            }
-            Err(e)
-        }
-    }
+    let reg = IoReg::register(unsafe { IoHandle::from_handle(client.handle) })?;
+    Ok(stream::from_reg_with_mode(reg, stream::Peer::PipeClient, client.message_mode))
 }
 
 impl NamedPipeConnector {
@@ -459,7 +436,7 @@ mod tests {
         // unconnected instance). This isolates exactly the
         // `ConnectNamedPipe` => `ERROR_PIPE_CONNECTED` path that `accept`'s
         // `await_io` closure must special-case.
-        let reg = IoReg::register(handle, false).unwrap();
+        let reg = IoReg::register(unsafe { crate::comio::tpio::IoHandle::from_handle(handle) }).unwrap();
         let server_stream = block_on(await_io(&reg, |ovl| unsafe {
             match ConnectNamedPipe(handle, Some(ovl)) {
                 Ok(()) => Issue::SyncSuccess,

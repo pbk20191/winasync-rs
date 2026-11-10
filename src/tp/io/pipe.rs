@@ -17,7 +17,7 @@ use crate::tp::Runtime;
 use std::sync::Arc;
 use std::time::Duration;
 use windows::Win32::Foundation::{
-    CloseHandle, E_ILLEGAL_METHOD_CALL, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_OPERATION_ABORTED,
+    E_ILLEGAL_METHOD_CALL, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_OPERATION_ABORTED,
     ERROR_PIPE_CONNECTED, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -439,21 +439,9 @@ impl NamedPipeListener {
                 Slot::Retry => crate::tp::sleep(&self.rt, server::RETRY_AFTER).await,
             }
         };
-        let handle = instance.handle;
-        let mut token: Option<Box<dyn std::any::Any + Send + Sync>> = Some(Box::new(instance.token));
-        let res = match IoRes::register_with(&self.rt.inner, handle, false, &mut token) {
-            Ok(res) => res,
-            Err(e) => {
-                // Handle first, then the count: see `InstanceToken`.
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                drop(token);
-                return Err(e);
-            }
-        };
+        let res = IoRes::register(&self.rt.inner, instance)?;
         let _replenish = ReplenishOnExit(&self.server);
-        let h = handle;
+        let h = res.handle;
         let fut = unsafe {
             submit(&res, (), move |ovl, _| {
                 // ERROR_PIPE_CONNECTED (a client connected between
@@ -504,19 +492,12 @@ impl NamedPipeConnector {
         timeout: Duration,
     ) -> windows_core::Result<NamedPipeStream> {
         let client = server::open_client_waiting(&HSTRING::from(name), timeout)?;
-        match IoRes::register(&rt.inner, client.handle, false) {
-            Ok(res) => Ok(NamedPipeStream {
-                res,
-                server_side: false,
-                message_mode: client.message_mode,
-            }),
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(client.handle);
-                }
-                Err(e)
-            }
-        }
+        let res = IoRes::register(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(client.handle) })?;
+        Ok(NamedPipeStream {
+            res,
+            server_side: false,
+            message_mode: client.message_mode,
+        })
     }
 }
 
@@ -616,7 +597,7 @@ mod tests {
             &NamedPipeOptions::new(),
         ).unwrap().accept()).err().unwrap();
         assert_eq!(err.code(), windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult());
-        unsafe { CloseHandle(squatter).unwrap() };
+        unsafe { windows::Win32::Foundation::CloseHandle(squatter).unwrap() };
     }
 
     /// Once a client has connected and gone, the name is still ours: the
@@ -764,7 +745,7 @@ mod tests {
             );
             RevertToSelf().unwrap();
             opened.map(|h| {
-                let _ = CloseHandle(h);
+                let _ = windows::Win32::Foundation::CloseHandle(h);
             })
         })
         .join()
@@ -1035,7 +1016,7 @@ mod tests {
         assert!(!squatter.is_invalid(), "the name was still held");
         let err = block_on(listener.accept()).err().unwrap();
         assert_eq!(err.code(), windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult());
-        unsafe { CloseHandle(squatter).unwrap() };
+        unsafe { windows::Win32::Foundation::CloseHandle(squatter).unwrap() };
     }
 
     /// A connect gives up when its time is spent, not before and not never.

@@ -27,7 +27,7 @@ use super::connector::connect_op;
 use super::listener::Accepted;
 use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
 use super::stream::{self, AcceptSockGuard};
-use super::tpio::{self, IoReg, OpHandle};
+use super::tpio::{self, IoHandle, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use crate::common::hvaddr::{
     peer_addr_of, HvSocketAddr, SockaddrHv, HV_GUID_ZERO, HV_PROTOCOL_RAW,
@@ -35,7 +35,6 @@ use crate::common::hvaddr::{
 use core::ffi::c_void;
 use std::mem;
 use std::sync::Arc;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, AF_HYPERV, INVALID_SOCKET,
     SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
@@ -78,19 +77,15 @@ impl HvStreamListener {
     /// locally may still be unreachable from a VM.
     pub fn bind(addr: HvSocketAddr) -> Result<Self> {
         let sock = new_socket()?;
-        let register = || -> Result<Arc<IoReg>> {
+        // Closed on any early return from here on.
+        let owned = unsafe { IoHandle::from_socket(sock) };
+        let register = move || -> Result<Arc<IoReg>> {
             let (sa, addrlen) = addr.to_raw();
             sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, addrlen) })?;
             sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
-            IoReg::register(HANDLE(sock.0 as *mut c_void), true)
+            IoReg::register(owned)
         };
-        match register() {
-            Ok(reg) => Ok(HvStreamListener { reg }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        Ok(HvStreamListener { reg: register()? })
     }
 
     /// Accepts one connection, returning it as a duplex WinRT stream.
@@ -124,21 +119,17 @@ impl HvStreamListener {
         result?;
 
         let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
-        let finish = || -> Result<ITransportStream> {
+        // Closed on any early return from here on.
+        let owned = unsafe { IoHandle::from_socket(sock) };
+        let finish = move || -> Result<ITransportStream> {
             let listen_val = listen_sock.0.to_ne_bytes();
             sock_check(unsafe {
                 setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
             })?;
-            let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
+            let reg = IoReg::register(owned)?;
             Ok(stream::from_reg(reg, stream::Peer::Opaque))
         };
-        match finish() {
-            Ok(s) => Ok(s),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        finish()
     }
 
     /// Callback-based counterpart to [`accept`](Self::accept), used by
@@ -164,7 +155,9 @@ impl HvStreamListener {
                     drop(addr_buf);
                     let res = if ioresult == 0 {
                         let listen_val = listen_sock.0.to_ne_bytes();
-                        let finish = || -> Result<Accepted> {
+                        // Closed on any early return from here on.
+                        let owned = IoHandle::from_socket(accept_sock);
+                        let finish = move || -> Result<Accepted> {
                             sock_check(setsockopt(
                                 accept_sock,
                                 SOL_SOCKET,
@@ -178,7 +171,7 @@ impl HvStreamListener {
                             // nothing else carries that. Valid only after
                             // SO_UPDATE_ACCEPT_CONTEXT above.
                             let remote = peer_addr_of(accept_sock).ok();
-                            let reg = IoReg::register(HANDLE(accept_sock.0 as *mut c_void), true)?;
+                            let reg = IoReg::register(owned)?;
                             Ok(Accepted {
                                 stream: stream::from_reg(reg, stream::Peer::Opaque),
                                 remote: remote.map(|a| HSTRING::from(a.to_string())),
@@ -187,13 +180,7 @@ impl HvStreamListener {
                                 peer: Default::default(),
                             })
                         };
-                        match finish() {
-                            Ok(s) => Ok(s),
-                            Err(e) => {
-                                closesocket(accept_sock);
-                                Err(e)
-                            }
-                        }
+                        finish()
                     } else {
                         closesocket(accept_sock);
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
@@ -237,22 +224,18 @@ impl HyperVConnector {
     /// Connects to `addr`, returning the connection as a duplex WinRT stream.
     pub async fn connect(addr: HvSocketAddr) -> Result<ITransportStream> {
         let sock = new_socket()?;
-        let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
+        // Closed on any early return from here on.
+        let owned = unsafe { IoHandle::from_socket(sock) };
+        let prepared = (move || -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket; the
             // AF_HYPERV equivalent of an autobind is the all-zero endpoint.
             let (local, local_len) = HvSocketAddr::new(HV_GUID_ZERO, HV_GUID_ZERO).to_raw();
             sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
             let connect_ex = get_connectex(sock)?;
-            let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
+            let reg = IoReg::register(owned)?;
             Ok((connect_ex, reg))
         })();
-        let (connect_ex, reg) = match prepared {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                return Err(e);
-            }
-        };
+        let (connect_ex, reg) = prepared?;
 
         let (remote, remote_len) = addr.to_raw();
         // `remote` is memory ConnectEx reads for the op's duration — boxed and
@@ -294,21 +277,17 @@ impl HyperVConnector {
         on_result: Box<dyn FnOnce(Result<ITransportStream>) + Send>,
     ) -> Result<OpHandle> {
         let sock = new_socket()?;
-        let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
+        // Closed on any early return from here on.
+        let owned = unsafe { IoHandle::from_socket(sock) };
+        let prepared = (move || -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
             let (local, local_len) = HvSocketAddr::new(HV_GUID_ZERO, HV_GUID_ZERO).to_raw();
             sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
             let connect_ex = get_connectex(sock)?;
-            let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
+            let reg = IoReg::register(owned)?;
             Ok((connect_ex, reg))
         })();
-        let (connect_ex, reg) = match prepared {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                return Err(e);
-            }
-        };
+        let (connect_ex, reg) = prepared?;
 
         // `reg`'s Drop closes the socket if this fails.
         let (remote, remote_len) = addr.to_raw();

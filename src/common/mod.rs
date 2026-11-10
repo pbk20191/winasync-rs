@@ -14,6 +14,9 @@ pub mod check;
 // Hyper-V socket transports.
 #[cfg(any(feature = "tp", feature = "comio"))]
 pub mod hvaddr;
+// Which pool a TP object lives in, with what keeps it valid.
+#[cfg(any(feature = "tp", feature = "comio", feature = "iocp", feature = "http", feature = "rio", feature = "ioring"))]
+pub mod pool;
 // `iocp` for dispatching what the core queues on a caller's port.
 #[cfg(any(feature = "tp", feature = "comio", feature = "iocp", feature = "http"))]
 pub mod overlapped;

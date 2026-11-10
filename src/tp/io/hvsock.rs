@@ -24,9 +24,8 @@ use crate::common::winsock::{connectex, ConnectExFn};
 use core::ffi::c_void;
 use std::mem;
 use std::sync::Arc;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_HYPERV, INVALID_SOCKET,
+    bind, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_HYPERV, INVALID_SOCKET,
     IPPROTO, SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT,
     SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
 };
@@ -85,14 +84,9 @@ impl HvStream {
         crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
-    fn from_socket(rt: &Arc<RuntimeInner>, sock: SOCKET) -> windows_core::Result<HvStream> {
-        match IoRes::register(rt, HANDLE(sock.0 as *mut c_void), true) {
-            Ok(res) => Ok(HvStream { res }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+    fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<HvStream> {
+        let res = IoRes::register(rt, sock)?;
+        Ok(HvStream { res })
     }
 
     /// Connects to `addr`. `connect_timeout_ms`, when given, caps how long the
@@ -105,30 +99,18 @@ impl HvStream {
         connect_timeout_ms: Option<u32>,
     ) -> windows_core::Result<HvStream> {
         let sock = hv_socket()?;
-        let prepared = (|| -> windows_core::Result<HvStream> {
-            if let Some(ms) = connect_timeout_ms {
-                sock_check(unsafe {
-                    setsockopt(
-                        sock,
-                        HV_PROTOCOL_RAW,
-                        HVSOCKET_CONNECT_TIMEOUT,
-                        Some(&ms.to_ne_bytes()),
-                    )
-                })?;
-            }
-            // ConnectEx requires a bound socket; bind to the wildcard endpoint.
-            let (local, local_len) = HvSocketAddr::new(HV_GUID_ZERO, HV_GUID_ZERO).to_raw();
-            sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
-            get_connectex(sock)?;
-            HvStream::from_socket(&rt.inner, sock)
-        })();
-        let stream = match prepared {
-            Ok(s) => s,
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                return Err(e);
-            }
-        };
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        if let Some(ms) = connect_timeout_ms {
+            sock_check(unsafe {
+                setsockopt(sock, HV_PROTOCOL_RAW, HVSOCKET_CONNECT_TIMEOUT, Some(&ms.to_ne_bytes()))
+            })?;
+        }
+        // ConnectEx requires a bound socket; bind to the wildcard endpoint.
+        let (local, local_len) = HvSocketAddr::new(HV_GUID_ZERO, HV_GUID_ZERO).to_raw();
+        sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
+        get_connectex(sock)?;
+        let stream = HvStream::from_socket(&rt.inner, owned)?;
         let connect_ex = get_connectex(sock)?;
         let (remote, remote_len) = addr.to_raw();
         let fut = unsafe {
@@ -298,22 +280,16 @@ impl HvListener {
     /// locally may still be unreachable from a VM.
     pub fn bind(rt: &Runtime, addr: HvSocketAddr) -> windows_core::Result<HvListener> {
         let sock = hv_socket()?;
-        let register = || -> windows_core::Result<Arc<IoRes>> {
-            let (sa, len) = addr.to_raw();
-            sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
-            sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
-            IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
-        };
-        match register() {
-            Ok(res) => Ok(HvListener {
-                res,
-                rt: rt.clone(),
-            }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let (sa, len) = addr.to_raw();
+        sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
+        sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
+        let res = IoRes::register(&rt.inner, owned)?;
+        Ok(HvListener {
+            res,
+            rt: rt.clone(),
+        })
     }
 
     /// Accepts one connection.
@@ -346,20 +322,12 @@ impl HvListener {
         let (result, mut payload) = fut.await;
         result?;
         let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
-        let finish = || -> windows_core::Result<HvStream> {
-            let listen_val = listen_sock.0.to_ne_bytes();
-            sock_check(unsafe {
-                setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
-            })?;
-            HvStream::from_socket(&self.rt.inner, sock)
-        };
-        match finish() {
-            Ok(stream) => Ok(stream),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let listen_val = listen_sock.0.to_ne_bytes();
+        sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
+        let stream = HvStream::from_socket(&self.rt.inner, owned)?;
+        Ok(stream)
     }
 }
 
@@ -382,7 +350,7 @@ mod tests {
     fn hv_socket_can_be_created() {
         match hv_socket() {
             Ok(s) => {
-                unsafe { closesocket(s) };
+                unsafe { windows::Win32::Networking::WinSock::closesocket(s) };
             }
             Err(e) if hv_unsupported(&e) => {
                 eprintln!("skipped: AF_HYPERV unsupported on this machine");

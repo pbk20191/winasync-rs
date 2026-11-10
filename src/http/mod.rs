@@ -49,7 +49,7 @@
 
 use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 use crate::common::opfuture::submit;
-use crate::common::overlapped::{IoReg, Issue};
+use crate::common::overlapped::{Binding, IoHandle, IoReg, Issue};
 use std::net::SocketAddr;
 use std::os::windows::io::AsRawHandle;
 use std::time::Duration;
@@ -172,15 +172,13 @@ impl HttpServer {
     /// completions run on the process's default thread pool. See the module
     /// docs for which prefixes need a reservation.
     pub fn bind(urls: &[&str]) -> Result<HttpServer> {
-        Self::bind_with(urls, |queue| IoReg::register(queue, false, None, None))
+        Self::bind_with(urls, Binding::process_default())
     }
 
     /// [`bind`](Self::bind), with completions on `rt`'s pool.
     #[cfg(feature = "tp")]
     pub fn bind_on(rt: &crate::tp::Runtime, urls: &[&str]) -> Result<HttpServer> {
-        let env = rt.inner.pool.default_env();
-        let keep: Arc<dyn std::any::Any + Send + Sync> = rt.inner.clone();
-        Self::bind_with(urls, |queue| IoReg::register(queue, false, Some(env), Some(keep)))
+        Self::bind_with(urls, Binding::Pool(rt.inner.pool_ref()))
     }
 
     /// [`bind`](Self::bind), with completions queued on `port`, which the
@@ -189,15 +187,10 @@ impl HttpServer {
     /// The server keeps the port open.
     #[cfg(feature = "iocp")]
     pub fn bind_to_port(port: &crate::iocp::CompletionPort, urls: &[&str]) -> Result<HttpServer> {
-        Self::bind_with(urls, |queue| {
-            IoReg::register_on_port(queue, false, port.raw(), port.keepalive())
-        })
+        Self::bind_with(urls, Binding::Port(port.port_ref()))
     }
 
-    fn bind_with(
-        urls: &[&str],
-        register: impl FnOnce(HANDLE) -> Result<Arc<IoReg>>,
-    ) -> Result<HttpServer> {
+    fn bind_with(urls: &[&str], binding: Binding) -> Result<HttpServer> {
         // From here on `Session::drop` undoes whatever succeeded.
         let mut session = Session {
             session: 0,
@@ -211,15 +204,7 @@ impl HttpServer {
         }
         let mut queue = HANDLE::default();
         check(unsafe { HttpCreateRequestQueue(API, windows_core::PCWSTR::null(), None, None, &mut queue) })?;
-        let queue = match register(queue) {
-            Ok(res) => res,
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(queue);
-                }
-                return Err(e);
-            }
-        };
+        let queue = IoReg::register(unsafe { IoHandle::from_handle(queue) }, binding)?;
         let binding = HTTP_BINDING_INFO {
             Flags: HTTP_PROPERTY_FLAGS { _bitfield: 1 },
             RequestQueueHandle: queue.handle,

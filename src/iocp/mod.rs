@@ -94,14 +94,14 @@ impl CompletionPort {
         })
     }
 
-    pub(crate) fn raw(&self) -> HANDLE {
+    fn raw(&self) -> HANDLE {
         HANDLE(self.handle.as_raw_handle())
     }
 
-    /// What a registration on this port holds to keep it open.
+    /// This port, for registering the crate's own handles on it.
     #[cfg(feature = "http")]
-    pub(crate) fn keepalive(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
-        self.handle.clone()
+    pub(crate) fn port_ref(&self) -> crate::common::overlapped::PortRef {
+        crate::common::overlapped::PortRef::new(self.handle.clone())
     }
 
     /// Finishes `completion` if it is one of this crate's own operations

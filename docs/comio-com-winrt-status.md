@@ -1040,6 +1040,21 @@ tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
   어느 서버에도 속하지 않아 기계 전체 기본값을 따른다. 판정이 거칠다: 유휴 1초로 걸었더니 5초 뒤에 끊겼다.
 - 응답 계열 Future가 `!Send`였던 것을 고쳤다(레코드의 raw 포인터 때문). 모든 핸들러 Future가 `Send`인지
   컴파일로 확인하는 테스트를 넣었다.
+### 등록 구조 정리: `_keepalive` 제거 (2026-11-11)
+
+`IoReg`의 `_keepalive: Option<Arc<dyn Any>>`는 성격이 다른 두 가지(풀을 살려 두는 것, 핸들 뒤에 닫혀야
+하는 것)를 타입을 지운 한 칸에 섞고 있었다. 같은 패턴이 rio·ioring 펌프에도 복사돼 있었다.
+
+- `common::pool::PoolRef` — 환경 포인터와 그 주인을 한 값으로: `ProcessDefault | Static(env) | Runtime(tp::Runtime)`.
+  환경만 넘기고 주인을 빼먹는 길이 사라졌다. `finalizes()`가 "누가 컨텍스트를 해제하나"를 답한다(rio·ioring의
+  `ctx_to_release`가 `env.is_none()` 대신 이것으로 결정).
+- `common::overlapped::Binding` — `Pool(PoolRef) | Port(PortRef)`. `IoReg::register(io, binding)` 하나로 통일.
+- `IoHandle` — `Handle(OwnedHandle) | Socket(OwnedSocket) | PipeInstance(Instance)`. 등록이 핸들을 **실패해도**
+  소유하고 닫는다. 호출부마다 있던 `Err(e) => { closesocket(..); Err(e) }` 23곳이 사라졌다. 파이프 인스턴스 카운트는
+  `Instance`의 Drop 순서(핸들 닫기 → 토큰)로 보장되므로 별도의 `closes_with` 인자가 필요 없다.
+- `dyn`은 등록 경로에서 모두 빠졌다. 특수화는 검토했으나 안정 Rust에 없고, 타입 파라미터로 대신하면 `Arc<IoReg>`를
+  담는 모든 스트림 타입이 제네릭이 되는 데 비해 얻는 게 등록 시 한 번의 `match`뿐이라 닫힌 enum으로 두었다.
+
 - 아직 없는 것: HTTPS(인증서 바인딩은 `HttpSetServiceConfiguration`, 관리자 필요), Windows 인증
   (`HttpServerAuthenticationProperty`), 이름 있는 요청 큐(프로세스 간 공유), 응답 캐시.
 

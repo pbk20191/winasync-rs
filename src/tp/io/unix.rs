@@ -16,9 +16,8 @@ use crate::common::winsock::{connectex, ConnectExFn};
 use core::ffi::c_void;
 use std::mem;
 use std::sync::Arc;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
+    bind, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
     IPPROTO, SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
 };
@@ -91,33 +90,21 @@ impl UnixStream {
         crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
-    fn from_socket(rt: &Arc<RuntimeInner>, sock: SOCKET) -> windows_core::Result<UnixStream> {
-        match IoRes::register(rt, HANDLE(sock.0 as *mut c_void), true) {
-            Ok(res) => Ok(UnixStream { res }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+    fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<UnixStream> {
+        let res = IoRes::register(rt, sock)?;
+        Ok(UnixStream { res })
     }
 
     /// Connects to the AF_UNIX socket at `path`.
     pub async fn connect(rt: &Runtime, path: &str) -> windows_core::Result<UnixStream> {
         let sock = unix_socket()?;
-        let prepared = (|| -> windows_core::Result<UnixStream> {
-            let (local, local_len) = sockaddr_un_autobind();
-            sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
-            // Prime the ConnectEx pointer on this socket before registration.
-            get_connectex(sock)?;
-            UnixStream::from_socket(&rt.inner, sock)
-        })();
-        let stream = match prepared {
-            Ok(s) => s,
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                return Err(e);
-            }
-        };
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let (local, local_len) = sockaddr_un_autobind();
+        sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
+        // Prime the ConnectEx pointer on this socket before registration.
+        get_connectex(sock)?;
+        let stream = UnixStream::from_socket(&rt.inner, owned)?;
         let connect_ex = get_connectex(sock)?;
         let (remote, remote_len) = sockaddr_un(path)?;
         let fut = unsafe {
@@ -353,25 +340,19 @@ impl UnixListener {
         security: Option<&SecurityDescriptor>,
     ) -> windows_core::Result<UnixListener> {
         let sock = unix_socket()?;
-        let register = || -> windows_core::Result<Arc<IoRes>> {
-            let (sa, len) = sockaddr_un(path)?;
-            sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
-            if let Some(security) = security {
-                security.apply_dacl_to_file(path)?;
-            }
-            sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
-            IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
-        };
-        match register() {
-            Ok(res) => Ok(UnixListener {
-                res,
-                rt: rt.clone(),
-            }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let (sa, len) = sockaddr_un(path)?;
+        sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
+        if let Some(security) = security {
+            security.apply_dacl_to_file(path)?;
         }
+        sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
+        let res = IoRes::register(&rt.inner, owned)?;
+        Ok(UnixListener {
+            res,
+            rt: rt.clone(),
+        })
     }
 
     /// Accepts one connection.
@@ -404,20 +385,12 @@ impl UnixListener {
         let (result, mut payload) = fut.await;
         result?;
         let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
-        let finish = || -> windows_core::Result<UnixStream> {
-            let listen_val = listen_sock.0.to_ne_bytes();
-            sock_check(unsafe {
-                setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
-            })?;
-            UnixStream::from_socket(&self.rt.inner, sock)
-        };
-        match finish() {
-            Ok(stream) => Ok(stream),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        // Closed on any early return from here on.
+        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let listen_val = listen_sock.0.to_ne_bytes();
+        sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
+        let stream = UnixStream::from_socket(&self.rt.inner, owned)?;
+        Ok(stream)
     }
 }
 

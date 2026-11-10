@@ -26,6 +26,7 @@
 //! system's default, which also admits Everyone and the anonymous account
 //! for reading.
 
+use crate::common::overlapped::IoHandle;
 use crate::common::security::{self, SecurityDescriptor};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -178,8 +179,8 @@ struct Slots {
 
 /// Counts one live instance; dropped after the instance's handle is closed.
 ///
-/// Attached to the instance's I/O registration as its keepalive, which the
-/// registration drops after `CloseHandle` -- so the count never says "none"
+/// Handed to the instance's I/O registration as `closes_with`, which the
+/// registration drops after closing the handle -- so the count never says "none"
 /// while a handle of ours is still open, which would make the next create
 /// ask to be first and fail against our own pipe. It can say "one" for a
 /// moment after the last handle closes; a create in that moment does not ask
@@ -217,22 +218,28 @@ pub(crate) enum Slot {
     Retry,
 }
 
-/// A created instance: its handle, and the count it holds.
-pub(crate) struct Instance {
+/// A created instance: its handle, and the count it holds. Dropping it
+/// closes the handle, then (field order) releases the count.
+pub struct Instance {
     pub(crate) handle: HANDLE,
-    pub(crate) token: InstanceToken,
+    token: InstanceToken,
 }
 
 // The handle is owned by exactly one `Instance` at a time.
 unsafe impl Send for Instance {}
+unsafe impl Sync for Instance {}
 
-impl Instance {
-    /// Closes an instance that was never handed to a registration.
-    pub(crate) fn close(self) {
+impl Drop for Instance {
+    fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.handle);
         }
-        drop(self.token);
+    }
+}
+
+impl From<Instance> for IoHandle {
+    fn from(instance: Instance) -> IoHandle {
+        IoHandle::PipeInstance(instance)
     }
 }
 
@@ -367,9 +374,7 @@ impl Drop for ReplenishOnExit<'_> {
 
 impl Drop for PipeServer {
     fn drop(&mut self) {
-        if let Some(spare) = self.spare.get_mut().unwrap().take() {
-            spare.close();
-        }
+        drop(self.spare.get_mut().unwrap().take());
         // Anyone still waiting for a slot is waiting on a listener that is
         // gone; tell them so rather than leave them parked.
         let waiters = std::mem::take(&mut self.slots.lock().unwrap().waiters);

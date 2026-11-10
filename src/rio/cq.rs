@@ -45,9 +45,9 @@ use windows::Win32::Networking::WinSock::{
 use windows::Win32::System::Threading::{
     CallbackMayRunLong, CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait,
     SetThreadpoolWait, WaitForThreadpoolWaitCallbacks, PTP_CALLBACK_INSTANCE, PTP_WAIT,
-    TP_CALLBACK_ENVIRON_V3,
 };
 
+use crate::common::pool::PoolRef;
 use super::buffer::RioSlice;
 use super::rq::RIO_INVALID_CQ;
 use super::table::rio_table;
@@ -156,11 +156,9 @@ struct PoolPump {
     header: CtxHeader,
     state: Arc<CqState>,
     event: HANDLE,
-    /// Whatever the environment's owner must outlive its own callbacks —
-    /// `tp`'s `RuntimeInner` for a private pool, nothing for the process
-    /// default one. Type-erased exactly as `IoReg::register` does it, so this
-    /// struct has one layout regardless of which features are on.
-    _keepalive: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    /// The pool the wait lives in, with what keeps its environment valid;
+    /// released with the context, after the wait is closed.
+    _pool: PoolRef,
 }
 
 unsafe impl Send for PoolPump {}
@@ -233,10 +231,10 @@ pub struct RioCq {
 struct Pump {
     wait: PTP_WAIT,
     event: HANDLE,
-    /// `Some` exactly when the callback environment is null, since only an
-    /// environment carries a `FinalizationCallback` to release the context
-    /// for us. Set from `env.is_none()` in one place, so the pairing cannot
-    /// drift the way two hand-written literals could.
+    /// `Some` exactly when the environment has no `FinalizationCallback` to
+    /// release the context for us. Set from [`PoolRef::finalizes`] in one
+    /// place, so the pairing cannot drift the way two hand-written literals
+    /// could.
     ctx_to_release: Option<*const PoolPump>,
 }
 
@@ -252,11 +250,7 @@ impl RioCq {
     /// overflow structurally impossible rather than something to handle.
     #[cfg(feature = "tp")]
     pub fn new(rt: &Runtime, size: u32) -> windows_core::Result<Arc<Self>> {
-        Self::with_pump(
-            size,
-            Some(rt.inner.pool.default_env()),
-            Some(rt.inner.clone()),
-        )
+        Self::with_pump(size, rt.inner.pool_ref())
     }
 
     /// Creates a queue pumped from the **process default thread pool**.
@@ -283,30 +277,22 @@ impl RioCq {
     /// or drive the queue from a loop you control
     /// ([`with_iocp`](Self::with_iocp) / [`polling`](Self::polling)).
     pub fn with_default_pool(size: u32) -> windows_core::Result<Arc<Self>> {
-        Self::with_pump(size, None, None)
+        Self::with_pump(size, PoolRef::ProcessDefault)
     }
 
-    /// The one pump constructor, parameterized by callback environment.
+    /// The one pump constructor, parameterized by pool.
     ///
-    /// `env` is the only thing that differs between the pools, and it decides
-    /// the one rule teardown must get right: an environment carries a
-    /// `FinalizationCallback` that releases the context, a null environment
-    /// does not. Deriving `ctx_to_release` from `env.is_none()` right here
-    /// makes that pairing structural — the alternative, two near-identical
+    /// The pool is the only thing that differs between the variants, and it
+    /// decides the one rule teardown must get right: an environment with a
+    /// `FinalizationCallback` releases the context, any other does not.
+    /// Deriving `ctx_to_release` from [`PoolRef::finalizes`] right here makes
+    /// that pairing structural -- the alternative, near-identical
     /// constructors each setting both by hand, is a double free if they drift
     /// one way and a leak the other.
-    ///
-    /// `keepalive` is whatever must outlive the pool's callbacks; `None` for
-    /// the process default pool, which outlives everything.
-    ///
-    /// # Safety
-    /// `env`, when given, must point at a callback environment that stays
-    /// valid for this queue's life — which `keepalive` is there to ensure.
-    fn with_pump(
-        size: u32,
-        env: Option<*const TP_CALLBACK_ENVIRON_V3>,
-        keepalive: Option<Arc<dyn core::any::Any + Send + Sync>>,
-    ) -> windows_core::Result<Arc<Self>> {
+    fn with_pump(size: u32, pool: PoolRef) -> windows_core::Result<Arc<Self>> {
+        // Read before the pool moves into the context.
+        let env = pool.env();
+        let release_ourselves = !pool.finalizes();
         // Manual-reset: with NotifyReset the event is cleared by the next
         // RIONotify, not by the signal.
         let event = unsafe { CreateEventW(None, true, false, None)? };
@@ -340,7 +326,7 @@ impl RioCq {
             header: unsafe { CtxHeader::new(release_pump) },
             state: state.clone(),
             event,
-            _keepalive: keepalive,
+            _pool: pool,
         });
         let ctx = Arc::into_raw(pump);
 
@@ -364,8 +350,7 @@ impl RioCq {
             pump: Some(Pump {
                 wait,
                 event,
-                // Only a null environment leaves the context to us.
-                ctx_to_release: env.is_none().then_some(ctx),
+                ctx_to_release: release_ourselves.then_some(ctx),
             }),
         });
         // Arm for the first time: notify, then wait, in that order.
@@ -981,7 +966,7 @@ mod finalization_timing {
     /// Is the context released by the time `CloseThreadpoolWait` returns?
     ///
     /// `Drop` assumes so. If it were deferred, the `tp`-environment path
-    /// would release the pump — and whatever keepalive it holds — later, on a
+    /// would release the pump — and the pool reference it holds — later, on a
     /// pool thread, which is how a pool ends up being torn down from inside
     /// itself.
     #[test]
@@ -1009,7 +994,7 @@ mod finalization_timing {
         );
         assert_eq!(
             immediately, eventually,
-            "finalization is DEFERRED: the context outlived CloseThreadpoolWait,              so Drop must not assume the keepalive is already gone"
+            "finalization is DEFERRED: the context outlived CloseThreadpoolWait,              so Drop must not assume the pool reference is already gone"
         );
     }
 }

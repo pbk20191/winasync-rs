@@ -1,10 +1,10 @@
-//! Unified TP_IO overlapped-IO core shared by `tp` and `comio`.
+//! Unified overlapped-IO core shared by `tp`, `comio` and `http`.
 //!
-//! One registration + op-block + completion engine, parameterized by:
-//! * the TP callback **environment** (`tp` uses its runtime's private pool;
-//!   `comio` uses the default process pool, `pcbe = NULL`), and
-//! * an optional **keepalive** kept alive for the registration's lifetime
-//!   (`tp` passes its `RuntimeInner` so the pool outlives in-flight ops).
+//! One registration + op-block + completion engine, parameterized by a
+//! [`Binding`]: a thread pool's `TP_IO` -- `tp`'s runtime pool, comio's
+//! environment, the process default -- or a caller's completion port. The
+//! binding carries what keeps its pool or port valid, and a registration
+//! drops it only after its `TP_IO` and handle are closed.
 //!
 //! The primitive is completion-callback based (`CompleteFn` + [`OpHandle`] with
 //! explicit `cancel`), which `comio` uses directly. `tp` layers its
@@ -16,18 +16,19 @@
 //! crosses the completion FFI boundary; `LIVE_OPS` tracks live blocks in test builds and under `counters`.
 
 use core::ffi::c_void;
-use std::any::Any;
 use std::cell::UnsafeCell;
 use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Networking::WinSock::{closesocket, SOCKET};
+use crate::common::pool::PoolRef;
+use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Networking::WinSock::SOCKET;
 use windows::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows::Win32::System::Threading::{
     CancelThreadpoolIo, CloseThreadpoolIo, CreateThreadpoolIo, StartThreadpoolIo,
-    PTP_CALLBACK_INSTANCE, PTP_IO, TP_CALLBACK_ENVIRON_V3,
+    PTP_CALLBACK_INSTANCE, PTP_IO,
 };
 use windows::Win32::System::IO::{CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, OVERLAPPED};
 
@@ -62,65 +63,132 @@ pub static LIVE_OPS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(any(test, feature = "counters"))]
 pub static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 
-/// A handle registered with a pool's TP_IO; owns the kernel handle + TP_IO.
+/// A kernel object to register: a handle or a socket, owned, so it is closed
+/// however registration ends -- by the registration when it succeeds, on the
+/// way out when it fails.
+pub enum IoHandle {
+    Handle(OwnedHandle),
+    Socket(OwnedSocket),
+    /// A named-pipe instance: closes its handle, then releases the count it
+    /// holds -- which must not fall while the instance is still open.
+    #[cfg(any(feature = "tp", feature = "comio"))]
+    PipeInstance(crate::common::pipe::Instance),
+}
+
+impl From<OwnedHandle> for IoHandle {
+    fn from(h: OwnedHandle) -> Self {
+        IoHandle::Handle(h)
+    }
+}
+
+impl From<OwnedSocket> for IoHandle {
+    fn from(s: OwnedSocket) -> Self {
+        IoHandle::Socket(s)
+    }
+}
+
+impl IoHandle {
+    /// Takes ownership of a raw handle.
+    ///
+    /// # Safety
+    /// `handle` is open, owned by the caller, and closed by nothing else.
+    pub unsafe fn from_handle(handle: HANDLE) -> Self {
+        IoHandle::Handle(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+    }
+
+    /// Takes ownership of a raw socket.
+    ///
+    /// # Safety
+    /// As [`from_handle`](Self::from_handle), for a socket.
+    pub unsafe fn from_socket(socket: SOCKET) -> Self {
+        IoHandle::Socket(unsafe { OwnedSocket::from_raw_socket(socket.0 as u64) })
+    }
+
+    fn raw(&self) -> HANDLE {
+        match self {
+            IoHandle::Handle(h) => HANDLE(h.as_raw_handle()),
+            IoHandle::Socket(s) => HANDLE(s.as_raw_socket() as *mut c_void),
+            #[cfg(any(feature = "tp", feature = "comio"))]
+            IoHandle::PipeInstance(i) => i.handle,
+        }
+    }
+
+    fn is_socket(&self) -> bool {
+        matches!(self, IoHandle::Socket(_))
+    }
+}
+
+/// Where a registered handle's completions go.
+pub enum Binding {
+    /// A thread pool, through a `TP_IO` created in that pool's environment.
+    Pool(PoolRef),
+    /// A completion port someone else drains, handing each completion to
+    /// [`dispatch`].
+    Port(PortRef),
+}
+
+impl Binding {
+    /// The process's default thread pool.
+    pub const fn process_default() -> Binding {
+        Binding::Pool(PoolRef::ProcessDefault)
+    }
+}
+
+/// A completion port, held open by every registration on it: a port closed
+/// under a pending operation loses its completion, and the operation with
+/// it.
+pub struct PortRef(Arc<OwnedHandle>);
+
+impl PortRef {
+    /// `port` must be a completion port; association with anything else
+    /// fails at registration.
+    pub fn new(port: Arc<OwnedHandle>) -> PortRef {
+        PortRef(port)
+    }
+}
+
+/// A handle registered with the completion engine: owns the kernel handle,
+/// its `TP_IO` when it has one, and what must outlive both.
 pub struct IoReg {
     pub handle: HANDLE,
-    /// `None` for a handle associated with a caller's completion port
-    /// ([`register_on_port`](Self::register_on_port)): nothing to arm, and
-    /// completions arrive through [`dispatch`].
-    io: Option<PTP_IO>,
     is_socket: bool,
     /// Set once [`set_skip_completion_on_success`](Self::set_skip_completion_on_success)
     /// succeeds; read by issue closures to decide whether a synchronous success
     /// still queues a completion packet.
     skip_on_success: AtomicBool,
-    /// Kept alive for the registration's lifetime (e.g. `tp`'s `RuntimeInner`
-    /// so the pool outlives in-flight ops). `None` for the default pool.
-    _keepalive: Option<Arc<dyn Any + Send + Sync>>,
+    /// `None` on a [`Binding::Port`]: nothing to arm there, and completions
+    /// arrive through [`dispatch`].
+    io: Option<PTP_IO>,
+    /// Taken in `drop` to close it at the right moment.
+    owned: Option<IoHandle>,
+    /// Dropped last: the pool or port the `TP_IO` and handle belonged to.
+    _binding: Binding,
 }
 
 unsafe impl Send for IoReg {}
 unsafe impl Sync for IoReg {}
 
 impl IoReg {
-    /// Registers `handle` with the TP_IO completion engine. `env` is the pool
-    /// callback environment (`None` = default process pool); `keepalive` is held
-    /// for the registration's life. Takes ownership of `handle` on success.
-    pub fn register(
-        handle: HANDLE,
-        is_socket: bool,
-        env: Option<*const TP_CALLBACK_ENVIRON_V3>,
-        keepalive: Option<Arc<dyn Any + Send + Sync>>,
-    ) -> windows_core::Result<Arc<Self>> {
-        let io = unsafe { CreateThreadpoolIo(handle, Some(io_complete), None, env)? };
+    /// Registers `io` with `binding`. Takes `io` either way: on failure it
+    /// is closed before this returns.
+    pub fn register(io: impl Into<IoHandle>, binding: Binding) -> windows_core::Result<Arc<Self>> {
+        let owned = io.into();
+        let handle = owned.raw();
+        let tp_io = match &binding {
+            Binding::Pool(pool) => Some(unsafe { CreateThreadpoolIo(handle, Some(io_complete), None, pool.env())? }),
+            Binding::Port(port) => {
+                let port = HANDLE(port.0.as_raw_handle());
+                unsafe { CreateIoCompletionPort(handle, Some(port), port_key(), 0)? };
+                None
+            }
+        };
         Ok(Arc::new(Self {
             handle,
-            io: Some(io),
-            is_socket,
+            is_socket: owned.is_socket(),
             skip_on_success: AtomicBool::new(false),
-            _keepalive: keepalive,
-        }))
-    }
-
-    /// Associates `handle` with the completion port `port` instead of a
-    /// pool: its completions are queued there under [`port_key`], and
-    /// whoever drains the port hands them to [`dispatch`]. `keepalive` must
-    /// keep the port open for the registration's life -- a port closed under
-    /// a pending operation loses its completion, and the operation with it.
-    /// Takes ownership of `handle` on success.
-    pub fn register_on_port(
-        handle: HANDLE,
-        is_socket: bool,
-        port: HANDLE,
-        keepalive: Arc<dyn Any + Send + Sync>,
-    ) -> windows_core::Result<Arc<Self>> {
-        unsafe { CreateIoCompletionPort(handle, Some(port), port_key(), 0)? };
-        Ok(Arc::new(Self {
-            handle,
-            io: None,
-            is_socket,
-            skip_on_success: AtomicBool::new(false),
-            _keepalive: Some(keepalive),
+            io: tp_io,
+            owned: Some(owned),
+            _binding: binding,
         }))
     }
 
@@ -169,16 +237,13 @@ impl Drop for IoReg {
         // tail, so by here all started IO has completed — closing is legal. This
         // may run at the tail of the last completion callback, so
         // WaitForThreadpoolIoCallbacks is NOT used (it would self-deadlock).
-        unsafe {
-            if let Some(io) = self.io {
-                CloseThreadpoolIo(io);
-            }
-            if self.is_socket {
-                closesocket(self.socket());
-            } else {
-                let _ = CloseHandle(self.handle);
-            }
+        //
+        // The order is the point: the TP_IO, then the handle, then (as the
+        // last field) the pool or port.
+        if let Some(io) = self.io {
+            unsafe { CloseThreadpoolIo(io) };
         }
+        drop(self.owned.take());
     }
 }
 
@@ -291,7 +356,7 @@ unsafe fn complete(overlapped: *mut c_void, ioresult: u32, bytes: usize) {
     unsafe { release_ref(overlapped) };
 }
 
-/// The completion key every handle of [`IoReg::register_on_port`] is
+/// The completion key every handle of [`Binding::Port`] is
 /// associated under: the address of a private static, so no other code has
 /// a reason to hold it. Code that associates or posts under arbitrary keys
 /// (the `iocp` module) refuses this one, which is what lets [`dispatch`]
@@ -308,7 +373,7 @@ pub fn port_key() -> usize {
 ///
 /// # Safety
 /// A completion carrying [`port_key`] must be one the port delivered for a
-/// handle registered through [`IoReg::register_on_port`], dispatched once.
+/// handle registered through [`Binding::Port`], dispatched once.
 /// What the `iocp` module lets safe code put on a port cannot carry the key.
 pub unsafe fn dispatch(key: usize, overlapped: *mut OVERLAPPED) -> bool {
     if key != port_key() || overlapped.is_null() {

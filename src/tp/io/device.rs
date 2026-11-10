@@ -16,7 +16,7 @@ use super::{submit, IoRes, Issue, OpFuture};
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::Runtime;
 use std::sync::Arc;
-use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE};
+use windows::Win32::Foundation::{ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
     FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -68,15 +68,8 @@ impl Device {
                 None,
             )?
         };
-        match IoRes::register(&rt.inner, handle, false) {
-            Ok(res) => Ok(Device { res }),
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                Err(e)
-            }
-        }
+        let res = IoRes::register(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(handle) })?;
+        Ok(Device { res })
     }
 
     /// Issues control code `code` with `input`, filling `output`.

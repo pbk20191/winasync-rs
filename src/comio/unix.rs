@@ -24,12 +24,11 @@ use super::connector::connect_op;
 use super::listener::Accepted;
 use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
 use super::stream::{self, AcceptSockGuard};
-use super::tpio::{self, IoReg, OpHandle};
+use super::tpio::{self, IoHandle, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use core::ffi::c_void;
 use std::mem;
 use std::sync::Arc;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
     SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
@@ -113,22 +112,18 @@ impl UnixStreamListener {
     /// hold, use a named pipe, or check the peer's SID at accept.
     pub fn bind(path: &str, security: Option<&SecurityDescriptor>) -> Result<Self> {
         let sock = new_socket()?;
-        let register = || -> Result<Arc<IoReg>> {
+        // Closed on any early return from here on.
+        let owned = unsafe { IoHandle::from_socket(sock) };
+        let register = move || -> Result<Arc<IoReg>> {
             let (sa, addrlen) = sockaddr_un(path)?;
             sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, addrlen) })?;
             if let Some(security) = security {
                 security.apply_dacl_to_file(path)?;
             }
             sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
-            IoReg::register(HANDLE(sock.0 as *mut c_void), true)
+            IoReg::register(owned)
         };
-        match register() {
-            Ok(reg) => Ok(UnixStreamListener { reg }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        Ok(UnixStreamListener { reg: register()? })
     }
 
     /// Accepts one connection, returning it as a duplex WinRT stream.
@@ -174,23 +169,19 @@ impl UnixStreamListener {
         // Success: take the socket out of the guard so its `Drop` no longer
         // closes it (`IoReg::register` owns it from here).
         let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
-        let finish = || -> Result<ITransportStream> {
+        // Closed on any early return from here on.
+        let owned = unsafe { IoHandle::from_socket(sock) };
+        let finish = move || -> Result<ITransportStream> {
             // Until `SO_UPDATE_ACCEPT_CONTEXT` (value = the listen socket)
             // the accepted socket is half-configured.
             let listen_val = listen_sock.0.to_ne_bytes();
             sock_check(unsafe {
                 setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
             })?;
-            let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
+            let reg = IoReg::register(owned)?;
             Ok(stream::from_reg(reg, stream::Peer::Unix))
         };
-        match finish() {
-            Ok(s) => Ok(s),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        finish()
     }
 
     /// Callback-based counterpart to [`UnixStreamListener::accept`], used by
@@ -239,7 +230,9 @@ impl UnixStreamListener {
                     drop(addr_buf);
                     let res = if ioresult == 0 {
                         let listen_val = listen_sock.0.to_ne_bytes();
-                        let finish = || -> Result<Accepted> {
+                        // Closed on any early return from here on.
+                        let owned = IoHandle::from_socket(accept_sock);
+                        let finish = move || -> Result<Accepted> {
                             sock_check(setsockopt(
                                 accept_sock,
                                 SOL_SOCKET,
@@ -250,16 +243,10 @@ impl UnixStreamListener {
                             // ours to query (and only valid after the
                             // accept context above).
                             let peer = PeerIdentity::of_unix_peer(accept_sock);
-                            let reg = IoReg::register(HANDLE(accept_sock.0 as *mut c_void), true)?;
+                            let reg = IoReg::register(owned)?;
                             Ok(Accepted::local(stream::from_reg(reg, stream::Peer::Unix), peer))
                         };
-                        match finish() {
-                            Ok(s) => Ok(s),
-                            Err(e) => {
-                                closesocket(accept_sock);
-                                Err(e)
-                            }
-                        }
+                        finish()
                     } else {
                         closesocket(accept_sock);
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
@@ -304,21 +291,17 @@ impl UnixConnector {
     /// connection as a duplex WinRT stream.
     pub async fn connect(path: &str) -> Result<ITransportStream> {
         let sock = new_socket()?;
-        let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
+        // Closed on any early return from here on.
+        let owned = unsafe { IoHandle::from_socket(sock) };
+        let prepared = (move || -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
             let (local, local_len) = sockaddr_un_autobind();
             sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
             let connect_ex = get_connectex(sock)?;
-            let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
+            let reg = IoReg::register(owned)?;
             Ok((connect_ex, reg))
         })();
-        let (connect_ex, reg) = match prepared {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                return Err(e);
-            }
-        };
+        let (connect_ex, reg) = prepared?;
 
         let (remote, remote_len) = match sockaddr_un(path) {
             Ok(v) => v,
@@ -366,21 +349,17 @@ impl UnixConnector {
         on_result: Box<dyn FnOnce(Result<ITransportStream>) + Send>,
     ) -> Result<OpHandle> {
         let sock = new_socket()?;
-        let prepared = (|| -> Result<(ConnectExFn, Arc<IoReg>)> {
+        // Closed on any early return from here on.
+        let owned = unsafe { IoHandle::from_socket(sock) };
+        let prepared = (move || -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
             let (local, local_len) = sockaddr_un_autobind();
             sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
             let connect_ex = get_connectex(sock)?;
-            let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
+            let reg = IoReg::register(owned)?;
             Ok((connect_ex, reg))
         })();
-        let (connect_ex, reg) = match prepared {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                return Err(e);
-            }
-        };
+        let (connect_ex, reg) = prepared?;
 
         // `reg`'s Drop closes the socket if this fails.
         let (remote, remote_len) = sockaddr_un(path)?;
