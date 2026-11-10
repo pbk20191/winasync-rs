@@ -77,6 +77,9 @@ features = [
     # `ioring`'s tests bind a handle to a completion port to show the ring
     # refusing it; the engine itself never touches one.
     "Win32_System_IO",
+    # `iocp`'s tests make events, whose constructor takes security
+    # attributes.
+    "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
 ]
@@ -194,6 +197,16 @@ ioring = [
     "windows/Win32_System_Threading",
     "windows/Win32_System_Memory",
     "windows/Win32_System_SystemInformation",
+]
+
+# I/O completion ports for a caller's own loop, and wait completion
+# packets: any waitable object (event, semaphore, thread, process) delivering
+# to a port like an I/O completion. Standalone.
+iocp = [
+    "windows/Win32_Foundation",
+    "windows/Win32_System_IO",
+    "windows/Win32_System_LibraryLoader",
+    "windows/Win32_System_Threading",
 ]
 
 # DispatcherQueue (WinUI 3) runtime.

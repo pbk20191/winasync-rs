@@ -946,6 +946,39 @@ flush다.
 스레드는 필요 없다. 위에 `TcpStream::connect_host(rt, host, port, &SocketOptions)`를 얹었다. 주소를 차례로
 시도하고, 모두 실패하면 마지막 오류를 돌려준다. 없는 이름은 `WSAHOST_NOT_FOUND`(11001)다.
 
+## I/O Ring 등록, IOCP 대기 패킷 (2026-11-10)
+
+**I/O Ring 등록 파일·버퍼.** `register_files`, `register_buffers`, `register_slab`. 연산 쪽 API는 바뀌지 않는다.
+`RegisteredFile`은 `RingHandle`이고, `RingBuffer`(와 그 `Slice`)는 `IoBuf`다. read와 write가 훅(`ring_registration`)으로
+등록 여부를 알아보고 인덱스로 빌드한다. 측정으로 확인하고 설계에 반영한 것은 다음과 같다.
+
+- 등록 배열은 Build 때 복사된다.
+- **커널은 등록한 핸들에 참조를 잡지 않는다.** 사용자 핸들을 닫으면 그 인덱스가 `ERROR_INVALID_HANDLE`로 실패한다.
+  그래서 표가 핸들과 메모리를 직접 소유한다.
+- **재등록은 표 전체를 교체한다.** 옛 인덱스는 새 표의 같은 칸을 가리키게 된다. 그래서 인덱스에 세대 번호를 붙이고,
+  교체된 세대의 인덱스는 `E_INVALIDARG`로 거부한다.
+- 교체는 그 완료가 와야 확정된다. 그 사이에 해당 종류의 등록이 필요한 연산은 빌드를 미룬다.
+- **실패한 등록은 이전 표도 무효로 만든다.** 빈 표 등록이 거부된 뒤 이전 표의 0번이 Build에서 "범위 밖"이 됐다.
+  그래서 실패하면 활성 등록이 없는 상태로 둔다.
+- 빈 표는 거부된다. 따라서 등록 해제는 없다.
+
+**`iocp` 피처.** `CompletionPort`는 생성, 핸들 연결, `post`, `dequeue`, `dequeue_many`를 제공한다. `WaitPacket`은
+`NtCreateWaitCompletionPacket`/`NtAssociateWaitCompletionPacket`/`NtCancelWaitCompletionPacket`으로 만든다.
+이벤트, 세마포어, 스레드, 프로세스가 신호를 받으면 I/O 완료처럼 포트에 패킷이 들어온다(참조:
+tringi/win32-iocp-events). ntdll 함수는 처음 쓸 때 이름으로 찾고, 없으면 `ERROR_PROC_NOT_FOUND`다.
+측정 결과는 다음과 같다.
+
+- 일회성이다. 다시 연결하지 않으면 두 번째 신호는 오지 않는다. 이미 신호 상태인 객체에 연결하면
+  `already_signaled`가 참이고 패킷이 즉시 들어온다.
+- 연결한 뒤 대상 핸들을 닫아도 신호는 온다. 대기가 핸들이 아니라 객체를 잡고 있기 때문이다.
+- 취소의 반환값은 둘로만 갈린다. 신호 전에 취소한 경우와, 신호 후 `remove_signaled`로 큐에서 뺀 경우는 모두
+  `STATUS_SUCCESS`이고, 패킷이 큐에 남은 경우만 `STATUS_PENDING`이다. 그래서 `CancelOutcome`도
+  `Cancelled`/`AlreadyDelivered` 두 가지다.
+
+**취소 경쟁에서 데이터를 잃는 것은 정상이다.** CI에서 `unchecked_drops_race_completions_cleanly`가 300바이트 중
+299바이트를 받아 실패했다. 읽기가 완료되는 순간 future가 drop되면, 커널은 이미 데이터를 파이프에서 꺼낸 뒤라 돌려줄
+곳이 없다. 모든 완료 기반 읽기가 그렇다. 테스트는 이제 중복이나 순서 꼬임이 없는지만 단언한다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |
