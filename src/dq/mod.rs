@@ -306,7 +306,7 @@ impl DispatcherRuntime {
     /// Creates a `DispatcherQueue` on the *current* thread, runs `root` to
     /// completion on it, and tears the queue back down before returning.
     ///
-    /// Mirrors the lifecycle in `src/main.rs`: `CreateOnCurrentThread` ->
+    /// Mirrors the lifecycle in `examples/dq_controller.rs`: `CreateOnCurrentThread` ->
     /// `EnsureSystemDispatcherQueue` -> spawn -> `RunEventLoop` ->
     /// `ShutdownQueue`. `root` is spawned wrapped in a `RunRootTask`, which
     /// polls it manually (see that type's docs) so its completion path —

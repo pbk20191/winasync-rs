@@ -28,13 +28,21 @@ members = ["dll", "tools/winmdgen"]
 # `cdylib`. Building it is the only way to get the exports, which turns the
 # convention into a fact about the build.
 
-# Renamed off the package name because the cdylib now claims
-# `winasync.pdb`, which a bin of the same name would also emit —
-# cargo warns on the collision and says it may become a hard error. There is
-# still only one bin, so `cargo run` is unaffected.
-[[bin]]
-name = "winasync-demo"
-path = "src/main.rs"
+# The demos are examples, one per engine, so each declares the features it
+# needs and a build without them simply skips it. There is no bin: a
+# library crate's consumers should not compile a demo, nor run a build
+# script that only existed to embed the demo's manifest.
+[[example]]
+name = "tp"
+required-features = ["tp"]
+
+[[example]]
+name = "dq_controller"
+required-features = ["dq"]
+
+[[example]]
+name = "dq_named_pipe"
+required-features = ["tp", "comio", "dq"]
 
 [dependencies]
 windows-core = "0.62.2"
@@ -160,7 +168,7 @@ counters = []
 # the DLL": the separate package says that structurally.
 dylib = ["comio", "counters"]
 
-# DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.
+# DispatcherQueue (WinUI 3) runtime.
 dq = [
     "dep:winio-winui3",
     "windows/Foundation",
@@ -183,6 +191,3 @@ rio = [
 
 # tp's optional futures-io interop (AsyncRead/AsyncWrite <-> futures_io).
 futures-io = ["tp", "dep:futures-io"]
-
-[build-dependencies]
-embed-resource = "3.0.9"
