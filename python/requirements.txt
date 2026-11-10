@@ -1,0 +1,6 @@
+# Pinned to what the acceptance run was last verified with; CI installs
+# exactly these. PyWinRT itself is a .NET tool, pinned in dotnet-tools.json.
+winrt-runtime==4.1.0
+winrt-table-compiler==4.0.0
+winrt-Windows.Foundation==4!10.0.28000.2957
+winrt-Windows.Storage.Streams==4!10.0.28000.2957

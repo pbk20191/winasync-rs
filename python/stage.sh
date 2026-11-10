@@ -4,9 +4,8 @@
 # Everything here is generated, so nothing it produces is checked in. Run it
 # once after `cargo run -p winmdgen` changes the metadata.
 #
-#   tools:  dotnet tool install --local PyWinRT
-#   python: pip install winrt-runtime winrt-Windows.Foundation \
-#                       winrt-Windows.Storage.Streams winrt-table-compiler
+#   tools:  dotnet tool restore            (PyWinRT, pinned in dotnet-tools.json)
+#   python: pip install -r requirements.txt
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -21,7 +20,7 @@ WINMD="../metadata/$NAMESPACE.winmd"
 
 # The server DLL is its own package, `dll/`; the integration test is what
 # writes the reg-free manifest out of `activation::manifest()` beside it.
-(cd "$REPO" && cargo build -p winasync-dll && cargo test --all-features --test activation)
+(cd "$REPO" && cargo build -p winasync-dll && cargo test --features comio --test activation)
 
 # winmd -> Python projection. `--component-dlls` says the component ships
 # inside the package, which is what the copy below arranges.

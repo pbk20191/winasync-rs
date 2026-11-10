@@ -72,6 +72,70 @@ jobs:
           case "${{ matrix.features }}" in *dq*) threads="-- --test-threads=1";; esac
           cargo test --no-default-features --features "${{ matrix.features }}" $threads
 
+  # The component driven from each script runtime it targets, through that
+  # runtime's own projection of the published `.winmd`. These are the
+  # acceptance tests for the metadata: a change to the RDL that one projection
+  # generator rejects, or that projects to something unusable, fails here and
+  # nowhere else. Each script prints its marker only after a full round trip.
+  consumers:
+    name: consumer (${{ matrix.runtime }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: python
+            marker: ROUND-TRIP-OK
+          - runtime: node
+            marker: NODE-ROUND-TRIP-OK
+          - runtime: csharp
+            marker: CS-ROUND-TRIP-OK
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: consumer-${{ matrix.runtime }}
+      # PyWinRT is a .NET tool and the C# sample targets net10.0.
+      - if: matrix.runtime != 'node'
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - if: matrix.runtime == 'python'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      # `node:ffi`, which loads the reg-free manifest, arrived in Node 26.
+      - if: matrix.runtime == 'node'
+        uses: actions/setup-node@v5
+        with:
+          node-version: '26'
+      - name: stage and run
+        shell: bash
+        run: |
+          set -o pipefail
+          case "${{ matrix.runtime }}" in
+            python)
+              cd python
+              dotnet tool restore
+              python -m pip install -r requirements.txt
+              ./stage.sh
+              python accept.py | tee ../consumer.log ;;
+            node)
+              cd node
+              npm ci
+              ./stage.sh
+              npm run accept | tee ../consumer.log ;;
+            csharp)
+              cargo build -p winasync-dll
+              cargo test --features comio --test activation
+              dotnet run --project csharp/accept.csproj | tee consumer.log ;;
+          esac
+      - name: round trip reached
+        shell: bash
+        # The scripts write CRLF on Windows.
+        run: tr -d '\r' < consumer.log | grep -qx '${{ matrix.marker }}'
+
   lint:
     runs-on: windows-latest
     steps:

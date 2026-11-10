@@ -4,9 +4,6 @@
 python/out/
 python/.venv/
 python/__pycache__/
-# Created by `dotnet new tool-manifest`; the version PyWinRT resolves to is
-# not pinned here, so the README names the install step instead.
-python/dotnet-tools.json
 
 # C# build output; the projection under obj/ is generated from the winmd.
 csharp/bin/
