@@ -21,7 +21,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_MORE_DATA, HANDLE, WIN32_ERROR};
 use windows::Win32::System::IO::OVERLAPPED;
 
 pub(crate) use crate::common::overlapped::Issue;
@@ -52,16 +52,41 @@ impl IoRes {
         handle: HANDLE,
         is_socket: bool,
     ) -> windows_core::Result<Arc<Self>> {
+        Self::register_with(rt, handle, is_socket, &mut None)
+    }
+
+    /// [`register`](Self::register), also holding `extra` until after the
+    /// handle is closed -- a named-pipe instance's count, which must not drop
+    /// while the instance still exists. Taken only on success: on failure the
+    /// caller still owns both, and must close the handle before dropping it.
+    pub(crate) fn register_with(
+        rt: &Arc<RuntimeInner>,
+        handle: HANDLE,
+        is_socket: bool,
+        extra: &mut Option<Box<dyn std::any::Any + Send + Sync>>,
+    ) -> windows_core::Result<Arc<Self>> {
         // Keepalive = the pool-owning Arc, so the pool outlives in-flight ops and
         // each TP_IO's `CloseThreadpoolIo` (in `IoReg::Drop`) runs before the
         // pool's cleanup-group teardown.
-        let keep: Arc<dyn std::any::Any + Send + Sync> = rt.clone();
-        let inner = IoReg::register(handle, is_socket, Some(rt.pool.default_env()), Some(keep))?;
+        let keep = Arc::new(Keep {
+            _rt: rt.clone(),
+            _extra: std::sync::Mutex::new(None),
+        });
+        let inner = IoReg::register(handle, is_socket, Some(rt.pool.default_env()), Some(keep.clone()))?;
+        *keep._extra.lock().unwrap() = extra.take();
         Ok(Arc::new(Self {
             inner,
             rt: rt.clone(),
         }))
     }
+}
+
+/// What a registration keeps alive until after its handle is closed.
+struct Keep {
+    _rt: Arc<RuntimeInner>,
+    // Filled after the registration succeeds, so a failed one leaves `extra`
+    // with the caller. A `Mutex` only to make that late write `Sync`.
+    _extra: std::sync::Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>,
 }
 
 /// Result/waker handoff between the completion callback and the polling future.
@@ -109,10 +134,9 @@ pub(crate) unsafe fn submit<P>(
     }
 }
 
-impl<P> Future for OpFuture<P> {
-    type Output = (windows_core::Result<usize>, P);
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+impl<P> OpFuture<P> {
+    /// The completion as the kernel reported it, with the payload.
+    fn poll_completion(&mut self, cx: &mut Context<'_>) -> Poll<(Completion, P)> {
         assert!(!self.done, "OpFuture polled after completion");
         let completion = {
             let mut g = self.slot.inner.lock().unwrap();
@@ -128,6 +152,42 @@ impl<P> Future for OpFuture<P> {
         // Completed (or sync-failed): the kernel is done with the block, so the
         // payload is exclusively ours again.
         let payload = unsafe { self.handle.take_payload() }.unwrap();
+        Poll::Ready((completion, payload))
+    }
+
+    /// Reads a message-mode pipe: like awaiting the op, except that
+    /// `ERROR_MORE_DATA` is a partial message, not a failure. Resolves to the
+    /// bytes read and whether the message has more.
+    pub(crate) fn message(self) -> MessageOp<P> {
+        MessageOp(self)
+    }
+}
+
+/// See [`OpFuture::message`].
+pub(crate) struct MessageOp<P>(OpFuture<P>);
+
+impl<P> Future for MessageOp<P> {
+    type Output = (windows_core::Result<(usize, bool)>, P);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (completion, payload) = std::task::ready!(self.0.poll_completion(cx));
+        let result = match completion {
+            Completion::Done(0, bytes) => Ok((bytes, false)),
+            Completion::Done(ioresult, bytes) if ioresult == ERROR_MORE_DATA.0 => Ok((bytes, true)),
+            Completion::Done(ioresult, _) => Err(windows_core::Error::from_hresult(
+                WIN32_ERROR(ioresult).to_hresult(),
+            )),
+            Completion::SyncFail(hr) => Err(windows_core::Error::from_hresult(hr)),
+        };
+        Poll::Ready((result, payload))
+    }
+}
+
+impl<P> Future for OpFuture<P> {
+    type Output = (windows_core::Result<usize>, P);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (completion, payload) = std::task::ready!(self.poll_completion(cx));
         let result = match completion {
             Completion::Done(0, bytes) => Ok(bytes),
             Completion::Done(ioresult, _) => Err(windows_core::Error::from_hresult(

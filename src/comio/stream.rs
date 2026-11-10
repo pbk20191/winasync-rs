@@ -10,7 +10,9 @@ use crate::comio::unload::ModuleRef;
 use super::asyncop::IoAsyncOp;
 use super::buffer::buffer_ptr;
 use super::bindings;
-use super::bindings::Pbk20191::WinAsync::Comio::{ITransportPeer_Impl, ITransportStream_Impl};
+use super::bindings::Pbk20191::WinAsync::Comio::{
+    IMessageStream_Impl, ITransportPeer_Impl, ITransportStream_Impl,
+};
 use crate::common::security;
 use super::tpio::{IoReg, Issue};
 use std::sync::Arc;
@@ -19,7 +21,7 @@ use windows::Storage::Streams::{
     IBuffer, IInputStream, IInputStream_Impl, IOutputStream, IOutputStream_Impl,
     InputStreamOptions,
 };
-use windows::Win32::Foundation::ERROR_IO_PENDING;
+use windows::Win32::Foundation::{ERROR_IO_PENDING, ERROR_MORE_DATA};
 use windows::Win32::Networking::WinSock::{WSARecv, WSASend, WSAGetLastError, WSA_IO_PENDING, SOCKET, WSABUF};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_core::{implement, ComObject, Ref, Result};
@@ -77,12 +79,15 @@ unsafe impl Send for AcceptSockGuard {}
     IInputStream,
     IOutputStream,
     windows::Foundation::IClosable,
-    bindings::Pbk20191::WinAsync::Comio::ITransportPeer
+    bindings::Pbk20191::WinAsync::Comio::ITransportPeer,
+    bindings::Pbk20191::WinAsync::Comio::IMessageStream
 )]
 pub struct TransportStream {
     reg: Arc<IoReg>,
     closed: std::sync::atomic::AtomicBool,
     peer: Peer,
+    /// A message-mode named pipe, which `IMessageStream` reads by message.
+    message_mode: bool,
     _module: ModuleRef,
 }
 
@@ -110,10 +115,20 @@ pub(crate) fn from_reg(
     reg: Arc<IoReg>,
     peer: Peer,
 ) -> bindings::Pbk20191::WinAsync::Comio::ITransportStream {
+    from_reg_with_mode(reg, peer, false)
+}
+
+/// [`from_reg`], for a named pipe that may be in message mode.
+pub(crate) fn from_reg_with_mode(
+    reg: Arc<IoReg>,
+    peer: Peer,
+    message_mode: bool,
+) -> bindings::Pbk20191::WinAsync::Comio::ITransportStream {
     let object = ComObject::new(TransportStream {
         reg,
         closed: std::sync::atomic::AtomicBool::new(false),
         peer,
+        message_mode,
         _module: ModuleRef::new(),
     });
     // A `QueryInterface` that cannot fail: `ITransportStream` is this class's
@@ -161,6 +176,27 @@ impl ITransportPeer_Impl for TransportStream_Impl {
             Peer::Opaque => Ok(String::new()),
         };
         Ok(windows_core::HSTRING::from(sid.unwrap_or_default()))
+    }
+}
+
+impl IMessageStream_Impl for TransportStream_Impl {
+    fn IsMessageMode(&self) -> Result<bool> {
+        Ok(self.message_mode)
+    }
+
+    fn ReadMessageAsync(&self, max_size: u32) -> Result<IAsyncOperationWithProgress<IBuffer, u32>> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(windows_core::Error::from_hresult(
+                crate::comio::listener::RO_E_CLOSED,
+            ));
+        }
+        if !self.message_mode {
+            return Err(windows_core::Error::new(
+                crate::comio::listener::E_ILLEGAL_METHOD_CALL,
+                "not a message-mode pipe",
+            ));
+        }
+        Ok(IoAsyncOp::start_read_message(&self.reg, max_size))
     }
 }
 
@@ -234,6 +270,8 @@ impl IInputStream_Impl for TransportStream_Impl {
                 ) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                    // Part of a message: a warning whose packet still comes.
+                    Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
                 }
             }))

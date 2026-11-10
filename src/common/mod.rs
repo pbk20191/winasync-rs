@@ -32,7 +32,7 @@ pub mod tpctx;
 #[cfg(any(feature = "tp", feature = "comio"))]
 pub mod security;
 #[cfg(any(feature = "tp", feature = "comio"))]
-pub(crate) mod pipe;
+pub mod pipe;
 // SOCKADDR conversions: neutral, used by every socket engine.
 #[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 pub mod sockaddr;

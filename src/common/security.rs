@@ -178,6 +178,26 @@ pub(crate) fn process_user_sid(pid: u32) -> Result<String> {
     token_user_sid(token.0)
 }
 
+/// The descriptor a named pipe gets when the caller supplies none: this
+/// process's own account, administrators and SYSTEM, nothing inherited.
+///
+/// Spelled out rather than left to `CreateNamedPipeW`'s default, because that
+/// default is wider than it looks. It grants full control to the creator,
+/// administrators and SYSTEM -- and *read* access to Everyone and to the
+/// anonymous account. A read-only client is still a client: it connects,
+/// completes the accept, and receives whatever the server writes. Measured
+/// 2026-11-10 on 26320: a thread impersonating the anonymous token opened a
+/// default pipe with `GENERIC_READ` and was refused only `GENERIC_WRITE`.
+pub(crate) fn default_pipe_descriptor() -> Result<SecurityDescriptor> {
+    static DEFAULT: std::sync::OnceLock<SecurityDescriptor> = std::sync::OnceLock::new();
+    if let Some(sd) = DEFAULT.get() {
+        return Ok(sd.clone());
+    }
+    let me = process_user_sid(std::process::id())?;
+    let sd = SecurityDescriptor::from_sddl(&format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{me})"))?;
+    Ok(DEFAULT.get_or_init(|| sd).clone())
+}
+
 /// The account the client of a connected named-pipe server instance
 /// connected as, read from its token.
 ///

@@ -983,6 +983,140 @@ pub mod Pbk20191 {
                     -> windows_core::HRESULT,
             }
             windows_core::imp::define_interface!(
+                IMessageStream,
+                IMessageStream_Vtbl,
+                0x81c32a75_7236_59d1_b840_f3b292d08ba0
+            );
+            impl windows_core::RuntimeType for IMessageStream {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IMessageStream,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IMessageStream {
+                pub fn IsMessageMode(&self) -> windows_core::Result<bool> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).IsMessageMode)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn ReadMessageAsync(
+                    &self,
+                    maxsize: u32,
+                ) -> windows_core::Result<
+                    windows_future::IAsyncOperationWithProgress<
+                        windows::Storage::Streams::IBuffer,
+                        u32,
+                    >,
+                > {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ReadMessageAsync)(
+                            windows_core::Interface::as_raw(this),
+                            maxsize,
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+            }
+            impl windows_core::RuntimeName for IMessageStream {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IMessageStream";
+            }
+            pub trait IMessageStream_Impl: windows_core::IUnknownImpl {
+                fn IsMessageMode(&self) -> windows_core::Result<bool>;
+                fn ReadMessageAsync(
+                    &self,
+                    maxSize: u32,
+                ) -> windows_core::Result<
+                    windows_future::IAsyncOperationWithProgress<
+                        windows::Storage::Streams::IBuffer,
+                        u32,
+                    >,
+                >;
+            }
+            impl IMessageStream_Vtbl {
+                pub const fn new<Identity: IMessageStream_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn IsMessageMode<
+                        Identity: IMessageStream_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut bool,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IMessageStream_Impl::IsMessageMode(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn ReadMessageAsync<
+                        Identity: IMessageStream_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        maxsize: u32,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IMessageStream_Impl::ReadMessageAsync(this, maxsize) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            IMessageStream,
+                            OFFSET,
+                        >(),
+                        IsMessageMode: IsMessageMode::<Identity, OFFSET>,
+                        ReadMessageAsync: ReadMessageAsync::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IMessageStream as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IMessageStream_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub IsMessageMode: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut bool,
+                )
+                    -> windows_core::HRESULT,
+                pub ReadMessageAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    u32,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
                 INamedPipeBind,
                 INamedPipeBind_Vtbl,
                 0x4e5db519_5fb8_5e37_81c8_b08a4a10b4fa
@@ -1072,7 +1206,7 @@ pub mod Pbk20191 {
             windows_core::imp::define_interface!(
                 INamedPipeConnector,
                 INamedPipeConnector_Vtbl,
-                0x9ad13fb2_9c7f_5286_a9cf_71f9b4c3e08f
+                0x99b7569c_4d6d_5b48_adfe_7d9619779605
             );
             impl windows_core::RuntimeType for INamedPipeConnector {
                 const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -1100,6 +1234,24 @@ pub mod Pbk20191 {
                         .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
+                pub fn ConnectWithTimeoutAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                    timeout: windows::Foundation::TimeSpan,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectWithTimeoutAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(name),
+                            timeout,
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
             }
             impl windows_core::RuntimeName for INamedPipeConnector {
                 const NAME: &'static str = "Pbk20191.WinAsync.Comio.INamedPipeConnector";
@@ -1108,6 +1260,11 @@ pub mod Pbk20191 {
                 fn ConnectAsync(
                     &self,
                     name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
+                fn ConnectWithTimeoutAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                    timeout: &windows::Foundation::TimeSpan,
                 ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>;
             }
             impl INamedPipeConnector_Vtbl {
@@ -1137,6 +1294,32 @@ pub mod Pbk20191 {
                             }
                         }
                     }
+                    unsafe extern "system" fn ConnectWithTimeoutAsync<
+                        Identity: INamedPipeConnector_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        name: *mut core::ffi::c_void,
+                        timeout: windows::Foundation::TimeSpan,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match INamedPipeConnector_Impl::ConnectWithTimeoutAsync(
+                                this,
+                                core::mem::transmute(&name),
+                                core::mem::transmute(&timeout),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
                     Self {
                         base__: windows_core::IInspectable_Vtbl::new::<
                             Identity,
@@ -1144,6 +1327,7 @@ pub mod Pbk20191 {
                             OFFSET,
                         >(),
                         ConnectAsync: ConnectAsync::<Identity, OFFSET>,
+                        ConnectWithTimeoutAsync: ConnectWithTimeoutAsync::<Identity, OFFSET>,
                     }
                 }
                 pub fn matches(iid: &windows_core::GUID) -> bool {
@@ -1160,6 +1344,381 @@ pub mod Pbk20191 {
                     *mut *mut core::ffi::c_void,
                 )
                     -> windows_core::HRESULT,
+                pub ConnectWithTimeoutAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    windows::Foundation::TimeSpan,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                INamedPipeListenerSettings,
+                INamedPipeListenerSettings_Vtbl,
+                0x7ce376b5_5aba_523f_ab37_9fbfaea13b17
+            );
+            impl windows_core::RuntimeType for INamedPipeListenerSettings {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                INamedPipeListenerSettings,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl INamedPipeListenerSettings {
+                pub fn MessageMode(&self) -> windows_core::Result<bool> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).MessageMode)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetMessageMode(&self, value: bool) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetMessageMode)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn AcceptRemoteClients(&self) -> windows_core::Result<bool> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).AcceptRemoteClients)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetAcceptRemoteClients(&self, value: bool) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetAcceptRemoteClients)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn MaxInstances(&self) -> windows_core::Result<u32> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).MaxInstances)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetMaxInstances(&self, value: u32) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetMaxInstances)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn InBufferSize(&self) -> windows_core::Result<u32> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).InBufferSize)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetInBufferSize(&self, value: u32) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetInBufferSize)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn OutBufferSize(&self) -> windows_core::Result<u32> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).OutBufferSize)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetOutBufferSize(&self, value: u32) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetOutBufferSize)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+            }
+            impl windows_core::RuntimeName for INamedPipeListenerSettings {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.INamedPipeListenerSettings";
+            }
+            pub trait INamedPipeListenerSettings_Impl: windows_core::IUnknownImpl {
+                fn MessageMode(&self) -> windows_core::Result<bool>;
+                fn SetMessageMode(&self, value: bool) -> windows_core::Result<()>;
+                fn AcceptRemoteClients(&self) -> windows_core::Result<bool>;
+                fn SetAcceptRemoteClients(&self, value: bool) -> windows_core::Result<()>;
+                fn MaxInstances(&self) -> windows_core::Result<u32>;
+                fn SetMaxInstances(&self, value: u32) -> windows_core::Result<()>;
+                fn InBufferSize(&self) -> windows_core::Result<u32>;
+                fn SetInBufferSize(&self, value: u32) -> windows_core::Result<()>;
+                fn OutBufferSize(&self) -> windows_core::Result<u32>;
+                fn SetOutBufferSize(&self, value: u32) -> windows_core::Result<()>;
+            }
+            impl INamedPipeListenerSettings_Vtbl {
+                pub const fn new<Identity: INamedPipeListenerSettings_Impl, const OFFSET: isize>(
+                ) -> Self {
+                    unsafe extern "system" fn MessageMode<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut bool,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match INamedPipeListenerSettings_Impl::MessageMode(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn SetMessageMode<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        value: bool,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            INamedPipeListenerSettings_Impl::SetMessageMode(this, value).into()
+                        }
+                    }
+                    unsafe extern "system" fn AcceptRemoteClients<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut bool,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match INamedPipeListenerSettings_Impl::AcceptRemoteClients(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn SetAcceptRemoteClients<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        value: bool,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            INamedPipeListenerSettings_Impl::SetAcceptRemoteClients(this, value)
+                                .into()
+                        }
+                    }
+                    unsafe extern "system" fn MaxInstances<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match INamedPipeListenerSettings_Impl::MaxInstances(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn SetMaxInstances<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        value: u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            INamedPipeListenerSettings_Impl::SetMaxInstances(this, value).into()
+                        }
+                    }
+                    unsafe extern "system" fn InBufferSize<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match INamedPipeListenerSettings_Impl::InBufferSize(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn SetInBufferSize<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        value: u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            INamedPipeListenerSettings_Impl::SetInBufferSize(this, value).into()
+                        }
+                    }
+                    unsafe extern "system" fn OutBufferSize<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match INamedPipeListenerSettings_Impl::OutBufferSize(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn SetOutBufferSize<
+                        Identity: INamedPipeListenerSettings_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        value: u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            INamedPipeListenerSettings_Impl::SetOutBufferSize(this, value).into()
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            INamedPipeListenerSettings,
+                            OFFSET,
+                        >(),
+                        MessageMode: MessageMode::<Identity, OFFSET>,
+                        SetMessageMode: SetMessageMode::<Identity, OFFSET>,
+                        AcceptRemoteClients: AcceptRemoteClients::<Identity, OFFSET>,
+                        SetAcceptRemoteClients: SetAcceptRemoteClients::<Identity, OFFSET>,
+                        MaxInstances: MaxInstances::<Identity, OFFSET>,
+                        SetMaxInstances: SetMaxInstances::<Identity, OFFSET>,
+                        InBufferSize: InBufferSize::<Identity, OFFSET>,
+                        SetInBufferSize: SetInBufferSize::<Identity, OFFSET>,
+                        OutBufferSize: OutBufferSize::<Identity, OFFSET>,
+                        SetOutBufferSize: SetOutBufferSize::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<INamedPipeListenerSettings as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct INamedPipeListenerSettings_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub MessageMode: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut bool,
+                )
+                    -> windows_core::HRESULT,
+                pub SetMessageMode: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    bool,
+                )
+                    -> windows_core::HRESULT,
+                pub AcceptRemoteClients: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut bool,
+                )
+                    -> windows_core::HRESULT,
+                pub SetAcceptRemoteClients: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    bool,
+                )
+                    -> windows_core::HRESULT,
+                pub MaxInstances: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut u32,
+                )
+                    -> windows_core::HRESULT,
+                pub SetMaxInstances:
+                    unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> windows_core::HRESULT,
+                pub InBufferSize: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut u32,
+                )
+                    -> windows_core::HRESULT,
+                pub SetInBufferSize:
+                    unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> windows_core::HRESULT,
+                pub OutBufferSize: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut u32,
+                )
+                    -> windows_core::HRESULT,
+                pub SetOutBufferSize:
+                    unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> windows_core::HRESULT,
             }
             windows_core::imp::define_interface!(
                 ITransport,
@@ -1662,6 +2221,7 @@ pub mod Pbk20191 {
                 windows::Foundation::IClosable,
                 IListenerSecurity,
                 INamedPipeBind,
+                INamedPipeListenerSettings,
                 ITransport
             );
             impl NamedPipeConnectionListener {
@@ -1770,6 +2330,111 @@ pub mod Pbk20191 {
                         .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
+                pub fn MessageMode(&self) -> windows_core::Result<bool> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).MessageMode)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetMessageMode(&self, value: bool) -> windows_core::Result<()> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetMessageMode)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn AcceptRemoteClients(&self) -> windows_core::Result<bool> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).AcceptRemoteClients)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetAcceptRemoteClients(&self, value: bool) -> windows_core::Result<()> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetAcceptRemoteClients)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn MaxInstances(&self) -> windows_core::Result<u32> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).MaxInstances)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetMaxInstances(&self, value: u32) -> windows_core::Result<()> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetMaxInstances)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn InBufferSize(&self) -> windows_core::Result<u32> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).InBufferSize)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetInBufferSize(&self, value: u32) -> windows_core::Result<()> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetInBufferSize)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
+                pub fn OutBufferSize(&self) -> windows_core::Result<u32> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).OutBufferSize)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn SetOutBufferSize(&self, value: u32) -> windows_core::Result<()> {
+                    let this = &windows_core::Interface::cast::<INamedPipeListenerSettings>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetOutBufferSize)(
+                            windows_core::Interface::as_raw(this),
+                            value,
+                        )
+                        .ok()
+                    }
+                }
                 pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
                     let this = &windows_core::Interface::cast::<ITransport>(self)?;
                     unsafe {
@@ -1836,6 +2501,24 @@ pub mod Pbk20191 {
                         .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
+                pub fn ConnectWithTimeoutAsync(
+                    &self,
+                    name: &windows_core::HSTRING,
+                    timeout: windows::Foundation::TimeSpan,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<ITransportStream>>
+                {
+                    let this = &windows_core::Interface::cast::<INamedPipeConnector>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ConnectWithTimeoutAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(name),
+                            timeout,
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
                 pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
                     let this = self;
                     unsafe {
@@ -1872,6 +2555,7 @@ pub mod Pbk20191 {
                 TransportStream,
                 windows::Foundation::IClosable,
                 windows::Storage::Streams::IInputStream,
+                IMessageStream,
                 windows::Storage::Streams::IOutputStream,
                 ITransportPeer
             );
@@ -1910,6 +2594,37 @@ pub mod Pbk20191 {
                             buffer.param().abi(),
                             count,
                             options,
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn IsMessageMode(&self) -> windows_core::Result<bool> {
+                    let this = &windows_core::Interface::cast::<IMessageStream>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).IsMessageMode)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn ReadMessageAsync(
+                    &self,
+                    maxsize: u32,
+                ) -> windows_core::Result<
+                    windows_future::IAsyncOperationWithProgress<
+                        windows::Storage::Streams::IBuffer,
+                        u32,
+                    >,
+                > {
+                    let this = &windows_core::Interface::cast::<IMessageStream>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ReadMessageAsync)(
+                            windows_core::Interface::as_raw(this),
+                            maxsize,
                             &mut result__,
                         )
                         .and_then(|| windows_core::Type::from_abi(result__))

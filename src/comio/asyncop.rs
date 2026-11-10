@@ -17,7 +17,7 @@ use super::check;
 use super::tpio::{submit, IoReg, Issue, OpHandle};
 use std::sync::{Arc, Mutex};
 use windows::Storage::Streams::IBuffer;
-use windows::Win32::Foundation::ERROR_HANDLE_EOF;
+use windows::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA};
 use windows::Win32::System::IO::OVERLAPPED;
 use windows_core::{
     implement, AgileReference, ComObject, Error, IUnknownImpl, Ref, Result, RuntimeType, HRESULT,
@@ -71,6 +71,11 @@ struct OpState<T: RuntimeType + 'static> {
     completed: Option<AsyncOperationWithProgressCompletedHandler<T, u32>>,
     completed_assigned: bool,
     op: Option<OpHandle>,
+    /// Which overlapped call `op` belongs to, for an operation made of more
+    /// than one (`start_read_message`). A step stores its handle only if no
+    /// later step has started, so a fast completion cannot have its
+    /// successor's handle overwritten by a stale one.
+    step: u64,
 }
 
 impl<T: RuntimeType + 'static> OpState<T> {
@@ -205,6 +210,7 @@ fn new_object<T: RuntimeType + 'static>() -> ComObject<IoAsyncOp<T>> {
             completed: None,
             completed_assigned: false,
             op: None,
+            step: 0,
         }),
         ModuleRef::new(),
     ))
@@ -212,7 +218,8 @@ fn new_object<T: RuntimeType + 'static>() -> ComObject<IoAsyncOp<T>> {
 
 impl IoAsyncOp<IBuffer> {
     /// Starts an overlapped read whose result is the (length-adjusted) `out`
-    /// buffer. `ioresult == 0` sets the buffer length to `bytes`;
+    /// buffer. `ioresult == 0` (or `ERROR_MORE_DATA`, a partial message) sets
+    /// the buffer length to `bytes`;
     /// `ERROR_HANDLE_EOF` sets it to 0 (clean EOF); any other error fails the
     /// operation.
     pub(crate) fn start_read(
@@ -250,7 +257,10 @@ impl IoAsyncOp<IBuffer> {
                     // `issue` closure wrote a kernel-visible pointer into.
                     let _ = &keep_alive;
                     let out = out_agile.resolve().expect("resolve agile IBuffer");
-                    let res = if ioresult == 0 {
+                    // `ERROR_MORE_DATA` is a message-mode pipe handing over
+                    // part of a message longer than the buffer: data, not a
+                    // failure. The rest comes with the next read.
+                    let res = if ioresult == 0 || ioresult == ERROR_MORE_DATA.0 {
                         let _ = out.SetLength(bytes as u32);
                         Ok(out)
                     } else if ioresult == ERROR_HANDLE_EOF.0 {
@@ -267,6 +277,157 @@ impl IoAsyncOp<IBuffer> {
         object.0.lock().unwrap().op = Some(handle);
         iface
     }
+}
+
+/// Largest single read `start_read_message` issues before it knows a
+/// message's size; a longer one is finished with one read of exactly the rest.
+const FIRST_READ: usize = 64 * 1024;
+
+impl IoAsyncOp<IBuffer> {
+    /// Reads one whole message from a message-mode pipe, of at most `max`
+    /// bytes. See `IMessageStream` in the metadata for the contract.
+    ///
+    /// A chain of overlapped reads rather than one: the first reads up to
+    /// `FIRST_READ`; if the message goes on (`ERROR_MORE_DATA`), the rest is
+    /// sized with `PeekNamedPipe` and read in one more. A message that will
+    /// not fit is read on to its end and dropped, so the pipe is left on a
+    /// boundary. Each step runs from the previous one's completion, and
+    /// `Cancel` reaches whichever is in flight.
+    pub(crate) fn start_read_message(
+        reg: &Arc<IoReg>,
+        max: u32,
+    ) -> IAsyncOperationWithProgress<IBuffer, u32> {
+        let object = new_object::<IBuffer>();
+        let iface: IAsyncOperationWithProgress<IBuffer, u32> = object.to_interface();
+        read_message_step(
+            object,
+            reg.clone(),
+            MessageRead {
+                max: max as usize,
+                message: Vec::new(),
+                discarding: None,
+            },
+            (max as usize).min(FIRST_READ),
+        );
+        iface
+    }
+}
+
+/// Where a `start_read_message` chain has got to.
+struct MessageRead {
+    max: usize,
+    message: Vec<u8>,
+    /// Set once the message is known not to fit: its full size, for the error.
+    discarding: Option<usize>,
+}
+
+fn read_message_step(
+    object: ComObject<IoAsyncOp<IBuffer>>,
+    reg: Arc<IoReg>,
+    mut read: MessageRead,
+    chunk: usize,
+) {
+    let step = {
+        let mut guard = object.0.lock().unwrap();
+        guard.step += 1;
+        guard.step
+    };
+    // Owned by the completion closure, which the op block keeps until the
+    // kernel is done writing into it.
+    let mut part = vec![0u8; chunk];
+    let ptr = part.as_mut_ptr();
+    let handle = reg.handle;
+    let cb_object = object.clone();
+    let cb_reg = reg.clone();
+    let op = unsafe {
+        submit(
+            &reg,
+            Box::new(move |ioresult: u32, bytes: usize| {
+                let more = ioresult == ERROR_MORE_DATA.0;
+                if ioresult != 0 && !more {
+                    let res = if ioresult == ERROR_HANDLE_EOF.0 {
+                        to_buffer(&[])
+                    } else {
+                        Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
+                    };
+                    cb_object.complete(res);
+                    return;
+                }
+                if read.discarding.is_none() {
+                    read.message.extend_from_slice(&part[..bytes]);
+                }
+                if !more {
+                    let res = match read.discarding {
+                        Some(size) => Err(Error::new(
+                            HRESULT::from_win32(ERROR_MORE_DATA.0),
+                            format!(
+                                "a {size}-byte message does not fit in {}; it was discarded",
+                                read.max
+                            ),
+                        )),
+                        None => to_buffer(&read.message),
+                    };
+                    cb_object.complete(res);
+                    return;
+                }
+                let left = match bytes_left_in_message(cb_reg.handle) {
+                    Ok(left) => left,
+                    Err(e) => {
+                        cb_object.complete(Err(e));
+                        return;
+                    }
+                };
+                if read.discarding.is_none() && read.message.len() + left > read.max {
+                    read.discarding = Some(read.message.len() + left);
+                    read.message = Vec::new();
+                }
+                let next = match read.discarding {
+                    Some(_) => left.clamp(1, FIRST_READ),
+                    None => left.max(1),
+                };
+                read_message_step(cb_object, cb_reg, read, next);
+            }),
+            move |ovl| match windows::Win32::Storage::FileSystem::ReadFile(
+                handle,
+                Some(std::slice::from_raw_parts_mut(ptr, chunk)),
+                None,
+                Some(ovl),
+            ) {
+                Ok(()) => Issue::SyncSuccess,
+                Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                // A partial message is a warning, not a failure: its packet
+                // is queued like any other. See `tp::io::pipe`'s `read_part`.
+                Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => Issue::Pending,
+                Err(e) => Issue::Failed(e.code()),
+            },
+        )
+    };
+    let mut guard = object.0.lock().unwrap();
+    if guard.step == step && guard.result.is_none() {
+        if guard.cancel_requested {
+            op.cancel();
+        }
+        guard.op = Some(op);
+    }
+}
+
+/// What remains of the message the last read stopped part-way through.
+fn bytes_left_in_message(handle: windows::Win32::Foundation::HANDLE) -> Result<usize> {
+    let mut left = 0u32;
+    unsafe {
+        windows::Win32::System::Pipes::PeekNamedPipe(handle, None, 0, None, None, Some(&mut left))?
+    };
+    Ok(left as usize)
+}
+
+/// A WinRT buffer holding `bytes`.
+fn to_buffer(bytes: &[u8]) -> Result<IBuffer> {
+    let buffer: IBuffer =
+        windows_core::Interface::cast(&super::buffer::new_buffer(bytes.len() as u32)?)?;
+    let ptr = super::buffer::buffer_ptr(&buffer)?;
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+    buffer.SetLength(bytes.len() as u32)?;
+    Ok(buffer)
 }
 
 impl IoAsyncOp<u32> {

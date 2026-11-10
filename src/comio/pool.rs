@@ -44,7 +44,8 @@ use super::unload;
 use super::unload::ModuleRef;
 use core::ffi::c_void;
 use windows::Win32::System::Threading::{
-    PTP_CALLBACK_INSTANCE, TP_CALLBACK_ENVIRON_V3, TrySubmitThreadpoolCallback,
+    CloseThreadpoolTimer, CreateThreadpoolTimer, PTP_CALLBACK_INSTANCE, PTP_TIMER,
+    SetThreadpoolTimer, TP_CALLBACK_ENVIRON_V3, TrySubmitThreadpoolCallback,
 };
 
 /// The callback environment every pool object `comio` creates should use.
@@ -128,6 +129,56 @@ pub(crate) fn submit(f: impl FnOnce() + Send + 'static) {
         // is still ours, and running it here keeps the contract.
         unsafe { run_job(PTP_CALLBACK_INSTANCE::default(), job.cast()) };
     }
+}
+
+/// [`submit`], after `delay`: a one-shot thread-pool timer, counted and
+/// pinned like any other job.
+///
+/// If the pool cannot make a timer, `f` waits out `delay` on a pool thread
+/// instead -- slower, but the work still happens.
+pub(crate) fn submit_after(delay: std::time::Duration, f: impl FnOnce() + Send + 'static) {
+    let job = Box::into_raw(Box::new(TimerJob {
+        job: Job {
+            run: Box::new(f),
+            _module: ModuleRef::new(),
+        },
+        timer: PTP_TIMER::default(),
+    }));
+    let timer = unsafe { CreateThreadpoolTimer(Some(run_timer_job), Some(job.cast()), callback_env()) };
+    let Ok(timer) = timer else {
+        let TimerJob { job, .. } = *unsafe { Box::from_raw(job) };
+        submit(move || {
+            std::thread::sleep(delay);
+            (job.run)();
+        });
+        return;
+    };
+    unsafe { (*job).timer = timer };
+    // A negative due time is relative, in 100 ns ticks.
+    let ticks = -(i64::try_from(delay.as_nanos() / 100).unwrap_or(i64::MAX));
+    let due = windows::Win32::Foundation::FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    unsafe { SetThreadpoolTimer(timer, Some(&due), 0, None) };
+}
+
+struct TimerJob {
+    job: Job,
+    timer: PTP_TIMER,
+}
+
+unsafe extern "system" fn run_timer_job(
+    _instance: PTP_CALLBACK_INSTANCE,
+    context: *mut c_void,
+    _timer: PTP_TIMER,
+) {
+    let TimerJob { job, timer } = *unsafe { Box::from_raw(context.cast::<TimerJob>()) };
+    // Closing from inside the callback is allowed: the timer is released
+    // once this callback returns.
+    unsafe { CloseThreadpoolTimer(timer) };
+    let Job { run, _module } = job;
+    run();
 }
 
 unsafe extern "system" fn run_job(_instance: PTP_CALLBACK_INSTANCE, context: *mut c_void) {

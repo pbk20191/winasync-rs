@@ -40,6 +40,25 @@ impl IoReg {
         let env = super::pool::callback_env();
         Ok(Arc::new(IoReg(CoreReg::register(handle, is_socket, env, None)?)))
     }
+
+    /// [`register`](Self::register), also holding `extra` until after the
+    /// handle is closed -- a named-pipe instance's count, which must not drop
+    /// while the instance still exists. Taken only on success: on failure the
+    /// caller still owns both, and must close the handle before dropping it.
+    pub(crate) fn register_with(
+        handle: windows::Win32::Foundation::HANDLE,
+        is_socket: bool,
+        extra: &mut Option<Box<dyn std::any::Any + Send + Sync>>,
+    ) -> windows_core::Result<Arc<Self>> {
+        // Filled after the registration succeeds, so a failed one leaves
+        // `extra` with the caller. A `Mutex` only to make that late write
+        // `Sync`.
+        let keep = Arc::new(std::sync::Mutex::new(None::<Box<dyn std::any::Any + Send + Sync>>));
+        let env = super::pool::callback_env();
+        let reg = CoreReg::register(handle, is_socket, env, Some(keep.clone()))?;
+        *keep.lock().unwrap() = extra.take();
+        Ok(Arc::new(IoReg(reg)))
+    }
 }
 
 /// comio's completion callback shape (unchanged): `(ioresult, bytes)`.

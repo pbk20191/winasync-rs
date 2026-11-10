@@ -1,11 +1,13 @@
 //! Named-pipe transport: `NamedPipeListener`/`NamedPipeConnector` produce
-//! `TransportStream`s (via `stream::from_reg`) over Win32 named
+//! `TransportStream`s (via `stream::from_reg_with_mode`) over Win32 named
 //! pipes, the first end-to-end transport built on the `comio` overlapped-IO
 //! engine.
 //!
-//! Instance creation follows `common::pipe`: the first instance claims the
-//! name, one listening instance is always kept, remote clients are refused.
-//! The connector opens at identification level.
+//! Instance creation follows `common::pipe`: whenever we hold no instance the
+//! next one claims the name, one listening instance is kept between accepts,
+//! remote clients are refused unless asked for, and `NamedPipeOptions` sets
+//! the rest. The connector opens at identification level and matches its
+//! read mode to the pipe's.
 
 use crate::comio::unload::ModuleRef;
 use super::bindings;
@@ -15,18 +17,43 @@ use super::bindings::Pbk20191::WinAsync::Comio::{
 use super::stream;
 use super::tpio::{self, IoReg, Issue, OpHandle};
 use super::waitop::await_io;
-use crate::common::pipe::{PipeServer, ReplenishOnExit};
+pub use crate::common::pipe::NamedPipeOptions;
+use crate::common::pipe::{
+    self as server, ClientEnd, Instance, PipeServer, ReplenishOnExit, Slot, SlotWaiter,
+};
 use crate::common::security::{PeerIdentity, SecurityDescriptor};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE,
+    CloseHandle, E_INVALIDARG, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED,
 };
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
-};
-use windows::Win32::System::Pipes::{ConnectNamedPipe, WaitNamedPipeW};
+use windows::Win32::System::Pipes::ConnectNamedPipe;
 use windows_core::{Error, Result, HRESULT, HSTRING};
+
+/// What an accept chain's `on_result` is handed when it was parked at the
+/// instance limit and an instance has since closed: not a failure, a cue to
+/// arm again. `ERROR_PIPE_BUSY` because that is the condition it waited out;
+/// `ConnectNamedPipe` itself never completes with it.
+pub(crate) const SLOT_FREED: HRESULT = HRESULT(0x800700E7u32 as i32);
+
+/// Registers a created instance, handing its count to the registration so it
+/// outlives the handle.
+fn register(instance: Instance) -> Result<Arc<IoReg>> {
+    let handle = instance.handle;
+    let mut token: Option<Box<dyn std::any::Any + Send + Sync>> = Some(Box::new(instance.token));
+    match IoReg::register_with(handle, false, &mut token) {
+        Ok(reg) => Ok(reg),
+        Err(e) => {
+            // Handle first, then the count: see `common::pipe::InstanceToken`.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            drop(token);
+            Err(e)
+        }
+    }
+}
 
 /// Server (listener) side of a named pipe. Each `accept()` waits for a
 /// client on a listening instance.
@@ -35,39 +62,60 @@ pub struct NamedPipeListener {
 }
 
 impl NamedPipeListener {
-    /// A listener for `name`, with the default security: the creator,
-    /// administrators and SYSTEM.
+    /// A listener for `name`, with the default options -- including the
+    /// default security: this process's account, administrators and SYSTEM.
     pub fn create(name: &str) -> Self {
         Self {
-            server: PipeServer::new(name, None),
+            server: PipeServer::new(name, NamedPipeOptions::new()),
         }
     }
 
-    /// [`create`](Self::create), with `security` on every instance. It must
-    /// grant this process's own account `FILE_CREATE_PIPE_INSTANCE` (`GA`
-    /// does): every instance after the first is checked against it.
+    /// [`create`](Self::create), with `security` on every instance. See
+    /// [`NamedPipeOptions::security`].
     pub fn create_with_security(name: &str, security: &SecurityDescriptor) -> Self {
         Self {
-            server: PipeServer::new(name, Some(security.clone())),
+            server: PipeServer::new(name, NamedPipeOptions::new().security(security)),
         }
+    }
+
+    /// [`create`](Self::create), with `options`. Fails with `E_INVALIDARG`
+    /// for options no pipe can have.
+    pub fn create_with_options(name: &str, options: &NamedPipeOptions) -> Result<Self> {
+        options.validate()?;
+        Ok(Self {
+            server: PipeServer::new(name, options.clone()),
+        })
     }
 
     /// Waits for a client on a listening instance, returning the connected
-    /// instance as a duplex WinRT stream.
+    /// instance as a duplex WinRT stream. At the instance limit this first
+    /// waits for one of this listener's instances to close.
     pub async fn accept(&self) -> Result<ITransportStream> {
-        let handle = self.server.instance()?;
-        let reg = match IoReg::register(handle, false) {
-            Ok(reg) => reg,
-            Err(e) => {
-                // `IoReg::register` only takes ownership of `handle` on
-                // success; on error the caller still owns (and must close)
-                // it.
-                unsafe {
-                    let _ = CloseHandle(handle);
+        let instance = loop {
+            let (freed, slot) = crate::common::oneshot::channel::<bool>();
+            let waiter: SlotWaiter = Box::new(move |closed_one| {
+                let _ = freed.send(closed_one);
+            });
+            match self.server.instance_or_wait(waiter)? {
+                Slot::Ready(instance) => break instance,
+                Slot::Wait => {
+                    if slot.await != Ok(true) {
+                        return Err(Error::from_hresult(ERROR_OPERATION_ABORTED.to_hresult()));
+                    }
                 }
-                return Err(e);
+                // Nothing to await but time; this future has no timer of its
+                // own, so a pool timer completes a oneshot instead.
+                Slot::Retry => {
+                    let (tick, later) = crate::common::oneshot::channel::<()>();
+                    super::pool::submit_after(server::RETRY_AFTER, move || {
+                        let _ = tick.send(());
+                    });
+                    let _ = later.await;
+                }
             }
         };
+        let handle = instance.handle;
+        let reg = register(instance)?;
 
         let _replenish = ReplenishOnExit(&self.server);
         let result = await_io(&reg, move |ovl| unsafe {
@@ -97,14 +145,18 @@ impl NamedPipeListener {
         })
         .await;
         result?;
-        Ok(stream::from_reg(reg, stream::Peer::PipeServer))
+        Ok(stream::from_reg_with_mode(
+            reg,
+            stream::Peer::PipeServer,
+            self.server.message_mode(),
+        ))
     }
 }
 
 /// Callback-based counterpart to [`NamedPipeListener::accept`], used by
 /// `listener.rs`'s self-re-arming, executor-free accept chain via
 /// [`tpio::submit`] directly instead of the `Future`-based `accept()`/
-/// `await_io`. Creates a fresh pipe instance, registers it, and issues the
+/// `await_io`. Takes a listening instance, registers it, and issues the
 /// overlapped `ConnectNamedPipe` — the same flags/classification as
 /// `accept()` above, including the `ERROR_PIPE_CONNECTED` special case.
 ///
@@ -117,6 +169,13 @@ impl NamedPipeListener {
 /// failure. Callers that re-arm from within `on_result` must account for
 /// that reentrancy.
 ///
+/// At the instance limit there is nothing to arm yet. Then this returns
+/// `Ok(None)` and `on_result` runs later with [`SLOT_FREED`]: when an
+/// instance of ours closes, or after `RETRY_AFTER` if none is open (see
+/// `common::pipe::Slot::Retry`) -- or with `ERROR_OPERATION_ABORTED` if the
+/// server is dropped first. Nothing is in flight meanwhile, so there is
+/// nothing to cancel.
+///
 /// A synchronous failure to create/register the pipe instance itself is
 /// returned as `Err` directly, without ever invoking `on_result` — mirroring
 /// `accept()`'s own synchronous-failure behavior — so a bad pipe name, or one
@@ -128,18 +187,36 @@ impl NamedPipeListener {
 pub(crate) fn arm_accept(
     server: &Arc<PipeServer>,
     on_result: Box<dyn FnOnce(Result<super::listener::Accepted>) + Send>,
-) -> Result<OpHandle> {
-    let handle = server.instance()?;
-    let server = server.clone();
-    let reg = match IoReg::register(handle, false) {
-        Ok(reg) => reg,
-        Err(e) => {
-            unsafe {
-                let _ = CloseHandle(handle);
-            }
-            return Err(e);
+) -> Result<Option<OpHandle>> {
+    // Shared by the slot waiter and the completion; whichever runs takes it.
+    let on_result = Arc::new(Mutex::new(Some(on_result)));
+    let parked = on_result.clone();
+    let waiter: SlotWaiter = Box::new(move |freed| {
+        if let Some(on_result) = parked.lock().unwrap().take() {
+            let code = if freed {
+                SLOT_FREED
+            } else {
+                ERROR_OPERATION_ABORTED.to_hresult()
+            };
+            on_result(Err(Error::from_hresult(code)));
+        }
+    });
+    let instance = match server.instance_or_wait(waiter)? {
+        Slot::Ready(instance) => instance,
+        Slot::Wait => return Ok(None),
+        Slot::Retry => {
+            super::pool::submit_after(server::RETRY_AFTER, move || {
+                if let Some(on_result) = on_result.lock().unwrap().take() {
+                    on_result(Err(Error::from_hresult(SLOT_FREED)));
+                }
+            });
+            return Ok(None);
         }
     };
+    let handle = instance.handle;
+    let reg = register(instance)?;
+    let server = server.clone();
+    let message_mode = server.message_mode();
     let reg_for_complete = reg.clone();
     let op = unsafe {
         tpio::submit(
@@ -153,13 +230,19 @@ pub(crate) fn arm_accept(
                 let res = if ioresult == 0 || ioresult == ERROR_PIPE_CONNECTED.0 {
                     let peer = PeerIdentity::of_pipe_client(reg_for_complete.handle);
                     Ok(super::listener::Accepted::local(
-                        stream::from_reg(reg_for_complete, stream::Peer::PipeServer),
+                        stream::from_reg_with_mode(
+                            reg_for_complete,
+                            stream::Peer::PipeServer,
+                            message_mode,
+                        ),
                         peer,
                     ))
                 } else {
                     Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                 };
-                on_result(res);
+                if let Some(on_result) = on_result.lock().unwrap().take() {
+                    on_result(res);
+                }
             }),
             move |ovl| match ConnectNamedPipe(handle, Some(ovl)) {
                 Ok(()) => Issue::SyncSuccess,
@@ -168,7 +251,7 @@ pub(crate) fn arm_accept(
             },
         )
     };
-    Ok(op)
+    Ok(Some(op))
 }
 
 /// Client side of a named pipe.
@@ -184,73 +267,38 @@ pub struct NamedPipeConnector {
 /// reports it.
 pub(crate) const TRANSPORT: &str = "namedpipe";
 
-impl NamedPipeConnector {
-    /// Opens the client end of an existing named pipe. If every server
-    /// instance is momentarily busy (`ERROR_PIPE_BUSY`), waits via
-    /// `WaitNamedPipeW` for one to free up and retries once.
-    pub async fn connect(name: &str) -> Result<ITransportStream> {
-        let wname = HSTRING::from(name);
-        let handle = match Self::open(&wname) {
-            Ok(h) => h,
-            Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
-                // A single retry is enough for tests/typical use; a caller
-                // needing a longer wait or a bespoke retry policy would
-                // build on `open`/`WaitNamedPipeW` directly.
-                unsafe { WaitNamedPipeW(&wname, 5000) }.ok()?;
-                Self::open(&wname)?
+/// Wraps an opened client end as a stream.
+fn client_stream(client: ClientEnd) -> Result<ITransportStream> {
+    match IoReg::register(client.handle, false) {
+        Ok(reg) => Ok(stream::from_reg_with_mode(
+            reg,
+            stream::Peer::PipeClient,
+            client.message_mode,
+        )),
+        Err(e) => {
+            unsafe {
+                let _ = CloseHandle(client.handle);
             }
-            Err(e) => return Err(e),
-        };
-        let reg = match IoReg::register(handle, false) {
-            Ok(reg) => reg,
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                return Err(e);
-            }
-        };
-        Ok(stream::from_reg(reg, stream::Peer::PipeClient))
-    }
-
-    /// One synchronous open attempt, with no `ERROR_PIPE_BUSY` wait: the
-    /// caller decides whether to wait and on whose thread.
-    pub(crate) fn try_open(wname: &HSTRING) -> Result<ITransportStream> {
-        let handle = Self::open(wname)?;
-        match IoReg::register(handle, false) {
-            Ok(reg) => Ok(stream::from_reg(reg, stream::Peer::PipeClient)),
-            Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(handle);
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Opening the client end is a plain synchronous `CreateFileW` — only
-    /// the server's `accept` needs an overlapped `ConnectNamedPipe`.
-    ///
-    /// Identification level, not the default impersonation: the server may
-    /// learn who we are, but cannot act as us. Without
-    /// `SECURITY_SQOS_PRESENT` a client grants full impersonation to whatever
-    /// answers on the name.
-    fn open(wname: &HSTRING) -> Result<HANDLE> {
-        unsafe {
-            CreateFileW(
-                wname,
-                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                None,
-            )
+            Err(e)
         }
     }
 }
 
 impl NamedPipeConnector {
+    /// Opens the client end of an existing named pipe, waiting up to five
+    /// seconds in all if every instance is busy.
+    pub async fn connect(name: &str) -> Result<ITransportStream> {
+        Self::connect_with_timeout(name, server::DEFAULT_CONNECT_TIMEOUT).await
+    }
+
+    /// [`connect`](Self::connect), waiting up to `timeout` in all while every
+    /// instance is busy; zero does not wait. Running out of time is
+    /// `ERROR_PIPE_BUSY`. The wait blocks the polling thread:
+    /// `WaitNamedPipeW` has no overlapped form.
+    pub async fn connect_with_timeout(name: &str, timeout: Duration) -> Result<ITransportStream> {
+        client_stream(server::open_client_waiting(&HSTRING::from(name), timeout)?)
+    }
+
     /// Creates the connector. It holds no state; connecting is what it does.
     #[allow(clippy::new_without_default)]
     pub fn new() -> windows_core::ComObject<NamedPipeConnector> {
@@ -260,24 +308,35 @@ impl NamedPipeConnector {
     }
 
     /// Typed Rust mirror of the vtable's `ConnectAsync`.
+    pub fn connect_async(
+        &self,
+        name: &windows_core::HSTRING,
+    ) -> windows_future::IAsyncOperation<ITransportStream> {
+        self.connect_with_timeout_async(name, server::DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    /// Typed Rust mirror of the vtable's `ConnectWithTimeoutAsync`.
     ///
     /// Opening the client end is a plain synchronous `CreateFileW`, so the
     /// usual case needs no thread at all: it is done here and handed back as
     /// an already-finished operation. Only `ERROR_PIPE_BUSY` has anything to
     /// wait for, and that wait goes to the thread pool rather than to the
     /// caller.
-    pub fn connect_async(
+    pub fn connect_with_timeout_async(
         &self,
         name: &windows_core::HSTRING,
+        timeout: Duration,
     ) -> windows_future::IAsyncOperation<ITransportStream> {
         // Every arm builds a `ConnectOp`, never a `windows_future` object:
         // this is the vtable's `ConnectAsync`, so whatever comes back crosses
         // the ABI, and only our own type is counted by `DllCanUnloadNow`.
-        match Self::try_open(name) {
-            Ok(stream) => super::connector::finished(Ok(stream)),
-            Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() => {
-                let name = name.to_string();
-                super::connector::spawned(move || crate::common::block_on(Self::connect(&name)))
+        match server::open_client(name) {
+            Ok(client) => super::connector::finished(client_stream(client)),
+            Err(e) if e.code() == ERROR_PIPE_BUSY.to_hresult() && !timeout.is_zero() => {
+                let name = name.clone();
+                super::connector::spawned(move || {
+                    client_stream(server::open_client_waiting(&name, timeout)?)
+                })
             }
             Err(e) => super::connector::finished(Err(e)),
         }
@@ -297,6 +356,17 @@ impl INamedPipeConnector_Impl for NamedPipeConnector_Impl {
     ) -> Result<windows_future::IAsyncOperation<ITransportStream>> {
         Ok(self.connect_async(name))
     }
+
+    fn ConnectWithTimeoutAsync(
+        &self,
+        name: &HSTRING,
+        timeout: &windows::Foundation::TimeSpan,
+    ) -> Result<windows_future::IAsyncOperation<ITransportStream>> {
+        // 100 ns ticks. A negative wait is not a wait.
+        let ticks = u64::try_from(timeout.Duration)
+            .map_err(|_| Error::new(E_INVALIDARG, "a negative timeout"))?;
+        Ok(self.connect_with_timeout_async(name, Duration::from_nanos(ticks.saturating_mul(100))))
+    }
 }
 
 #[cfg(test)]
@@ -306,7 +376,9 @@ mod tests {
     use crate::common::block_on;
     use std::future::IntoFuture;
     use windows::Storage::Streams::{IBuffer, IInputStream, IOutputStream, InputStreamOptions};
-    use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX,
+    };
     use windows::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };

@@ -613,7 +613,8 @@ named pipe와 AF_UNIX는 로컬 서비스가 쓰는 전송이다. 그래서 "누
 
 | | 전 | 후 |
 | --- | --- | --- |
-| 원격 클라이언트 | SMB로 접속 가능 | `PIPE_REJECT_REMOTE_CLIENTS` |
+| 원격 클라이언트 | SMB로 접속 가능 | `PIPE_REJECT_REMOTE_CLIENTS` (아래 "named pipe 옵션"에서 디스크립터와 함께 켤 수 있게 됨) |
+| 기본 디스크립터 | 시스템 기본값. Everyone과 anonymous에 읽기를 준다 | `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<자기 계정>)` (아래 "named pipe 옵션" 참고) |
 | 파이프 선점 | 남이 먼저 만든 이름에 인스턴스를 보탰다 | 첫 인스턴스는 `FILE_FLAG_FIRST_PIPE_INSTANCE`. 이미 누가 쥐고 있으면 bind가 `ERROR_ACCESS_DENIED` |
 | 이름의 빈틈 | 연결이 끝나면 이름이 사라질 수 있었다 | 인스턴스가 대기 풀을 떠나기 전에(연결, 실패, 취소, future drop 모두) 다음 인스턴스를 먼저 만든다. `Close`까지 이름을 놓지 않는다 |
 | 클라이언트 impersonation | 기본 레벨(impersonation). 악성 서버가 클라이언트 권한으로 행동할 수 있었다 | `SECURITY_SQOS_PRESENT \| SECURITY_IDENTIFICATION`. 서버는 확인만 할 수 있다 |
@@ -702,6 +703,78 @@ DLL에만 있어야 할 동작이 다른 경로로 닿는지 점검했다. rlib�
 access violation으로 이어진다는 것을 보였기 때문이다. 남은 것: `activation_context(HANDLE)`는 아무
 값이나 받는 safe 빌더이고, 가짜 값이 풀에서 무엇을 하는지는 측정하지 않았다. `LIVE_OPS`는 쓰기 가능한 `pub static`이지만
 영향은 그 바이너리의 복사본에 그친다.
+
+## named pipe 옵션 (2026-11-10)
+
+`CreateNamedPipeW`/`WaitNamedPipeW`의 모드 중 고정돼 있던 것을 열었다. tp는
+`NamedPipeOptions` + `NamedPipeListener::bind_with_options`, comio는
+`INamedPipeListenerSettings`(bind 전에만 설정, 이후 `E_ILLEGAL_METHOD_CALL`)다.
+
+| 옵션 | 기본값 | 비고 |
+| --- | --- | --- |
+| 메시지 모드 | 꺼짐 | `PIPE_TYPE_MESSAGE \| PIPE_READMODE_MESSAGE`. 커넥터는 `GetNamedPipeInfo`로 알아채고 자기 쪽을 메시지 읽기로 바꾼다 |
+| 원격 클라이언트 | 거부 | 켜려면 디스크립터가 있어야 한다. 없으면 bind가 `E_INVALIDARG` |
+| 최대 인스턴스 | 무제한 | 1~254. comio는 0이 무제한 |
+| 버퍼 크기 | 4096 / 4096 | 권고값이다 |
+| 접속 대기 | 5초 | tp `connect_with_timeout`, comio `ConnectWithTimeoutAsync(name, TimeSpan)`. 0은 기다리지 않는다. 시간이 다 되면 `ERROR_PIPE_BUSY` |
+
+`PIPE_NOWAIT`는 넣지 않았다. LAN Manager 2.0 호환용으로만 남은 모드이고, 비동기는
+overlapped I/O로 하라는 것이 Microsoft의 안내다. `NMPWAIT_WAIT_FOREVER`와
+`NMPWAIT_USE_DEFAULT_WAIT`(0)도 넘기지 않는다. `WaitNamedPipeW`는 overlapped 형태가 없어서
+스레드를 잡고 기다리므로 항상 상한을 둔다. 0은 서버가 정한 시간을 뜻해서 호출자의 뜻과 다르다.
+
+**메시지 읽기**
+
+- 쓰기는 그대로다. 메시지 파이프에서는 `WriteAsync`/`write` 한 번이 메시지 하나다.
+- `ReadAsync`/`read`는 메시지 하나를 넘지 않는다. 버퍼보다 긴 메시지는 여러 번에 나눠
+  오고, 어디서 끝나는지 알 수 없다. 전에는 이 경우가 `ERROR_MORE_DATA` 오류였고 읽은 바이트도
+  버려졌다. 이제는 데이터로 다룬다.
+- 경계가 필요하면 `IMessageStream.ReadMessageAsync(maxSize)` / `read_message(max_len)`을 쓴다.
+  먼저 최대 64KiB를 읽고, 남으면 `PeekNamedPipe`로 남은 크기를 재서 한 번 더 읽는다. `maxSize`를
+  넘는 메시지는 끝까지 읽어 버리고 `ERROR_MORE_DATA`로 실패한다. 꼬리를 남겨 두면 다음 읽기가
+  그것을 메시지로 착각하기 때문이다. 바이트 파이프에서는 `E_ILLEGAL_METHOD_CALL`이다.
+- 측정: 큐에 든 긴 메시지를 overlapped로 읽으면 `ReadFile`은 `ERROR_IO_PENDING`을 돌려주고,
+  완료 패킷에 `ERROR_MORE_DATA`와 읽은 바이트 수가 온다. 동기로 `ERROR_MORE_DATA`가 와도 경고
+  상태라 패킷이 따라오므로 pending으로 분류한다.
+
+**측정으로 드러난 것**
+
+- **시스템 기본 디스크립터가 생각보다 넓었다.** 문서에는 "생성자, 관리자, SYSTEM"이라고
+  적었지만, 시스템 기본값은 Everyone과 anonymous에게 읽기도 준다. anonymous 토큰으로
+  `GENERIC_READ`만 요청하자 열렸다. 읽기 전용 클라이언트도 accept를 완료시키고 서버가 쓰는 것을
+  받는다. 이제 디스크립터를 주지 않으면 `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<자기 계정>)`를
+  쓴다. tp와 comio 양쪽에 anonymous 읽기를 거부하는 테스트가 있다.
+- **`\\localhost\pipe\...`는 원격 경로다.** 같은 머신에서도 SMB 리디렉터를 거친다. 그래서
+  원격 옵션을 로컬에서 시험할 수 있다. 거부 모드에서는 `ERROR_ACCESS_DENIED`가 난다. 허용
+  모드에서 `RemoteUserSid`는 정확했지만, `RemoteProcessId`는 `65279`(0xFEFF)였다. 이 머신의
+  프로세스가 아니다.
+- **커널은 양쪽 끝이 모두 닫혀야 인스턴스를 놓는다.** 서버가 자기 핸들을 닫아도 클라이언트가
+  열고 있으면 인스턴스는 상한에 계속 잡힌다. 그 시점은 서버가 알 수 없다.
+
+**인스턴스 상한과 이름**
+
+- 이름 지키기는 원래 `claimed` 플래그였다. 한 번 인스턴스를 만들면 이후에는
+  `FILE_FLAG_FIRST_PIPE_INSTANCE` 없이 만들었다. 무제한일 때는 대기 인스턴스가 늘 있어서 이름이
+  비지 않았지만, 상한이 있으면 모든 인스턴스가 연결됐다가 닫히는 순간 이름이 빈다. 그 틈에 남이
+  만든 파이프에 `claimed` 상태로 인스턴스를 보태면 그대로 합류하게 된다.
+- 이제는 우리 인스턴스 수를 센다. 셈이 0이면 다음 인스턴스는 다시 "첫 인스턴스"를 요구한다.
+  셈은 인스턴스 등록(`IoReg`)의 keepalive에 붙어서, 핸들을 닫은 **뒤에** 줄어든다. 닫히기 전에
+  0으로 보이면 우리 파이프에 대고 첫 인스턴스를 요구하다 실패하기 때문이다. 핸들을 닫은 직후
+  아주 짧게 1로 남는 틈은 있다. 테스트는 상한 1에서 이름을 빼앗기면 다음 accept가 합류하지 않고
+  `ERROR_ACCESS_DENIED`로 실패하는 것을 확인한다.
+- 상한에서 accept는 기다린다. 우리 인스턴스가 닫히면 깨어난다(waiter). 우리 것이 하나도 없는데
+  `ERROR_PIPE_BUSY`라면, 남은 인스턴스는 클라이언트가 아직 쥐고 있는 것이다. 이때는 깨울 신호가
+  없어서 50ms 뒤 다시 시도한다(`Slot::Retry`). comio에는 이를 위해 `pool::submit_after`(계수되고
+  고정되는 thread-pool 타이머)를 추가했다.
+- 상한이 있으면 마지막 연결이 닫힌 뒤 다음 accept 전까지 클라이언트가 `ERROR_FILE_NOT_FOUND`를
+  볼 수 있다. 옵션 문서에 적었다.
+
+**덤으로 고친 것: 끝난 accept의 핸들이 인스턴스를 붙잡고 있었다**
+
+comio 리스너는 마지막 accept의 `OpHandle`을 `current_op`에 둔다. 끝난 op도 자기 등록을 쥐고
+있어서, 다음 accept가 그것을 바꿀 때까지 연결된 인스턴스의 서버 핸들이 열려 있었다. 보통은 곧바로
+바뀌어서 드러나지 않았다. 상한에 걸려 아무것도 걸지 못하면, 리스너는 바로 그 인스턴스가 닫히기를
+영원히 기다렸다. 상한 테스트가 이것을 잡았다. `try_arm`이 시작할 때 이전 핸들을 놓는다.
 
 ## 커밋 상태
 

@@ -18,9 +18,11 @@ use super::bindings::Pbk20191::WinAsync::Comio::{
     ConnectionReceivedArgs as ConnectionReceivedArgsClass, IConnectionListener,
     IConnectionReceivedArgs,
     IConnectionListener_Impl, IConnectionReceivedArgs_Impl, ITransport_Impl, IHyperVBind_Impl,
-    IListenerSecurity_Impl, INamedPipeBind_Impl, ITransportStream, IUnixBind_Impl,
+    IListenerSecurity_Impl, INamedPipeBind_Impl, INamedPipeListenerSettings_Impl,
+    ITransportStream, IUnixBind_Impl,
 };
-use crate::common::pipe::PipeServer;
+use crate::common::pipe::{NamedPipeOptions, PipeServer};
+use windows::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES;
 use crate::common::security::{PeerIdentity, SecurityDescriptor};
 // Queried for by the tests below, which check that each listener exposes only
 // the bind its addressing supports.
@@ -36,7 +38,7 @@ pub(crate) const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
 const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
 
 /// E_ILLEGAL_METHOD_CALL — a member called in a state it does not apply to.
-const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
+pub(crate) const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
 
 // The interfaces are no longer declared here: they live in
 // `metadata/winasync.rdl` and are generated into `super::bindings`.
@@ -145,7 +147,11 @@ pub(crate) trait AcceptSource: Send + Sync {
     /// Issues one accept through the transport's callback-based primitive
     /// (`pipe::arm_accept` / `*StreamListener::arm_accept`), each built
     /// directly on `tpio::submit` — no `Future`, no executor.
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle>;
+    ///
+    /// `Ok(None)` means nothing could be armed yet -- a named pipe at its
+    /// instance limit -- and `on_result` will be called with
+    /// [`super::pipe::SLOT_FREED`] once something can be.
+    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>>;
 }
 
 /// The pipe's name and its instances. Dropping it -- on `Close`, or when a
@@ -154,7 +160,7 @@ pub(crate) trait AcceptSource: Send + Sync {
 struct PipeSource(Arc<PipeServer>);
 
 impl AcceptSource for PipeSource {
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
+    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>> {
         super::pipe::arm_accept(&self.0, on_result)
     }
 }
@@ -167,7 +173,7 @@ struct UnixSource {
 }
 
 impl AcceptSource for UnixSource {
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
+    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>> {
         let mut guard = self.listener.lock().unwrap();
         if guard.is_none() {
             *guard = Some(super::UnixStreamListener::bind_inner(
@@ -175,7 +181,7 @@ impl AcceptSource for UnixSource {
                 self.security.as_ref(),
             )?);
         }
-        guard.as_ref().unwrap().arm_accept(on_result)
+        guard.as_ref().unwrap().arm_accept(on_result).map(Some)
     }
 }
 
@@ -185,12 +191,12 @@ struct HyperVSource {
 }
 
 impl AcceptSource for HyperVSource {
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
+    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>> {
         let mut guard = self.listener.lock().unwrap();
         if guard.is_none() {
             *guard = Some(super::HvStreamListener::bind(self.addr)?);
         }
-        guard.as_ref().unwrap().arm_accept(on_result)
+        guard.as_ref().unwrap().arm_accept(on_result).map(Some)
     }
 }
 
@@ -238,6 +244,10 @@ struct ListenerState {
     /// Who may connect, set through `IListenerSecurity` before the bind that
     /// uses it. `None` is the transport's default.
     security: Mutex<Option<SecurityDescriptor>>,
+    /// How a named pipe's instances are made, set through
+    /// `INamedPipeListenerSettings` before the bind. Its `security` is unused:
+    /// that comes from the field above when the bind combines the two.
+    pipe_options: Mutex<NamedPipeOptions>,
     /// Whether an accept chain is logically active. See the type-level
     /// "Handler gating" note.
     running: AtomicBool,
@@ -256,6 +266,7 @@ impl ListenerState {
             current_op: Mutex::new(None),
             handlers: Mutex::new(HashSet::new()),
             security: Mutex::new(None),
+            pipe_options: Mutex::new(NamedPipeOptions::new()),
             running: AtomicBool::new(false),
             restart_pending: AtomicBool::new(false),
         }
@@ -393,6 +404,35 @@ impl ListenerCore {
         self.state.security.lock().unwrap().clone()
     }
 
+    /// The named-pipe settings, as `INamedPipeListenerSettings` reads them.
+    fn pipe_options(&self) -> Result<NamedPipeOptions> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        Ok(self.state.pipe_options.lock().unwrap().clone())
+    }
+
+    /// Changes one named-pipe setting. Only before the first bind, for the
+    /// reason [`set_security_descriptor`](Self::set_security_descriptor)
+    /// gives.
+    fn update_pipe_options(
+        &self,
+        update: impl FnOnce(NamedPipeOptions) -> Result<NamedPipeOptions>,
+    ) -> Result<()> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        if self.state.source.lock().unwrap().is_some() {
+            return Err(Error::new(
+                E_ILLEGAL_METHOD_CALL,
+                "change named-pipe settings before binding",
+            ));
+        }
+        let mut options = self.state.pipe_options.lock().unwrap();
+        *options = update(options.clone())?;
+        Ok(())
+    }
+
     /// Shared tail of every bind: swap in the accept source and (re)start the
     /// chain if a consumer is already registered.
     ///
@@ -526,6 +566,7 @@ macro_rules! listener_impls {
     bindings::Pbk20191::WinAsync::Comio::ITransport,
     bindings::Pbk20191::WinAsync::Comio::INamedPipeBind,
     bindings::Pbk20191::WinAsync::Comio::IListenerSecurity,
+    bindings::Pbk20191::WinAsync::Comio::INamedPipeListenerSettings,
     windows::Foundation::IClosable
 )]
 pub struct NamedPipeConnectionListener {
@@ -613,6 +654,62 @@ impl IListenerSecurity_Impl for NamedPipeConnectionListener_Impl {
     }
 }
 
+// The metadata spells "no limit" as 0; the pipe API spells it 255. Both are
+// accepted nowhere else, so the conversion lives here and only here.
+impl INamedPipeListenerSettings_Impl for NamedPipeConnectionListener_Impl {
+    fn MessageMode(&self) -> Result<bool> {
+        Ok(self.core.pipe_options()?.message_mode)
+    }
+
+    fn SetMessageMode(&self, value: bool) -> Result<()> {
+        self.core.update_pipe_options(|o| Ok(o.message_mode(value)))
+    }
+
+    fn AcceptRemoteClients(&self) -> Result<bool> {
+        Ok(self.core.pipe_options()?.accept_remote_clients)
+    }
+
+    fn SetAcceptRemoteClients(&self, value: bool) -> Result<()> {
+        self.core.update_pipe_options(|o| Ok(o.accept_remote_clients(value)))
+    }
+
+    fn MaxInstances(&self) -> Result<u32> {
+        Ok(match self.core.pipe_options()?.max_instances {
+            PIPE_UNLIMITED_INSTANCES => 0,
+            n => n,
+        })
+    }
+
+    fn SetMaxInstances(&self, value: u32) -> Result<()> {
+        self.core.update_pipe_options(|o| match value {
+            0 => Ok(o.max_instances(PIPE_UNLIMITED_INSTANCES)),
+            1..PIPE_UNLIMITED_INSTANCES => Ok(o.max_instances(value)),
+            _ => Err(Error::new(
+                windows::Win32::Foundation::E_INVALIDARG,
+                "MaxInstances is 1 to 254, or 0 for no limit",
+            )),
+        })
+    }
+
+    fn InBufferSize(&self) -> Result<u32> {
+        Ok(self.core.pipe_options()?.in_buffer)
+    }
+
+    fn SetInBufferSize(&self, value: u32) -> Result<()> {
+        self.core
+            .update_pipe_options(|o| Ok(NamedPipeOptions { in_buffer: value, ..o }))
+    }
+
+    fn OutBufferSize(&self) -> Result<u32> {
+        Ok(self.core.pipe_options()?.out_buffer)
+    }
+
+    fn SetOutBufferSize(&self, value: u32) -> Result<()> {
+        self.core
+            .update_pipe_options(|o| Ok(NamedPipeOptions { out_buffer: value, ..o }))
+    }
+}
+
 impl IListenerSecurity_Impl for UnixConnectionListener_Impl {
     fn SecurityDescriptor(&self) -> Result<HSTRING> {
         self.core.security_descriptor()
@@ -660,8 +757,15 @@ impl NamedPipeConnectionListener {
     /// `Close` (see `common::pipe`), so the name is never free for another
     /// server to take. A client may therefore connect while no handler is
     /// registered; it is delivered once one is.
+    ///
+    /// Uses the `INamedPipeListenerSettings` and `SecurityDescriptor` set so
+    /// far, and fails with `E_INVALIDARG` if they cannot go together --
+    /// remote clients without a descriptor.
     pub fn bind(&self, name: &HSTRING) -> Result<IAsyncAction> {
-        let server = PipeServer::new(&name.to_string(), self.core.security());
+        let mut options = self.core.pipe_options()?;
+        options.security = self.core.security();
+        options.validate()?;
+        let server = PipeServer::new(&name.to_string(), options);
         self.core
             .install_source(Arc::new(PipeSource(Arc::new(server))), name.clone())
     }
@@ -903,6 +1007,16 @@ fn ensure_running(state: Arc<ListenerState>) -> Result<()> {
 /// * `Err(e)`    — a synchronous failure to issue the accept (a malformed pipe
 ///   name, or the AF_UNIX `bind`/`listen` on the first arm).
 fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
+    // The previous accept has finished by the time the chain gets here --
+    // this runs after its `on_result`, or on a cold start -- but its handle
+    // is still stored, and a finished op still holds its registration. Left
+    // there, it keeps the instance it connected open after the consumer has
+    // released the stream, until the next arm replaces it. Usually that is
+    // at once. A named pipe parked at its instance limit arms nothing, and
+    // then waits for that very instance to close -- forever, as the limit
+    // test found. (A chain that stops because the last handler went in the
+    // moment between a delivery and the re-arm would hold it too.)
+    state.current_op.lock().unwrap().take();
     if !want_running(state) {
         return Ok(false);
     }
@@ -954,6 +1068,16 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
                     let _ = drive(next, true);
                 });
             }
+            // A named pipe was parked at its instance limit and an instance
+            // has closed: arm again, still owning `running`, exactly as after
+            // a connection -- `drive` parks the chain instead if it is no
+            // longer wanted.
+            Err(e) if e.code() == super::pipe::SLOT_FREED => {
+                let next = state_cb.clone();
+                super::pool::submit(move || {
+                    let _ = drive(next, true);
+                });
+            }
             Err(_) => {
                 // Hard accept failure, or a cancellation from Close / the last
                 // handler being removed. Release the flag; restart only if a
@@ -967,7 +1091,11 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
         }
     });
 
-    let op = source.arm(on_result)?;
+    // Parked at a named pipe's instance limit: nothing is in flight, and
+    // `on_result` re-arms once an instance closes.
+    let Some(op) = source.arm(on_result)? else {
+        return Ok(true);
+    };
 
     *state.current_op.lock().unwrap() = Some(op);
 
@@ -2005,3 +2133,290 @@ mod listener_tests {
         );
     }
 }
+
+/// `INamedPipeListenerSettings`, `IMessageStream` and the connector's
+/// timeout, through the ABI a projection uses.
+#[cfg(test)]
+mod pipe_settings_tests {
+    use super::*;
+    use crate::common::block_on;
+    use std::future::IntoFuture;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows::Foundation::{IClosable, TimeSpan};
+    use windows::Storage::Streams::{IBuffer, IOutputStream};
+    use windows::Win32::Foundation::{
+        E_INVALIDARG, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PIPE_BUSY,
+    };
+    use windows_core::{AgileReference, HSTRING, Interface};
+
+    use super::super::bindings::Pbk20191::WinAsync::Comio::{
+        IListenerSecurity, IMessageStream, INamedPipeConnector, INamedPipeListenerSettings,
+    };
+
+    fn pipe_name(tag: &str) -> String {
+        format!(r"\\.\pipe\comio_set_{tag}_{}", std::process::id())
+    }
+
+    fn buffer_of(bytes: &[u8]) -> IBuffer {
+        let buffer: IBuffer = crate::comio::buffer::new_buffer(bytes.len() as u32)
+            .unwrap()
+            .cast()
+            .unwrap();
+        let ptr = crate::comio::buffer::buffer_ptr(&buffer).unwrap();
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        buffer.SetLength(bytes.len() as u32).unwrap();
+        buffer
+    }
+
+    fn bytes_of(buffer: &IBuffer) -> Vec<u8> {
+        let ptr = crate::comio::buffer::buffer_ptr(buffer).unwrap();
+        let len = buffer.Length().unwrap() as usize;
+        unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+    }
+
+    fn send(stream: &ITransportStream, bytes: &[u8]) {
+        let out: IOutputStream = stream.cast().unwrap();
+        block_on(out.WriteAsync(&buffer_of(bytes)).unwrap().into_future()).unwrap();
+    }
+
+    /// Delivered server streams, handed to the test thread.
+    fn stream_handler() -> (ConnectionHandler, mpsc::Receiver<AgileReference<ITransportStream>>) {
+        let (tx, rx) = mpsc::channel();
+        let handler = ConnectionHandler::new(move |_s, args| {
+            let stream = args.as_ref().unwrap().Stream()?;
+            let _ = tx.send(AgileReference::new(&stream)?);
+            Ok(())
+        });
+        (handler, rx)
+    }
+
+    /// Connects, retrying while the name is missing: with an instance limit
+    /// the name does not exist between the last close and the next accept.
+    fn connect_soon(name: &str) -> ITransportStream {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match block_on(crate::comio::NamedPipeConnector::connect(name)) {
+                Err(e)
+                    if e.code() == ERROR_FILE_NOT_FOUND.to_hresult()
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn settings_round_trip_and_are_fixed_at_bind() {
+        let listener = NamedPipeConnectionListener::new();
+        let settings: INamedPipeListenerSettings = listener.cast().unwrap();
+        assert!(!settings.MessageMode().unwrap());
+        assert!(!settings.AcceptRemoteClients().unwrap());
+        assert_eq!(settings.MaxInstances().unwrap(), 0);
+        assert_eq!(settings.InBufferSize().unwrap(), 4096);
+        assert_eq!(settings.OutBufferSize().unwrap(), 4096);
+
+        assert_eq!(settings.SetMaxInstances(255).unwrap_err().code(), E_INVALIDARG);
+        settings.SetMaxInstances(3).unwrap();
+        assert_eq!(settings.MaxInstances().unwrap(), 3);
+        settings.SetMaxInstances(0).unwrap();
+        assert_eq!(settings.MaxInstances().unwrap(), 0);
+        settings.SetInBufferSize(512).unwrap();
+        assert_eq!(settings.InBufferSize().unwrap(), 512);
+
+        // Remote clients need a descriptor, and the bind is where that is
+        // checked: the two are set independently.
+        settings.SetAcceptRemoteClients(true).unwrap();
+        let name = HSTRING::from(pipe_name("fixed"));
+        assert_eq!(listener.bind(&name).unwrap_err().code(), E_INVALIDARG);
+        let me = crate::common::security::process_user_sid(std::process::id()).unwrap();
+        listener
+            .cast::<IListenerSecurity>()
+            .unwrap()
+            .SetSecurityDescriptor(&HSTRING::from(format!("D:P(A;;GA;;;{me})")))
+            .unwrap();
+        block_on(listener.bind(&name).unwrap().into_future()).unwrap();
+
+        assert_eq!(
+            settings.SetMessageMode(true).unwrap_err().code(),
+            E_ILLEGAL_METHOD_CALL,
+            "a setting changed after the bind"
+        );
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+    }
+
+    /// Messages through the WinRT surface: whole, in order, empty and large
+    /// included; an oversized one discarded without disturbing the next.
+    #[test]
+    fn messages_cross_whole() {
+        let name = pipe_name("messages");
+        let listener = NamedPipeConnectionListener::new();
+        listener
+            .cast::<INamedPipeListenerSettings>()
+            .unwrap()
+            .SetMessageMode(true)
+            .unwrap();
+        // The server end reads on the pool thread it was delivered on.
+        let (tx, rx) = mpsc::channel();
+        let handler = ConnectionHandler::new(move |_s, args| {
+            let stream: IMessageStream = args.as_ref().unwrap().Stream()?.cast()?;
+            let _ = tx.send(Ok(vec![stream.IsMessageMode()? as u8]));
+            for max in [1 << 20, 1 << 20, 1 << 20, 1 << 20, 10, 10] {
+                let got = block_on(stream.ReadMessageAsync(max)?.into_future())
+                    .map(|b| bytes_of(&b))
+                    .map_err(|e| e.code());
+                let _ = tx.send(got);
+            }
+            Ok(())
+        });
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+
+        let client = block_on(crate::comio::NamedPipeConnector::connect(&name)).unwrap();
+        assert!(client.cast::<IMessageStream>().unwrap().IsMessageMode().unwrap());
+        let big: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        for m in [&b"hello"[..], &[], &big, b"!", &[7u8; 100_000], b"next"] {
+            send(&client, m);
+        }
+
+        let next = || rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(next(), Ok(vec![1]), "the server end is not in message mode");
+        assert_eq!(next(), Ok(b"hello".to_vec()));
+        assert_eq!(next(), Ok(Vec::new()));
+        assert_eq!(next(), Ok(big));
+        assert_eq!(next(), Ok(b"!".to_vec()));
+        assert_eq!(next(), Err(HRESULT::from_win32(ERROR_MORE_DATA.0)));
+        assert_eq!(next(), Ok(b"next".to_vec()));
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+    }
+
+    #[test]
+    fn a_byte_stream_has_no_messages() {
+        let (stream, _other) = crate::comio::stream::tests::pipe_pair();
+        let messages: IMessageStream = stream.cast().unwrap();
+        assert!(!messages.IsMessageMode().unwrap());
+        assert_eq!(
+            messages.ReadMessageAsync(16).unwrap_err().code(),
+            E_ILLEGAL_METHOD_CALL
+        );
+    }
+
+    /// At the limit the accept chain parks instead of stopping, and resumes
+    /// when an instance closes.
+    #[test]
+    fn the_chain_waits_out_the_instance_limit() {
+        let name = pipe_name("limit");
+        let listener = NamedPipeConnectionListener::new();
+        listener
+            .cast::<INamedPipeListenerSettings>()
+            .unwrap()
+            .SetMaxInstances(1)
+            .unwrap();
+        let (handler, rx) = stream_handler();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+
+        let client1 = connect_soon(&name);
+        let server1 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let err = block_on(crate::comio::NamedPipeConnector::connect_with_timeout(
+            &name,
+            Duration::ZERO,
+        ))
+        .unwrap_err();
+        assert_eq!(err.code(), ERROR_PIPE_BUSY.to_hresult());
+
+        drop(server1);
+        drop(client1);
+        let _client2 = connect_soon(&name);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the chain did not resume after an instance closed");
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+    }
+
+    /// `ConnectWithTimeoutAsync` through the vtable: a busy pipe is busy
+    /// after the time given, and a negative time is not a time.
+    #[test]
+    fn connect_with_timeout_through_the_vtable() {
+        let name = pipe_name("timeout");
+        let listener = NamedPipeConnectionListener::new();
+        listener
+            .cast::<INamedPipeListenerSettings>()
+            .unwrap()
+            .SetMaxInstances(1)
+            .unwrap();
+        let (handler, rx) = stream_handler();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        let _client1 = connect_soon(&name);
+        let _server1 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let connector: INamedPipeConnector =
+            crate::comio::NamedPipeConnector::new().cast().unwrap();
+        let name = HSTRING::from(&name);
+        assert_eq!(
+            connector
+                .ConnectWithTimeoutAsync(&name, TimeSpan { Duration: -1 })
+                .unwrap_err()
+                .code(),
+            E_INVALIDARG
+        );
+        let started = std::time::Instant::now();
+        let err = connector
+            .ConnectWithTimeoutAsync(&name, TimeSpan { Duration: 300 * 10_000 })
+            .unwrap()
+            .join()
+            .unwrap_err();
+        let waited = started.elapsed();
+        assert_eq!(err.code(), ERROR_PIPE_BUSY.to_hresult());
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(3),
+            "waited {waited:?} for a 300 ms timeout"
+        );
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+    }
+
+    /// The listener's default descriptor is the explicit one, so a reader
+    /// the system's default would admit is turned away.
+    #[test]
+    fn the_default_descriptor_keeps_out_anonymous_readers() {
+        use windows::Win32::Security::{ImpersonateAnonymousToken, RevertToSelf};
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_SHARE_NONE, OPEN_EXISTING,
+        };
+        use windows::Win32::System::Threading::GetCurrentThread;
+        let name = pipe_name("anon");
+        let listener = NamedPipeConnectionListener::new();
+        let (handler, rx) = stream_handler();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+
+        let opened = std::thread::spawn(move || unsafe {
+            ImpersonateAnonymousToken(GetCurrentThread()).unwrap();
+            let opened = CreateFileW(
+                &HSTRING::from(&name),
+                FILE_GENERIC_READ.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                None,
+            );
+            RevertToSelf().unwrap();
+            opened.map(|h| {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(opened.unwrap_err().code(), ERROR_ACCESS_DENIED.to_hresult());
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a connection was delivered for an anonymous reader"
+        );
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+    }
+}
+

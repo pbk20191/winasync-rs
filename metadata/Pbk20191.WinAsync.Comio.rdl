@@ -148,6 +148,30 @@ mod Pbk20191 {
                 #[get] RemoteUserSid: String;
             }
 
+            // Message framing, for a named pipe bound in message mode
+            // (`INamedPipeListenerSettings.MessageMode`); a connector finds
+            // the mode out by itself.
+            //
+            // Writing needs nothing new: on a message pipe each `WriteAsync`
+            // is one message. Reading does, because `IInputStream` has no
+            // notion of a boundary -- `ReadAsync` returns at most one message,
+            // but one longer than the buffer arrives over several reads with
+            // nothing to say where it ends. `ReadMessageAsync` returns one
+            // whole message of at most `maxSize` bytes; a longer one is read
+            // to its end, discarded, and fails the call with
+            // HRESULT_FROM_WIN32(ERROR_MORE_DATA), so the next read starts on
+            // a boundary. On any other stream it fails with
+            // E_ILLEGAL_METHOD_CALL.
+            //
+            // Its own interface, like `ITransportPeer`, so a composed stream
+            // is not obliged to answer it.
+            #[Version(1)]
+            #[guid(auto)]
+            interface IMessageStream {
+                #[get] IsMessageMode: bool;
+                fn ReadMessageAsync(&self, #[in] maxSize: u32) -> Windows::Foundation::IAsyncOperationWithProgress<Windows::Storage::Streams::IBuffer, u32>;
+            }
+
             #[Version(1)]
             class TransportStream {
                 ITransportStream,
@@ -155,6 +179,7 @@ mod Pbk20191 {
                 Windows::Storage::Streams::IOutputStream,
                 Windows::Foundation::IClosable,
                 ITransportPeer,
+                IMessageStream,
             }
 
             // ---------------------------------------------------------------------
@@ -208,7 +233,10 @@ mod Pbk20191 {
 
             // Who may connect, as SDDL. Read and write; set it before binding,
             // after which it is fixed (`E_ILLEGAL_METHOD_CALL`). Empty means
-            // the default: the creator, administrators and SYSTEM.
+            // the default. For a pipe that is this process's account,
+            // administrators and SYSTEM, spelled out -- the system's own
+            // default also lets Everyone and the anonymous account connect
+            // to read. For AF_UNIX it is whatever the socket file inherits.
             //
             // SDDL rather than a descriptor type because WinRT has none, and a
             // string is what a script can write: `D:P(A;;GA;;;OW)(A;;GA;;;SY)`
@@ -231,6 +259,35 @@ mod Pbk20191 {
             #[guid(auto)]
             interface IListenerSecurity {
                 SecurityDescriptor: String;
+            }
+
+            // How a named pipe's instances are created. Read and write; like
+            // `SecurityDescriptor`, set before binding, after which it is
+            // fixed (E_ILLEGAL_METHOD_CALL).
+            //
+            // MessageMode     -- each write is one message; see IMessageStream.
+            // AcceptRemoteClients -- admit clients on other machines (over
+            //                    SMB). Binding fails with E_INVALIDARG unless
+            //                    a SecurityDescriptor is set too. A remote
+            //                    client's RemoteUserSid is its account; its
+            //                    RemoteProcessId is not a process here (a
+            //                    `\localhost` client reported 65279).
+            // MaxInstances    -- 1 to 254, or 0 for no limit (the default).
+            //                    Every connected client holds one, and so
+            //                    does the one listening instance kept in
+            //                    reserve. At the limit the listener waits for
+            //                    one to close, and clients see the pipe busy.
+            // InBufferSize / OutBufferSize -- what the system reserves for
+            //                    each instance, client to server and back.
+            //                    4096 each by default; advisory.
+            #[Version(1)]
+            #[guid(auto)]
+            interface INamedPipeListenerSettings {
+                MessageMode: bool;
+                AcceptRemoteClients: bool;
+                MaxInstances: u32;
+                InBufferSize: u32;
+                OutBufferSize: u32;
             }
 
             #[Version(1)]
@@ -271,6 +328,7 @@ mod Pbk20191 {
                 INamedPipeBind,
                 Windows::Foundation::IClosable,
                 IListenerSecurity,
+                INamedPipeListenerSettings,
             }
 
             #[Version(1)]
@@ -298,8 +356,16 @@ mod Pbk20191 {
 
             #[Version(1)]
             #[guid(auto)]
+            // `ConnectAsync` waits up to five seconds in all while every
+            // instance is busy. `ConnectWithTimeoutAsync` takes that wait as
+            // an argument: zero does not wait, and running out of time fails
+            // with HRESULT_FROM_WIN32(ERROR_PIPE_BUSY). The wait occupies a
+            // thread-pool thread -- `WaitNamedPipe` has no overlapped form --
+            // so it is bounded by what the caller passes, never "forever". A
+            // pipe that does not exist fails at once either way.
             interface INamedPipeConnector {
                 fn ConnectAsync(&self, #[in] name: String) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
+                fn ConnectWithTimeoutAsync(&self, #[in] name: String, #[in] timeout: Windows::Foundation::TimeSpan) -> Windows::Foundation::IAsyncOperation<ITransportStream>;
             }
 
             #[Version(1)]
