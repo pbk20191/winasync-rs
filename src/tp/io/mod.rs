@@ -15,6 +15,7 @@ pub mod net;
 pub mod pipe;
 pub mod serial;
 pub mod unix;
+pub mod watch;
 
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::common::overlapped::{self as ov, Completion, IoReg, OpHandle};
