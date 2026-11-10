@@ -698,8 +698,9 @@ DLL에만 있어야 할 동작이 다른 경로로 닿는지 점검했다. rlib�
   바꾸고 "DLL 진입점에서만"을 safety 조건으로 적었다. `tp`와 `dylib`를 같이 켠 exe에서는 대기 중인
   tp 리스너가 어떤 카운트에도 잡히지 않아, `can_unload`가 참이어도 `WSACleanup`이 그 소켓을 끊는다.
 
-남은 것: `tp::pool`의 `race_dll(HMODULE)`, `activation_context(HANDLE)`는 아무 값이나 받는 safe
-빌더다. 가짜 값이 풀에서 무엇을 하는지는 측정하지 않았다. `LIVE_OPS`는 쓰기 가능한 `pub static`이지만
+`tp::pool`의 `race_dll(HMODULE)`도 `unsafe fn`이 되었다. 위의 위조 실험이 엉뚱한 `RaceDll`이
+access violation으로 이어진다는 것을 보였기 때문이다. 남은 것: `activation_context(HANDLE)`는 아무
+값이나 받는 safe 빌더이고, 가짜 값이 풀에서 무엇을 하는지는 측정하지 않았다. `LIVE_OPS`는 쓰기 가능한 `pub static`이지만
 영향은 그 바이너리의 복사본에 그친다.
 
 ## 커밋 상태

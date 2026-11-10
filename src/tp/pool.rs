@@ -287,7 +287,15 @@ impl PoolBuilder {
     /// stop the pool calling into a module that has been unloaded -- without
     /// it, the late completion is an access violation; with it, the pool
     /// declines the call and the process survives.
-    pub fn race_dll(mut self, module: HMODULE) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `module` must be the handle of the loaded module that holds the code
+    /// every callback of this pool runs. The pool trusts it: naming some other
+    /// module tells it the callbacks are safe to run as long as *that* one is
+    /// loaded, and a callback then reaches unmapped code. Measured with a
+    /// forged `RaceDll` in `tests/racedll.rs`: `STATUS_ACCESS_VIOLATION`.
+    pub unsafe fn race_dll(mut self, module: HMODULE) -> Self {
         self.race_dll = module.0;
         self
     }
