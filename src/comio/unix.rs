@@ -20,8 +20,8 @@ use crate::common::winsock::{
 };
 use super::bindings;
 use super::bindings::Pbk20191::WinAsync::Comio::{ITransport_Impl, IUnixConnector_Impl};
-use super::connector::connect_op;
-use super::listener::Accepted;
+use super::connector::{connect_op, ConnectSink};
+use super::listener::{AcceptSink, Accepted};
 use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
 use super::stream::{self, AcceptSockGuard};
 use super::tpio::{self, IoHandle, IoReg, OpHandle};
@@ -209,7 +209,7 @@ impl UnixStreamListener {
     /// `Err` directly, without ever invoking `on_result`.
     pub(crate) fn arm_accept(
         &self,
-        on_result: Box<dyn FnOnce(Result<Accepted>) + Send>,
+        on_result: AcceptSink,
     ) -> Result<OpHandle> {
         let accept_sock = new_socket()?;
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
@@ -223,7 +223,7 @@ impl UnixStreamListener {
         let op = unsafe {
             tpio::submit(
                 &self.reg,
-                Box::new(move |ioresult: u32, _bytes: usize| {
+                move |ioresult: u32, _bytes: usize| {
                     // Keep the address buffer alive until this real
                     // completion (success or aborted failure) — see the
                     // doc comment above.
@@ -251,8 +251,8 @@ impl UnixStreamListener {
                         closesocket(accept_sock);
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };
-                    on_result(res);
-                }),
+                    on_result.deliver(res);
+                },
                 move |ovl| {
                     let mut bytes = 0u32;
                     let ok = AcceptEx(
@@ -346,7 +346,7 @@ impl UnixConnector {
     /// that could be dropped first.
     pub(crate) fn arm_connect(
         path: &str,
-        on_result: Box<dyn FnOnce(Result<ITransportStream>) + Send>,
+        on_result: ConnectSink,
     ) -> Result<OpHandle> {
         let sock = new_socket()?;
         // Closed on any early return from here on.
@@ -370,7 +370,7 @@ impl UnixConnector {
         let op = unsafe {
             tpio::submit(
                 &reg,
-                Box::new(move |ioresult: u32, _bytes: usize| {
+                move |ioresult: u32, _bytes: usize| {
                     // Hold the address until the real completion.
                     drop(remote_box);
                     let res = if ioresult == 0 {
@@ -379,8 +379,8 @@ impl UnixConnector {
                     } else {
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };
-                    on_result(res);
-                }),
+                    on_result.deliver(res);
+                },
                 move |ovl| {
                     let mut sent = 0u32;
                     let ok = connect_ex(

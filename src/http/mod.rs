@@ -266,7 +266,8 @@ impl HttpServer {
     /// Measured: they apply to a connection once it has carried a request
     /// here -- one that has sent nothing yet belongs to no server, and keeps
     /// the machine-wide defaults -- and they are checked coarsely: a
-    /// one-second idle timeout closed a kept-alive connection after five.
+    /// one-second idle timeout closed a kept-alive connection after five
+    /// seconds on one machine and ten on another.
     pub fn set_timeouts(&self, timeouts: &Timeouts) -> Result<()> {
         let secs = |d: Option<Duration>| d.map_or(0, |d| d.as_secs().clamp(1, u16::MAX as u64) as u16);
         let info = HTTP_TIMEOUT_LIMIT_INFO {
@@ -1322,7 +1323,7 @@ mod tests {
             .unwrap();
         server.set_queue_length(10).unwrap();
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(90))).unwrap();
         s.write_all(format!("GET /slow/ HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes()).unwrap();
         let req = block_on(server.accept()).unwrap();
         block_on(req.respond(Response::new(200), b"ok".to_vec())).0.unwrap();
@@ -1338,7 +1339,9 @@ mod tests {
         let _ = s.read_to_end(&mut rest);
         let waited = started.elapsed();
         eprintln!("idle connection closed after {waited:?}");
-        assert!(waited < Duration::from_secs(10), "{waited:?}");
+        // Measured: 5 s here, 10 s on a GitHub runner, against a default of
+        // 120 s. Only "well under the default" is asserted.
+        assert!(waited < Duration::from_secs(60), "{waited:?}");
     }
 
     #[cfg(feature = "tp")]

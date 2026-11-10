@@ -167,7 +167,27 @@ impl NamedPipeOptions {
 
 /// Called when an instance of ours closes (`true`) or the server is dropped
 /// (`false`). Never called under a lock.
-pub(crate) type SlotWaiter = Box<dyn FnOnce(bool) + Send>;
+/// Who is told when an instance closes at the limit: `true` for an instance
+/// freed, `false` for the server going away.
+pub(crate) enum SlotWaiter {
+    /// An `accept` future, waiting on the channel.
+    Signal(crate::common::oneshot::Sender<bool>),
+    /// comio's executor-free accept chain, parked until it can arm.
+    #[cfg(feature = "comio")]
+    Accept(crate::comio::pipe::ParkedAccept),
+}
+
+impl SlotWaiter {
+    fn wake(self, freed: bool) {
+        match self {
+            SlotWaiter::Signal(tx) => {
+                let _ = tx.send(freed);
+            }
+            #[cfg(feature = "comio")]
+            SlotWaiter::Accept(parked) => parked.wake(freed),
+        }
+    }
+}
 
 /// How many instances of the name this process holds, and who is waiting
 /// for one to close.
@@ -195,7 +215,7 @@ impl Drop for InstanceToken {
             std::mem::take(&mut slots.waiters)
         };
         for w in waiters {
-            w(true);
+            w.wake(true);
         }
     }
 }
@@ -379,7 +399,7 @@ impl Drop for PipeServer {
         // gone; tell them so rather than leave them parked.
         let waiters = std::mem::take(&mut self.slots.lock().unwrap().waiters);
         for w in waiters {
-            w(false);
+            w.wake(false);
         }
     }
 }

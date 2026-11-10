@@ -111,8 +111,8 @@ pub(crate) fn callback_env() -> Option<*const TP_CALLBACK_ENVIRON_V3> {
     None
 }
 
-struct Job {
-    run: Box<dyn FnOnce() + Send>,
+struct Job<F> {
+    run: F,
     _module: ModuleRef,
 }
 
@@ -127,16 +127,16 @@ struct Job {
 /// A panic in `f` aborts the process, as it did under `windows_threading`:
 /// the callback is an `extern "system"` frame, and unwinding out of one is not
 /// something Rust permits.
-pub(crate) fn submit(f: impl FnOnce() + Send + 'static) {
+pub(crate) fn submit<F: FnOnce() + Send + 'static>(f: F) {
     let job = Box::into_raw(Box::new(Job {
-        run: Box::new(f),
+        run: f,
         _module: ModuleRef::new(),
     }));
-    let queued = unsafe { TrySubmitThreadpoolCallback(Some(run_job), Some(job.cast()), callback_env()) };
+    let queued = unsafe { TrySubmitThreadpoolCallback(Some(run_job::<F>), Some(job.cast()), callback_env()) };
     if queued.is_err() {
         // Not queued, so the pool will never call back: ownership of the job
         // is still ours, and running it here keeps the contract.
-        unsafe { run_job(PTP_CALLBACK_INSTANCE::default(), job.cast()) };
+        unsafe { run_job::<F>(PTP_CALLBACK_INSTANCE::default(), job.cast()) };
     }
 }
 
@@ -145,20 +145,21 @@ pub(crate) fn submit(f: impl FnOnce() + Send + 'static) {
 ///
 /// If the pool cannot make a timer, `f` waits out `delay` on a pool thread
 /// instead -- slower, but the work still happens.
-pub(crate) fn submit_after(delay: std::time::Duration, f: impl FnOnce() + Send + 'static) {
+pub(crate) fn submit_after<F: FnOnce() + Send + 'static>(delay: std::time::Duration, f: F) {
     let job = Box::into_raw(Box::new(TimerJob {
         job: Job {
-            run: Box::new(f),
+            run: f,
             _module: ModuleRef::new(),
         },
         timer: PTP_TIMER::default(),
     }));
-    let timer = unsafe { CreateThreadpoolTimer(Some(run_timer_job), Some(job.cast()), callback_env()) };
+    let timer = unsafe { CreateThreadpoolTimer(Some(run_timer_job::<F>), Some(job.cast()), callback_env()) };
     let Ok(timer) = timer else {
         let TimerJob { job, .. } = *unsafe { Box::from_raw(job) };
         submit(move || {
             std::thread::sleep(delay);
-            (job.run)();
+            let Job { run, _module } = job;
+            run();
         });
         return;
     };
@@ -172,17 +173,17 @@ pub(crate) fn submit_after(delay: std::time::Duration, f: impl FnOnce() + Send +
     unsafe { SetThreadpoolTimer(timer, Some(&due), 0, None) };
 }
 
-struct TimerJob {
-    job: Job,
+struct TimerJob<F> {
+    job: Job<F>,
     timer: PTP_TIMER,
 }
 
-unsafe extern "system" fn run_timer_job(
+unsafe extern "system" fn run_timer_job<F: FnOnce() + Send + 'static>(
     _instance: PTP_CALLBACK_INSTANCE,
     context: *mut c_void,
     _timer: PTP_TIMER,
 ) {
-    let TimerJob { job, timer } = *unsafe { Box::from_raw(context.cast::<TimerJob>()) };
+    let TimerJob { job, timer } = *unsafe { Box::from_raw(context.cast::<TimerJob<F>>()) };
     // Closing from inside the callback is allowed: the timer is released
     // once this callback returns.
     unsafe { CloseThreadpoolTimer(timer) };
@@ -190,8 +191,11 @@ unsafe extern "system" fn run_timer_job(
     run();
 }
 
-unsafe extern "system" fn run_job(_instance: PTP_CALLBACK_INSTANCE, context: *mut c_void) {
-    let Job { run, _module } = *unsafe { Box::from_raw(context.cast::<Job>()) };
+unsafe extern "system" fn run_job<F: FnOnce() + Send + 'static>(
+    _instance: PTP_CALLBACK_INSTANCE,
+    context: *mut c_void,
+) {
+    let Job { run, _module } = *unsafe { Box::from_raw(context.cast::<Job<F>>()) };
     run();
     // `_module` drops here, still inside this module's code: the count can
     // read zero while this frame has yet to return. See the module docs for

@@ -18,7 +18,7 @@ use windows::Win32::Networking::WinSock::{
 };
 
 use super::buffer::RioSlice;
-use super::cq::{CompleteFn, Request, RioCq};
+use super::cq::{Request, RioCq};
 use super::table::rio_table;
 use crate::common::oneshot;
 use crate::common::winsock::{wsa_init, wsa_last_err};
@@ -162,11 +162,8 @@ impl RequestQueue {
         let (tx, rx) = oneshot::channel::<(windows_core::Result<usize>, Option<RioSlice>)>();
         let buf = slice.rio_buf();
 
-        let complete: CompleteFn = Box::new(move |status, bytes, returned| {
-            let _ = tx.send((status_to_result(status, bytes), returned));
-        });
         let ctx = Request {
-            complete,
+            finish: Finish::Plain(tx),
             // The request owns the buffer until the completion carries it
             // back — the only way to satisfy RIO's "buffer outlives the op"
             // rule when operations cannot be cancelled.
@@ -241,11 +238,11 @@ impl RequestQueue {
         addr_buf: &RIO_BUF,
         is_send: bool,
         slice: RioSlice,
-        complete: CompleteFn,
+        finish: Finish,
     ) -> windows_core::Result<()> {
         let table = rio_table()?;
         let ctx = Request {
-            complete,
+            finish,
             slice: Some(slice),
         }
         .into_context();
@@ -296,6 +293,59 @@ impl RequestQueue {
 }
 
 /// Turns a completion status into a result.
+/// What a finished operation hands back, and to whom: the raw status (0 =
+/// success, else a winsock error), the transferred byte count, and the
+/// buffer the operation held.
+///
+/// The slice travels through the completion rather than being released by the
+/// pump, so the caller gets its buffer back at exactly the moment the kernel
+/// is provably done with it.
+pub(crate) enum Finish {
+    /// A plain send or receive: the count and the buffer.
+    Plain(Sender<Finished<usize>>),
+    /// A send-to or receive-from: the peer travels in `addr`, a registered
+    /// slice of its own, released once it has been read.
+    Addressed {
+        tx: Sender<Finished<(usize, std::net::SocketAddr)>>,
+        addr: RioSlice,
+    },
+}
+
+/// What a completion sends on: the result, and the buffer coming back.
+pub(crate) type Finished<T> = (windows_core::Result<T>, Option<RioSlice>);
+use crate::common::oneshot::Sender;
+
+impl Finish {
+    pub(crate) fn run(self, status: i32, bytes: u32, slice: Option<RioSlice>) {
+        match self {
+            Finish::Plain(tx) => {
+                let _ = tx.send((status_to_result(status, bytes), slice));
+            }
+            Finish::Addressed { tx, addr } => {
+                use windows::Win32::Networking::WinSock::{SOCKADDR_INET, SOCKADDR_STORAGE};
+                // The kernel is done with the address slice by now, so
+                // reading the peer here is sound, and the slot returns to
+                // the pool on the way out.
+                let result = if status == 0 {
+                    let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            addr.as_ptr(),
+                            &mut storage as *mut _ as *mut u8,
+                            size_of::<SOCKADDR_INET>(),
+                        );
+                    }
+                    crate::common::sockaddr::read_sockaddr(&storage).map(|a| (bytes as usize, a))
+                } else {
+                    Err(status_to_result(status, bytes).unwrap_err())
+                };
+                drop(addr);
+                let _ = tx.send((result, slice));
+            }
+        }
+    }
+}
+
 pub(crate) fn status_to_result(status: i32, bytes: u32) -> windows_core::Result<usize> {
     if status == 0 {
         Ok(bytes as usize)

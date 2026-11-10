@@ -553,7 +553,7 @@ impl File {
         });
         let (tx, rx) = crate::common::oneshot::channel::<windows_core::Result<()>>();
         let completion_state = state.clone();
-        let on_complete: ov::CompleteFn = Box::new(move |c: Completion| {
+        let on_complete = move |c: Completion| {
             let result = match c {
                 Completion::Done(0, _) => {
                     completion_state
@@ -570,7 +570,7 @@ impl File {
             // If the future is already gone, this was the last reference,
             // and a granted lock is unlocked right here.
             drop(completion_state);
-        });
+        };
         let mut flags = LOCK_FILE_FLAGS(0);
         if exclusive {
             flags |= LOCKFILE_EXCLUSIVE_LOCK;

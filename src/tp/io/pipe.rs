@@ -11,7 +11,7 @@
 use super::{submit, IoRes, Issue};
 use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 pub use crate::common::pipe::NamedPipeOptions;
-use crate::common::pipe::{self as server, PipeServer, ReplenishOnExit, Slot};
+use crate::common::pipe::{self as server, PipeServer, ReplenishOnExit, Slot, SlotWaiter};
 use crate::common::security;
 use crate::tp::Runtime;
 use std::sync::Arc;
@@ -423,10 +423,7 @@ impl NamedPipeListener {
     pub async fn accept(&self) -> windows_core::Result<NamedPipeStream> {
         let instance = loop {
             let (freed, slot) = crate::common::oneshot::channel::<bool>();
-            let waiter = Box::new(move |closed_one| {
-                let _ = freed.send(closed_one);
-            });
-            match self.server.instance_or_wait(waiter)? {
+            match self.server.instance_or_wait(SlotWaiter::Signal(freed))? {
                 Slot::Ready(instance) => break instance,
                 // `false` (or a dropped sender) would mean the server is
                 // gone, which cannot happen while `&self` is borrowed -- but

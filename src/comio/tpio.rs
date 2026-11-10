@@ -40,9 +40,6 @@ impl IoReg {
     }
 }
 
-/// comio's completion callback shape (unchanged): `(ioresult, bytes)`.
-pub(crate) type CompleteFn = Box<dyn FnOnce(u32, usize) + Send>;
-
 /// Opaque in-flight op handle; `cancel` is explicit, drop does not cancel.
 pub(crate) type OpHandle = ov::OpHandle<()>;
 
@@ -54,12 +51,12 @@ pub(crate) type OpHandle = ov::OpHandle<()>;
 /// # Safety
 /// Same contract as [`ov::submit`]: `issue` issues exactly one overlapped op and
 /// classifies its outcome truthfully.
-pub(crate) unsafe fn submit(
+pub(crate) unsafe fn submit<F: FnOnce(u32, usize) + Send + 'static>(
     reg: &Arc<IoReg>,
-    on_complete: CompleteFn,
+    on_complete: F,
     issue: impl FnOnce(*mut OVERLAPPED) -> Issue,
 ) -> OpHandle {
-    let cb: ov::CompleteFn = Box::new(move |c: Completion| match c {
+    let cb = move |c: Completion| match c {
         Completion::Done(ioresult, bytes) => on_complete(ioresult, bytes),
         Completion::SyncFail(hr) => {
             // Map HRESULT -> nonzero win32 (low 16 bits in FACILITY_WIN32 form,
@@ -72,7 +69,7 @@ pub(crate) unsafe fn submit(
             };
             on_complete(win32, 0);
         }
-    });
+    };
     unsafe { ov::submit(&reg.0, (), cb, |ovl, _| issue(ovl)) }
 }
 
@@ -107,7 +104,7 @@ mod tests {
         let wbuf = Box::new(*b"Z");
         let wptr = wbuf.as_ptr();
         let _wop = unsafe {
-            submit(&sreg, Box::new(move |ioresult, bytes| { let _ = &wbuf; tx.send((ioresult, bytes)).unwrap(); }), |ovl| {
+            submit(&sreg, move |ioresult, bytes| { let _ = &wbuf; tx.send((ioresult, bytes)).unwrap(); }, |ovl| {
                 match WriteFile(sreg.handle, Some(std::slice::from_raw_parts(wptr, 1)), None, Some(ovl)) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
@@ -123,7 +120,7 @@ mod tests {
         let rbuf2 = rbuf.clone();
         let rptr = rbuf.lock().unwrap().as_mut_ptr();
         let _rop = unsafe {
-            submit(&creg, Box::new(move |ioresult, bytes| { let _ = &rbuf2; tx2.send((ioresult, bytes)).unwrap(); }), |ovl| {
+            submit(&creg, move |ioresult, bytes| { let _ = &rbuf2; tx2.send((ioresult, bytes)).unwrap(); }, |ovl| {
                 match ReadFile(creg.handle, Some(std::slice::from_raw_parts_mut(rptr, 1)), None, Some(ovl)) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,

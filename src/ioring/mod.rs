@@ -347,14 +347,14 @@ struct Registration {
     generation: u64,
     /// Keeps the active table -- its handles, its memory -- alive while the
     /// kernel may use it.
-    active: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    active: Option<Arc<dyn Send + Sync>>,
     pending: Option<PendingRegistration>,
 }
 
 struct PendingRegistration {
     user_data: usize,
     generation: u64,
-    table: Arc<dyn core::any::Any + Send + Sync>,
+    table: Arc<dyn Send + Sync>,
 }
 
 impl Registration {
@@ -1182,7 +1182,7 @@ struct FileTable {
     generation: u64,
     handles: Vec<HANDLE>,
     /// Whatever keeps each handle open.
-    _keep: Vec<Box<dyn core::any::Any + Send + Sync>>,
+    _keep: Vec<Box<dyn Send + Sync>>,
 }
 
 // Handle values and the owners that keep them open; never mutated.
@@ -1285,7 +1285,7 @@ struct BufferTable {
     generation: u64,
     infos: Vec<IORING_BUFFER_INFO>,
     /// The owners of the memory; only ever dropped.
-    _keep: Vec<Box<dyn core::any::Any + Send>>,
+    _keep: Vec<Box<dyn Send>>,
     free: Mutex<Vec<u32>>,
 }
 
@@ -1466,7 +1466,7 @@ impl IoRing {
             handles: files.iter().map(RingHandle::raw_handle).collect(),
             _keep: files
                 .iter()
-                .map(|f| Box::new(f.clone()) as Box<dyn core::any::Any + Send + Sync>)
+                .map(|f| Box::new(f.clone()) as Box<dyn Send + Sync>)
                 .collect(),
         });
         drop(ring);
@@ -1483,7 +1483,7 @@ impl IoRing {
     /// registration cannot describe.
     pub fn register_buffers<B: IoBufMut + 'static>(&self, buffers: Vec<B>) -> RingOp<RegisterBuffersOp> {
         let mut infos = Vec::with_capacity(buffers.len());
-        let mut keep: Vec<Box<dyn core::any::Any + Send>> = Vec::with_capacity(buffers.len());
+        let mut keep: Vec<Box<dyn Send>> = Vec::with_capacity(buffers.len());
         let mut too_big = false;
         for mut b in buffers {
             let Ok(len) = u32::try_from(b.bytes_total()) else {
@@ -1518,7 +1518,7 @@ impl IoRing {
     fn register_infos(
         &self,
         infos: Vec<IORING_BUFFER_INFO>,
-        keep: Vec<Box<dyn core::any::Any + Send>>,
+        keep: Vec<Box<dyn Send>>,
         too_big: bool,
     ) -> RingOp<RegisterBuffersOp> {
         let mut ring = self.inner.ring.lock().unwrap();

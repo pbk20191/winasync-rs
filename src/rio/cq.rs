@@ -49,7 +49,7 @@ use windows::Win32::System::Threading::{
 
 use crate::common::pool::PoolRef;
 use super::buffer::RioSlice;
-use super::rq::RIO_INVALID_CQ;
+use super::rq::{Finish, RIO_INVALID_CQ};
 use super::table::rio_table;
 use crate::common::winsock::wsa_last_err;
 use crate::common::tpctx::CtxHeader;
@@ -60,15 +60,6 @@ use crate::tp::Runtime;
 /// completion queue — a larger batch amortises the call over more results.
 const DRAIN_BATCH: usize = 128;
 
-/// What a finished operation hands back: the raw status (0 = success, else a
-/// winsock error), the transferred byte count, and the buffer the operation
-/// held.
-///
-/// The slice travels through the completion rather than being released by the
-/// pump, so the caller gets its buffer back at exactly the moment the kernel
-/// is provably done with it.
-pub(crate) type CompleteFn = Box<dyn FnOnce(i32, u32, Option<RioSlice>) + Send>;
-
 /// One in-flight operation's state, reached from the completion's
 /// `RequestContext`.
 ///
@@ -77,7 +68,7 @@ pub(crate) type CompleteFn = Box<dyn FnOnce(i32, u32, Option<RioSlice>) + Send>;
 /// `closesocket`, so the buffer has to stay registered until the result
 /// actually appears in the queue.
 pub(crate) struct Request {
-    pub(crate) complete: CompleteFn,
+    pub(crate) finish: Finish,
     pub(crate) slice: Option<RioSlice>,
 }
 
@@ -684,11 +675,11 @@ fn drain(state: &CqState) -> Option<usize> {
         }
         for r in &results[..n as usize] {
             if let Some(req) = unsafe { Request::from_context(r.RequestContext) } {
-                let Request { complete, slice } = *req;
+                let Request { finish, slice } = *req;
                 // Hand the buffer on with the result: now, and only now, is
                 // the kernel provably finished with it.
                 let (status, bytes) = (r.Status, r.BytesTransferred);
-                let _ = catch_unwind(AssertUnwindSafe(move || complete(status, bytes, slice)));
+                let _ = catch_unwind(AssertUnwindSafe(move || finish.run(status, bytes, slice)));
             }
         }
         total += n as usize;

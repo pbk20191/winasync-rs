@@ -250,7 +250,7 @@ impl IoAsyncOp<IBuffer> {
         let handle = unsafe {
             submit(
                 reg,
-                Box::new(move |ioresult: u32, bytes: usize| {
+                move |ioresult: u32, bytes: usize| {
                     // Force the closure to capture (and thus keep alive until
                     // the real completion fires, whether natural or
                     // cancelled) whatever `keep_alive` value the caller's
@@ -270,7 +270,7 @@ impl IoAsyncOp<IBuffer> {
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };
                     cb_object.complete(res);
-                }),
+                },
                 issue,
             )
         };
@@ -374,7 +374,7 @@ fn read_message_step(
     let op = unsafe {
         submit(
             &reg,
-            Box::new(move |ioresult: u32, bytes: usize| {
+            move |ioresult: u32, bytes: usize| {
                 // The kernel reads the request until here.
                 let _ = &request;
                 let more = ioresult == ERROR_MORE_DATA.0;
@@ -420,7 +420,7 @@ fn read_message_step(
                     None => left.max(1),
                 };
                 read_message_step(cb_object, cb_reg, read, next, None);
-            }),
+            },
             move |ovl| match match sent {
                 Some((request, len)) => windows::Win32::System::Pipes::TransactNamedPipe(
                     handle,
@@ -503,7 +503,7 @@ impl IoAsyncOp<u32> {
         let handle = unsafe {
             submit(
                 reg,
-                Box::new(move |ioresult: u32, bytes: usize| {
+                move |ioresult: u32, bytes: usize| {
                     // Force the closure to capture (and thus keep alive until
                     // this point) the agile reference to the source buffer.
                     let _ = &out_agile;
@@ -513,7 +513,7 @@ impl IoAsyncOp<u32> {
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };
                     cb_object.complete(res);
-                }),
+                },
                 issue,
             )
         };

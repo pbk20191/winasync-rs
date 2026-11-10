@@ -37,7 +37,7 @@ pub(crate) unsafe fn submit<P>(
         inner: Mutex::new((None, None)),
     });
     let slot2 = slot.clone();
-    let on_complete: ov::CompleteFn = Box::new(move |c: Completion| {
+    let on_complete = move |c: Completion| {
         let waker = {
             let mut g = slot2.inner.lock().unwrap();
             g.0 = Some(c);
@@ -46,7 +46,7 @@ pub(crate) unsafe fn submit<P>(
         if let Some(w) = waker {
             w.wake();
         }
-    });
+    };
     let handle = unsafe { ov::submit(reg, payload, on_complete, issue) };
     OpFuture {
         handle,

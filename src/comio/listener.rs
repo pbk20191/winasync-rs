@@ -143,61 +143,65 @@ pub(crate) fn new_args(
 ///
 /// Held behind an `Arc` in `ListenerState::source` and cloned out before use,
 /// so `try_arm` can drop that lock before arming.
-pub(crate) trait AcceptSource: Send + Sync {
+/// Where a listener's connections come from: one of the three transports.
+pub(crate) enum AcceptSource {
+    /// The pipe's name and its instances. Dropping it -- on `Close`, or
+    /// when a rebind replaces it -- closes the instance held in reserve,
+    /// which is what gives the name up.
+    Pipe(Arc<PipeServer>),
+    Unix(UnixSource),
+    HyperV(HyperVSource),
+}
+
+impl AcceptSource {
     /// Issues one accept through the transport's callback-based primitive
     /// (`pipe::arm_accept` / `*StreamListener::arm_accept`), each built
     /// directly on `tpio::submit` — no `Future`, no executor.
     ///
     /// `Ok(None)` means nothing could be armed yet -- a named pipe at its
-    /// instance limit -- and `on_result` will be called with
+    /// instance limit -- and `on_result` will be given
     /// [`super::pipe::SLOT_FREED`] once something can be.
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>>;
-}
-
-/// The pipe's name and its instances. Dropping it -- on `Close`, or when a
-/// rebind replaces it -- closes the instance held in reserve, which is what
-/// gives the name up.
-struct PipeSource(Arc<PipeServer>);
-
-impl AcceptSource for PipeSource {
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>> {
-        super::pipe::arm_accept(&self.0, on_result)
+    fn arm(&self, on_result: AcceptSink) -> Result<Option<OpHandle>> {
+        match self {
+            AcceptSource::Pipe(server) => super::pipe::arm_accept(server, on_result),
+            AcceptSource::Unix(source) => {
+                let mut guard = source.listener.lock().unwrap();
+                if guard.is_none() {
+                    *guard = Some(super::UnixStreamListener::bind(
+                        &source.path,
+                        source.security.as_ref(),
+                    )?);
+                }
+                guard.as_ref().unwrap().arm_accept(on_result).map(Some)
+            }
+            AcceptSource::HyperV(source) => {
+                let mut guard = source.listener.lock().unwrap();
+                if guard.is_none() {
+                    *guard = Some(super::HvStreamListener::bind(source.addr)?);
+                }
+                guard.as_ref().unwrap().arm_accept(on_result).map(Some)
+            }
+        }
     }
 }
 
-struct UnixSource {
+pub(crate) struct UnixSource {
     path: String,
     security: Option<SecurityDescriptor>,
     /// `None` until the first `arm` binds the persistent listen socket.
     listener: Mutex<Option<super::UnixStreamListener>>,
 }
 
-impl AcceptSource for UnixSource {
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>> {
-        let mut guard = self.listener.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(super::UnixStreamListener::bind(
-                &self.path,
-                self.security.as_ref(),
-            )?);
-        }
-        guard.as_ref().unwrap().arm_accept(on_result).map(Some)
-    }
-}
-
-struct HyperVSource {
+pub(crate) struct HyperVSource {
     addr: HvSocketAddr,
     listener: Mutex<Option<super::HvStreamListener>>,
 }
 
-impl AcceptSource for HyperVSource {
-    fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>> {
-        let mut guard = self.listener.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(super::HvStreamListener::bind(self.addr)?);
-        }
-        guard.as_ref().unwrap().arm_accept(on_result).map(Some)
-    }
+/// Where an armed accept delivers: the listener's chain, which fires the
+/// event and re-arms (see [`drive`]). One per armed accept; delivered
+/// exactly once, by the completion or by the slot waiter that parked it.
+pub(crate) struct AcceptSink {
+    state: Arc<ListenerState>,
 }
 
 /// Shared, `Send + Sync` state behind a [`ConnectionListener`]: held both by
@@ -231,7 +235,7 @@ struct ListenerState {
     event: windows_core::Event<ConnectionHandler>,
     endpoint: Mutex<Option<HSTRING>>,
     /// Set once by `BindAsync`, read (cloned) by every `try_arm` call.
-    source: Mutex<Option<Arc<dyn AcceptSource>>>,
+    source: Mutex<Option<Arc<AcceptSource>>>,
     /// The in-flight accept's `OpHandle`. `tpio::submit` guarantees every
     /// completion — synchronous or asynchronous — is delivered on a
     /// thread-pool thread (see `tpio::submit`'s doc comment), so `try_arm`
@@ -446,7 +450,7 @@ impl ListenerCore {
     /// source's first accept happens on the restart path and its error is not
     /// returned from here. Rebind after an explicit `Close`, or onto a fresh
     /// listener, if you need that error synchronously.
-    fn install_source(&self, source: Arc<dyn AcceptSource>, label: HSTRING) -> Result<IAsyncAction> {
+    fn install_source(&self, source: Arc<AcceptSource>, label: HSTRING) -> Result<IAsyncAction> {
         if self.state.closed.load(Ordering::Acquire) {
             return Err(Error::from_hresult(RO_E_CLOSED));
         }
@@ -767,7 +771,7 @@ impl NamedPipeConnectionListener {
         options.validate()?;
         let server = PipeServer::new(&name.to_string(), options);
         self.core
-            .install_source(Arc::new(PipeSource(Arc::new(server))), name.clone())
+            .install_source(Arc::new(AcceptSource::Pipe(Arc::new(server))), name.clone())
     }
 
     /// Typed Rust equivalent of the vtable's `SecurityDescriptor` setter.
@@ -784,11 +788,11 @@ impl UnixConnectionListener {
     /// `ConnectionReceived` completes the gating condition.
     pub fn bind(&self, path: &HSTRING) -> Result<IAsyncAction> {
         self.core.install_source(
-            Arc::new(UnixSource {
+            Arc::new(AcceptSource::Unix(UnixSource {
                 path: path.to_string(),
                 security: self.core.security(),
                 listener: Mutex::new(None),
-            }),
+            })),
             path.clone(),
         )
     }
@@ -818,10 +822,10 @@ impl HyperVConnectionListener {
         let addr = HvSocketAddr::new(*vm_id, *service_id);
         let label = HSTRING::from(addr.to_string());
         self.core.install_source(
-            Arc::new(HyperVSource {
+            Arc::new(AcceptSource::HyperV(HyperVSource {
                 addr,
                 listener: Mutex::new(None),
-            }),
+            })),
             label,
         )
     }
@@ -911,6 +915,69 @@ fn want_running(state: &ListenerState) -> bool {
 fn release_running(state: &Arc<ListenerState>) -> bool {
     state.running.store(false, Ordering::SeqCst);
     state.restart_pending.swap(false, Ordering::SeqCst) && want_running(state)
+}
+
+impl AcceptSink {
+    /// One accept's outcome, from the transport's completion: fires the
+    /// event and re-arms, or releases the chain (see [`drive`]).
+    pub(crate) fn deliver(self, res: Result<Accepted>) {
+        let state_cb = self.state;
+        if state_cb.closed.load(Ordering::Acquire) {
+            // Closed: just release (`want_running` is false, so no restart).
+            let _ = release_running(&state_cb);
+            return;
+        }
+        match res {
+            Ok(accepted) => {
+                // The peer's endpoint when the transport could name one
+                // (AF_HYPERV: which partition connected), else this
+                // listener's own bound endpoint — which is all the other
+                // transports can say.
+                let endpoint = accepted.remote.unwrap_or_else(|| {
+                    state_cb
+                        .endpoint
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_default()
+                });
+                fire_event(&state_cb, accepted.stream, endpoint, accepted.peer);
+                // Re-arm on a *fresh* pool stack, continuing to own `running`
+                // (`drive(.., true)`). Handing the re-arm to the pool bounds
+                // chain depth to O(1) even when completions arrive synchronously
+                // (the named-pipe `ERROR_PIPE_CONNECTED` "already connected"
+                // backlog case); `drive` itself parks the chain if it is no
+                // longer wanted.
+                let next = state_cb.clone();
+                // `comio::pool::submit`, not `windows_threading::submit`: the
+                // queued re-arm is code in this module that will run, so it is
+                // counted until it has, and the module is pinned while it does.
+                super::pool::submit(move || {
+                    let _ = drive(next, true);
+                });
+            }
+            // A named pipe was parked at its instance limit and an instance
+            // has closed: arm again, still owning `running`, exactly as after
+            // a connection -- `drive` parks the chain instead if it is no
+            // longer wanted.
+            Err(e) if e.code() == super::pipe::SLOT_FREED => {
+                let next = state_cb.clone();
+                super::pool::submit(move || {
+                    let _ = drive(next, true);
+                });
+            }
+            Err(_) => {
+                // Hard accept failure, or a cancellation from Close / the last
+                // handler being removed. Release the flag; restart only if a
+                // start was explicitly requested meanwhile (the add-races-stop
+                // handoff) — never on a bare failure, so a persistent error
+                // can't hot-spin the pool.
+                if release_running(&state_cb) {
+                    let _ = drive(state_cb, false);
+                }
+            }
+        }
+        }
 }
 
 /// The single, non-recursive accept-chain driver.
@@ -1032,68 +1099,10 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
         return Ok(false);
     };
 
-    let state_cb = state.clone();
-    let on_result: Box<dyn FnOnce(Result<Accepted>) + Send> = Box::new(move |res| {
-        if state_cb.closed.load(Ordering::Acquire) {
-            // Closed: just release (`want_running` is false, so no restart).
-            let _ = release_running(&state_cb);
-            return;
-        }
-        match res {
-            Ok(accepted) => {
-                // The peer's endpoint when the transport could name one
-                // (AF_HYPERV: which partition connected), else this
-                // listener's own bound endpoint — which is all the other
-                // transports can say.
-                let endpoint = accepted.remote.unwrap_or_else(|| {
-                    state_cb
-                        .endpoint
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .unwrap_or_default()
-                });
-                fire_event(&state_cb, accepted.stream, endpoint, accepted.peer);
-                // Re-arm on a *fresh* pool stack, continuing to own `running`
-                // (`drive(.., true)`). Handing the re-arm to the pool bounds
-                // chain depth to O(1) even when completions arrive synchronously
-                // (the named-pipe `ERROR_PIPE_CONNECTED` "already connected"
-                // backlog case); `drive` itself parks the chain if it is no
-                // longer wanted.
-                let next = state_cb.clone();
-                // `comio::pool::submit`, not `windows_threading::submit`: the
-                // queued re-arm is code in this module that will run, so it is
-                // counted until it has, and the module is pinned while it does.
-                super::pool::submit(move || {
-                    let _ = drive(next, true);
-                });
-            }
-            // A named pipe was parked at its instance limit and an instance
-            // has closed: arm again, still owning `running`, exactly as after
-            // a connection -- `drive` parks the chain instead if it is no
-            // longer wanted.
-            Err(e) if e.code() == super::pipe::SLOT_FREED => {
-                let next = state_cb.clone();
-                super::pool::submit(move || {
-                    let _ = drive(next, true);
-                });
-            }
-            Err(_) => {
-                // Hard accept failure, or a cancellation from Close / the last
-                // handler being removed. Release the flag; restart only if a
-                // start was explicitly requested meanwhile (the add-races-stop
-                // handoff) — never on a bare failure, so a persistent error
-                // can't hot-spin the pool.
-                if release_running(&state_cb) {
-                    let _ = drive(state_cb, false);
-                }
-            }
-        }
-    });
 
     // Parked at a named pipe's instance limit: nothing is in flight, and
     // `on_result` re-arms once an instance closes.
-    let Some(op) = source.arm(on_result)? else {
+    let Some(op) = source.arm(AcceptSink { state: state.clone() })? else {
         return Ok(true);
     };
 

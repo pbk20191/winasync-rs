@@ -89,7 +89,7 @@ pub(crate) fn await_io(
     let handle = unsafe {
         tpio::submit(
             reg,
-            Box::new(move |ioresult: u32, bytes: usize| {
+            move |ioresult: u32, bytes: usize| {
                 let res = if ioresult == 0 || ioresult == ERROR_PIPE_CONNECTED.0 {
                     Ok(bytes)
                 } else {
@@ -103,7 +103,7 @@ pub(crate) fn await_io(
                 if let Some(w) = waker {
                     w.wake();
                 }
-            }),
+            },
             issue,
         )
     };
@@ -152,7 +152,7 @@ pub(crate) fn await_io_owning<P: Send + 'static>(
     let handle = unsafe {
         tpio::submit(
             reg,
-            Box::new(move |ioresult: u32, bytes: usize| {
+            move |ioresult: u32, bytes: usize| {
                 // Dropped here: at the real completion (whether the op ran
                 // to natural completion or was aborted by `OpHandle::cancel`
                 // and completed with `ERROR_OPERATION_ABORTED`), never
@@ -171,7 +171,7 @@ pub(crate) fn await_io_owning<P: Send + 'static>(
                 if let Some(w) = waker {
                     w.wake();
                 }
-            }),
+            },
             issue,
         )
     };

@@ -6,8 +6,8 @@
 //! binding carries what keeps its pool or port valid, and a registration
 //! drops it only after its `TP_IO` and handle are closed.
 //!
-//! The primitive is completion-callback based (`CompleteFn` + [`OpHandle`] with
-//! explicit `cancel`), which `comio` uses directly. `tp` layers its
+//! The primitive is completion-callback based (a closure stored in the op
+//! block + [`OpHandle`] with explicit `cancel`), which `comio` uses directly. `tp` layers its
 //! `Future`/drop-cancels API on top (see `tp::io`). The op block is generic over
 //! a payload `P` that the kernel may write into (buffers); it lives in the block
 //! until completion. Invariants preserved from the two cores this replaces:
@@ -276,20 +276,15 @@ pub enum Completion {
     SyncFail(windows_core::HRESULT),
 }
 
-/// Completion action, run exactly once (on the pool thread for `Done`, inline
-/// for `SyncFail`).
-pub type CompleteFn = Box<dyn FnOnce(Completion) + Send>;
-
-struct OpShared {
-    fired: bool,
-    on_complete: Option<CompleteFn>,
-}
-
 struct OpHeader {
     /// 2 at issue time: caller (`OpHandle`) + kernel/completion side.
     refs: AtomicUsize,
-    shared: Mutex<OpShared>,
-    /// Typed deallocation of the whole `Op<P>` block (header offset is
+    /// Set by whichever completion path runs, before the callback.
+    fired: Mutex<bool>,
+    /// Runs the block's completion callback: typed, like `release`, so the
+    /// callback is stored inline in the block rather than boxed.
+    complete: unsafe fn(*mut c_void, Completion),
+    /// Typed deallocation of the whole `Op<P, F>` block (header offset is
     /// P-independent thanks to `repr(C)` with OVERLAPPED first).
     release: unsafe fn(*mut c_void),
     /// Keeps the handle + TP_IO alive while the op is in flight.
@@ -298,25 +293,30 @@ struct OpHeader {
 
 /// Heap op block. `repr(C)` with OVERLAPPED first, so the completion's
 /// `overlapped` pointer *is* the block pointer and the header sits at a fixed
-/// offset for every `P`. The payload owns whatever the kernel may touch.
+/// offset for every `P` and `F`; the callback comes last, so the payload's
+/// offset does not depend on it either, and an `Op<P, ()>` is a valid view
+/// of the fields before it. The payload owns whatever the kernel may touch;
+/// the callback runs exactly once, on the pool thread for a delivered
+/// completion, inline for a synchronous failure.
 #[repr(C)]
-pub struct Op<P> {
+pub struct Op<P, F = ()> {
     overlapped: OVERLAPPED,
     header: OpHeader,
     payload: UnsafeCell<Option<P>>,
+    on_complete: UnsafeCell<Option<F>>,
 }
 
-unsafe fn release_op<P>(op: *mut c_void) {
+unsafe fn release_op<P, F>(op: *mut c_void) {
     // Release, not Relaxed, for the same reason `Arc` uses it on the way
     // down: a thread that observes this counter at zero and acts on it (see
     // `comio::unload`) must see everything this op did.
     #[cfg(any(test, feature = "counters"))]
     LIVE_OPS.fetch_sub(1, Ordering::Release);
-    unsafe { drop(Box::from_raw(op as *mut Op<P>)) }
+    unsafe { drop(Box::from_raw(op as *mut Op<P, F>)) }
 }
 
 unsafe fn release_ref(op: *mut c_void) {
-    let header = unsafe { &(*(op as *mut Op<()>)).header };
+    let header = unsafe { &(*(op as *mut Op<(), ()>)).header };
     if header.refs.fetch_sub(1, Ordering::Release) == 1 {
         std::sync::atomic::fence(Ordering::Acquire);
         let release = header.release;
@@ -344,16 +344,31 @@ unsafe extern "system" fn io_complete(
 /// `overlapped` is an op block's `OVERLAPPED` whose completion was delivered
 /// and not finished before.
 unsafe fn complete(overlapped: *mut c_void, ioresult: u32, bytes: usize) {
-    let header = unsafe { &(*(overlapped as *mut Op<()>)).header };
-    let cb = {
-        let mut s = header.shared.lock().unwrap();
-        s.fired = true;
-        s.on_complete.take()
-    };
-    if let Some(cb) = cb {
-        let _ = catch_unwind(AssertUnwindSafe(move || cb(Completion::Done(ioresult, bytes))));
+    unsafe { finish(overlapped, Completion::Done(ioresult, bytes)) }
+}
+
+/// Finishes the op at `op` with `c`: its callback, then the kernel's
+/// reference.
+///
+/// # Safety
+/// `op` is an op block that has not been finished before.
+unsafe fn finish(op: *mut c_void, c: Completion) {
+    let header = unsafe { &(*(op as *mut Op<(), ()>)).header };
+    unsafe {
+        (header.complete)(op, c);
+        release_ref(op);
     }
-    unsafe { release_ref(overlapped) };
+}
+
+/// The typed half of [`finish`]: marks the op fired and runs its callback.
+unsafe fn complete_op<P, F: FnOnce(Completion)>(op: *mut c_void, c: Completion) {
+    let op = unsafe { &*(op as *mut Op<P, F>) };
+    *op.header.fired.lock().unwrap() = true;
+    // Exactly one completion path runs per op, so the callback is this
+    // one's to take.
+    if let Some(cb) = unsafe { (*op.on_complete.get()).take() } {
+        let _ = catch_unwind(AssertUnwindSafe(move || cb(c)));
+    }
 }
 
 /// The completion key every handle of [`Binding::Port`] is
@@ -383,7 +398,7 @@ pub unsafe fn dispatch(key: usize, overlapped: *mut OVERLAPPED) -> bool {
     // what `GetOverlappedResult` makes of it.
     // The byte count is read straight from the block: on a warning such as
     // `ERROR_MORE_DATA` it is still the count the operation reported.
-    let header = unsafe { &(*(overlapped as *mut Op<()>)).header };
+    let header = unsafe { &(*(overlapped as *mut Op<(), ()>)).header };
     let bytes = unsafe { (*overlapped).InternalHigh };
     let mut ignored = 0u32;
     let ioresult = match unsafe { GetOverlappedResult(header.reg.handle, overlapped, &mut ignored, false) } {
@@ -397,7 +412,9 @@ pub unsafe fn dispatch(key: usize, overlapped: *mut OVERLAPPED) -> bool {
 /// Opaque handle to an in-flight op (for cancellation + payload retrieval).
 /// Holds the caller-side ref; dropping it releases that ref.
 pub struct OpHandle<P> {
-    op: *mut Op<P>,
+    /// The block's prefix view: everything before the callback, whose type
+    /// the handle does not know (see [`Op`]).
+    op: *mut Op<P, ()>,
 }
 
 unsafe impl<P: Send> Send for OpHandle<P> {}
@@ -406,7 +423,7 @@ impl<P> OpHandle<P> {
     /// Requests cancellation if the op has not yet fired a completion.
     pub fn cancel(&self) {
         let header = unsafe { &(*self.op).header };
-        let in_flight = !header.shared.lock().unwrap().fired;
+        let in_flight = !*header.fired.lock().unwrap();
         if in_flight {
             unsafe {
                 let _ = CancelIoEx(header.reg.handle, Some(&(*self.op).overlapped));
@@ -416,7 +433,7 @@ impl<P> OpHandle<P> {
 
     /// Whether a completion has fired.
     pub fn fired(&self) -> bool {
-        unsafe { (*self.op).header.shared.lock().unwrap().fired }
+        unsafe { *(*self.op).header.fired.lock().unwrap() }
     }
 
     /// Takes the payload out of the op block.
@@ -444,24 +461,23 @@ impl<P> Drop for OpHandle<P> {
 /// provided OVERLAPPED pointer and classify truthfully: `Failed` when a
 /// completion is still coming is a use-after-free; `Pending` when none is coming
 /// leaks the block and unbalances the TP_IO.
-pub unsafe fn submit<P>(
+pub unsafe fn submit<P, F: FnOnce(Completion) + Send + 'static>(
     reg: &Arc<IoReg>,
     payload: P,
-    on_complete: CompleteFn,
+    on_complete: F,
     issue: impl FnOnce(*mut OVERLAPPED, &mut P) -> Issue,
 ) -> OpHandle<P> {
     let op = Box::into_raw(Box::new(Op {
         overlapped: unsafe { mem::zeroed() },
         header: OpHeader {
             refs: AtomicUsize::new(2),
-            shared: Mutex::new(OpShared {
-                fired: false,
-                on_complete: Some(on_complete),
-            }),
-            release: release_op::<P>,
+            fired: Mutex::new(false),
+            complete: complete_op::<P, F>,
+            release: release_op::<P, F>,
             reg: reg.clone(),
         },
         payload: UnsafeCell::new(Some(payload)),
+        on_complete: UnsafeCell::new(Some(on_complete)),
     }));
     #[cfg(any(test, feature = "counters"))]
     LIVE_OPS.fetch_add(1, Ordering::Relaxed);
@@ -501,16 +517,10 @@ pub unsafe fn submit<P>(
             if let Some(io) = reg.io {
                 CancelThreadpoolIo(io);
             }
-            let cb = {
-                let mut s = (*op).header.shared.lock().unwrap();
-                s.fired = true;
-                s.on_complete.take()
-            };
-            if let Some(cb) = cb {
-                let _ = catch_unwind(AssertUnwindSafe(move || cb(completion)));
-            }
-            release_ref(op as *mut c_void);
+            finish(op as *mut c_void, completion);
         }
     }
-    OpHandle { op }
+    OpHandle {
+        op: op as *mut Op<P, ()>,
+    }
 }

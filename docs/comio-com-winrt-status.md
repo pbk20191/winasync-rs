@@ -1055,6 +1055,31 @@ tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
 - `dyn`은 등록 경로에서 모두 빠졌다. 특수화는 검토했으나 안정 Rust에 없고, 타입 파라미터로 대신하면 `Arc<IoReg>`를
   담는 모든 스트림 타입이 제네릭이 되는 데 비해 얻는 게 등록 시 한 번의 `match`뿐이라 닫힌 enum으로 두었다.
 
+### `dyn` 전수 검토 (2026-11-11)
+
+제거한 것 — 모두 "닫힌 집합"이거나 "제네릭이 흡수"할 수 있던 자리다.
+
+- **op 블록의 완료 콜백** (`common::overlapped::CompleteFn`, `Box<dyn FnOnce(Completion)>`): 블록이 이미 페이로드
+  `P`에 대해 제네릭이었으므로 콜백 `F`도 블록 안에 인라인으로 둔다(`Op<P, F>`, 헤더에 `release`처럼 타입별
+  `complete` 함수 포인터). `OpHandle<P>`는 콜백 앞까지의 접두 뷰(`Op<P, ()>`)를 들고 있다 — `repr(C)`에서 앞 필드의
+  오프셋은 뒤 필드에 영향받지 않는다. **작업당 힙 할당이 하나 줄었다** (tp·comio·http 공통).
+- comio `tpio::submit`·`pool::submit`/`submit_after`: 콜백을 제네릭으로. 호출부 11곳의 `Box::new(move |ioresult…)`가
+  사라졌다.
+- comio `AcceptSource` trait object → 전송 3종의 enum. 콜백 `Box<dyn FnOnce(Result<Accepted>)>`는 구체 타입
+  `AcceptSink { state }`(accept 체인의 한 걸음, `deliver`)로, connect 쪽은 `ConnectSink(ComObject<ConnectOp>)`로.
+- `common::pipe::SlotWaiter` → enum `Signal(oneshot::Sender<bool>) | Accept(comio::pipe::ParkedAccept)`.
+- rio `CompleteFn` → `Finish::Plain(tx) | Addressed { tx, addr }`. 여기도 작업당 Box 하나가 없어졌다.
+- `RawBuf`/ioring 테이블의 `dyn Any`는 downcast하는 곳이 없었으므로 `dyn Send(+Sync)`로 — 뜻만 남겼다.
+
+남긴 것과 이유 — 전부 타입을 지우는 것 자체가 목적인 자리다.
+- 실행기(tp `ErasedTask`, dq `TaskObj`, dq의 root future): 서로 다른 Future를 한 테이블에 넣는다.
+- `JoinError::Panicked(Box<dyn Any>)`: `catch_unwind`가 주는 그대로.
+- `RawBuf._keeper`, ioring 등록 테이블의 `_keep`: 사용자 타입이 소유하는 메모리/핸들을 ring이 "살려만" 둔다.
+  제네릭으로 바꾸면 `RawBuf<K>`가 모든 소비자에게 번진다.
+- `tp::io::async_rw::DynIoFut`: `AsyncRead` 어댑터가 진행 중인 Future를 필드에 둬야 하는데 `impl Future` 반환형은
+  이름이 없다(TAIT 없음).
+- `TransmitPackets`의 `Elem::Mem(Box<dyn IoBuf>)`: 원소마다 다른 버퍼 타입을 섞는 것이 API의 뜻.
+
 - 아직 없는 것: HTTPS(인증서 바인딩은 `HttpSetServiceConfiguration`, 관리자 필요), Windows 인증
   (`HttpServerAuthenticationProperty`), 이름 있는 요청 큐(프로세스 간 공유), 응답 캐시.
 

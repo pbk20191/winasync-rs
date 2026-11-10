@@ -197,14 +197,23 @@ fn new_op() -> ComObject<ConnectOp> {
     ))
 }
 
+/// Where an armed connect delivers its one result: the operation handed to
+/// the caller.
+pub(crate) struct ConnectSink(ComObject<ConnectOp>);
+
+impl ConnectSink {
+    pub(crate) fn deliver(self, res: Result<ITransportStream>) {
+        self.0.complete(res);
+    }
+}
+
 /// Builds an operation and arms `start`, which must deliver exactly one
-/// result through the callback it is given.
+/// result through the sink it is given.
 pub(crate) fn connect_op(
-    start: impl FnOnce(Box<dyn FnOnce(Result<ITransportStream>) + Send>) -> Result<OpHandle>,
+    start: impl FnOnce(ConnectSink) -> Result<OpHandle>,
 ) -> IAsyncOperation<ITransportStream> {
     let op = new_op();
-    let sink = op.clone();
-    match start(Box::new(move |res| sink.complete(res))) {
+    match start(ConnectSink(op.clone())) {
         Ok(handle) => {
             op.0.lock().unwrap().op = Some(handle);
             op.to_interface()

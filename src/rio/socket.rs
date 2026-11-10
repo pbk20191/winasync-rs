@@ -25,11 +25,9 @@ use windows::Win32::Networking::WinSock::{
 };
 
 use super::buffer::RioSlice;
-use crate::common::sockaddr::read_sockaddr;
-use super::cq::{CompleteFn, RioCq};
+use super::cq::RioCq;
 use super::rq::{
-    bind_socket, new_rio_socket, resolve, status_to_result, RequestQueue, RqConfig,
-    WSAENOBUFS_HRESULT,
+    bind_socket, new_rio_socket, resolve, Finish, RequestQueue, RqConfig, WSAENOBUFS_HRESULT,
 };
 use crate::common::winsock::sock_check;
 use crate::common::oneshot;
@@ -270,29 +268,9 @@ impl RioUdpSocket {
         let addr_buf = addr_slice.rio_buf();
         let data_buf = slice.rio_buf();
 
-        // The closure owns the address slice: by the time it runs, the kernel
-        // has finished with the buffer, so reading the peer here is sound and
-        // the slot returns to the pool on the way out.
-        let complete: CompleteFn = Box::new(move |status, bytes, data| {
-            let result = if status == 0 {
-                let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        addr_slice.as_ptr(),
-                        &mut storage as *mut _ as *mut u8,
-                        size_of::<SOCKADDR_INET>(),
-                    );
-                }
-                read_sockaddr(&storage).map(|a| (bytes as usize, a))
-            } else {
-                Err(status_to_result(status, bytes).unwrap_err())
-            };
-            drop(addr_slice);
-            let _ = tx.send((result, data));
-        });
-
+        let finish = Finish::Addressed { tx, addr: addr_slice };
         self.rq
-            .post_ex(&data_buf, &addr_buf, dest.is_some(), slice, complete)?;
+            .post_ex(&data_buf, &addr_buf, dest.is_some(), slice, finish)?;
 
         Ok(async move { resolve(rx).await })
     }

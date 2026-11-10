@@ -342,7 +342,7 @@ pub struct RawBuf {
     ptr: *mut u8,
     len: usize,
     total: usize,
-    _keeper: Box<dyn core::any::Any + Send>,
+    _keeper: Box<dyn Send>,
 }
 
 // The constructor's contract makes the memory usable from any thread.
@@ -364,7 +364,7 @@ impl RawBuf {
         ptr: *mut u8,
         len: usize,
         total: usize,
-        keeper: impl core::any::Any + Send,
+        keeper: impl Send + 'static,
     ) -> Self {
         assert!(len <= total, "len {len} > total {total}");
         Self {

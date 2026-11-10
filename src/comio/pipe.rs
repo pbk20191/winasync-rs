@@ -37,6 +37,26 @@ use windows_core::{Error, Result, HRESULT, HSTRING};
 /// `ConnectNamedPipe` itself never completes with it.
 pub(crate) const SLOT_FREED: HRESULT = HRESULT(0x800700E7u32 as i32);
 
+/// An accept parked at the instance limit, shared with the arm that parked
+/// it: whichever runs first -- an instance closing, or the completion of an
+/// instance that turned up after all -- takes the sink.
+pub(crate) struct ParkedAccept(Arc<Mutex<Option<super::listener::AcceptSink>>>);
+
+impl ParkedAccept {
+    /// An instance closed (`freed`), or the server is gone: the chain is
+    /// told to arm again, or to stop.
+    pub(crate) fn wake(self, freed: bool) {
+        if let Some(on_result) = self.0.lock().unwrap().take() {
+            let code = if freed {
+                SLOT_FREED
+            } else {
+                ERROR_OPERATION_ABORTED.to_hresult()
+            };
+            on_result.deliver(Err(Error::from_hresult(code)));
+        }
+    }
+}
+
 /// Registers a created instance, handing its count to the registration so it
 /// outlives the handle.
 fn register(instance: Instance) -> Result<Arc<IoReg>> {
@@ -67,10 +87,7 @@ impl NamedPipeListener {
     pub async fn accept(&self) -> Result<ITransportStream> {
         let instance = loop {
             let (freed, slot) = crate::common::oneshot::channel::<bool>();
-            let waiter: SlotWaiter = Box::new(move |closed_one| {
-                let _ = freed.send(closed_one);
-            });
-            match self.server.instance_or_wait(waiter)? {
+            match self.server.instance_or_wait(SlotWaiter::Signal(freed))? {
                 Slot::Ready(instance) => break instance,
                 Slot::Wait => {
                     if slot.await != Ok(true) {
@@ -160,28 +177,18 @@ impl NamedPipeListener {
 /// next listening instance before handing the connected one on.
 pub(crate) fn arm_accept(
     server: &Arc<PipeServer>,
-    on_result: Box<dyn FnOnce(Result<super::listener::Accepted>) + Send>,
+    on_result: super::listener::AcceptSink,
 ) -> Result<Option<OpHandle>> {
     // Shared by the slot waiter and the completion; whichever runs takes it.
     let on_result = Arc::new(Mutex::new(Some(on_result)));
-    let parked = on_result.clone();
-    let waiter: SlotWaiter = Box::new(move |freed| {
-        if let Some(on_result) = parked.lock().unwrap().take() {
-            let code = if freed {
-                SLOT_FREED
-            } else {
-                ERROR_OPERATION_ABORTED.to_hresult()
-            };
-            on_result(Err(Error::from_hresult(code)));
-        }
-    });
+    let waiter = SlotWaiter::Accept(ParkedAccept(on_result.clone()));
     let instance = match server.instance_or_wait(waiter)? {
         Slot::Ready(instance) => instance,
         Slot::Wait => return Ok(None),
         Slot::Retry => {
             super::pool::submit_after(server::RETRY_AFTER, move || {
                 if let Some(on_result) = on_result.lock().unwrap().take() {
-                    on_result(Err(Error::from_hresult(SLOT_FREED)));
+                    on_result.deliver(Err(Error::from_hresult(SLOT_FREED)));
                 }
             });
             return Ok(None);
@@ -195,7 +202,7 @@ pub(crate) fn arm_accept(
     let op = unsafe {
         tpio::submit(
             &reg,
-            Box::new(move |ioresult: u32, _bytes: usize| {
+            move |ioresult: u32, _bytes: usize| {
                 // Whatever happened, this instance is about to leave the
                 // listening pool -- handed on as a stream, or closed after a
                 // failure or a cancellation -- so the next one is made first,
@@ -215,9 +222,9 @@ pub(crate) fn arm_accept(
                     Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                 };
                 if let Some(on_result) = on_result.lock().unwrap().take() {
-                    on_result(res);
+                    on_result.deliver(res);
                 }
-            }),
+            },
             move |ovl| match ConnectNamedPipe(handle, Some(ovl)) {
                 Ok(()) => Issue::SyncSuccess,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
