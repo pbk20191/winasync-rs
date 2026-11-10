@@ -61,7 +61,7 @@ impl UdpSocket {
     /// codes that wait for something (`SIO_ADDRESS_LIST_CHANGE`,
     /// `SIO_ROUTING_INTERFACE_CHANGE`) resolve when it happens, and dropping
     /// the future cancels them.
-    pub fn ioctl<I: IoBuf, O: IoBufMut>(
+    pub fn ioctl<I: IoBuf + 'static, O: IoBufMut + 'static>(
         &self,
         code: u32,
         input: I,
@@ -132,7 +132,7 @@ impl UdpSocket {
 
     /// Sends `buf` as one datagram to `addr`; resolves to the byte count and
     /// hands the buffer back.
-    pub fn send_to<B: IoBuf>(
+    pub fn send_to<B: IoBuf + 'static>(
         &self,
         buf: B,
         addr: SocketAddr,
@@ -171,7 +171,7 @@ impl UdpSocket {
     /// A datagram larger than `buf` is truncated to `buf.len()` and the op fails
     /// with `WSAEMSGSIZE` (the Windows semantics for an oversized datagram); the
     /// partial bytes are discarded. Size `buf` to the largest datagram expected.
-    pub fn recv_from<B: IoBufMut>(
+    pub fn recv_from<B: IoBufMut + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, B)> + Send + use<B> {
@@ -220,7 +220,7 @@ impl UdpSocket {
     /// Scatter-receives one datagram into `bufs` with a vectored `WSARecvFrom`;
     /// resolves to the byte count plus the source address, and hands the buffers
     /// back. Truncation still fails with `WSAEMSGSIZE`.
-    pub fn recv_from_vectored<B: IoBufMut>(
+    pub fn recv_from_vectored<B: IoBufMut + 'static>(
         &self,
         bufs: Vec<B>,
     ) -> impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, Vec<B>)> + Send + use<B>
@@ -265,7 +265,7 @@ impl UdpSocket {
 
     /// Gather-sends `bufs` as **one** datagram to `addr` with a vectored
     /// `WSASendTo`; resolves to the byte count and hands the buffers back.
-    pub fn send_to_vectored<B: IoBuf>(
+    pub fn send_to_vectored<B: IoBuf + 'static>(
         &self,
         bufs: Vec<B>,
         addr: SocketAddr,
@@ -317,7 +317,7 @@ impl UdpSocket {
     /// Sends `buf` as one datagram to the connected peer (see
     /// [`connect`](Self::connect)); resolves to the byte count and hands the
     /// buffer back.
-    pub fn send<B: IoBuf>(
+    pub fn send<B: IoBuf + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -338,10 +338,40 @@ impl UdpSocket {
         }
     }
 
+    /// [`send`](Self::send), with a buffer that need not be `'static`:
+    /// a borrowed `&[u8]` included. See
+    /// [borrowed buffers](crate::common::buffer::IoBuf#borrowed-buffers).
+    ///
+    /// The operation completes through an event rather than the pool's
+    /// completion port, and dropping the future before it finishes cancels
+    /// it and waits for that event -- so the borrow cannot end while the
+    /// kernel still uses the buffer, and the wait needs no pool thread.
+    ///
+    /// # Safety
+    /// The future must be dropped or run to completion -- never forgotten or
+    /// leaked: not `mem::forget`, not a reference cycle, not `Box::leak`, not
+    /// an executor that frees tasks without dropping them. A future that
+    /// disappears without its `Drop` running leaves the kernel reading from
+    /// memory the borrow has already given back.
+    pub unsafe fn send_unchecked<B: IoBuf>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let sock = self.res.socket().0;
+        super::super::evented(&self.res, buf, move |mem, buf| unsafe {
+            let wsabuf = WSABUF {
+                len: IoBuf::len(buf) as u32,
+                buf: windows_core::PSTR(buf.stable_ptr() as *mut u8),
+            };
+            let r = WSASend(SOCKET(sock), &[wsabuf], None, 0, Some(&mut mem.ovl), None);
+            classify_wsa_overlapped(r == 0)
+        })
+    }
+
     /// Receives one datagram from the connected peer into `buf`; resolves to the
     /// byte count and hands the buffer back. Truncation fails with `WSAEMSGSIZE`
     /// (see [`recv_from`](Self::recv_from)).
-    pub fn recv<B: IoBufMut>(
+    pub fn recv<B: IoBufMut + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -362,6 +392,41 @@ impl UdpSocket {
                 let n = result.as_ref().ok().copied();
                 (result, crate::common::buffer::mark_read(n, payload.buf))
             }
+        }
+    }
+
+    /// [`recv`](Self::recv), with a buffer that need not be `'static`:
+    /// a borrowed `&mut [u8]` included. See
+    /// [borrowed buffers](crate::common::buffer::IoBuf#borrowed-buffers).
+    ///
+    /// The operation completes through an event rather than the pool's
+    /// completion port, and dropping the future before it finishes cancels
+    /// it and waits for that event -- so the borrow cannot end while the
+    /// kernel still uses the buffer, and the wait needs no pool thread.
+    ///
+    /// # Safety
+    /// The future must be dropped or run to completion -- never forgotten or
+    /// leaked: not `mem::forget`, not a reference cycle, not `Box::leak`, not
+    /// an executor that frees tasks without dropping them. A future that
+    /// disappears without its `Drop` running leaves the kernel writing into
+    /// memory the borrow has already given back.
+    pub unsafe fn recv_unchecked<B: IoBufMut>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let sock = self.res.socket().0;
+        let fut = super::super::evented(&self.res, buf, move |mem, buf| unsafe {
+            let wsabuf = WSABUF {
+                len: IoBuf::bytes_total(buf) as u32,
+                buf: windows_core::PSTR(buf.stable_mut_ptr()),
+            };
+            let r = WSARecv(SOCKET(sock), &[wsabuf], None, &mut mem.flags, Some(&mut mem.ovl), None);
+            classify_wsa_overlapped(r == 0)
+        });
+        async move {
+            let (result, buf) = fut.await;
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, buf))
         }
     }
 }

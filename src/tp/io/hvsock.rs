@@ -76,7 +76,7 @@ impl HvStream {
     /// codes that wait for something (`SIO_ADDRESS_LIST_CHANGE`,
     /// `SIO_ROUTING_INTERFACE_CHANGE`) resolve when it happens, and dropping
     /// the future cancels them.
-    pub fn ioctl<I: IoBuf, O: IoBufMut>(
+    pub fn ioctl<I: IoBuf + 'static, O: IoBufMut + 'static>(
         &self,
         code: u32,
         input: I,
@@ -178,7 +178,7 @@ impl HvStream {
     }
 
     /// Receives into `buf`; resolves to the byte count (0 = peer closed).
-    pub fn read<B: IoBufMut>(
+    pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -203,7 +203,7 @@ impl HvStream {
     }
 
     /// Sends `buf`; resolves to the byte count.
-    pub fn write<B: IoBuf>(
+    pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -222,7 +222,7 @@ impl HvStream {
     }
 
     /// Scatter-reads into `bufs` with one vectored `WSARecv`.
-    pub fn read_vectored<B: IoBufMut>(
+    pub fn read_vectored<B: IoBufMut + 'static>(
         &self,
         bufs: Vec<B>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
@@ -244,7 +244,7 @@ impl HvStream {
     }
 
     /// Gather-writes `bufs` with one vectored `WSASend`.
-    pub fn write_vectored<B: IoBuf>(
+    pub fn write_vectored<B: IoBuf + 'static>(
         &self,
         bufs: Vec<B>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
@@ -280,7 +280,7 @@ impl HvListener {
     /// codes that wait for something (`SIO_ADDRESS_LIST_CHANGE`,
     /// `SIO_ROUTING_INTERFACE_CHANGE`) resolve when it happens, and dropping
     /// the future cancels them.
-    pub fn ioctl<I: IoBuf, O: IoBufMut>(
+    pub fn ioctl<I: IoBuf + 'static, O: IoBufMut + 'static>(
         &self,
         code: u32,
         input: I,

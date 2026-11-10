@@ -70,7 +70,7 @@ impl NamedPipeStream {
     /// longer than `buf` arrives over several reads with nothing to say where
     /// it ends. Use [`read_message`](Self::read_message) to keep the
     /// boundaries.
-    pub fn read<B: IoBufMut>(
+    pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -78,6 +78,43 @@ impl NamedPipeStream {
         async move {
             let (result, buf) = part.await;
             let result = result.map(|(n, _more)| n);
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, buf))
+        }
+    }
+
+    /// [`read`](Self::read), with a buffer that need not be `'static`:
+    /// a borrowed `&mut [u8]` included. See
+    /// [borrowed buffers](crate::common::buffer::IoBuf#borrowed-buffers).
+    ///
+    /// The operation completes through an event rather than the pool's
+    /// completion port, and dropping the future before it finishes cancels
+    /// it and waits for that event -- so the borrow cannot end while the
+    /// kernel still uses the buffer, and the wait needs no pool thread.
+    ///
+    /// # Safety
+    /// The future must be dropped or run to completion -- never forgotten or
+    /// leaked: not `mem::forget`, not a reference cycle, not `Box::leak`, not
+    /// an executor that frees tasks without dropping them. A future that
+    /// disappears without its `Drop` running leaves the kernel writing into
+    /// memory the borrow has already given back.
+    pub unsafe fn read_unchecked<B: IoBufMut>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let handle = self.res.handle.0 as usize;
+        let fut = super::evented(&self.res, buf, move |mem, buf| unsafe {
+            let slice =
+                core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::bytes_total(buf));
+            super::classify_file(ReadFile(
+                windows::Win32::Foundation::HANDLE(handle as *mut core::ffi::c_void),
+                Some(slice),
+                None,
+                Some(&mut mem.ovl),
+            ))
+        });
+        async move {
+            let (result, buf) = fut.await;
             let n = result.as_ref().ok().copied();
             (result, crate::common::buffer::mark_read(n, buf))
         }
@@ -130,7 +167,7 @@ impl NamedPipeStream {
     /// A message too long for `buf` is read to its end and discarded, as in
     /// [`read_message`](Self::read_message), and this fails with
     /// `ERROR_MORE_DATA` -- `buf` then holds its first part.
-    pub async fn read_message_into<B: IoBufMut>(&self, buf: B) -> (windows_core::Result<usize>, B) {
+    pub async fn read_message_into<B: IoBufMut + 'static>(&self, buf: B) -> (windows_core::Result<usize>, B) {
         if let Err(e) = self.message_mode() {
             return (Err(e), buf);
         }
@@ -151,7 +188,7 @@ impl NamedPipeStream {
     ///
     /// Allocates the reply; [`transact_into`](Self::transact_into) reads it
     /// into a buffer of the caller's.
-    pub async fn transact<I: IoBuf>(
+    pub async fn transact<I: IoBuf + 'static>(
         &self,
         request: I,
         max_response: usize,
@@ -167,7 +204,7 @@ impl NamedPipeStream {
     /// must have room for it; resolves to the reply's length and hands both
     /// buffers back. A reply too long for `reply` is discarded as in
     /// [`read_message_into`](Self::read_message_into).
-    pub async fn transact_into<I: IoBuf, O: IoBufMut>(
+    pub async fn transact_into<I: IoBuf + 'static, O: IoBufMut + 'static>(
         &self,
         request: I,
         reply: O,
@@ -292,7 +329,7 @@ impl NamedPipeStream {
     /// Writes `buf`; resolves to the byte count and hands the buffer back.
     ///
     /// On a message-mode pipe each write is one message.
-    pub fn write<B: IoBuf>(
+    pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -308,6 +345,37 @@ impl NamedPipeStream {
                 }
             })
         }
+    }
+
+    /// [`write`](Self::write), with a buffer that need not be `'static`:
+    /// a borrowed `&[u8]` included. See
+    /// [borrowed buffers](crate::common::buffer::IoBuf#borrowed-buffers).
+    ///
+    /// The operation completes through an event rather than the pool's
+    /// completion port, and dropping the future before it finishes cancels
+    /// it and waits for that event -- so the borrow cannot end while the
+    /// kernel still uses the buffer, and the wait needs no pool thread.
+    ///
+    /// # Safety
+    /// The future must be dropped or run to completion -- never forgotten or
+    /// leaked: not `mem::forget`, not a reference cycle, not `Box::leak`, not
+    /// an executor that frees tasks without dropping them. A future that
+    /// disappears without its `Drop` running leaves the kernel reading from
+    /// memory the borrow has already given back.
+    pub unsafe fn write_unchecked<B: IoBuf>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let handle = self.res.handle.0 as usize;
+        super::evented(&self.res, buf, move |mem, buf| unsafe {
+            let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
+            super::classify_file(WriteFile(
+                windows::Win32::Foundation::HANDLE(handle as *mut core::ffi::c_void),
+                Some(slice),
+                None,
+                Some(&mut mem.ovl),
+            ))
+        })
     }
 }
 
@@ -471,7 +539,7 @@ impl NamedPipeConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{block_on, Runtime};
+    use super::super::super::{block_on, timeout, Runtime};
     use super::*;
 
     #[test]
@@ -1177,5 +1245,111 @@ mod tests {
         assert_eq!(reply, b"SHOUT");
         drop(client);
         server.join().unwrap();
+    }
+
+    /// Borrowed buffers both ways: a stack array in, a slice out.
+    #[test]
+    fn unchecked_ops_take_borrowed_buffers() {
+        let rt = Runtime::new();
+        let (server, client) = byte_pair(&rt);
+        let request = *b"borrowed";
+        let mut reply = [0u8; 16];
+        // SAFETY: each future is awaited to completion right here.
+        let (n, _) = block_on(unsafe { client.write_unchecked(&request[..]) });
+        assert_eq!(n.unwrap(), 8);
+        let (n, _) = block_on(unsafe { server.read_unchecked(&mut reply[..]) });
+        assert_eq!(&reply[..n.unwrap()], b"borrowed");
+    }
+
+    /// The point of the waiting drop: once a cancelled read's future is gone,
+    /// the kernel no longer writes into the buffer -- data that arrives later
+    /// is left in the pipe for the next read, and the buffer keeps what the
+    /// caller put there.
+    #[test]
+    fn a_dropped_unchecked_read_lets_go_of_the_buffer() {
+        let rt = Runtime::new();
+        let (server, client) = byte_pair(&rt);
+        let mut buf = [0u8; 16];
+        // SAFETY: the future is dropped by the timeout, never forgotten.
+        let timed_out = block_on(timeout(
+            &rt,
+            std::time::Duration::from_millis(100),
+            unsafe { server.read_unchecked(&mut buf[..]) },
+        ))
+        .is_err();
+        assert!(timed_out);
+        buf.fill(0xAA);
+        block_on(client.write(b"late".to_vec())).0.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(buf.iter().all(|&b| b == 0xAA), "the kernel wrote after the drop: {buf:?}");
+        let (n, got) = block_on(server.read(Vec::with_capacity(16)));
+        assert_eq!(&got[..n.unwrap()], b"late", "the late data was lost");
+    }
+
+    /// Dropping on the pool's only thread does not deadlock: the drop waits
+    /// on the operation's status, not on a callback that thread would have
+    /// to run.
+    #[test]
+    fn a_dropped_unchecked_read_does_not_need_a_pool_thread() {
+        let rt = crate::tp::PoolBuilder::new().thread_limits(1, 1).build_runtime();
+        let (server, _client) = byte_pair(&rt);
+        let (done, finished) = std::sync::mpsc::channel();
+        let rt2 = rt.clone();
+        let task = rt.spawn(async move {
+            let mut buf = [0u8; 16];
+            // SAFETY: dropped by the timeout, inside this task.
+            let r = timeout(&rt2, std::time::Duration::from_millis(50), unsafe {
+                server.read_unchecked(&mut buf[..])
+            })
+            .await;
+            r.is_err()
+        });
+        std::thread::spawn(move || {
+            let _ = done.send(block_on(task));
+        });
+        let timed_out = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deadlocked dropping an unchecked read on a one-thread pool");
+        assert!(timed_out.unwrap());
+    }
+
+    /// Cancellation racing completion, many times over: whatever wins, the
+    /// drop returns, and no operation is left behind.
+    #[test]
+    fn unchecked_drops_race_completions_cleanly() {
+        let rt = Runtime::new();
+        let (server, client) = byte_pair(&rt);
+        let writer = std::thread::spawn(move || {
+            for i in 0..300u32 {
+                block_on(client.write(vec![i as u8])).0.unwrap();
+                if i % 7 == 0 {
+                    std::thread::yield_now();
+                }
+            }
+            client
+        });
+        let mut got = 0usize;
+        for i in 0..2000u32 {
+            let mut buf = [0u8; 4];
+            let wait = std::time::Duration::from_micros(u64::from(i % 5) * 200);
+            // SAFETY: dropped by the timeout or completed, never forgotten.
+            if let Ok((n, _)) = block_on(timeout(&rt, wait, unsafe { server.read_unchecked(&mut buf[..]) })) {
+                got += n.unwrap();
+            }
+            if got >= 300 {
+                break;
+            }
+        }
+        let client = writer.join().unwrap();
+        drop(client);
+        // Whatever was left unread arrives now.
+        loop {
+            let (n, _) = block_on(server.read(Vec::with_capacity(512)));
+            match n {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+        }
+        assert_eq!(got, 300, "bytes were lost or duplicated across cancelled reads");
     }
 }

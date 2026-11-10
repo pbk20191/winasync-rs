@@ -31,11 +31,13 @@
 //! `Vec::with_capacity(n)` is a read buffer that was never zeroed, and its
 //! length is set to what arrived ([`IoBufMut::set_init`]).
 //!
-//! What is *not* possible is a borrowed `&mut [u8]`. Dropping a future can
-//! cancel the I/O, but forgetting one is safe Rust and cancels nothing, so a
-//! borrow could end while the kernel still writes through it. A caller with
-//! only a borrow reads into an owned buffer and copies; `tp::io::async_rw`
-//! does exactly that for `futures-io`.
+//! A borrowed `&mut [u8]` is a buffer too, but only for the `unsafe`
+//! `*_unchecked` operations. Dropping a future can cancel the I/O, but
+//! forgetting one is safe Rust and cancels nothing, so a borrow could end
+//! while the kernel still writes through it; those operations make the
+//! caller promise not to. See [`IoBuf`]'s "Borrowed buffers". Without the
+//! promise, read into an owned buffer and copy -- what `tp::io::async_rw`
+//! does for `futures-io`.
 //!
 //! # What this does and does not buy
 //!
@@ -75,6 +77,17 @@ use windows::Win32::System::Memory::{
 /// `Vec` includes capacity beyond its length, so a read needs no zeroed
 /// buffer to land in. [`IoBufMut::set_init`] then says how much it filled.
 ///
+/// # Borrowed buffers
+///
+/// The trait does not require `'static`, so `&'a mut [u8]` is a buffer too.
+/// Every safe operation in this crate asks for `B: IoBuf + 'static` -- an
+/// owned buffer moves into the operation and outlives it whatever happens to
+/// the future. A borrowed one does not: a future can be forgotten, which is
+/// safe and cancels nothing, and the borrow would end while the kernel still
+/// writes through it. So borrowed buffers go only to the `*_unchecked`
+/// operations, which are `unsafe` for exactly that, and whose futures wait
+/// for the kernel when dropped.
+///
 /// # Safety
 /// [`stable_ptr`](Self::stable_ptr) must keep returning the same address, and
 /// that address must stay valid and allocated, for as long as the value
@@ -83,7 +96,7 @@ use windows::Win32::System::Memory::{
 ///
 /// [`len`](Self::len) bytes starting there must be readable, and
 /// [`bytes_total`](Self::bytes_total) must be at least `len`.
-pub unsafe trait IoBuf: Send + 'static {
+pub unsafe trait IoBuf: Send {
     /// The address the kernel will read from or write to.
     fn stable_ptr(&self) -> *const u8;
 
@@ -263,8 +276,10 @@ unsafe impl IoBuf for std::sync::Arc<Vec<u8>> {
     }
 }
 
-/// Memory that is never freed: a `static`, or a leaked allocation.
-unsafe impl IoBuf for &'static [u8] {
+/// A borrow. With `'static` -- a `static`, a leaked allocation -- any
+/// operation takes it; with a shorter lifetime, only the `unsafe`
+/// `*_unchecked` ones (see the trait docs).
+unsafe impl IoBuf for &[u8] {
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
@@ -273,7 +288,7 @@ unsafe impl IoBuf for &'static [u8] {
     }
 }
 
-unsafe impl IoBuf for &'static mut [u8] {
+unsafe impl IoBuf for &mut [u8] {
     fn stable_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
@@ -282,7 +297,7 @@ unsafe impl IoBuf for &'static mut [u8] {
     }
 }
 
-unsafe impl IoBufMut for &'static mut [u8] {
+unsafe impl IoBufMut for &mut [u8] {
     fn stable_mut_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()
     }

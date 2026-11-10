@@ -92,7 +92,7 @@ impl SerialPort {
 
     /// Reads into `buf`, as the timeouts decide; resolves to the byte count
     /// and hands the buffer back.
-    pub fn read<B: IoBufMut>(
+    pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -112,7 +112,7 @@ impl SerialPort {
     }
 
     /// Writes `buf`; resolves to the byte count and hands the buffer back.
-    pub fn write<B: IoBuf>(
+    pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {

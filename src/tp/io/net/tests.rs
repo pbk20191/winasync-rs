@@ -1115,3 +1115,43 @@
             "the cancelled ioctl leaked its op"
         );
     }
+
+    /// Borrowed buffers over TCP and connected UDP, and a dropped TCP read
+    /// that leaves late data for the next read instead of writing it into a
+    /// buffer the caller has taken back.
+    #[test]
+    fn unchecked_socket_ops_take_borrowed_buffers() {
+        let rt = Runtime::new();
+        let listener =
+            TcpListener::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || block_on(listener.accept()).unwrap());
+        let client = block_on(TcpStream::connect(&rt, addr)).unwrap();
+        let server = server.join().unwrap();
+
+        let mut buf = [0u8; 16];
+        // SAFETY: dropped by the timeout, never forgotten.
+        let timed_out =
+            block_on(timeout(&rt, Duration::from_millis(100), unsafe { server.read_unchecked(&mut buf[..]) }))
+                .is_err();
+        assert!(timed_out);
+        buf.fill(0xAA);
+        let hello = *b"hello";
+        // SAFETY: awaited to completion.
+        block_on(unsafe { client.write_unchecked(&hello[..]) }).0.unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(buf.iter().all(|&b| b == 0xAA), "the kernel wrote after the drop");
+        // SAFETY: awaited to completion.
+        let (n, _) = block_on(unsafe { server.read_unchecked(&mut buf[..]) });
+        assert_eq!(&buf[..n.unwrap()], b"hello");
+
+        let a = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let b = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+        a.connect(b.local_addr().unwrap()).unwrap();
+        b.connect(a.local_addr().unwrap()).unwrap();
+        let mut got = [0u8; 8];
+        // SAFETY: both awaited to completion.
+        block_on(unsafe { a.send_unchecked(&b"dgram"[..]) }).0.unwrap();
+        let (n, _) = block_on(unsafe { b.recv_unchecked(&mut got[..]) });
+        assert_eq!(&got[..n.unwrap()], b"dgram");
+    }

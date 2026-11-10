@@ -27,7 +27,7 @@ impl TcpListener {
     /// codes that wait for something (`SIO_ADDRESS_LIST_CHANGE`,
     /// `SIO_ROUTING_INTERFACE_CHANGE`) resolve when it happens, and dropping
     /// the future cancels them.
-    pub fn ioctl<I: IoBuf, O: IoBufMut>(
+    pub fn ioctl<I: IoBuf + 'static, O: IoBufMut + 'static>(
         &self,
         code: u32,
         input: I,
@@ -262,7 +262,7 @@ impl TcpStream {
     /// codes that wait for something (`SIO_ADDRESS_LIST_CHANGE`,
     /// `SIO_ROUTING_INTERFACE_CHANGE`) resolve when it happens, and dropping
     /// the future cancels them.
-    pub fn ioctl<I: IoBuf, O: IoBufMut>(
+    pub fn ioctl<I: IoBuf + 'static, O: IoBufMut + 'static>(
         &self,
         code: u32,
         input: I,
@@ -339,7 +339,7 @@ impl TcpStream {
 
     /// Receives into `buf`; resolves to the byte count (0 = peer closed) and
     /// hands the buffer back.
-    pub fn read<B: IoBufMut>(
+    pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -363,8 +363,43 @@ impl TcpStream {
         }
     }
 
+    /// [`read`](Self::read), with a buffer that need not be `'static`:
+    /// a borrowed `&mut [u8]` included. See
+    /// [borrowed buffers](crate::common::buffer::IoBuf#borrowed-buffers).
+    ///
+    /// The operation completes through an event rather than the pool's
+    /// completion port, and dropping the future before it finishes cancels
+    /// it and waits for that event -- so the borrow cannot end while the
+    /// kernel still uses the buffer, and the wait needs no pool thread.
+    ///
+    /// # Safety
+    /// The future must be dropped or run to completion -- never forgotten or
+    /// leaked: not `mem::forget`, not a reference cycle, not `Box::leak`, not
+    /// an executor that frees tasks without dropping them. A future that
+    /// disappears without its `Drop` running leaves the kernel writing into
+    /// memory the borrow has already given back.
+    pub unsafe fn read_unchecked<B: IoBufMut>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let sock = self.res.socket().0;
+        let fut = super::super::evented(&self.res, buf, move |mem, buf| unsafe {
+            let wsabuf = WSABUF {
+                len: IoBuf::bytes_total(buf) as u32,
+                buf: windows_core::PSTR(buf.stable_mut_ptr()),
+            };
+            let r = WSARecv(SOCKET(sock), &[wsabuf], None, &mut mem.flags, Some(&mut mem.ovl), None);
+            classify_wsa_overlapped(r == 0)
+        });
+        async move {
+            let (result, buf) = fut.await;
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, buf))
+        }
+    }
+
     /// Sends `buf`; resolves to the byte count and hands the buffer back.
-    pub fn write<B: IoBuf>(
+    pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -385,10 +420,40 @@ impl TcpStream {
         }
     }
 
+    /// [`write`](Self::write), with a buffer that need not be `'static`:
+    /// a borrowed `&[u8]` included. See
+    /// [borrowed buffers](crate::common::buffer::IoBuf#borrowed-buffers).
+    ///
+    /// The operation completes through an event rather than the pool's
+    /// completion port, and dropping the future before it finishes cancels
+    /// it and waits for that event -- so the borrow cannot end while the
+    /// kernel still uses the buffer, and the wait needs no pool thread.
+    ///
+    /// # Safety
+    /// The future must be dropped or run to completion -- never forgotten or
+    /// leaked: not `mem::forget`, not a reference cycle, not `Box::leak`, not
+    /// an executor that frees tasks without dropping them. A future that
+    /// disappears without its `Drop` running leaves the kernel reading from
+    /// memory the borrow has already given back.
+    pub unsafe fn write_unchecked<B: IoBuf>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let sock = self.res.socket().0;
+        super::super::evented(&self.res, buf, move |mem, buf| unsafe {
+            let wsabuf = WSABUF {
+                len: IoBuf::len(buf) as u32,
+                buf: windows_core::PSTR(buf.stable_ptr() as *mut u8),
+            };
+            let r = WSASend(SOCKET(sock), &[wsabuf], None, 0, Some(&mut mem.ovl), None);
+            classify_wsa_overlapped(r == 0)
+        })
+    }
+
     /// Like [`read`](Self::read), but leaves the data queued (`MSG_PEEK`), so a
     /// subsequent read returns the same bytes. Useful for inspecting a protocol
     /// header before deciding how much to consume.
-    pub fn peek<B: IoBufMut>(
+    pub fn peek<B: IoBufMut + 'static>(
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
@@ -422,7 +487,7 @@ impl TcpStream {
     /// Scatter-reads into `bufs` with a single vectored `WSARecv` — the socket
     /// counterpart to `File::read_scatter`. Resolves to the total byte count
     /// (0 = peer closed) and hands the buffers back; they are filled in order.
-    pub fn read_vectored<B: IoBufMut>(
+    pub fn read_vectored<B: IoBufMut + 'static>(
         &self,
         bufs: Vec<B>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
@@ -446,7 +511,7 @@ impl TcpStream {
     /// Gather-writes `bufs` with a single vectored `WSASend` — the socket
     /// counterpart to `File::write_gather`. Resolves to the total byte count and
     /// hands the buffers back; they are sent in order as one contiguous stream.
-    pub fn write_vectored<B: IoBuf>(
+    pub fn write_vectored<B: IoBuf + 'static>(
         &self,
         bufs: Vec<B>,
     ) -> impl Future<Output = (windows_core::Result<usize>, Vec<B>)> + Send + use<B> {
@@ -732,7 +797,7 @@ impl TransmitPackets {
 
     /// Appends an in-memory buffer (sent inline): any owned buffer, so a
     /// shared `Arc<[u8]>` header can go out on many connections uncopied.
-    pub fn bytes(mut self, buf: impl IoBuf) -> Self {
+    pub fn bytes(mut self, buf: impl IoBuf + 'static) -> Self {
         self.elems.push(Elem::Mem(Box::new(buf)));
         self
     }

@@ -841,10 +841,40 @@ Winsock이 사용자 모드에서 답하는 코드도 패킷이 왔다. 그래�
 5. **`RawBuf`** — `unsafe fn from_raw_parts(ptr, len, total, keeper)`. 매핑된 섹션이나 C 할당자
    메모리를 그 수명을 쥔 객체와 함께 감싼다. 계약은 한 곳에 적었다.
 
-바운스 버퍼(빌린 슬라이스를 받아 내부 버퍼로 I/O 후 복사)는 넣지 않았다. 필요한 경우는 `Read`/
+바운스 버퍼(빌린 슬라이스를 받아 내부 버퍼로 I/O 후 복사)는 넣지 않았다. 빌린 버퍼를 직접 쓰는
+길은 아래 "빌린 버퍼: `*_unchecked`"로 따로 열었다. 필요한 경우는 `Read`/
 `AsyncRead`처럼 `&mut [u8]` 시그니처를 강제하는 트레이트, FFI 콜백 버퍼, 스택 배열 정도다. 그중
 `futures-io`는 `tp::io::async_rw`가 이미 그렇게 구현한다. 나머지는 호출자가 소유 버퍼로 읽고 한 번
 복사하면 된다.
+
+## 빌린 버퍼: `*_unchecked` (2026-11-10)
+
+`IoBuf`에서 `'static` 상위 조건을 뺐다. 그래서 `&'a mut [u8]`/`&'a [u8]`도 버퍼가 된다. 대신 safe
+연산은 모두 `B: IoBuf + 'static`을 요구한다. 빌린 버퍼는 `unsafe fn *_unchecked`만 받는다: 파이프
+`read`/`write`, TCP `read`/`write`, UDP `recv`/`send`, Unix `read`/`write`, 파일 `read_at`/`write_at`.
+safety 조건은 하나다. "future를 drop하거나 끝까지 돌려야 한다. forget하거나 누수시키면 안 된다."
+`mem::forget`이 safe인 이상 이 조건은 타입으로 강제할 수 없고, 라이프타임 표기로도 표현되지 않는다.
+
+**drop이 기다리는 것.** 완료 전에 future가 drop되면 `CancelIoEx` 후 커널이 버퍼를 놓을 때까지 막는다.
+처음 구현은 `OVERLAPPED.Internal`을 폴링했다. `HasOverlappedIoCompleted`가 읽는 필드라서, 풀 스레드
+없이 커널 완료를 알 수 있다고 봤기 때문이다. **틀렸다.** 스레드 1개 풀에서 그 스레드가 drop하면 영원히
+끝나지 않았다(safe `read`는 같은 구성에서 정상). 완료 포트에 묶인 핸들에서는 최종 상태 기록과, 버퍼드
+I/O라면 사용자 버퍼로의 복사가, 풀 스레드가 패킷을 꺼낼 때 일어나는 것으로 보인다. 풀 스레드가 모두
+이런 drop에 묶이면 교착이다.
+
+그래서 `*_unchecked`는 완료 포트를 쓰지 않는다. `OVERLAPPED.hEvent`에 최하위 비트를 세운 이벤트를
+넣으면 패킷이 포트로 가지 않는다(`GetQueuedCompletionStatus` 문서). 측정해 보니 파이프와 TCP 모두 포트에
+패킷이 오지 않았다. 또 읽기를 건 스레드가 `CancelIoEx` 후 그 이벤트를 기다려도 이벤트가 켜지고
+`Internal`(`STATUS_CANCELLED`)이 쓰였다. future는 이벤트를 `TP_WAIT`(`tp::wait`)로 기다리고, drop은 직접
+`WaitForSingleObject`한다. 연산마다 이벤트 하나와 대기 객체 하나가 드는데, 빌린 버퍼를 쓰는 대가로 본다.
+
+테스트(`tp::io::pipe`, `net::tests`, `file`):
+
+- 스택 배열로 왕복한다.
+- 시간 초과로 drop한 뒤 버퍼를 덮어쓰고 데이터를 늦게 보낸다. 버퍼는 그대로이고, 데이터는 다음 읽기로 온다.
+- 스레드 1개 풀의 태스크 안에서 drop해도 5초 안에 끝난다. 처음 구현은 여기서 멈췄다.
+- 2000번 취소와 완료를 경쟁시켜도 300바이트가 빠지거나 겹치지 않는다.
+- TCP와 UDP 왕복, TCP의 늦은 데이터, 파일 오프셋과 EOF를 확인한다.
 
 ## 커밋 상태
 

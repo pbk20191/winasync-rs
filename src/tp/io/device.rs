@@ -91,7 +91,7 @@ impl Device {
     /// A driver that needs a bigger output buffer reports
     /// `ERROR_MORE_DATA` / `ERROR_INSUFFICIENT_BUFFER`; retry with a larger
     /// one.
-    pub fn ioctl<I: IoBuf, O: IoBufMut>(
+    pub fn ioctl<I: IoBuf + 'static, O: IoBufMut + 'static>(
         &self,
         code: u32,
         input: I,

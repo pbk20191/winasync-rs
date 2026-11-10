@@ -251,7 +251,7 @@ impl File {
 
     /// Reads into `buf` at absolute offset `pos`. Resolves to the number of
     /// bytes read (0 at end of file) and hands the buffer back.
-    pub fn read_at<B: IoBufMut>(
+    pub fn read_at<B: IoBufMut + 'static>(
         &self,
         buf: B,
         pos: u64,
@@ -269,9 +269,53 @@ impl File {
         }
     }
 
+    /// [`read_at`](Self::read_at), with a buffer that need not be `'static`:
+    /// a borrowed `&mut [u8]` included. See
+    /// [borrowed buffers](crate::common::buffer::IoBuf#borrowed-buffers).
+    ///
+    /// The operation completes through an event rather than the pool's
+    /// completion port, and dropping the future before it finishes cancels
+    /// it and waits for that event -- so the borrow cannot end while the
+    /// kernel still uses the buffer, and the wait needs no pool thread.
+    ///
+    /// # Safety
+    /// The future must be dropped or run to completion -- never forgotten or
+    /// leaked: not `mem::forget`, not a reference cycle, not `Box::leak`, not
+    /// an executor that frees tasks without dropping them. A future that
+    /// disappears without its `Drop` running leaves the kernel writing into
+    /// memory the borrow has already given back.
+    pub unsafe fn read_at_unchecked<B: IoBufMut>(
+        &self,
+        buf: B,
+        pos: u64,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let handle = self.res.handle.0 as usize;
+        let fut = super::evented(&self.res, buf, move |mem, buf| unsafe {
+            mem.ovl.Anonymous.Anonymous.Offset = pos as u32;
+            mem.ovl.Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
+            let slice =
+                core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::bytes_total(buf));
+            super::classify_file(ReadFile(
+                windows::Win32::Foundation::HANDLE(handle as *mut core::ffi::c_void),
+                Some(slice),
+                None,
+                Some(&mut mem.ovl),
+            ))
+        });
+        async move {
+            let (result, buf) = fut.await;
+            let result = match result {
+                Err(e) if e.code() == windows::Win32::Foundation::ERROR_HANDLE_EOF.to_hresult() => Ok(0),
+                other => other,
+            };
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, buf))
+        }
+    }
+
     /// Writes `buf` at absolute offset `pos`. Resolves to the number of bytes
     /// written and hands the buffer back.
-    pub fn write_at<B: IoBuf>(
+    pub fn write_at<B: IoBuf + 'static>(
         &self,
         buf: B,
         pos: u64,
@@ -289,6 +333,40 @@ impl File {
                 }
             })
         }
+    }
+
+    /// [`write_at`](Self::write_at), with a buffer that need not be `'static`:
+    /// a borrowed `&[u8]` included. See
+    /// [borrowed buffers](crate::common::buffer::IoBuf#borrowed-buffers).
+    ///
+    /// The operation completes through an event rather than the pool's
+    /// completion port, and dropping the future before it finishes cancels
+    /// it and waits for that event -- so the borrow cannot end while the
+    /// kernel still uses the buffer, and the wait needs no pool thread.
+    ///
+    /// # Safety
+    /// The future must be dropped or run to completion -- never forgotten or
+    /// leaked: not `mem::forget`, not a reference cycle, not `Box::leak`, not
+    /// an executor that frees tasks without dropping them. A future that
+    /// disappears without its `Drop` running leaves the kernel reading from
+    /// memory the borrow has already given back.
+    pub unsafe fn write_at_unchecked<B: IoBuf>(
+        &self,
+        buf: B,
+        pos: u64,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let handle = self.res.handle.0 as usize;
+        super::evented(&self.res, buf, move |mem, buf| unsafe {
+            mem.ovl.Anonymous.Anonymous.Offset = pos as u32;
+            mem.ovl.Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
+            let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
+            super::classify_file(WriteFile(
+                windows::Win32::Foundation::HANDLE(handle as *mut core::ffi::c_void),
+                Some(slice),
+                None,
+                Some(&mut mem.ovl),
+            ))
+        })
     }
 
     /// Scatter-reads `buffers.len()` bytes at absolute offset `pos` into the
@@ -529,6 +607,25 @@ mod tests {
                 "op blocks leaked"
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A borrowed buffer at an offset, and end of file reading as 0.
+    #[test]
+    fn unchecked_file_ops_take_borrowed_buffers() {
+        let rt = Runtime::new();
+        let path = std::env::temp_dir().join(format!("tp_unchecked_{}.bin", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let file = File::create(&rt, &path).unwrap();
+        // SAFETY: each future is awaited to completion.
+        let (n, _) = block_on(unsafe { file.write_at_unchecked(&b"0123456789"[..], 0) });
+        assert_eq!(n.unwrap(), 10);
+        let mut part = [0u8; 4];
+        let (n, _) = block_on(unsafe { file.read_at_unchecked(&mut part[..], 3) });
+        assert_eq!(&part[..n.unwrap()], b"3456");
+        let (n, _) = block_on(unsafe { file.read_at_unchecked(&mut part[..], 100) });
+        assert_eq!(n.unwrap(), 0, "end of file is a zero-length read");
+        drop(file);
         let _ = std::fs::remove_file(&path);
     }
 }
