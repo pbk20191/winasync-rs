@@ -1080,8 +1080,27 @@ tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
   이름이 없다(TAIT 없음).
 - `TransmitPackets`의 `Elem::Mem(Box<dyn IoBuf>)`: 원소마다 다른 버퍼 타입을 섞는 것이 API의 뜻.
 
-- 아직 없는 것: HTTPS(인증서 바인딩은 `HttpSetServiceConfiguration`, 관리자 필요), Windows 인증
-  (`HttpServerAuthenticationProperty`), 이름 있는 요청 큐(프로세스 간 공유), 응답 캐시.
+### HTTP_REQUEST_V2와 Windows 인증 (2026-11-11)
+
+요청을 `HTTP_REQUEST_V2`로 받아 `pRequestInfo` 배열을 읽는다. `HttpRequest`에 추가된 것:
+`http2`/`http3`/`ip_routed`(Flags), `auth: Option<AuthInfo>`, `ssl_protocol: Option<SslProtocol>`,
+`timing: Vec<u64>`(`HTTP_REQUEST_TIMING_TYPE` 순서의 QPC 틱, 측정: 30개), `other_info: Vec<(i32, Vec<u8>)>`
+(안 푼 레코드 — 측정: sizing(7), TcpInfoV0(6), TcpInfoV1(9), 11번 타입 하나 — 열린 끝).
+
+- `HttpServer::set_authentication(schemes, realm, domain)`: URL 그룹에 `HttpServerAuthenticationProperty`.
+  **측정**: Digest가 꺼져 있는데 DigestParams를 채우면 `E_INVALIDARG`. 각 파라미터 블록은 해당 스킴이 켜졌을 때만
+  채운다. `ReceiveMutualAuth`는 끈다(켜면 Kerberos 상호 인증 데이터를 앱이 직접 실어야 한다).
+- **흐름(측정 + 문서 "Authentication (HTTP Server API)")**: http.sys는 스스로 401을 보내지 않는다. 자격 증명 없는
+  요청은 `AuthStatus::NotAuthenticated`로 **앱에 전달**되고, 앱이 `Response::challenge(schemes, realm)`(401 +
+  `WWW-Authenticate` 헤더들)로 답한다. 그 뒤 NTLM/Negotiate의 중간 leg는 http.sys가 처리하고, 끝나면 같은 요청이
+  `Success`(토큰 포함) 또는 `Failure`(SecStatus 포함, 토큰 없음)로 다시 전달된다. Basic에 틀린 자격 증명:
+  `Failure`, `STATUS_LOGON_FAILURE`(0xC000006D). 잘못된 `Authorization` 헤더는 http.sys가 400으로 거른다.
+- **테스트 클라이언트**: PowerShell `Invoke-WebRequest -UseDefaultCredentials`(WinHTTP) — 2라운드에
+  `Negotiate`/패키지 `NTLM`/토큰. System32의 curl은 `--ntlm`이 빌드에 없고 `--negotiate -u :`는
+  `SEC_E_NO_CREDENTIALS`로 첫 401에서 멈춘다.
+- `AuthInfo.token`은 `OwnedHandle`: 앱이 닫아야 하는 핸들이므로 drop이 닫는다.
+- 아직 없는 것: HTTPS(인증서 바인딩은 `HttpSetServiceConfiguration`, 관리자 필요), 이름 있는 요청 큐(프로세스 간
+  공유), 응답 캐시, Digest 챌린지(nonce 추적 필요).
 
 ## 커밋 상태
 

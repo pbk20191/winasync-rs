@@ -51,7 +51,7 @@ use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 use crate::common::opfuture::submit;
 use crate::common::overlapped::{Binding, IoHandle, IoReg, Issue};
 use std::net::SocketAddr;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -70,9 +70,18 @@ use windows::Win32::Networking::HttpServer::{
     HttpShutdownRequestQueue, HttpTerminate, HttpWaitForDisconnect, HTTPAPI_VERSION, HTTP_BINDING_INFO,
     HTTP_BYTE_RANGE, HTTP_DATA_CHUNK, HTTP_DATA_CHUNK_0, HTTP_DATA_CHUNK_0_0,
     HTTP_DATA_CHUNK_0_1, HTTP_INITIALIZE_SERVER, HTTP_KNOWN_HEADER, HTTP_PROPERTY_FLAGS,
-    HTTP_RECEIVE_HTTP_REQUEST_FLAGS, HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS, HTTP_REQUEST_V1,
+    HTTP_RECEIVE_HTTP_REQUEST_FLAGS, HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS,
     HTTP_RESPONSE_V2, HTTP_SEND_RESPONSE_FLAG_MORE_DATA, HTTP_SERVER_PROPERTY, HTTP_STATE_INFO,
     HTTP_TIMEOUT_LIMIT_INFO, HTTP_UNKNOWN_HEADER, HTTP_VERSION,
+    HttpAuthStatusFailure, HttpAuthStatusNotAuthenticated, HttpAuthStatusSuccess,
+    HttpRequestAuthTypeBasic, HttpRequestAuthTypeDigest, HttpRequestAuthTypeKerberos,
+    HttpRequestAuthTypeNTLM, HttpRequestAuthTypeNegotiate, HttpRequestInfoTypeAuth,
+    HttpRequestInfoTypeRequestTiming, HttpRequestInfoTypeSslProtocol, HttpServerAuthenticationProperty,
+    HTTP_AUTH_ENABLE_BASIC, HTTP_AUTH_ENABLE_DIGEST, HTTP_AUTH_ENABLE_KERBEROS, HTTP_AUTH_ENABLE_NEGOTIATE,
+    HTTP_AUTH_ENABLE_NTLM, HTTP_REQUEST_AUTH_INFO, HTTP_REQUEST_FLAG_HTTP2, HTTP_REQUEST_FLAG_HTTP3,
+    HTTP_REQUEST_FLAG_IP_ROUTED, HTTP_REQUEST_INFO, HTTP_REQUEST_TIMING_INFO, HTTP_REQUEST_V2,
+    HTTP_SERVER_AUTHENTICATION_BASIC_PARAMS, HTTP_SERVER_AUTHENTICATION_DIGEST_PARAMS,
+    HTTP_SERVER_AUTHENTICATION_INFO, HTTP_SSL_PROTOCOL_INFO,
 };
 use windows::Win32::Storage::FileSystem::GetFileSizeEx;
 use windows::Win32::System::IO::OVERLAPPED;
@@ -289,6 +298,65 @@ impl HttpServer {
         })
     }
 
+    /// Has http.sys authenticate requests before they are delivered, with
+    /// the Windows schemes in `schemes`. The request then carries the
+    /// outcome in [`HttpRequest::auth`], whose docs say what arrives when;
+    /// in short, answer a request that is not authenticated with
+    /// [`Response::challenge`], and http.sys does the rest.
+    ///
+    /// `realm` is what Basic and Digest challenges name; `domain` is for
+    /// Digest. Setting no scheme turns authentication off.
+    pub fn set_authentication(&self, schemes: AuthSchemes, realm: &str, domain: &str) -> Result<()> {
+        let mut realm: Vec<u16> = realm.encode_utf16().chain([0]).collect();
+        let mut domain: Vec<u16> = domain.encode_utf16().chain([0]).collect();
+        // A string is given only to the scheme it is for: measured, a
+        // Digest parameter block filled while Digest is off is
+        // `E_INVALIDARG`.
+        let wide = |v: &mut Vec<u16>| {
+            let len = (v.len() - 1) * 2;
+            (len as u16, if len == 0 { windows_core::PWSTR::null() } else { windows_core::PWSTR(v.as_mut_ptr()) })
+        };
+        let mut info = HTTP_SERVER_AUTHENTICATION_INFO {
+            Flags: HTTP_PROPERTY_FLAGS { _bitfield: 1 },
+            AuthSchemes: schemes.0,
+            // Off, http.sys appends Kerberos mutual-authentication data to
+            // the final response itself; on, the application would have to.
+            ReceiveMutualAuth: false,
+            // The token is what a server wants; the packed context is for
+            // handing the authentication to another process.
+            ReceiveContextHandle: false,
+            DisableNTLMCredentialCaching: false,
+            ExFlags: 0,
+            DigestParams: HTTP_SERVER_AUTHENTICATION_DIGEST_PARAMS::default(),
+            BasicParams: HTTP_SERVER_AUTHENTICATION_BASIC_PARAMS::default(),
+        };
+        if schemes.0 & HTTP_AUTH_ENABLE_BASIC != 0 {
+            let (len, ptr) = wide(&mut realm);
+            info.BasicParams = HTTP_SERVER_AUTHENTICATION_BASIC_PARAMS {
+                RealmLength: len,
+                Realm: ptr,
+            };
+        }
+        if schemes.0 & HTTP_AUTH_ENABLE_DIGEST != 0 {
+            let (rlen, rptr) = wide(&mut realm);
+            let (dlen, dptr) = wide(&mut domain);
+            info.DigestParams = HTTP_SERVER_AUTHENTICATION_DIGEST_PARAMS {
+                DomainNameLength: dlen,
+                DomainName: dptr,
+                RealmLength: rlen,
+                Realm: rptr,
+            };
+        }
+        check(unsafe {
+            HttpSetUrlGroupProperty(
+                self.inner.session.group,
+                HttpServerAuthenticationProperty,
+                (&info as *const HTTP_SERVER_AUTHENTICATION_INFO).cast(),
+                size_of::<HTTP_SERVER_AUTHENTICATION_INFO>() as u32,
+            )
+        })
+    }
+
     /// How many requests may wait in the queue for an `accept`; past it
     /// http.sys answers 503 itself. The default is 1000.
     pub fn set_queue_length(&self, length: u32) -> Result<()> {
@@ -342,11 +410,11 @@ impl HttpServer {
             .message();
             let (result, buf) = fut.await;
             let (bytes, more) = result?;
-            let record = unsafe { &*(buf.as_ptr() as *const HTTP_REQUEST_V1) };
+            let record = unsafe { &*(buf.as_ptr() as *const HTTP_REQUEST_V2) };
             if more {
                 // Too small: the byte count is the size needed, and the
                 // partial record already names the request.
-                id = record.RequestId;
+                id = record.Base.RequestId;
                 size = bytes.max(size * 2);
                 continue;
             }
@@ -438,6 +506,37 @@ unsafe fn address(sa: *const windows::Win32::Networking::WinSock::SOCKADDR) -> O
     crate::common::sockaddr::read_sockaddr(&storage).ok()
 }
 
+/// # Safety
+/// `info` is the auth record of a request being parsed, whose pointers are
+/// valid for the call; the token handle is taken over.
+unsafe fn parse_auth(info: &HTTP_REQUEST_AUTH_INFO) -> AuthInfo {
+    let status = match info.AuthStatus {
+        s if s == HttpAuthStatusSuccess => AuthStatus::Success,
+        s if s == HttpAuthStatusNotAuthenticated => AuthStatus::NotAuthenticated,
+        s if s == HttpAuthStatusFailure => AuthStatus::Failure,
+        s => AuthStatus::Other(s.0),
+    };
+    let scheme = match info.AuthType {
+        t if t == HttpRequestAuthTypeBasic => AuthScheme::Basic,
+        t if t == HttpRequestAuthTypeDigest => AuthScheme::Digest,
+        t if t == HttpRequestAuthTypeNTLM => AuthScheme::Ntlm,
+        t if t == HttpRequestAuthTypeNegotiate => AuthScheme::Negotiate,
+        t if t == HttpRequestAuthTypeKerberos => AuthScheme::Kerberos,
+        t if t.0 == 0 => AuthScheme::None,
+        t => AuthScheme::Other(t.0),
+    };
+    unsafe {
+        AuthInfo {
+            status,
+            sec_status: info.SecStatus,
+            scheme,
+            token: (!info.AccessToken.is_invalid()).then(|| OwnedHandle::from_raw_handle(info.AccessToken.0)),
+            package: wide(info.pPackageName.0, info.PackageNameLength as usize),
+            context_attributes: info.ContextAttributes,
+        }
+    }
+}
+
 /// One request, read out of http.sys's record into owned values.
 ///
 /// Respond with [`respond`](Self::respond), or with
@@ -465,16 +564,86 @@ pub struct HttpRequest {
     pub remote_addr: Option<SocketAddr>,
     pub local_addr: Option<SocketAddr>,
     pub connection_id: u64,
+    /// Arrived over HTTP/2.
+    pub http2: bool,
+    /// Arrived over HTTP/3.
+    pub http3: bool,
+    /// Routed by IP: the URL was registered for the address it came to
+    /// rather than a host name.
+    pub ip_routed: bool,
+    /// Who sent it, when [`HttpServer::set_authentication`] is on.
+    ///
+    /// http.sys does not challenge on its own (measured, and documented
+    /// under "Authentication (HTTP Server API)"). A request with no
+    /// credentials is delivered marked [`AuthStatus::NotAuthenticated`], and
+    /// the server either serves it anonymously or answers
+    /// [`Response::challenge`] -- a 401 naming the schemes; http.sys appends
+    /// nothing to a bare 401. The client's next request, with credentials,
+    /// is http.sys's: it runs the interim legs of NTLM and Negotiate itself
+    /// and delivers the request once more, [`AuthStatus::Success`] with the
+    /// caller's token, or [`AuthStatus::Failure`] with the security status
+    /// and no token, for the server to decide on (challenge again, or serve
+    /// anonymously). A malformed `Authorization` header gets a 400 from
+    /// http.sys and is never delivered.
+    pub auth: Option<AuthInfo>,
+    /// The connection's TLS parameters, on HTTPS.
+    pub ssl_protocol: Option<SslProtocol>,
+    /// http.sys's timestamps for the request, in `QueryPerformanceCounter`
+    /// ticks, indexed by `HTTP_REQUEST_TIMING_TYPE`; 0 where a step did not
+    /// happen. Empty on a Windows without them.
+    pub timing: Vec<u64>,
+    /// Request infos this crate does not parse, as `(HTTP_REQUEST_INFO_TYPE,
+    /// bytes)` -- the open end: TCP info, QUIC stats, token binding, sizing.
+    pub other_info: Vec<(i32, Vec<u8>)>,
     has_body: bool,
     responded: AtomicBool,
 }
 
 impl HttpRequest {
     /// # Safety
-    /// `record` is a complete `HTTP_REQUEST_V1` whose pointers point into
+    /// `record` is a complete `HTTP_REQUEST_V2` whose pointers point into
     /// the buffer it sits in, which is alive for the call.
-    unsafe fn parse(server: &Arc<Server>, record: &HTTP_REQUEST_V1) -> HttpRequest {
+    unsafe fn parse(server: &Arc<Server>, record: &HTTP_REQUEST_V2) -> HttpRequest {
         unsafe {
+            let mut auth = None;
+            let mut ssl_protocol = None;
+            let mut timing = Vec::new();
+            let mut other_info = Vec::new();
+            for i in 0..record.RequestInfoCount as usize {
+                let info: &HTTP_REQUEST_INFO = &*record.pRequestInfo.add(i);
+                let len = info.InfoLength as usize;
+                match info.InfoType {
+                    t if t == HttpRequestInfoTypeAuth && len >= size_of::<HTTP_REQUEST_AUTH_INFO>() => {
+                        auth = Some(parse_auth(&*info.pInfo.cast::<HTTP_REQUEST_AUTH_INFO>()));
+                    }
+                    t if t == HttpRequestInfoTypeSslProtocol && len >= size_of::<HTTP_SSL_PROTOCOL_INFO>() => {
+                        let p = &*info.pInfo.cast::<HTTP_SSL_PROTOCOL_INFO>();
+                        ssl_protocol = Some(SslProtocol {
+                            protocol: p.Protocol,
+                            cipher: p.CipherType,
+                            cipher_strength: p.CipherStrength,
+                            hash: p.HashType,
+                            hash_strength: p.HashStrength,
+                            key_exchange: p.KeyExchangeType,
+                            key_exchange_strength: p.KeyExchangeStrength,
+                        });
+                    }
+                    t if t == HttpRequestInfoTypeRequestTiming && len >= size_of::<HTTP_REQUEST_TIMING_INFO>() => {
+                        let p = &*info.pInfo.cast::<HTTP_REQUEST_TIMING_INFO>();
+                        let n = (p.RequestTimingCount as usize).min(p.RequestTiming.len());
+                        timing = p.RequestTiming[..n].to_vec();
+                    }
+                    t => {
+                        let bytes = if info.pInfo.is_null() || len == 0 {
+                            Vec::new()
+                        } else {
+                            core::slice::from_raw_parts(info.pInfo.cast::<u8>(), len).to_vec()
+                        };
+                        other_info.push((t.0, bytes));
+                    }
+                }
+            }
+            let record = &record.Base;
             let method = match verb_name(record.Verb.0) {
                 Some(name) => name.to_owned(),
                 None => ascii(record.pUnknownVerb.0, record.UnknownVerbLength as usize),
@@ -510,6 +679,13 @@ impl HttpRequest {
                 remote_addr: address(record.Address.pRemoteAddress),
                 local_addr: address(record.Address.pLocalAddress),
                 connection_id: record.ConnectionId,
+                http2: record.Flags & HTTP_REQUEST_FLAG_HTTP2 != 0,
+                http3: record.Flags & HTTP_REQUEST_FLAG_HTTP3 != 0,
+                ip_routed: record.Flags & HTTP_REQUEST_FLAG_IP_ROUTED != 0,
+                auth,
+                ssl_protocol,
+                timing,
+                other_info,
                 has_body: record.Flags & HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS != 0,
                 responded: AtomicBool::new(false),
             }
@@ -852,6 +1028,82 @@ pub struct Timeouts {
     pub min_send_rate: Option<u32>,
 }
 
+/// Which authentication schemes http.sys offers ([`HttpServer::set_authentication`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuthSchemes(u32);
+
+impl AuthSchemes {
+    pub const NONE: AuthSchemes = AuthSchemes(0);
+    pub const BASIC: AuthSchemes = AuthSchemes(HTTP_AUTH_ENABLE_BASIC);
+    pub const DIGEST: AuthSchemes = AuthSchemes(HTTP_AUTH_ENABLE_DIGEST);
+    pub const NTLM: AuthSchemes = AuthSchemes(HTTP_AUTH_ENABLE_NTLM);
+    pub const NEGOTIATE: AuthSchemes = AuthSchemes(HTTP_AUTH_ENABLE_NEGOTIATE);
+    pub const KERBEROS: AuthSchemes = AuthSchemes(HTTP_AUTH_ENABLE_KERBEROS);
+}
+
+impl core::ops::BitOr for AuthSchemes {
+    type Output = AuthSchemes;
+    fn bitor(self, rhs: AuthSchemes) -> AuthSchemes {
+        AuthSchemes(self.0 | rhs.0)
+    }
+}
+
+/// How http.sys's authentication of a request ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthStatus {
+    /// The caller is who [`AuthInfo::token`] says.
+    Success,
+    /// The request carried no credentials.
+    NotAuthenticated,
+    /// The credentials were refused; [`AuthInfo::sec_status`] says why.
+    Failure,
+    /// A status this crate does not know.
+    Other(i32),
+}
+
+/// The scheme a request authenticated with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthScheme {
+    None,
+    Basic,
+    Digest,
+    Ntlm,
+    Negotiate,
+    Kerberos,
+    Other(i32),
+}
+
+/// What http.sys found out about who sent a request
+/// ([`HttpRequest::auth`]).
+#[derive(Debug)]
+pub struct AuthInfo {
+    pub status: AuthStatus,
+    /// The security status behind a [`AuthStatus::Failure`].
+    pub sec_status: windows_core::HRESULT,
+    pub scheme: AuthScheme,
+    /// The caller's access token on success: impersonate with it, or read
+    /// its user. Closed when dropped.
+    pub token: Option<OwnedHandle>,
+    /// The security package that authenticated, e.g. `NTLM`.
+    pub package: String,
+    /// `ISC_RET_*`/`ASC_RET_*` attributes of the security context.
+    pub context_attributes: u32,
+}
+
+/// The TLS parameters of the connection a request came on
+/// ([`HttpRequest::ssl_protocol`]); `SP_PROT_*`, `CALG_*` values from
+/// schannel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SslProtocol {
+    pub protocol: u32,
+    pub cipher: u32,
+    pub cipher_strength: u32,
+    pub hash: u32,
+    pub hash_strength: u32,
+    pub key_exchange: u32,
+    pub key_exchange_strength: u32,
+}
+
 /// What http.sys's own 503 says ([`HttpServer::set_503_verbosity`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verbosity503 {
@@ -895,6 +1147,24 @@ impl Response {
             reason: reason.to_owned(),
             headers: Vec::new(),
         }
+    }
+
+    /// A 401 that names `schemes` in `WWW-Authenticate` headers, one per
+    /// scheme -- the initial challenge of [`HttpServer::set_authentication`].
+    /// `realm` is for Basic; Digest is not offered here, since its
+    /// challenge needs a nonce the server would have to track.
+    pub fn challenge(schemes: AuthSchemes, realm: &str) -> Response {
+        let mut response = Response::new(401);
+        if schemes.0 & (HTTP_AUTH_ENABLE_NEGOTIATE | HTTP_AUTH_ENABLE_KERBEROS) != 0 {
+            response = response.header("WWW-Authenticate", "Negotiate");
+        }
+        if schemes.0 & HTTP_AUTH_ENABLE_NTLM != 0 {
+            response = response.header("WWW-Authenticate", "NTLM");
+        }
+        if schemes.0 & HTTP_AUTH_ENABLE_BASIC != 0 {
+            response = response.header("WWW-Authenticate", &format!("Basic realm=\"{realm}\""));
+        }
+        response
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Response {
@@ -1392,5 +1662,127 @@ mod tests {
         assert!(dispatched.load(Ordering::Relaxed) >= 2);
         // Someone else's completion is left alone.
         assert!(!cp.dispatch(&Completion { key: 7, overlapped: 0x1234, ..Completion::default() }));
+    }
+
+    /// What a plain request carries beyond V1: measured, not assumed.
+    #[test]
+    fn a_request_carries_its_v2_info() {
+        let (port, url) = prefix("v2");
+        let server = HttpServer::bind(&[&url]).unwrap();
+        let c = client(port, get(port, "/v2/"));
+        let req = block_on(server.accept()).unwrap();
+        eprintln!(
+            "v2: http2={} ip_routed={} auth={:?} ssl={:?} timing={} other={:?}",
+            req.http2,
+            req.ip_routed,
+            req.auth.as_ref().map(|a| a.status),
+            req.ssl_protocol,
+            req.timing.len(),
+            req.other_info.iter().map(|(t, b)| (*t, b.len())).collect::<Vec<_>>()
+        );
+        assert!(!req.http2 && !req.http3);
+        assert!(req.ssl_protocol.is_none(), "TLS parameters on plain HTTP");
+        assert!(req.auth.is_none(), "an auth record with authentication off");
+        block_on(req.respond(Response::new(200), b"ok".to_vec())).0.unwrap();
+        c.join().unwrap();
+    }
+
+    /// Accepts until a request arrives authenticated, answering the
+    /// challenge to the rest -- the server's half of the exchange. Gives up
+    /// after 15 s rather than hang on a client that stopped.
+    fn accept_authenticated(server: &HttpServer, schemes: AuthSchemes) -> Option<HttpRequest> {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let started = std::time::Instant::now();
+        loop {
+            let mut accept = Box::pin(server.accept());
+            let req = loop {
+                if let std::task::Poll::Ready(r) = accept.as_mut().poll(&mut cx) {
+                    break r.unwrap();
+                }
+                if started.elapsed() > Duration::from_secs(15) {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let auth = req.auth.as_ref().expect("no auth record with authentication on");
+            eprintln!("auth round: {:?} {:?} package={:?} sec={:?}", auth.status, auth.scheme, auth.package, auth.sec_status);
+            if auth.status == AuthStatus::Success {
+                return Some(req);
+            }
+            block_on(req.respond(Response::challenge(schemes, ""), Vec::new())).0.unwrap();
+        }
+    }
+
+    /// Basic: a request with no credentials is delivered, marked; the server
+    /// challenges; wrong credentials are delivered marked as failed.
+    #[test]
+    fn basic_credentials_are_checked_by_http_sys() {
+        let (port, url) = prefix("basic");
+        let server = HttpServer::bind(&[&url]).unwrap();
+        server.set_authentication(AuthSchemes::BASIC, "winasync", "").unwrap();
+
+        let c = client(port, get(port, "/basic/"));
+        let req = block_on(server.accept()).unwrap();
+        let auth = req.auth.as_ref().expect("no auth record");
+        assert_eq!(auth.status, AuthStatus::NotAuthenticated);
+        block_on(req.respond(Response::challenge(AuthSchemes::BASIC, "winasync"), Vec::new())).0.unwrap();
+        let (head, _) = split(&c.join().unwrap());
+        assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+        assert!(head.contains("WWW-Authenticate: Basic realm=\"winasync\""), "{head}");
+
+        // bogus:nope
+        let c = client(
+            port,
+            format!(
+                "GET /basic/ HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Basic Ym9ndXM6bm9wZQ==\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        );
+        let req = block_on(server.accept()).unwrap();
+        let auth = req.auth.as_ref().expect("no auth record");
+        eprintln!("basic, bad credentials: {:?} {:?} {:?}", auth.status, auth.scheme, auth.sec_status);
+        assert_eq!(auth.status, AuthStatus::Failure);
+        assert_eq!(auth.scheme, AuthScheme::Basic);
+        assert!(auth.token.is_none());
+        block_on(req.respond(Response::new(403), b"no".to_vec())).0.unwrap();
+        let (head, _) = split(&c.join().unwrap());
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    }
+
+    /// Negotiate against the local machine. The client is WinHTTP through
+    /// PowerShell, which authenticates on loopback with the caller's logon;
+    /// the system curl cannot (no NTLM in its build, and Negotiate finds
+    /// no default credentials for it). Measured: two rounds -- the first
+    /// `NotAuthenticated`, then, after the challenge and http.sys's own NTLM
+    /// leg, `Success` with `Negotiate`/`NTLM` and the token.
+    #[test]
+    fn negotiate_delivers_the_callers_token() {
+        let (port, url) = prefix("nego");
+        let server = HttpServer::bind(&[&url]).unwrap();
+        let schemes = AuthSchemes::NEGOTIATE | AuthSchemes::NTLM;
+        server.set_authentication(schemes, "", "").unwrap();
+        let script = format!("(Invoke-WebRequest -UseBasicParsing -UseDefaultCredentials 'http://localhost:{port}/nego/').StatusCode");
+        let c = std::thread::spawn(move || {
+            std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-Command", &script])
+                .output()
+                .unwrap()
+        });
+        let req = match accept_authenticated(&server, schemes) {
+            Some(req) => req,
+            None => {
+                let out = c.join().unwrap();
+                panic!("no authenticated request; client said {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            }
+        };
+        let auth = req.auth.as_ref().unwrap();
+        eprintln!("negotiate: {:?} package={} attrs={:#x}", auth.scheme, auth.package, auth.context_attributes);
+        assert_eq!(auth.scheme, AuthScheme::Negotiate);
+        assert!(auth.token.is_some(), "no access token");
+        assert!(!auth.package.is_empty());
+        block_on(req.respond(Response::new(200), b"hello".to_vec())).0.unwrap();
+        let out = c.join().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "200", "{}", String::from_utf8_lossy(&out.stderr));
     }
 }
