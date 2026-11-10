@@ -985,7 +985,7 @@ pub mod Pbk20191 {
             windows_core::imp::define_interface!(
                 IMessageStream,
                 IMessageStream_Vtbl,
-                0x81c32a75_7236_59d1_b840_f3b292d08ba0
+                0xed8521cc_2cee_51bf_9cb5_b25363234305
             );
             impl windows_core::RuntimeType for IMessageStream {
                 const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -1028,6 +1028,31 @@ pub mod Pbk20191 {
                         .and_then(|| windows_core::Type::from_abi(result__))
                     }
                 }
+                pub fn TransactAsync<P0>(
+                    &self,
+                    request: P0,
+                    maxsize: u32,
+                ) -> windows_core::Result<
+                    windows_future::IAsyncOperationWithProgress<
+                        windows::Storage::Streams::IBuffer,
+                        u32,
+                    >,
+                >
+                where
+                    P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).TransactAsync)(
+                            windows_core::Interface::as_raw(this),
+                            request.param().abi(),
+                            maxsize,
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
             }
             impl windows_core::RuntimeName for IMessageStream {
                 const NAME: &'static str = "Pbk20191.WinAsync.Comio.IMessageStream";
@@ -1036,6 +1061,16 @@ pub mod Pbk20191 {
                 fn IsMessageMode(&self) -> windows_core::Result<bool>;
                 fn ReadMessageAsync(
                     &self,
+                    maxSize: u32,
+                ) -> windows_core::Result<
+                    windows_future::IAsyncOperationWithProgress<
+                        windows::Storage::Streams::IBuffer,
+                        u32,
+                    >,
+                >;
+                fn TransactAsync(
+                    &self,
+                    request: windows_core::Ref<'_, windows::Storage::Streams::IBuffer>,
                     maxSize: u32,
                 ) -> windows_core::Result<
                     windows_future::IAsyncOperationWithProgress<
@@ -1086,6 +1121,32 @@ pub mod Pbk20191 {
                             }
                         }
                     }
+                    unsafe extern "system" fn TransactAsync<
+                        Identity: IMessageStream_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        request: *mut core::ffi::c_void,
+                        maxsize: u32,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IMessageStream_Impl::TransactAsync(
+                                this,
+                                core::mem::transmute_copy(&request),
+                                maxsize,
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
                     Self {
                         base__: windows_core::IInspectable_Vtbl::new::<
                             Identity,
@@ -1094,6 +1155,7 @@ pub mod Pbk20191 {
                         >(),
                         IsMessageMode: IsMessageMode::<Identity, OFFSET>,
                         ReadMessageAsync: ReadMessageAsync::<Identity, OFFSET>,
+                        TransactAsync: TransactAsync::<Identity, OFFSET>,
                     }
                 }
                 pub fn matches(iid: &windows_core::GUID) -> bool {
@@ -1110,6 +1172,13 @@ pub mod Pbk20191 {
                 )
                     -> windows_core::HRESULT,
                 pub ReadMessageAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    u32,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub TransactAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
                     *mut core::ffi::c_void,
                     u32,
                     *mut *mut core::ffi::c_void,
@@ -2624,6 +2693,31 @@ pub mod Pbk20191 {
                         let mut result__ = core::mem::zeroed();
                         (windows_core::Interface::vtable(this).ReadMessageAsync)(
                             windows_core::Interface::as_raw(this),
+                            maxsize,
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn TransactAsync<P0>(
+                    &self,
+                    request: P0,
+                    maxsize: u32,
+                ) -> windows_core::Result<
+                    windows_future::IAsyncOperationWithProgress<
+                        windows::Storage::Streams::IBuffer,
+                        u32,
+                    >,
+                >
+                where
+                    P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = &windows_core::Interface::cast::<IMessageStream>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).TransactAsync)(
+                            windows_core::Interface::as_raw(this),
+                            request.param().abi(),
                             maxsize,
                             &mut result__,
                         )

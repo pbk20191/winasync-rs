@@ -21,7 +21,7 @@ use windows::Win32::Foundation::{
     ERROR_PIPE_CONNECTED, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows::Win32::System::Pipes::{ConnectNamedPipe, PeekNamedPipe};
+use windows::Win32::System::Pipes::{ConnectNamedPipe, PeekNamedPipe, TransactNamedPipe};
 use windows_core::{Error, HSTRING};
 
 /// Largest single read `read_message` issues before it knows a message's
@@ -117,8 +117,68 @@ impl NamedPipeStream {
             return Err(Error::new(E_ILLEGAL_METHOD_CALL, "not a message-mode pipe"));
         }
         let (result, mut message) = self.read_part(vec![0u8; max_len.min(FIRST_READ)]).await;
-        let (n, mut more) = result?;
+        let (n, more) = result?;
         message.truncate(n);
+        self.finish_message(message, more, max_len).await
+    }
+
+    /// Writes `request` as one message and reads the reply, of at most
+    /// `max_response` bytes, in one `TransactNamedPipe`: the round trip of a
+    /// request/response protocol in a single kernel call.
+    ///
+    /// For a message-mode pipe only (`E_ILLEGAL_METHOD_CALL` otherwise), and
+    /// only with nothing unread in the pipe -- the kernel refuses a
+    /// transaction that would read a stale message as its reply. A reply
+    /// longer than `max_response` is read to its end and discarded, as in
+    /// [`read_message`](Self::read_message).
+    pub async fn transact(
+        &self,
+        request: Vec<u8>,
+        max_response: usize,
+    ) -> windows_core::Result<Vec<u8>> {
+        if !self.message_mode {
+            return Err(Error::new(E_ILLEGAL_METHOD_CALL, "not a message-mode pipe"));
+        }
+        let handle = self.res.handle;
+        let reply = vec![0u8; max_response.min(FIRST_READ)];
+        let (result, (_request, mut reply)) = unsafe {
+            submit(&self.res, (request, reply), move |ovl, (request, reply)| {
+                match TransactNamedPipe(
+                    handle,
+                    Some(request.as_ptr().cast()),
+                    request.len() as u32,
+                    Some(reply.as_mut_ptr().cast()),
+                    reply.len() as u32,
+                    // Overlapped: the count comes with the completion, and
+                    // the documentation allows null here for that case.
+                    core::ptr::null_mut(),
+                    Some(ovl),
+                ) {
+                    Ok(()) => Issue::SyncSuccess,
+                    Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                    // A reply longer than the buffer: the same warning a read
+                    // reports, and the same packet follows.
+                    Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => Issue::Pending,
+                    Err(e) => Issue::Failed(e.code()),
+                }
+            })
+        }
+        .message()
+        .await;
+        let (n, more) = result?;
+        reply.truncate(n);
+        self.finish_message(reply, more, max_response).await
+    }
+
+    /// Reads the rest of a message whose first `message.len()` bytes are in
+    /// hand, if `more` says there is a rest; discards it, and fails, if the
+    /// whole would exceed `max_len`.
+    async fn finish_message(
+        &self,
+        mut message: Vec<u8>,
+        mut more: bool,
+        max_len: usize,
+    ) -> windows_core::Result<Vec<u8>> {
         while more {
             let left = bytes_left_in_message(self.res.handle)?;
             if message.len() + left > max_len {
@@ -842,6 +902,71 @@ mod tests {
         assert!(
             waited >= Duration::from_millis(250) && waited < Duration::from_secs(3),
             "waited {waited:?} for a 300 ms timeout"
+        );
+    }
+
+    /// A server that answers each message with `reply(message)` until the
+    /// client goes away.
+    fn answering(
+        server: NamedPipeStream,
+        reply: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while let Ok(m) = block_on(server.read_message(1 << 20)) {
+                if block_on(server.write(reply(&m))).0.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// One call writes the request and reads the reply, whatever its size.
+    #[test]
+    fn transact_round_trips() {
+        let rt = Runtime::new();
+        let (server, client) = message_pair(&rt, NamedPipeOptions::new());
+        let server = answering(server, |m| {
+            if m == b"big" {
+                (0..150_000u32).map(|i| i as u8).collect()
+            } else {
+                m.to_ascii_uppercase()
+            }
+        });
+        assert_eq!(block_on(client.transact(b"ping".to_vec(), 64)).unwrap(), b"PING");
+        let big = block_on(client.transact(b"big".to_vec(), 1 << 20)).unwrap();
+        assert_eq!(big, (0..150_000u32).map(|i| i as u8).collect::<Vec<_>>());
+        assert_eq!(block_on(client.transact(b"again".to_vec(), 64)).unwrap(), b"AGAIN");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    /// A reply too long for the caller is discarded whole, and the pipe is
+    /// ready for the next transaction.
+    #[test]
+    fn an_oversized_reply_is_discarded_whole() {
+        let rt = Runtime::new();
+        let (server, client) = message_pair(&rt, NamedPipeOptions::new());
+        let server = answering(server, |m| {
+            if m == b"big" { vec![9u8; 100_000] } else { m.to_vec() }
+        });
+        let err = block_on(client.transact(b"big".to_vec(), 10)).unwrap_err();
+        assert_eq!(err.code(), ERROR_MORE_DATA.to_hresult());
+        assert_eq!(block_on(client.transact(b"small".to_vec(), 10)).unwrap(), b"small");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_byte_pipe_has_no_transactions() {
+        let rt = Runtime::new();
+        let name = unique("bytes_tx");
+        let server = accept_one(&rt, NamedPipeListener::bind(&rt, &name));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let client = NamedPipeConnector::connect(&rt, &name).unwrap();
+        let _server = server.join().unwrap().unwrap();
+        assert_eq!(
+            block_on(client.transact(b"x".to_vec(), 16)).unwrap_err().code(),
+            E_ILLEGAL_METHOD_CALL
         );
     }
 }

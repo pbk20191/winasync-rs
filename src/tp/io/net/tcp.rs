@@ -17,6 +17,23 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
+    /// Sends a Winsock control code (`WSAIoctl`, overlapped) and resolves to
+    /// the output it wrote, at most `output_len` bytes.
+    ///
+    /// The socket-level counterpart of [`Device::ioctl`](crate::tp::io::device::Device::ioctl).
+    /// Codes that finish at once (`SIO_KEEPALIVE_VALS`,
+    /// `SIO_ADDRESS_LIST_QUERY`) resolve straight away; codes that wait for
+    /// something (`SIO_ADDRESS_LIST_CHANGE`, `SIO_ROUTING_INTERFACE_CHANGE`)
+    /// resolve when it happens, and dropping the future cancels them.
+    pub fn ioctl(
+        &self,
+        code: u32,
+        input: Vec<u8>,
+        output_len: usize,
+    ) -> impl Future<Output = windows_core::Result<Vec<u8>>> + Send + use<> {
+        crate::tp::io::socket_ioctl(&self.res, code, input, output_len)
+    }
+
     /// Binds and listens on `addr` (IPv4 or IPv6).
     pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpListener> {
         Self::bind_with_flags(rt, addr, 0)
@@ -233,6 +250,23 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
+    /// Sends a Winsock control code (`WSAIoctl`, overlapped) and resolves to
+    /// the output it wrote, at most `output_len` bytes.
+    ///
+    /// The socket-level counterpart of [`Device::ioctl`](crate::tp::io::device::Device::ioctl).
+    /// Codes that finish at once (`SIO_KEEPALIVE_VALS`,
+    /// `SIO_ADDRESS_LIST_QUERY`) resolve straight away; codes that wait for
+    /// something (`SIO_ADDRESS_LIST_CHANGE`, `SIO_ROUTING_INTERFACE_CHANGE`)
+    /// resolve when it happens, and dropping the future cancels them.
+    pub fn ioctl(
+        &self,
+        code: u32,
+        input: Vec<u8>,
+        output_len: usize,
+    ) -> impl Future<Output = windows_core::Result<Vec<u8>>> + Send + use<> {
+        crate::tp::io::socket_ioctl(&self.res, code, input, output_len)
+    }
+
     fn from_socket(rt: &Arc<RuntimeInner>, sock: SOCKET) -> windows_core::Result<TcpStream> {
         match IoRes::register(rt, HANDLE(sock.0 as *mut c_void), true) {
             Ok(res) => Ok(TcpStream { res }),

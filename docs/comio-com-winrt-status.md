@@ -776,6 +776,44 @@ comio 리스너는 마지막 accept의 `OpHandle`을 `current_op`에 둔다. 끝
 바뀌어서 드러나지 않았다. 상한에 걸려 아무것도 걸지 못하면, 리스너는 바로 그 인스턴스가 닫히기를
 영원히 기다렸다. 상한 테스트가 이것을 잡았다. `try_arm`이 시작할 때 이전 핸들을 놓는다.
 
+## TransactNamedPipe, 소켓 ioctl, 시리얼 포트 (2026-11-10)
+
+`ConnectNamedPipe`는 이미 accept 경로(tp `accept`, comio 리스너 체인)가 overlapped로 쓰고 있어서
+따로 열지 않았다.
+
+**TransactNamedPipe** — tp `NamedPipeStream::transact(request, max)`, comio
+`IMessageStream.TransactAsync(request, maxSize)`. 메시지 하나를 쓰고 응답 하나를 읽는 일을 커널 호출
+한 번으로 한다. 응답은 메시지 읽기와 같은 규칙을 따른다. 처음 64KiB를 넘으면 나머지를 마저 읽고,
+`max`를 넘으면 끝까지 읽어 버린 뒤 `ERROR_MORE_DATA`로 실패한다. comio에서는 메시지 읽기 체인의
+첫 단계만 `TransactNamedPipe`로 바꿨다. 요청은 복사해 둔다. 커널이 완료 때까지 읽기 때문이다.
+메시지 모드가 아니면 `E_ILLEGAL_METHOD_CALL`이다.
+
+**소켓 ioctl** — tp의 모든 소켓 타입(`TcpStream`/`TcpListener`/`UdpSocket`/`UnixStream`/
+`UnixListener`/`HvStream`/`HvListener`)에 `ioctl(code, input, output_len)`을 달았다. overlapped
+`WSAIoctl`이다. comio에는 넣지 않았다. 측정(26320, 완료 포트에 연결한 소켓)은 다음과 같다.
+
+| 코드 | 결과 |
+| --- | --- |
+| `SIO_KEEPALIVE_VALS`, `SIO_ADDRESS_LIST_QUERY`, `SIO_ROUTING_INTERFACE_QUERY`, `SIO_GET_EXTENSION_FUNCTION_POINTER`, `FIONREAD`, `FIONBIO` | 즉시 성공, 완료 패킷 옴 |
+| `SIO_ADDRESS_LIST_CHANGE` | pending, 주소가 바뀔 때까지 |
+| `SIO_BASE_HANDLE`, `SIO_TCP_INFO`(연결 전) | pending 후 오류 패킷 |
+
+Winsock이 사용자 모드에서 답하는 코드도 패킷이 왔다. 그래서 "패킷이 안 와서 op가 영원히 남는"
+경우는 측정 범위 안에서는 없었다. 대신 즉시 성공한 호출은 패킷의 바이트 수가 **0**이었다.
+출력 길이는 `lpcbBytesReturned`에만 있다(`ADDRESS_LIST_QUERY`가 72바이트를 쓰고 패킷은 0).
+그래서 그 값을 op 블록 안에 받아 두고, 0이 아니면 그것을 쓴다. 테스트가 이 경우를 고정한다.
+
+**시리얼 포트** — tp `SerialPort`: `open("COM3")`(10번 이상은 `\\.\` 접두사를 붙여 준다),
+`state`/`set_state`(`DCB`), `set_timeouts`(`COMMTIMEOUTS`), `read`/`write`, `wait_event(mask)`
+(`SetCommMask` + overlapped `WaitCommEvent`). comio에는 없다. WinRT에
+`Windows.Devices.SerialCommunication.SerialDevice`가 있기 때문이다. 대기는 한 번에 하나다. 마스크는
+포트에 하나뿐이라서, 새 대기가 마스크를 바꾸면 이전 대기가 빈 집합으로 끝난다.
+
+검증은 제한적이다. 개발 머신과 CI 러너 모두 COM 포트가 없다. 항상 도는 테스트는 없는 포트가
+`ERROR_FILE_NOT_FOUND`인 것 하나뿐이다. 설정 왕복, `EV_TXEMPTY`, 대기 취소 테스트는
+`WINASYNC_TEST_COM`(예: `COM3`)이 있을 때만 돌고, `GITHUB_ACTIONS`에서는 건너뛴다. **실제 포트에서는
+아직 한 번도 돌리지 않았다.**
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

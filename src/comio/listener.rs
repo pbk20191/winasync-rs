@@ -2292,6 +2292,45 @@ mod pipe_settings_tests {
         listener.cast::<IClosable>().unwrap().Close().unwrap();
     }
 
+    /// `TransactAsync`: request out, whole reply back, in one call -- and a
+    /// reply too long for the caller discarded without spoiling the next.
+    #[test]
+    fn transactions_round_trip() {
+        let name = pipe_name("transact");
+        let listener = NamedPipeConnectionListener::new();
+        listener
+            .cast::<INamedPipeListenerSettings>()
+            .unwrap()
+            .SetMessageMode(true)
+            .unwrap();
+        // Answers each message on the pool thread it was delivered on.
+        let handler = ConnectionHandler::new(move |_s, args| {
+            let stream = args.as_ref().unwrap().Stream()?;
+            let messages: IMessageStream = stream.cast()?;
+            while let Ok(m) = block_on(messages.ReadMessageAsync(1 << 20)?.into_future()) {
+                let m = bytes_of(&m);
+                let reply = if m == b"big" { vec![5u8; 100_000] } else { m.to_ascii_uppercase() };
+                send(&stream, &reply);
+            }
+            Ok(())
+        });
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+
+        let client: IMessageStream = connect_soon(&name).cast().unwrap();
+        let transact = |request: &[u8], max: u32| {
+            block_on(client.TransactAsync(&buffer_of(request), max).unwrap().into_future())
+                .map(|b| bytes_of(&b))
+                .map_err(|e| e.code())
+        };
+        assert_eq!(transact(b"ping", 64), Ok(b"PING".to_vec()));
+        assert_eq!(transact(b"big", 1 << 20), Ok(vec![5u8; 100_000]));
+        assert_eq!(transact(b"big", 10), Err(HRESULT::from_win32(ERROR_MORE_DATA.0)));
+        assert_eq!(transact(b"after", 64), Ok(b"AFTER".to_vec()));
+        drop(client);
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+    }
+
     #[test]
     fn a_byte_stream_has_no_messages() {
         let (stream, _other) = crate::comio::stream::tests::pipe_pair();
@@ -2299,6 +2338,10 @@ mod pipe_settings_tests {
         assert!(!messages.IsMessageMode().unwrap());
         assert_eq!(
             messages.ReadMessageAsync(16).unwrap_err().code(),
+            E_ILLEGAL_METHOD_CALL
+        );
+        assert_eq!(
+            messages.TransactAsync(&buffer_of(b"x"), 16).unwrap_err().code(),
             E_ILLEGAL_METHOD_CALL
         );
     }

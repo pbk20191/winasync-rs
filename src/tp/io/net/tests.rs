@@ -1048,3 +1048,67 @@
             );
         }
     }
+
+    const SIO_KEEPALIVE_VALS: u32 = 0x9800_0004;
+    const SIO_ADDRESS_LIST_QUERY: u32 = 0x4800_0016;
+    const SIO_ADDRESS_LIST_CHANGE: u32 = 0x2800_0017;
+
+    /// An ioctl that finishes at once still reports its output's length:
+    /// the completion packet says 0 bytes, and only `lpcbBytesReturned`
+    /// has the real count.
+    #[test]
+    fn ioctl_output_survives_an_immediate_completion() {
+        let rt = Runtime::new();
+        let udp = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let out = block_on(udp.ioctl(SIO_ADDRESS_LIST_QUERY, Vec::new(), 4096)).unwrap();
+        // SOCKET_ADDRESS_LIST: an i32 count, then the entries.
+        assert!(out.len() > 4, "no output from SIO_ADDRESS_LIST_QUERY: {out:?}");
+        let count = i32::from_ne_bytes(out[..4].try_into().unwrap());
+        assert!(count >= 1, "no addresses listed");
+    }
+
+    /// An input-only ioctl on a connected stream.
+    #[test]
+    fn ioctl_sets_keepalive() {
+        let rt = Runtime::new();
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener =
+                TcpListener::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+                    .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = rt.spawn(async move { listener.accept().await.unwrap() });
+            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let _server = server.await.unwrap();
+            let vals: Vec<u8> = [1u32, 10_000, 1_000].iter().flat_map(|v| v.to_ne_bytes()).collect();
+            client.ioctl(SIO_KEEPALIVE_VALS, vals, 0).await
+        }));
+        assert_eq!(result.expect("timed out").unwrap(), Vec::<u8>::new());
+    }
+
+    /// A code that waits (here for the machine's addresses to change) stays
+    /// pending, and dropping its future cancels it without leaking the op.
+    #[test]
+    fn a_waiting_ioctl_is_cancelled_by_drop() {
+        let rt = Runtime::new();
+        let udp = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let waited = block_on(timeout(
+            &rt,
+            Duration::from_millis(200),
+            udp.ioctl(SIO_ADDRESS_LIST_CHANGE, Vec::new(), 0),
+        ));
+        assert!(waited.is_err(), "SIO_ADDRESS_LIST_CHANGE completed: {waited:?}");
+        drop(udp);
+        for _ in 0..500 {
+            if super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the cancelled ioctl leaked its op"
+        );
+    }

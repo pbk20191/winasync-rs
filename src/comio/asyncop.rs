@@ -308,6 +308,34 @@ impl IoAsyncOp<IBuffer> {
                 discarding: None,
             },
             (max as usize).min(FIRST_READ),
+            None,
+        );
+        iface
+    }
+
+    /// Writes `request` as one message and reads the reply, as
+    /// `start_read_message` would, starting with one `TransactNamedPipe`.
+    ///
+    /// The request is copied: the kernel reads it until the transaction
+    /// completes, and an owned copy is simpler to keep alive that long than
+    /// the caller's `IBuffer`.
+    pub(crate) fn start_transact(
+        reg: &Arc<IoReg>,
+        request: Vec<u8>,
+        max: u32,
+    ) -> IAsyncOperationWithProgress<IBuffer, u32> {
+        let object = new_object::<IBuffer>();
+        let iface: IAsyncOperationWithProgress<IBuffer, u32> = object.to_interface();
+        read_message_step(
+            object,
+            reg.clone(),
+            MessageRead {
+                max: max as usize,
+                message: Vec::new(),
+                discarding: None,
+            },
+            (max as usize).min(FIRST_READ),
+            Some(request),
         );
         iface
     }
@@ -321,11 +349,14 @@ struct MessageRead {
     discarding: Option<usize>,
 }
 
+/// One step of a message read. With `request`, the step is the transaction
+/// that sends it and reads the start of the reply; every later step is a read.
 fn read_message_step(
     object: ComObject<IoAsyncOp<IBuffer>>,
     reg: Arc<IoReg>,
     mut read: MessageRead,
     chunk: usize,
+    request: Option<Vec<u8>>,
 ) {
     let step = {
         let mut guard = object.0.lock().unwrap();
@@ -336,6 +367,7 @@ fn read_message_step(
     // kernel is done writing into it.
     let mut part = vec![0u8; chunk];
     let ptr = part.as_mut_ptr();
+    let sent = request.as_ref().map(|r| (r.as_ptr(), r.len()));
     let handle = reg.handle;
     let cb_object = object.clone();
     let cb_reg = reg.clone();
@@ -343,6 +375,8 @@ fn read_message_step(
         submit(
             &reg,
             Box::new(move |ioresult: u32, bytes: usize| {
+                // The kernel reads the request until here.
+                let _ = &request;
                 let more = ioresult == ERROR_MORE_DATA.0;
                 if ioresult != 0 && !more {
                     let res = if ioresult == ERROR_HANDLE_EOF.0 {
@@ -385,14 +419,26 @@ fn read_message_step(
                     Some(_) => left.clamp(1, FIRST_READ),
                     None => left.max(1),
                 };
-                read_message_step(cb_object, cb_reg, read, next);
+                read_message_step(cb_object, cb_reg, read, next, None);
             }),
-            move |ovl| match windows::Win32::Storage::FileSystem::ReadFile(
-                handle,
-                Some(std::slice::from_raw_parts_mut(ptr, chunk)),
-                None,
-                Some(ovl),
-            ) {
+            move |ovl| match match sent {
+                Some((request, len)) => windows::Win32::System::Pipes::TransactNamedPipe(
+                    handle,
+                    Some(request.cast()),
+                    len as u32,
+                    Some(ptr.cast()),
+                    chunk as u32,
+                    // Overlapped: the count comes with the completion.
+                    core::ptr::null_mut(),
+                    Some(ovl),
+                ),
+                None => windows::Win32::Storage::FileSystem::ReadFile(
+                    handle,
+                    Some(std::slice::from_raw_parts_mut(ptr, chunk)),
+                    None,
+                    Some(ovl),
+                ),
+            } {
                 Ok(()) => Issue::SyncSuccess,
                 Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                 // A partial message is a warning, not a failure: its packet

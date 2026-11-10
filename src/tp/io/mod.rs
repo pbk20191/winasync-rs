@@ -13,6 +13,7 @@ pub mod file;
 pub mod hvsock;
 pub mod net;
 pub mod pipe;
+pub mod serial;
 pub mod unix;
 
 use crate::common::overlapped::{self as ov, Completion, IoReg, OpHandle};
@@ -78,6 +79,63 @@ impl IoRes {
             inner,
             rt: rt.clone(),
         }))
+    }
+}
+
+/// Buffers of an in-flight `WSAIoctl`, kept in the op block until it
+/// completes.
+struct SocketIoctl {
+    input: Vec<u8>,
+    output: Vec<u8>,
+    /// Where `WSAIoctl` writes the output length when it finishes at once.
+    returned: u32,
+}
+
+/// Issues `WSAIoctl(code)` overlapped on a registered socket and resolves to
+/// the output it wrote.
+///
+/// Measured on 26320 (codes Winsock answers in user mode included --
+/// `SIO_GET_EXTENSION_FUNCTION_POINTER`, `FIONBIO` -- and ones the provider
+/// rejects): every call either returned `WSA_IO_PENDING` or succeeded at
+/// once, and either way a completion packet followed. But a call that
+/// succeeds at once reports its output length only through
+/// `lpcbBytesReturned`; the packet says 0. So the length is read from there
+/// when it is set, and from the packet otherwise.
+pub(crate) fn socket_ioctl(
+    res: &Arc<IoRes>,
+    code: u32,
+    input: Vec<u8>,
+    output_len: usize,
+) -> impl Future<Output = windows_core::Result<Vec<u8>>> + Send + use<> {
+    use windows::Win32::Networking::WinSock::WSAIoctl;
+    let sock = res.socket();
+    let payload = SocketIoctl {
+        input,
+        output: vec![0u8; output_len],
+        returned: 0,
+    };
+    let fut = unsafe {
+        submit(res, payload, move |ovl, p| {
+            let r = WSAIoctl(
+                sock,
+                code,
+                (!p.input.is_empty()).then(|| p.input.as_ptr().cast()),
+                p.input.len() as u32,
+                (!p.output.is_empty()).then(|| p.output.as_mut_ptr().cast()),
+                p.output.len() as u32,
+                &mut p.returned,
+                Some(ovl),
+                None,
+            );
+            crate::common::winsock::classify_wsa_overlapped(r == 0)
+        })
+    };
+    async move {
+        let (result, mut p) = fut.await;
+        let bytes = result?;
+        let n = if p.returned != 0 { p.returned as usize } else { bytes };
+        p.output.truncate(n);
+        Ok(p.output)
     }
 }
 

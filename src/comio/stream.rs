@@ -198,6 +198,29 @@ impl IMessageStream_Impl for TransportStream_Impl {
         }
         Ok(IoAsyncOp::start_read_message(&self.reg, max_size))
     }
+
+    fn TransactAsync(
+        &self,
+        request: Ref<IBuffer>,
+        max_size: u32,
+    ) -> Result<IAsyncOperationWithProgress<IBuffer, u32>> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(windows_core::Error::from_hresult(
+                crate::comio::listener::RO_E_CLOSED,
+            ));
+        }
+        if !self.message_mode {
+            return Err(windows_core::Error::new(
+                crate::comio::listener::E_ILLEGAL_METHOD_CALL,
+                "not a message-mode pipe",
+            ));
+        }
+        let request = request.ok()?;
+        let ptr = buffer_ptr(request)?;
+        let len = request.Length()? as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+        Ok(IoAsyncOp::start_transact(&self.reg, bytes, max_size))
+    }
 }
 
 impl IClosable_Impl for TransportStream_Impl {

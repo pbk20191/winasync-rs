@@ -61,6 +61,7 @@ pub use io::net::{
 #[allow(unused_imports)]
 pub use io::pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeOptions, NamedPipeStream};
 #[allow(unused_imports)]
+pub use io::serial::SerialPort;
 pub use io::unix::{UnixListener, UnixStream};
 // Who may connect to a listener, for `bind_with_security` on the local
 // transports.

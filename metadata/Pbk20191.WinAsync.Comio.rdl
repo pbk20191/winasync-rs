@@ -163,6 +163,13 @@ mod Pbk20191 {
             // a boundary. On any other stream it fails with
             // E_ILLEGAL_METHOD_CALL.
             //
+            // `TransactAsync` writes `request` as one message and reads the
+            // reply, of at most `maxSize` bytes, in one `TransactNamedPipe`:
+            // a request/response round trip in a single kernel call. The
+            // reply follows `ReadMessageAsync`'s rules. The kernel refuses a
+            // transaction while anything unread is in the pipe, since the
+            // reply would be the stale message.
+            //
             // Its own interface, like `ITransportPeer`, so a composed stream
             // is not obliged to answer it.
             #[Version(1)]
@@ -170,6 +177,7 @@ mod Pbk20191 {
             interface IMessageStream {
                 #[get] IsMessageMode: bool;
                 fn ReadMessageAsync(&self, #[in] maxSize: u32) -> Windows::Foundation::IAsyncOperationWithProgress<Windows::Storage::Streams::IBuffer, u32>;
+                fn TransactAsync(&self, #[in] request: Windows::Storage::Streams::IBuffer, #[in] maxSize: u32) -> Windows::Foundation::IAsyncOperationWithProgress<Windows::Storage::Streams::IBuffer, u32>;
             }
 
             #[Version(1)]

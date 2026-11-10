@@ -104,6 +104,8 @@ default = ["tp", "dq", "comio"]
 
 # Win32 thread-pool async runtime. Standalone: no winui3 / windows-future.
 tp = [
+    # Serial ports: `DCB`, `COMMTIMEOUTS`, `WaitCommEvent`.
+    "windows/Win32_Devices_Communication",
     "windows/Win32_Foundation",
     "windows/Win32_Security",
     "windows/Win32_Security_Authorization",
