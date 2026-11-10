@@ -52,6 +52,13 @@ fn a_late_completion_after_a_forced_unload_does_not_call_into_freed_code() {
     );
     let module = unsafe { LoadLibraryW(&HSTRING::from(path.as_os_str())) }.expect("LoadLibraryW");
 
+    // `DllMain` is exported, so anyone can call it. A forged attach, before
+    // the module's first callback environment is built, must not replace the
+    // handle the loader gave it; otherwise the `RaceDll` below would name
+    // something other than this module and the late completion would land in
+    // freed code.
+    unsafe { forge_attach(module) };
+
     // The other end belongs to the test, so it stays open -- and the read
     // stays pending -- until the test decides otherwise.
     let pipe = format!(r"\\.\pipe\comio_racedll_{}", std::process::id());
@@ -126,6 +133,28 @@ unsafe fn activate(module: HMODULE, class: &str) -> IInspectable {
         .expect("DllGetActivationFactory");
     let factory = unsafe { IActivationFactory::from_raw(raw) };
     unsafe { factory.ActivateInstance() }.expect("ActivateInstance")
+}
+
+/// Calls the DLL's exported `DllMain` as an attach for a module that is not
+/// this one.
+///
+/// # Safety
+///
+/// `module` must be the loaded server DLL.
+unsafe fn forge_attach(module: HMODULE) {
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    let addr = unsafe { GetProcAddress(module, PCSTR(c"DllMain".as_ptr().cast())) }
+        .expect("DllMain not exported");
+    let f: unsafe extern "system" fn(*mut core::ffi::c_void, u32, *mut core::ffi::c_void) -> i32 =
+        unsafe { core::mem::transmute(addr) };
+    // A loaded module, so a pool handed it as `RaceDll` would happily pin it
+    // -- and then call into ours after it is gone.
+    let decoy = unsafe { GetModuleHandleW(w!("kernel32.dll")) }.expect("kernel32");
+    assert_eq!(
+        unsafe { f(decoy.0, DLL_PROCESS_ATTACH, core::ptr::null_mut()) },
+        1,
+        "DllMain must not fail a call it ignores"
+    );
 }
 
 /// # Safety

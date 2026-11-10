@@ -156,7 +156,10 @@ counters = []
 
 # Compiled for the in-process server DLL. **Do not enable this yourself** --
 # `dll/` (package `winasync-dll`) enables it through its dependency
-# declaration, and that is the only place it should come from.
+# declaration, and that is the only place it should come from. Cargo has no
+# private features, so this cannot be enforced; what is enforced is that the
+# entry points it exposes are `unsafe fn`, so turning it on reaches nothing
+# unsound from safe code.
 #
 # What it turns on is the module-lifetime accounting `DllCanUnloadNow`
 # answers from: live objects, server locks, in-flight operations, and whether

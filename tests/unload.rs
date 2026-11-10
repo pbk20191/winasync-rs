@@ -228,8 +228,10 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
     );
 
     // The release is what `DllCanUnloadNow` performs just before saying yes.
+    // SAFETY (here and below): `can_unload` holds, and this test process
+    // builds only `comio` sockets, every one of which it counts.
     assert!(
-        release_process_state(),
+        unsafe { release_process_state() },
         "nothing was released, but Winsock was up"
     );
     assert!(
@@ -237,7 +239,7 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
         "the Winsock reference was not given back"
     );
     assert!(
-        !release_process_state(),
+        !unsafe { release_process_state() },
         "a second release claimed to have done something"
     );
 
@@ -258,7 +260,10 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
         "Winsock did not come back up for a socket created after teardown"
     );
     assert_eq!(outstanding(), 0);
-    assert!(release_process_state(), "the second reference was not released");
+    assert!(
+        unsafe { release_process_state() },
+        "the second reference was not released"
+    );
 }
 
 /// A listener bound to a fresh pipe name, plus that name.

@@ -680,6 +680,28 @@ pipe 리스너에도 클라이언트가 접속할 수 있다. 전달은 핸들�
 쓰거나, accept 시점에 `RemoteUserSid`를 확인한다. 테스트는 개발 머신에서는 거부를 단언하고,
 GitHub Actions(`GITHUB_ACTIONS`)에서는 결과를 출력만 한다.
 
+## DLL 전용 진입점의 접근 제어 (2026-11-10)
+
+DLL에만 있어야 할 동작이 다른 경로로 닿는지 점검했다. rlib을 링크하는 쪽은 static을 자기
+바이너리에 따로 복사해 가지므로 `winasync.dll` 안의 상태에는 닿지 않는다. 남은 경로는 세 가지였다.
+
+- **위조 `DllMain`**: `DllMain`은 export되고, `exports.def`에서 빠져 있어 import library에도
+  남는다. 그래서 누구나 `DllMain(가짜 핸들, DLL_PROCESS_ATTACH, null)`을 부를 수 있었고, 그 핸들이
+  `MODULE`을 덮어써 스레드 풀의 `RaceDll`이 되었다. `tests/racedll.rs`에 이 위조를 넣어 보면 가드
+  없이 `STATUS_ACCESS_VIOLATION`으로 죽는다. 이제 `dll_main`은 첫 attach만 받는다(로더가 항상
+  먼저다). detach는 attach한 핸들일 때만 믿는다. export와 import library는 Windows 기능으로 보고
+  그대로 둔다.
+- **`common::winsock::wsa_shutdown`**: cfg 없는 safe `pub fn`이라 `tp`만 쓰는 빌드에서도 자기
+  소켓 밑에서 `WSACleanup`을 부를 수 있었다. `pub(crate)`로 내렸다.
+- **`dylib` 피처를 외부에서 켜는 경우**: cargo에는 비공개 피처가 없다. 켜면 `dll_main`,
+  `dll_can_unload_now`, `release_process_state`가 열린다. 셋 다 `unsafe fn` + `#[doc(hidden)]`로
+  바꾸고 "DLL 진입점에서만"을 safety 조건으로 적었다. `tp`와 `dylib`를 같이 켠 exe에서는 대기 중인
+  tp 리스너가 어떤 카운트에도 잡히지 않아, `can_unload`가 참이어도 `WSACleanup`이 그 소켓을 끊는다.
+
+남은 것: `tp::pool`의 `race_dll(HMODULE)`, `activation_context(HANDLE)`는 아무 값이나 받는 safe
+빌더다. 가짜 값이 풀에서 무엇을 하는지는 측정하지 않았다. `LIVE_OPS`는 쓰기 가능한 `pub static`이지만
+영향은 그 바이너리의 복사본에 그친다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

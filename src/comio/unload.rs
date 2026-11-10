@@ -200,8 +200,17 @@ pub fn can_unload() -> bool {
 /// against.
 ///
 /// Returns whether anything was released, which is only of interest to tests.
+///
+/// # Safety
+///
+/// [`can_unload`] must have returned true, and the build must be the server
+/// DLL, where every socket this crate owns is counted by it. Neither holds in
+/// an executable that turns on `dylib` beside `tp`: an idle tp listener sits
+/// outside every count, and this would close it. Public only for
+/// `tests/unload.rs`, which needs a process of its own.
+#[doc(hidden)]
 #[cfg(feature = "dylib")]
-pub fn release_process_state() -> bool {
+pub unsafe fn release_process_state() -> bool {
     // Winsock is the whole list. The Windows App SDK bootstrap that would
     // otherwise belong here is `#[cfg(test)]` in `dq` and never ships in this
     // module; thread-pool registrations are owned by the objects already
@@ -252,8 +261,21 @@ pub fn locks_held() -> usize {
 ///
 /// Returns the `BOOL` `DllMain` must return; anything but TRUE fails the
 /// load.
+///
+/// # Safety
+///
+/// Only the server DLL's `DllMain` may call this, with the arguments the
+/// loader passed it.
+///
+/// That is a contract, not the whole defence. `DllMain` stays exported -- and
+/// in the import library, so it can be linked against -- which means anyone
+/// can call the DLL's copy with arguments of their choosing. So the first
+/// attach wins and every later one is ignored: the loader's call always comes
+/// first, and a forged handle would otherwise become the `RaceDll` the thread
+/// pool trusts. A detach is only believed for the handle that attached.
+#[doc(hidden)]
 #[cfg(feature = "dylib")]
-pub fn dll_main(
+pub unsafe fn dll_main(
     instance: *mut core::ffi::c_void,
     reason: u32,
     reserved: *mut core::ffi::c_void,
@@ -265,13 +287,18 @@ pub fn dll_main(
         DLL_PROCESS_ATTACH => {
             // Before anything else in the module can run, so every reader of
             // `module()` -- `pool::callback_env` above all -- sees it set.
-            MODULE.store(instance, Ordering::Release);
+            let _ = MODULE.compare_exchange(
+                core::ptr::null_mut(),
+                instance,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
         }
         // `reserved` is null when the module is being unloaded by
         // `FreeLibrary`, and non-null when the process is exiting. Only the
         // first is a mistake: at process exit nothing will run again, so
         // outstanding objects are not a dangling-call risk.
-        DLL_PROCESS_DETACH if reserved.is_null() => on_forced_unload(),
+        DLL_PROCESS_DETACH if reserved.is_null() && instance == module() => on_forced_unload(),
         _ => {}
     }
     1

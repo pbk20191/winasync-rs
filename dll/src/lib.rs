@@ -72,13 +72,27 @@ pub unsafe extern "system" fn DllGetActivationFactory(
 /// moment it says so it gives back `WSAStartup`'s process reference.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    activation::dll_can_unload_now()
+    // SAFETY: this is the DLL's export, and the DLL carries `comio` alone, so
+    // every socket in it is one `can_unload` counts.
+    unsafe { activation::dll_can_unload_now() }
 }
 
 /// Load and unload notifications. Records this module's handle on attach
 /// -- the `RaceDll` the thread pool pins -- and observes on detach; see
 /// `unload::dll_main`.
+///
+/// # Safety
+///
+/// Called by the loader. Exported, so others can call it too; a forged
+/// attach is ignored, as the comment below explains.
 #[unsafe(no_mangle)]
-pub extern "system" fn DllMain(instance: *mut c_void, reason: u32, reserved: *mut c_void) -> i32 {
-    unload::dll_main(instance, reason, reserved)
+pub unsafe extern "system" fn DllMain(
+    instance: *mut c_void,
+    reason: u32,
+    reserved: *mut c_void,
+) -> i32 {
+    // SAFETY: this is the DLL's `DllMain`. Being exported, it can also be
+    // called by anyone; `dll_main` keeps only the first attach, which is the
+    // loader's, so a forged call cannot replace the handle.
+    unsafe { unload::dll_main(instance, reason, reserved) }
 }

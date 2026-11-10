@@ -398,15 +398,26 @@ pub unsafe fn dll_get_activation_factory(
 /// Present only in a `dylib` build, because only that build keeps the counts
 /// the answer comes from. Without the export COM never asks, which is the
 /// same outcome as an unconditional `S_FALSE` — see [`super::unload`].
+///
+/// # Safety
+///
+/// Only the server DLL's `DllCanUnloadNow` may call this. It ends in
+/// `WSACleanup`, which is sound only where every socket of ours is counted --
+/// true of the DLL, which carries `comio` alone, and false of an executable
+/// that turns `dylib` on beside `tp`. See
+/// [`super::unload::release_process_state`].
+#[doc(hidden)]
 #[cfg(feature = "dylib")]
-pub fn dll_can_unload_now() -> HRESULT {
+pub unsafe fn dll_can_unload_now() -> HRESULT {
     if !super::unload::can_unload() {
         return S_FALSE;
     }
     // Saying yes is also the moment to give back what unloading would
     // otherwise strand -- `WSAStartup`'s process reference. See
     // `unload::release_process_state` for why here and nowhere else.
-    super::unload::release_process_state();
+    // SAFETY: `can_unload` just said nothing is live, and the caller is the
+    // DLL's export, per this function's contract.
+    unsafe { super::unload::release_process_state() };
     S_OK
 }
 

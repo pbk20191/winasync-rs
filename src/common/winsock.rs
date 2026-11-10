@@ -71,7 +71,7 @@ fn ensure_started(state: &mut Startup) {
 /// Process-wide Winsock initialization. Idempotent and safe to call from
 /// every socket constructor.
 ///
-/// Balanced by [`wsa_shutdown`] since 2026-11-09. It was a `Once` that never
+/// Balanced by `wsa_shutdown` since 2026-11-09. It was a `Once` that never
 /// ran down, on the reasoning that "a library has no way to know it is the
 /// last user" — which misreads the API. `WSAStartup` and `WSACleanup` are
 /// refcounted precisely so each component balances its own call and nobody
@@ -118,7 +118,11 @@ pub fn socket(af: i32, ty: i32, protocol: i32, flags: u32) -> windows_core::Resu
 /// Refuses while [`pin`] has been called. Teardown is only sound if every
 /// cached provider pointer can be invalidated, and a pin is how a module
 /// says it holds one that cannot be.
-pub fn wsa_shutdown() -> bool {
+///
+/// Crate-private because the precondition is one only `comio::unload` can
+/// establish. As a `pub fn` it let any caller -- a `tp`-only build included,
+/// where no such count exists -- tear Winsock down under its own live sockets.
+pub(crate) fn wsa_shutdown() -> bool {
     if PINNED.load(Ordering::Acquire) {
         return false;
     }
@@ -137,7 +141,7 @@ pub fn wsa_shutdown() -> bool {
 }
 
 /// Declares that the caller holds provider-derived state it cannot
-/// invalidate, which vetoes [`wsa_shutdown`] for the life of the process.
+/// invalidate, which vetoes `wsa_shutdown` for the life of the process.
 ///
 /// `rio::table` is the one caller: its `RIO_EXTENSION_FUNCTION_TABLE` is
 /// cached behind a `OnceLock` and handed out as `&'static`, so there is no
