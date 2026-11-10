@@ -20,7 +20,6 @@ pub mod watch;
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::common::overlapped::{Binding, IoHandle, IoReg};
 use crate::tp::RuntimeInner;
-use std::ops::Deref;
 use std::sync::Arc;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::IO::OVERLAPPED;
@@ -32,33 +31,17 @@ pub(crate) use crate::common::overlapped::Issue;
 #[cfg(any(test, feature = "counters"))]
 pub(crate) use crate::common::overlapped::LIVE_OPS;
 
-/// A handle registered with the runtime's pool, plus the typed runtime so
-/// accept/connect can register freshly-accepted sockets on the same pool via
-/// `res.rt`. Derefs to the shared [`IoReg`] (for `handle`/`socket()`/`is_socket()`).
-pub(crate) struct IoRes {
-    inner: Arc<IoReg>,
-    pub(crate) rt: Arc<RuntimeInner>,
-}
+/// A handle registered with the runtime's pool: the shared [`IoReg`], whose
+/// binding holds the runtime (`runtime_inner`) so accept/connect can
+/// register freshly-accepted sockets on the same pool.
+pub(crate) type IoRes = IoReg;
 
-impl Deref for IoRes {
-    type Target = IoReg;
-    fn deref(&self) -> &IoReg {
-        &self.inner
-    }
-}
-
-impl IoRes {
-    /// Registers `io` with `rt`'s pool. Takes `io` either way: a failed
-    /// registration closes it.
-    pub(crate) fn register(rt: &Arc<RuntimeInner>, io: impl Into<IoHandle>) -> windows_core::Result<Arc<Self>> {
-        // The pool stays until the registration is gone, so each TP_IO is
-        // closed before the pool's cleanup-group teardown.
-        let inner = IoReg::register(io, Binding::Pool(rt.pool_ref()))?;
-        Ok(Arc::new(Self {
-            inner,
-            rt: rt.clone(),
-        }))
-    }
+/// Registers `io` with `rt`'s pool. Takes `io` either way: a failed
+/// registration closes it.
+pub(crate) fn register_on(rt: &Arc<RuntimeInner>, io: impl Into<IoHandle>) -> windows_core::Result<Arc<IoReg>> {
+    // The pool stays until the registration is gone, so each TP_IO is
+    // closed before the pool's cleanup-group teardown.
+    IoReg::register(io, Binding::Pool(rt.pool_ref()))
 }
 
 /// Buffers of an in-flight `WSAIoctl`, kept in the op block until it
@@ -130,7 +113,7 @@ pub(crate) unsafe fn submit<P>(
     payload: P,
     issue: impl FnOnce(*mut OVERLAPPED, &mut P) -> Issue,
 ) -> OpFuture<P> {
-    unsafe { crate::common::opfuture::submit(&res.inner, payload, issue) }
+    unsafe { crate::common::opfuture::submit(res, payload, issue) }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +182,7 @@ pub(crate) fn evented<B: Send, F: FnOnce(&mut EventedMem, &mut B) -> Issue + Sen
 ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, F> {
     use windows::Win32::System::Threading::CreateEventW;
     let rt = crate::tp::Runtime {
-        inner: res.rt.clone(),
+        inner: res.runtime_inner().clone(),
     };
     // As an address: a raw `HANDLE` held across the await would make the
     // future `!Send`. `Evented` carries the real ones.

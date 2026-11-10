@@ -85,7 +85,7 @@ impl HvStream {
     }
 
     fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<HvStream> {
-        let res = IoRes::register(rt, sock)?;
+        let res = crate::tp::io::register_on(rt, sock)?;
         Ok(HvStream { res })
     }
 
@@ -285,7 +285,7 @@ impl HvListener {
         let (sa, len) = addr.to_raw();
         sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
         sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
-        let res = IoRes::register(&rt.inner, owned)?;
+        let res = crate::tp::io::register_on(&rt.inner, owned)?;
         Ok(HvListener {
             res,
             rt: rt.clone(),

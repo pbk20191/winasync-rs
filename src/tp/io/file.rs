@@ -142,7 +142,7 @@ impl File {
                 None,
             )?
         };
-        let res = IoRes::register(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(handle) })?;
+        let res = crate::tp::io::register_on(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(handle) })?;
         Ok(File { res })
     }
 
@@ -580,7 +580,7 @@ impl File {
         }
         let handle = self.res.handle;
         let op = unsafe {
-            ov::submit(&self.res.inner, (), on_complete, move |ovl, _| {
+            ov::submit(&self.res, (), on_complete, move |ovl, _| {
                 (*ovl).Anonymous.Anonymous.Offset = offset as u32;
                 (*ovl).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
                 match LockFileEx(handle, flags, None, len as u32, (len >> 32) as u32, ovl) {

@@ -91,7 +91,7 @@ impl UnixStream {
     }
 
     fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<UnixStream> {
-        let res = IoRes::register(rt, sock)?;
+        let res = crate::tp::io::register_on(rt, sock)?;
         Ok(UnixStream { res })
     }
 
@@ -348,7 +348,7 @@ impl UnixListener {
             security.apply_dacl_to_file(path)?;
         }
         sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
-        let res = IoRes::register(&rt.inner, owned)?;
+        let res = crate::tp::io::register_on(&rt.inner, owned)?;
         Ok(UnixListener {
             res,
             rt: rt.clone(),

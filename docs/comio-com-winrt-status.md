@@ -1117,6 +1117,20 @@ tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
   `curl -k`로 받은 뒤 `ssl_protocol`을 확인한다 — GitHub 런너는 관리자라 CI에서 돈다.
 - 아직 없는 것: 로깅 속성, 채널 바인딩/확장 인증, 요청 위임(`HttpDelegateRequestEx`), 클라이언트 인증서.
 
+### 메모리/수명 리뷰 반영 (2026-11-11)
+
+- **완료 슬롯을 op 블록 안으로**: `OpHeader.shared = Mutex<{fired, result, waker}>`. 핵심이 완료를 항상 기록하고
+  등록된 waker를 깨우므로 `OpFuture`(tp/http)와 comio `AwaitIo`는 `OpHandle` 하나로 줄었다(`poll_completion`).
+  이전의 `Arc<ResultSlot>`/`Arc<Slot>`이 사라져 **작업당 힙 할당 2 → 1**.
+- **`IoRes` 제거**: `Arc<IoRes{Arc<IoReg>, Arc<RuntimeInner>}>`의 겹이 사라지고 `IoRes = IoReg` 별칭.
+  런타임은 바인딩(`PoolRef::Runtime`)에서 `runtime_inner()`로 꺼낸다 — 핸들당 Arc 1개와 런타임 클론 1개 감소.
+- **http 요청 제로 카피**: `HttpRequest`가 수신 버퍼(`Vec<u64>`)를 소유하고 `method()`, `raw_url()`, `headers()`,
+  `header()`/`header_bytes()`가 레코드를 제자리에서 읽는다(헤더당 2회 할당 → 0). UTF-16인 `url/path/query`와
+  `auth.token`만 eager. 공개 필드 `method/raw_url/headers`는 메서드가 됐다.
+- `Response::header`가 `impl Into<String>`을 받아 소유한 문자열은 복사 없이 이동.
+- 검토 후 둔 것: `HttpRequest<'a>`(spawn이 `'static`을 요구해 결국 Arc로 돌아옴), `RawBuf<K>`, 작업당 `Arc<IoReg>` 클론
+  (핸들을 열어 두는 유일한 장치).
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

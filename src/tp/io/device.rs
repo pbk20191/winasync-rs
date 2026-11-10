@@ -68,7 +68,7 @@ impl Device {
                 None,
             )?
         };
-        let res = IoRes::register(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(handle) })?;
+        let res = crate::tp::io::register_on(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(handle) })?;
         Ok(Device { res })
     }
 

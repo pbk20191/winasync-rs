@@ -21,6 +21,7 @@ use std::mem;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use crate::common::pool::PoolRef;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket};
 use windows::Win32::Foundation::HANDLE;
@@ -196,6 +197,16 @@ impl IoReg {
         SOCKET(self.handle.0 as usize)
     }
 
+    /// The `tp` runtime this handle is registered with. Only for handles
+    /// `tp` registered, which always are.
+    #[cfg(feature = "tp")]
+    pub(crate) fn runtime_inner(&self) -> &Arc<crate::tp::RuntimeInner> {
+        match &self._binding {
+            Binding::Pool(PoolRef::Runtime(rt)) => &rt.inner,
+            _ => unreachable!("a tp handle registered elsewhere"),
+        }
+    }
+
     pub fn is_socket(&self) -> bool {
         self.is_socket
     }
@@ -268,6 +279,7 @@ pub enum Issue {
 }
 
 /// How an op finished, handed to its completion callback.
+#[derive(Clone, Copy, Debug)]
 pub enum Completion {
     /// Delivered by the kernel: raw win32 `ioresult` (0 = success) + `bytes`.
     Done(u32, usize),
@@ -276,11 +288,22 @@ pub enum Completion {
     SyncFail(windows_core::HRESULT),
 }
 
+/// What the completion path and the caller's side exchange: the outcome,
+/// and who to wake when it lands. In the block, so a future over the op
+/// needs no allocation of its own.
+struct Shared {
+    /// Set by whichever completion path runs.
+    fired: bool,
+    /// The outcome, until [`OpHandle::poll_completion`] takes it.
+    result: Option<Completion>,
+    /// Registered by a poll that found no result yet.
+    waker: Option<Waker>,
+}
+
 struct OpHeader {
     /// 2 at issue time: caller (`OpHandle`) + kernel/completion side.
     refs: AtomicUsize,
-    /// Set by whichever completion path runs, before the callback.
-    fired: Mutex<bool>,
+    shared: Mutex<Shared>,
     /// Runs the block's completion callback: typed, like `release`, so the
     /// callback is stored inline in the block rather than boxed.
     complete: unsafe fn(*mut c_void, Completion),
@@ -360,14 +383,23 @@ unsafe fn finish(op: *mut c_void, c: Completion) {
     }
 }
 
-/// The typed half of [`finish`]: marks the op fired and runs its callback.
+/// The typed half of [`finish`]: runs the callback, then records the
+/// outcome and wakes whoever polls for it.
 unsafe fn complete_op<P, F: FnOnce(Completion)>(op: *mut c_void, c: Completion) {
     let op = unsafe { &*(op as *mut Op<P, F>) };
-    *op.header.fired.lock().unwrap() = true;
     // Exactly one completion path runs per op, so the callback is this
     // one's to take.
     if let Some(cb) = unsafe { (*op.on_complete.get()).take() } {
         let _ = catch_unwind(AssertUnwindSafe(move || cb(c)));
+    }
+    let waker = {
+        let mut s = op.header.shared.lock().unwrap();
+        s.fired = true;
+        s.result = Some(c);
+        s.waker.take()
+    };
+    if let Some(w) = waker {
+        w.wake();
     }
 }
 
@@ -423,7 +455,7 @@ impl<P> OpHandle<P> {
     /// Requests cancellation if the op has not yet fired a completion.
     pub fn cancel(&self) {
         let header = unsafe { &(*self.op).header };
-        let in_flight = !*header.fired.lock().unwrap();
+        let in_flight = !header.shared.lock().unwrap().fired;
         if in_flight {
             unsafe {
                 let _ = CancelIoEx(header.reg.handle, Some(&(*self.op).overlapped));
@@ -433,7 +465,21 @@ impl<P> OpHandle<P> {
 
     /// Whether a completion has fired.
     pub fn fired(&self) -> bool {
-        unsafe { *(*self.op).header.fired.lock().unwrap() }
+        unsafe { (*self.op).header.shared.lock().unwrap().fired }
+    }
+
+    /// The outcome, once: `Pending` registers `cx`'s waker for when it
+    /// lands. After `Ready`, the kernel is done with the block and
+    /// [`take_payload`](Self::take_payload) is sound.
+    pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Completion> {
+        let mut s = unsafe { (*self.op).header.shared.lock().unwrap() };
+        match s.result.take() {
+            Some(c) => Poll::Ready(c),
+            None => {
+                s.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 
     /// Takes the payload out of the op block.
@@ -471,7 +517,11 @@ pub unsafe fn submit<P, F: FnOnce(Completion) + Send + 'static>(
         overlapped: unsafe { mem::zeroed() },
         header: OpHeader {
             refs: AtomicUsize::new(2),
-            fired: Mutex::new(false),
+            shared: Mutex::new(Shared {
+                fired: false,
+                result: None,
+                waker: None,
+            }),
             complete: complete_op::<P, F>,
             release: release_op::<P, F>,
             reg: reg.clone(),

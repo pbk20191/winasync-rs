@@ -1,25 +1,20 @@
 //! A `Future` over one operation of the overlapped core: resolves to the
 //! result and hands the payload back, and cancels the operation if dropped
 //! while it is in flight. Shared by `tp` and `http`, whichever pool or port
-//! the handle is registered with.
+//! the handle is registered with. Nothing is allocated beyond the op block:
+//! the block itself carries the outcome and the waker.
 
 use crate::common::overlapped::{self as ov, Completion, IoReg, Issue, OpHandle};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use windows::Win32::Foundation::{ERROR_MORE_DATA, WIN32_ERROR};
 use windows::Win32::System::IO::OVERLAPPED;
-
-/// Result/waker handoff between the completion callback and the polling future.
-struct ResultSlot {
-    inner: Mutex<(Option<Completion>, Option<Waker>)>,
-}
 
 /// Future of one overlapped operation; resolves to the transfer result and hands
 /// the payload (with its buffers) back. Cancels the op on drop if still in flight.
 pub(crate) struct OpFuture<P> {
     handle: OpHandle<P>,
-    slot: Arc<ResultSlot>,
     done: bool,
 }
 
@@ -33,42 +28,15 @@ pub(crate) unsafe fn submit<P>(
     payload: P,
     issue: impl FnOnce(*mut OVERLAPPED, &mut P) -> Issue,
 ) -> OpFuture<P> {
-    let slot = Arc::new(ResultSlot {
-        inner: Mutex::new((None, None)),
-    });
-    let slot2 = slot.clone();
-    let on_complete = move |c: Completion| {
-        let waker = {
-            let mut g = slot2.inner.lock().unwrap();
-            g.0 = Some(c);
-            g.1.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    };
-    let handle = unsafe { ov::submit(reg, payload, on_complete, issue) };
-    OpFuture {
-        handle,
-        slot,
-        done: false,
-    }
+    let handle = unsafe { ov::submit(reg, payload, |_| {}, issue) };
+    OpFuture { handle, done: false }
 }
 
 impl<P> OpFuture<P> {
     /// The completion as the kernel reported it, with the payload.
     fn poll_completion(&mut self, cx: &mut Context<'_>) -> Poll<(Completion, P)> {
         assert!(!self.done, "OpFuture polled after completion");
-        let completion = {
-            let mut g = self.slot.inner.lock().unwrap();
-            match g.0.take() {
-                Some(c) => c,
-                None => {
-                    g.1 = Some(cx.waker().clone());
-                    return Poll::Pending;
-                }
-            }
-        };
+        let completion = std::task::ready!(self.handle.poll_completion(cx));
         self.done = true;
         // Completed (or sync-failed): the kernel is done with the block, so the
         // payload is exclusively ours again.
@@ -122,17 +90,12 @@ impl<P> Future for OpFuture<P> {
 
 impl<P> Drop for OpFuture<P> {
     fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        // Not yet consumed: if no completion has landed, request cancellation.
-        // The completion still arrives (ERROR_OPERATION_ABORTED, or a raced
-        // success) and releases the kernel ref; the handle's own `Drop` releases
-        // our caller ref, freeing the block + payload together.
-        let pending = self.slot.inner.lock().unwrap().0.is_none();
-        if pending {
+        // Not yet consumed: request cancellation if nothing has fired (the
+        // handle checks). The completion still arrives (ERROR_OPERATION_ABORTED,
+        // or a raced success) and releases the kernel ref; the handle's own
+        // `Drop` releases our caller ref, freeing the block + payload together.
+        if !self.done {
             self.handle.cancel();
         }
     }
 }
-

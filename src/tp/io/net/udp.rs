@@ -90,7 +90,7 @@ impl UdpSocket {
         let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let len = write_sockaddr(&addr, &mut storage);
         sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
-        let res = IoRes::register(&rt.inner, owned)?;
+        let res = crate::tp::io::register_on(&rt.inner, owned)?;
         Ok(UdpSocket { res })
     }
 

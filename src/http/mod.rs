@@ -80,7 +80,7 @@ use windows::Win32::Networking::HttpServer::{
     HttpRequestInfoTypeRequestTiming, HttpRequestInfoTypeSslProtocol, HttpServerAuthenticationProperty,
     HTTP_AUTH_ENABLE_BASIC, HTTP_AUTH_ENABLE_DIGEST, HTTP_AUTH_ENABLE_KERBEROS, HTTP_AUTH_ENABLE_NEGOTIATE,
     HTTP_AUTH_ENABLE_NTLM, HTTP_REQUEST_AUTH_INFO, HTTP_REQUEST_FLAG_HTTP2, HTTP_REQUEST_FLAG_HTTP3,
-    HTTP_REQUEST_FLAG_IP_ROUTED, HTTP_REQUEST_INFO, HTTP_REQUEST_TIMING_INFO, HTTP_REQUEST_V2,
+    HTTP_REQUEST_FLAG_IP_ROUTED, HTTP_REQUEST_INFO, HTTP_REQUEST_TIMING_INFO, HTTP_REQUEST_V1, HTTP_REQUEST_V2,
     HTTP_SERVER_AUTHENTICATION_BASIC_PARAMS, HTTP_SERVER_AUTHENTICATION_DIGEST_PARAMS,
     HTTP_SERVER_AUTHENTICATION_INFO, HTTP_SSL_PROTOCOL_INFO,
     HttpAddFragmentToCache, HttpCachePolicyTimeToLive, HttpCachePolicyUserInvalidates,
@@ -499,15 +499,14 @@ impl HttpServer {
             .message();
             let (result, buf) = fut.await;
             let (bytes, more) = result?;
-            let record = unsafe { &*(buf.as_ptr() as *const HTTP_REQUEST_V2) };
             if more {
                 // Too small: the byte count is the size needed, and the
                 // partial record already names the request.
-                id = record.Base.RequestId;
+                id = unsafe { &*(buf.as_ptr() as *const HTTP_REQUEST_V2) }.Base.RequestId;
                 size = bytes.max(size * 2);
                 continue;
             }
-            return Ok(unsafe { HttpRequest::parse(&self.inner, record) });
+            return Ok(unsafe { HttpRequest::parse(&self.inner, buf) });
         }
     }
 }
@@ -560,11 +559,17 @@ const RESPONSE_HEADERS: [&str; 30] = [
 ];
 
 /// Bytes at `ptr` as text (http.sys hands header text over as bytes).
-unsafe fn ascii(ptr: *const u8, len: usize) -> String {
+/// `len` bytes at `ptr`, borrowed for `'a` -- the receive buffer's life.
+unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     if ptr.is_null() || len == 0 {
-        return String::new();
+        return &[];
     }
-    String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(ptr, len) }).into_owned()
+    unsafe { core::slice::from_raw_parts(ptr, len) }
+}
+
+/// [`bytes`] as text; empty if it is not UTF-8.
+unsafe fn ascii<'a>(ptr: *const u8, len: usize) -> &'a str {
+    core::str::from_utf8(unsafe { bytes(ptr, len) }).unwrap_or("")
 }
 
 /// `len` *bytes* of UTF-16 at `ptr`.
@@ -635,11 +640,11 @@ unsafe fn parse_auth(info: &HTTP_REQUEST_AUTH_INFO) -> AuthInfo {
 /// than left for http.sys to time out.
 pub struct HttpRequest {
     server: Arc<Server>,
+    /// The record as received. Its pointers point into this same
+    /// allocation, which a `Vec` keeps in place however the `Vec` moves;
+    /// the method, raw URL and headers are read from it in place.
+    buf: Vec<u64>,
     id: u64,
-    /// The method, upper case.
-    pub method: String,
-    /// The request's URL as received, before http.sys decoded it.
-    pub raw_url: String,
     /// The decoded URL, scheme and host included.
     pub url: String,
     /// The decoded path, without the query.
@@ -647,9 +652,6 @@ pub struct HttpRequest {
     /// The query, `?` included; empty if there is none.
     pub query: String,
     pub version: (u16, u16),
-    /// In arrival order: the headers http.sys knows by ID first, then the
-    /// rest.
-    pub headers: Vec<(String, String)>,
     pub remote_addr: Option<SocketAddr>,
     pub local_addr: Option<SocketAddr>,
     pub connection_id: u64,
@@ -692,9 +694,10 @@ pub struct HttpRequest {
 
 impl HttpRequest {
     /// # Safety
-    /// `record` is a complete `HTTP_REQUEST_V2` whose pointers point into
-    /// the buffer it sits in, which is alive for the call.
-    unsafe fn parse(server: &Arc<Server>, record: &HTTP_REQUEST_V2) -> HttpRequest {
+    /// `buf` holds a complete `HTTP_REQUEST_V2` whose pointers point into
+    /// `buf`.
+    unsafe fn parse(server: &Arc<Server>, buf: Vec<u64>) -> HttpRequest {
+        let record = unsafe { &*(buf.as_ptr() as *const HTTP_REQUEST_V2) };
         unsafe {
             let mut auth = None;
             let mut ssl_protocol = None;
@@ -735,38 +738,14 @@ impl HttpRequest {
                 }
             }
             let record = &record.Base;
-            let method = match verb_name(record.Verb.0) {
-                Some(name) => name.to_owned(),
-                None => ascii(record.pUnknownVerb.0, record.UnknownVerbLength as usize),
-            };
             let cooked = &record.CookedUrl;
-            let mut headers = Vec::new();
-            for (i, known) in record.Headers.KnownHeaders.iter().enumerate() {
-                if known.RawValueLength != 0 || !known.pRawValue.is_null() {
-                    let value = ascii(known.pRawValue.0, known.RawValueLength as usize);
-                    if known.RawValueLength != 0 {
-                        headers.push((REQUEST_HEADERS[i].to_owned(), value));
-                    }
-                }
-            }
-            let unknown = record.Headers.pUnknownHeaders;
-            for i in 0..record.Headers.UnknownHeaderCount as usize {
-                let h = &*unknown.add(i);
-                headers.push((
-                    ascii(h.pName.0, h.NameLength as usize),
-                    ascii(h.pRawValue.0, h.RawValueLength as usize),
-                ));
-            }
             HttpRequest {
                 server: server.clone(),
                 id: record.RequestId,
-                method,
-                raw_url: ascii(record.pRawUrl.0, record.RawUrlLength as usize),
                 url: wide(cooked.pFullUrl.0, cooked.FullUrlLength as usize),
                 path: wide(cooked.pAbsPath.0, cooked.AbsPathLength as usize),
                 query: wide(cooked.pQueryString.0, cooked.QueryStringLength as usize),
                 version: (record.Version.MajorVersion, record.Version.MinorVersion),
-                headers,
                 remote_addr: address(record.Address.pRemoteAddress),
                 local_addr: address(record.Address.pLocalAddress),
                 connection_id: record.ConnectionId,
@@ -779,16 +758,60 @@ impl HttpRequest {
                 other_info,
                 has_body: record.Flags & HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS != 0,
                 responded: AtomicBool::new(false),
+                buf,
             }
         }
     }
 
-    /// The first header named `name`, ignoring case.
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
+    fn base(&self) -> &HTTP_REQUEST_V1 {
+        unsafe { &(*(self.buf.as_ptr() as *const HTTP_REQUEST_V2)).Base }
+    }
+
+    /// The method, upper case.
+    pub fn method(&self) -> &str {
+        let r = self.base();
+        match verb_name(r.Verb.0) {
+            Some(name) => name,
+            None => unsafe { ascii(r.pUnknownVerb.0, r.UnknownVerbLength as usize) },
+        }
+    }
+
+    /// The request's URL as received, before http.sys decoded it.
+    pub fn raw_url(&self) -> &str {
+        let r = self.base();
+        unsafe { ascii(r.pRawUrl.0, r.RawUrlLength as usize) }
+    }
+
+    /// The headers, in place: the ones http.sys knows by ID first, then
+    /// the rest. Values are bytes, as the client sent them.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        let h = &self.base().Headers;
+        let known = h
+            .KnownHeaders
             .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .enumerate()
+            .filter(|(_, k)| k.RawValueLength != 0)
+            .map(|(i, k)| (REQUEST_HEADERS[i], unsafe { bytes(k.pRawValue.0, k.RawValueLength as usize) }));
+        let unknown = if h.pUnknownHeaders.is_null() {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(h.pUnknownHeaders, h.UnknownHeaderCount as usize) }
+        };
+        let unknown = unknown.iter().map(|u| unsafe {
+            (ascii(u.pName.0, u.NameLength as usize), bytes(u.pRawValue.0, u.RawValueLength as usize))
+        });
+        known.chain(unknown)
+    }
+
+    /// The first header named `name`, ignoring case.
+    pub fn header_bytes(&self, name: &str) -> Option<&[u8]> {
+        self.headers().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v)
+    }
+
+    /// The first header named `name`, ignoring case, as text; `None` if
+    /// absent or not UTF-8 (see [`header_bytes`](Self::header_bytes)).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.header_bytes(name).and_then(|v| core::str::from_utf8(v).ok())
     }
 
     /// Reads the next part of the body into `buf`; resolves to the bytes
@@ -1335,16 +1358,16 @@ impl Response {
             response = response.header("WWW-Authenticate", "NTLM");
         }
         if schemes.0 & HTTP_AUTH_ENABLE_DIGEST != 0 {
-            response = response.header("WWW-Authenticate", &format!("Digest realm=\"{realm}\""));
+            response = response.header("WWW-Authenticate", format!("Digest realm=\"{realm}\""));
         }
         if schemes.0 & HTTP_AUTH_ENABLE_BASIC != 0 {
-            response = response.header("WWW-Authenticate", &format!("Basic realm=\"{realm}\""));
+            response = response.header("WWW-Authenticate", format!("Basic realm=\"{realm}\""));
         }
         response
     }
 
-    pub fn header(mut self, name: &str, value: &str) -> Response {
-        self.headers.push((name.to_owned(), value.to_owned()));
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Response {
+        self.headers.push((name.into(), value.into()));
         self
     }
 
@@ -1623,10 +1646,10 @@ mod tests {
             .into_bytes(),
         );
         let req = block_on(server.accept()).unwrap();
-        assert_eq!(req.method, "GET");
+        assert_eq!(req.method(), "GET");
         assert_eq!(req.path, "/get/hello there");
         assert_eq!(req.query, "?x=1");
-        assert_eq!(req.raw_url, "/get/hello%20there?x=1");
+        assert_eq!(req.raw_url(), "/get/hello%20there?x=1");
         assert_eq!(req.version, (1, 1));
         assert_eq!(req.header("x-test"), Some("yes"));
         assert_eq!(req.header("User-Agent"), Some("probe"));
@@ -1654,7 +1677,7 @@ mod tests {
         request.extend_from_slice(&payload);
         let c = client(port, request);
         let req = block_on(server.accept()).unwrap();
-        assert_eq!(req.method, "POST");
+        assert_eq!(req.method(), "POST");
         let body = block_on(req.read_body_to_end(1 << 20)).unwrap();
         assert_eq!(body, payload);
         block_on(req.respond(Response::new(204), Vec::new())).0.unwrap();
@@ -1801,7 +1824,7 @@ mod tests {
         let c = client(port, get(port, "/file/"));
         let req = block_on(server.accept()).unwrap();
         let len = 5 + (data.len() - 299_990);
-        block_on(req.start_response(Response::new(200).header("Content-Length", &len.to_string()))).unwrap();
+        block_on(req.start_response(Response::new(200).header("Content-Length", len.to_string()))).unwrap();
         block_on(req.send_body(b"head:".to_vec(), false)).0.unwrap();
         let (r, file) = block_on(req.send_file(file, 299_990, None, true));
         r.unwrap();

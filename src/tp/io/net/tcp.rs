@@ -52,7 +52,7 @@ impl TcpListener {
         let len = write_sockaddr(&addr, &mut storage);
         sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
         sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
-        let res = IoRes::register(&rt.inner, owned)?;
+        let res = crate::tp::io::register_on(&rt.inner, owned)?;
         Ok(TcpListener {
             res,
             family,
@@ -103,7 +103,7 @@ impl TcpListener {
         // getpeername fail).
         let listen_val = listen_sock.0.to_ne_bytes();
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
-        let stream = TcpStream::from_socket(&self.res.rt, owned)?;
+        let stream = TcpStream::from_socket(self.res.runtime_inner(), owned)?;
         Ok(stream)
     }
 
@@ -163,7 +163,7 @@ impl TcpListener {
         let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
         let listen_val = listen_sock.0.to_ne_bytes();
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
-        let stream = TcpStream::from_socket(&self.res.rt, owned)?;
+        let stream = TcpStream::from_socket(self.res.runtime_inner(), owned)?;
         Ok((stream, data))
     }
 
@@ -242,7 +242,7 @@ impl TcpStream {
     }
 
     fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<TcpStream> {
-        let res = IoRes::register(rt, sock)?;
+        let res = crate::tp::io::register_on(rt, sock)?;
         Ok(TcpStream { res })
     }
 

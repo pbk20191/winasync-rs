@@ -436,7 +436,7 @@ impl NamedPipeListener {
                 Slot::Retry => crate::tp::sleep(&self.rt, server::RETRY_AFTER).await,
             }
         };
-        let res = IoRes::register(&self.rt.inner, instance)?;
+        let res = crate::tp::io::register_on(&self.rt.inner, instance)?;
         let _replenish = ReplenishOnExit(&self.server);
         let h = res.handle;
         let fut = unsafe {
@@ -489,7 +489,7 @@ impl NamedPipeConnector {
         timeout: Duration,
     ) -> windows_core::Result<NamedPipeStream> {
         let client = server::open_client_waiting(&HSTRING::from(name), timeout)?;
-        let res = IoRes::register(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(client.handle) })?;
+        let res = crate::tp::io::register_on(&rt.inner, unsafe { crate::common::overlapped::IoHandle::from_handle(client.handle) })?;
         Ok(NamedPipeStream {
             res,
             server_side: false,
