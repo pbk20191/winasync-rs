@@ -59,6 +59,7 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, HANDLE, NO_ERROR, WIN32_ERROR,
 };
 use windows::Win32::Networking::HttpServer::{
+    HTTP_INITIALIZE,
     Http503ResponseVerbosityBasic, Http503ResponseVerbosityFull, Http503ResponseVerbosityLimited,
     HttpAddUrlToUrlGroup, HttpCancelHttpRequest, HttpCloseServerSession, HttpCloseUrlGroup,
     HttpCreateRequestQueue, HttpCreateServerSession, HttpCreateUrlGroup, HttpDataChunkFromFileHandle,
@@ -82,6 +83,9 @@ use windows::Win32::Networking::HttpServer::{
     HTTP_REQUEST_FLAG_IP_ROUTED, HTTP_REQUEST_INFO, HTTP_REQUEST_TIMING_INFO, HTTP_REQUEST_V2,
     HTTP_SERVER_AUTHENTICATION_BASIC_PARAMS, HTTP_SERVER_AUTHENTICATION_DIGEST_PARAMS,
     HTTP_SERVER_AUTHENTICATION_INFO, HTTP_SSL_PROTOCOL_INFO,
+    HttpAddFragmentToCache, HttpCachePolicyTimeToLive, HttpCachePolicyUserInvalidates,
+    HttpDataChunkFromFragmentCache, HttpFlushResponseCache, HTTP_CACHE_POLICY,
+    HTTP_CREATE_REQUEST_QUEUE_FLAG_OPEN_EXISTING, HTTP_DATA_CHUNK_0_2, HTTP_FLUSH_RESPONSE_FLAG_RECURSIVE,
 };
 use windows::Win32::Storage::FileSystem::GetFileSizeEx;
 use windows::Win32::System::IO::OVERLAPPED;
@@ -123,19 +127,19 @@ fn issue(code: u32) -> Issue {
 /// counts them -- each initialize needs its own terminate, with the same
 /// flags -- so every server holds one, and the last server gone is the last
 /// terminate.
-struct ApiInit(());
+struct ApiInit(HTTP_INITIALIZE);
 
 impl ApiInit {
-    fn new() -> Result<ApiInit> {
-        check(unsafe { HttpInitialize(API, HTTP_INITIALIZE_SERVER, None) })?;
-        Ok(ApiInit(()))
+    fn new(what: HTTP_INITIALIZE) -> Result<ApiInit> {
+        check(unsafe { HttpInitialize(API, what, None) })?;
+        Ok(ApiInit(what))
     }
 }
 
 impl Drop for ApiInit {
     fn drop(&mut self) {
         unsafe {
-            let _ = HttpTerminate(HTTP_INITIALIZE_SERVER, None);
+            let _ = HttpTerminate(self.0, None);
         }
     }
 }
@@ -181,13 +185,65 @@ impl HttpServer {
     /// completions run on the process's default thread pool. See the module
     /// docs for which prefixes need a reservation.
     pub fn bind(urls: &[&str]) -> Result<HttpServer> {
-        Self::bind_with(urls, Binding::process_default())
+        Self::bind_with(urls, Binding::process_default(), None)
+    }
+
+    /// [`bind`](Self::bind), with the request queue given `name`, so that
+    /// other processes can [`open`](Self::open) it and take requests from
+    /// it too -- the way IIS shares a queue between worker processes. The
+    /// name is global to the machine and fails with `ERROR_ALREADY_EXISTS`
+    /// if taken.
+    pub fn bind_named(name: &str, urls: &[&str]) -> Result<HttpServer> {
+        Self::bind_with(urls, Binding::process_default(), Some(name))
+    }
+
+    /// Opens the request queue another server created with
+    /// [`bind_named`](Self::bind_named): requests to that server's URLs are
+    /// then taken by whichever `accept` -- here or there -- asks first.
+    /// This handle serves no URLs of its own.
+    pub fn open(name: &str) -> Result<HttpServer> {
+        Self::open_with(name, Binding::process_default())
+    }
+
+    /// [`open`](Self::open), with completions on `rt`'s pool.
+    #[cfg(feature = "tp")]
+    pub fn open_on(rt: &crate::tp::Runtime, name: &str) -> Result<HttpServer> {
+        Self::open_with(name, Binding::Pool(rt.inner.pool_ref()))
+    }
+
+    /// [`open`](Self::open), with completions queued on `port`; see
+    /// [`bind_to_port`](Self::bind_to_port).
+    #[cfg(feature = "iocp")]
+    pub fn open_to_port(port: &crate::iocp::CompletionPort, name: &str) -> Result<HttpServer> {
+        Self::open_with(name, Binding::Port(port.port_ref()))
+    }
+
+    fn open_with(name: &str, binding: Binding) -> Result<HttpServer> {
+        let session = Session {
+            session: 0,
+            group: 0,
+            _api: ApiInit::new(HTTP_INITIALIZE_SERVER)?,
+        };
+        let mut queue = HANDLE::default();
+        check(unsafe {
+            HttpCreateRequestQueue(
+                API,
+                &HSTRING::from(name),
+                None,
+                Some(HTTP_CREATE_REQUEST_QUEUE_FLAG_OPEN_EXISTING),
+                &mut queue,
+            )
+        })?;
+        let queue = IoReg::register(unsafe { IoHandle::from_handle(queue) }, binding)?;
+        Ok(HttpServer {
+            inner: Arc::new(Server { queue, session }),
+        })
     }
 
     /// [`bind`](Self::bind), with completions on `rt`'s pool.
     #[cfg(feature = "tp")]
     pub fn bind_on(rt: &crate::tp::Runtime, urls: &[&str]) -> Result<HttpServer> {
-        Self::bind_with(urls, Binding::Pool(rt.inner.pool_ref()))
+        Self::bind_with(urls, Binding::Pool(rt.inner.pool_ref()), None)
     }
 
     /// [`bind`](Self::bind), with completions queued on `port`, which the
@@ -196,15 +252,15 @@ impl HttpServer {
     /// The server keeps the port open.
     #[cfg(feature = "iocp")]
     pub fn bind_to_port(port: &crate::iocp::CompletionPort, urls: &[&str]) -> Result<HttpServer> {
-        Self::bind_with(urls, Binding::Port(port.port_ref()))
+        Self::bind_with(urls, Binding::Port(port.port_ref()), None)
     }
 
-    fn bind_with(urls: &[&str], binding: Binding) -> Result<HttpServer> {
+    fn bind_with(urls: &[&str], binding: Binding, name: Option<&str>) -> Result<HttpServer> {
         // From here on `Session::drop` undoes whatever succeeded.
         let mut session = Session {
             session: 0,
             group: 0,
-            _api: ApiInit::new()?,
+            _api: ApiInit::new(HTTP_INITIALIZE_SERVER)?,
         };
         check(unsafe { HttpCreateServerSession(API, &mut session.session, None) })?;
         check(unsafe { HttpCreateUrlGroup(session.session, &mut session.group, None) })?;
@@ -212,7 +268,16 @@ impl HttpServer {
             check(unsafe { HttpAddUrlToUrlGroup(session.group, &HSTRING::from(*url), 0, None) })?;
         }
         let mut queue = HANDLE::default();
-        check(unsafe { HttpCreateRequestQueue(API, windows_core::PCWSTR::null(), None, None, &mut queue) })?;
+        let name = name.map(HSTRING::from);
+        check(unsafe {
+            HttpCreateRequestQueue(
+                API,
+                name.as_ref().map_or(windows_core::PCWSTR::null(), |n| windows_core::PCWSTR(n.as_ptr())),
+                None,
+                None,
+                &mut queue,
+            )
+        })?;
         let queue = IoReg::register(unsafe { IoHandle::from_handle(queue) }, binding)?;
         let binding = HTTP_BINDING_INFO {
             Flags: HTTP_PROPERTY_FLAGS { _bitfield: 1 },
@@ -355,6 +420,30 @@ impl HttpServer {
                 size_of::<HTTP_SERVER_AUTHENTICATION_INFO>() as u32,
             )
         })
+    }
+
+    /// Drops what http.sys has cached for `url_prefix` -- responses sent
+    /// with [`Response::cache_until_flushed`] or
+    /// [`Response::cache_for`], and fragments -- and, with `recursive`,
+    /// everything under it.
+    pub fn flush_cache(&self, url_prefix: &str, recursive: bool) -> Result<()> {
+        let flags = if recursive { HTTP_FLUSH_RESPONSE_FLAG_RECURSIVE } else { 0 };
+        check(unsafe { HttpFlushResponseCache(self.inner.queue.handle, &HSTRING::from(url_prefix), flags, None) })
+    }
+
+    /// Puts `data` in http.sys's cache under `name` -- a URL under one of
+    /// this server's prefixes, which is the name's only role -- to be sent
+    /// as a response body by [`HttpRequest::respond_fragment`] and
+    /// [`HttpRequest::send_fragment`] without passing through this process
+    /// again. `ttl` is `None` to keep it until flushed.
+    pub fn add_fragment(&self, name: &str, data: &[u8], ttl: Option<Duration>) -> Result<()> {
+        let chunk = memory_chunk(data.as_ptr(), data.len());
+        let policy = cache_policy(match ttl {
+            Some(ttl) => CachePolicy::TimeToLive(ttl),
+            None => CachePolicy::UntilFlushed,
+        })
+        .unwrap();
+        check(unsafe { HttpAddFragmentToCache(self.inner.queue.handle, &HSTRING::from(name), &chunk, &policy, None) })
     }
 
     /// How many requests may wait in the queue for an `accept`; past it
@@ -584,7 +673,9 @@ pub struct HttpRequest {
     /// caller's token, or [`AuthStatus::Failure`] with the security status
     /// and no token, for the server to decide on (challenge again, or serve
     /// anonymously). A malformed `Authorization` header gets a 400 from
-    /// http.sys and is never delivered.
+    /// http.sys and is never delivered. Digest works the same way, with
+    /// http.sys completing the challenge header (see
+    /// [`Response::challenge`]) and verifying the answer.
     pub auth: Option<AuthInfo>,
     /// The connection's TLS parameters, on HTTPS.
     pub ssl_protocol: Option<SslProtocol>,
@@ -798,6 +889,21 @@ impl HttpRequest {
         (r, body.unwrap().file)
     }
 
+    /// Sends the whole response with a fragment [`HttpServer::add_fragment`]
+    /// put in http.sys's cache as the body. No `Content-Length` is added:
+    /// http.sys knows the fragment's size.
+    pub async fn respond_fragment(&self, response: Response, name: &str) -> Result<()> {
+        let fragment = Fragment(name.encode_utf16().collect());
+        self.send_head(response, Some(fragment), false).await.0
+    }
+
+    /// Sends a cached fragment as part of the body; `last` ends the
+    /// response.
+    pub async fn send_fragment(&self, name: &str, last: bool) -> Result<()> {
+        let fragment = Fragment(name.encode_utf16().collect());
+        self.send_part(fragment, last).await.0
+    }
+
     /// Sends the status and headers only; the body follows through
     /// [`send_body`](Self::send_body) and [`send_file`](Self::send_file).
     /// Give a `Content-Length` -- or `Transfer-Encoding: chunked` and chunk
@@ -888,7 +994,7 @@ impl HttpRequest {
                     id,
                     flags,
                     &p.response,
-                    None,
+                    p.policy.as_ref().map(|c| c as *const HTTP_CACHE_POLICY),
                     None,
                     None,
                     None,
@@ -952,6 +1058,23 @@ impl<F: AsRawHandle + Send + 'static> BodySource for FileRange<F> {
                         Length: self.len,
                     },
                     FileHandle: HANDLE(self.file.as_raw_handle()),
+                },
+            },
+        })
+    }
+}
+
+/// A fragment in http.sys's cache, by name.
+struct Fragment(Vec<u16>);
+
+impl BodySource for Fragment {
+    fn chunk(&self) -> Option<HTTP_DATA_CHUNK> {
+        Some(HTTP_DATA_CHUNK {
+            DataChunkType: HttpDataChunkFromFragmentCache,
+            Anonymous: HTTP_DATA_CHUNK_0 {
+                FromFragmentCache: HTTP_DATA_CHUNK_0_2 {
+                    FragmentNameLength: (self.0.len() * 2) as u16,
+                    pFragmentName: windows_core::PCWSTR(self.0.as_ptr()),
                 },
             },
         })
@@ -1121,6 +1244,38 @@ pub struct Response {
     pub status: u16,
     pub reason: String,
     pub headers: Vec<(String, String)>,
+    /// Whether http.sys keeps the sent response and answers the next
+    /// requests for the URL itself; see [`cache_for`](Self::cache_for).
+    pub cache: CachePolicy,
+}
+
+/// http.sys's response cache for one response ([`Response::cache`]).
+///
+/// Measured: a cached response is served by http.sys to later `GET`s of
+/// the same URL without the request ever reaching `accept`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Not cached.
+    #[default]
+    None,
+    /// Cached for this long (whole seconds).
+    TimeToLive(Duration),
+    /// Cached until [`HttpServer::flush_cache`].
+    UntilFlushed,
+}
+
+fn cache_policy(policy: CachePolicy) -> Option<HTTP_CACHE_POLICY> {
+    match policy {
+        CachePolicy::None => None,
+        CachePolicy::TimeToLive(ttl) => Some(HTTP_CACHE_POLICY {
+            Policy: HttpCachePolicyTimeToLive,
+            SecondsToLive: ttl.as_secs().clamp(1, u32::MAX as u64) as u32,
+        }),
+        CachePolicy::UntilFlushed => Some(HTTP_CACHE_POLICY {
+            Policy: HttpCachePolicyUserInvalidates,
+            SecondsToLive: 0,
+        }),
+    }
 }
 
 impl Response {
@@ -1146,13 +1301,31 @@ impl Response {
             status,
             reason: reason.to_owned(),
             headers: Vec::new(),
+            cache: CachePolicy::None,
         }
+    }
+
+    /// Has http.sys cache the response for `ttl` once sent whole (with
+    /// [`respond`](HttpRequest::respond) or
+    /// [`respond_file`](HttpRequest::respond_file); a streamed response is
+    /// not cacheable). Only a `GET` answer with a 200 is cached, and only
+    /// while the response is cacheable by HTTP's rules.
+    pub fn cache_for(mut self, ttl: Duration) -> Response {
+        self.cache = CachePolicy::TimeToLive(ttl);
+        self
+    }
+
+    /// [`cache_for`](Self::cache_for), until [`HttpServer::flush_cache`].
+    pub fn cache_until_flushed(mut self) -> Response {
+        self.cache = CachePolicy::UntilFlushed;
+        self
     }
 
     /// A 401 that names `schemes` in `WWW-Authenticate` headers, one per
     /// scheme -- the initial challenge of [`HttpServer::set_authentication`].
-    /// `realm` is for Basic; Digest is not offered here, since its
-    /// challenge needs a nonce the server would have to track.
+    /// `realm` is for Basic and Digest. Measured: for Digest the header
+    /// need only name the realm; http.sys rewrites it on the way out with
+    /// the nonce, `qop` and algorithm it will verify against.
     pub fn challenge(schemes: AuthSchemes, realm: &str) -> Response {
         let mut response = Response::new(401);
         if schemes.0 & (HTTP_AUTH_ENABLE_NEGOTIATE | HTTP_AUTH_ENABLE_KERBEROS) != 0 {
@@ -1160,6 +1333,9 @@ impl Response {
         }
         if schemes.0 & HTTP_AUTH_ENABLE_NTLM != 0 {
             response = response.header("WWW-Authenticate", "NTLM");
+        }
+        if schemes.0 & HTTP_AUTH_ENABLE_DIGEST != 0 {
+            response = response.header("WWW-Authenticate", &format!("Digest realm=\"{realm}\""));
         }
         if schemes.0 & HTTP_AUTH_ENABLE_BASIC != 0 {
             response = response.header("WWW-Authenticate", &format!("Basic realm=\"{realm}\""));
@@ -1187,6 +1363,7 @@ struct ResponsePayload<S> {
     unknown: Vec<HTTP_UNKNOWN_HEADER>,
     chunk: HTTP_DATA_CHUNK,
     body: Option<S>,
+    policy: Option<HTTP_CACHE_POLICY>,
 }
 
 // Every pointer in the records points into the payload itself, and the body
@@ -1216,6 +1393,7 @@ impl<S: BodySource> ResponsePayload<S> {
             unknown: Vec::new(),
             chunk: HTTP_DATA_CHUNK::default(),
             body,
+            policy: cache_policy(response.cache),
         }
         .with_status(response.status)
     }
@@ -1260,6 +1438,143 @@ impl<S: BodySource> ResponsePayload<S> {
             base.EntityChunkCount = 1;
             base.pEntityChunks = &mut self.chunk;
         }
+    }
+}
+
+/// http.sys's SSL configuration: which certificate answers on a port.
+///
+/// This is machine-wide state (`netsh http add sslcert` edits the same
+/// table) and setting it needs an elevated process; reading it does not.
+pub mod ssl {
+    use super::*;
+    use windows::Win32::Networking::HttpServer::{
+        HttpDeleteServiceConfiguration, HttpQueryServiceConfiguration, HttpServiceConfigQueryExact,
+        HttpServiceConfigSSLCertInfo, HttpSetServiceConfiguration, HTTP_INITIALIZE_CONFIG,
+        HTTP_SERVICE_CONFIG_SSL_KEY, HTTP_SERVICE_CONFIG_SSL_PARAM, HTTP_SERVICE_CONFIG_SSL_QUERY,
+        HTTP_SERVICE_CONFIG_SSL_SET,
+    };
+    use windows::Win32::Networking::WinSock::{SOCKADDR, SOCKADDR_STORAGE};
+
+    /// A certificate bound to an address ([`query_certificate`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SslBinding {
+        /// The certificate's SHA-1 thumbprint.
+        pub hash: Vec<u8>,
+        /// The application that bound it.
+        pub app_id: windows_core::GUID,
+        /// The certificate store it is in, e.g. `MY`.
+        pub store: String,
+        /// `HTTP_SERVICE_CONFIG_SSL_FLAG_*`.
+        pub flags: u32,
+    }
+
+    fn key(addr: SocketAddr, storage: &mut SOCKADDR_STORAGE) -> HTTP_SERVICE_CONFIG_SSL_KEY {
+        crate::common::sockaddr::write_sockaddr(&addr, storage);
+        HTTP_SERVICE_CONFIG_SSL_KEY {
+            pIpPort: (storage as *mut SOCKADDR_STORAGE).cast::<SOCKADDR>(),
+        }
+    }
+
+    /// Answers HTTPS on `addr` -- `0.0.0.0:443` for every interface -- with
+    /// the certificate whose SHA-1 thumbprint is `hash`, from the local
+    /// machine's `store` (`MY` for the personal store). `app_id` names the
+    /// application for `netsh`'s benefit. Needs elevation; measured
+    /// unelevated: `ERROR_ACCESS_DENIED`.
+    pub fn bind_certificate(addr: SocketAddr, hash: &[u8], app_id: windows_core::GUID, store: &str) -> Result<()> {
+        let _api = ApiInit::new(HTTP_INITIALIZE_CONFIG)?;
+        let mut storage = SOCKADDR_STORAGE::default();
+        let mut store: Vec<u16> = store.encode_utf16().chain([0]).collect();
+        let set = HTTP_SERVICE_CONFIG_SSL_SET {
+            KeyDesc: key(addr, &mut storage),
+            ParamDesc: HTTP_SERVICE_CONFIG_SSL_PARAM {
+                SslHashLength: hash.len() as u32,
+                pSslHash: hash.as_ptr() as *mut core::ffi::c_void,
+                AppId: app_id,
+                pSslCertStoreName: windows_core::PWSTR(store.as_mut_ptr()),
+                ..Default::default()
+            },
+        };
+        check(unsafe {
+            HttpSetServiceConfiguration(
+                None,
+                HttpServiceConfigSSLCertInfo,
+                (&set as *const HTTP_SERVICE_CONFIG_SSL_SET).cast(),
+                size_of::<HTTP_SERVICE_CONFIG_SSL_SET>() as u32,
+                None,
+            )
+        })
+    }
+
+    /// Removes the binding on `addr`. Needs elevation.
+    pub fn unbind_certificate(addr: SocketAddr) -> Result<()> {
+        let _api = ApiInit::new(HTTP_INITIALIZE_CONFIG)?;
+        let mut storage = SOCKADDR_STORAGE::default();
+        let set = HTTP_SERVICE_CONFIG_SSL_SET {
+            KeyDesc: key(addr, &mut storage),
+            ParamDesc: Default::default(),
+        };
+        check(unsafe {
+            HttpDeleteServiceConfiguration(
+                None,
+                HttpServiceConfigSSLCertInfo,
+                (&set as *const HTTP_SERVICE_CONFIG_SSL_SET).cast(),
+                size_of::<HTTP_SERVICE_CONFIG_SSL_SET>() as u32,
+                None,
+            )
+        })
+    }
+
+    /// The certificate bound to exactly `addr`, if any.
+    pub fn query_certificate(addr: SocketAddr) -> Result<Option<SslBinding>> {
+        let _api = ApiInit::new(HTTP_INITIALIZE_CONFIG)?;
+        let mut storage = SOCKADDR_STORAGE::default();
+        let query = HTTP_SERVICE_CONFIG_SSL_QUERY {
+            QueryDesc: HttpServiceConfigQueryExact,
+            KeyDesc: key(addr, &mut storage),
+            dwToken: 0,
+        };
+        let mut needed = 0u32;
+        let mut buf: Vec<u64> = Vec::new();
+        loop {
+            let code = unsafe {
+                HttpQueryServiceConfiguration(
+                    None,
+                    HttpServiceConfigSSLCertInfo,
+                    Some((&query as *const HTTP_SERVICE_CONFIG_SSL_QUERY).cast()),
+                    size_of::<HTTP_SERVICE_CONFIG_SSL_QUERY>() as u32,
+                    Some(buf.as_mut_ptr().cast()),
+                    (buf.len() * 8) as u32,
+                    Some(&mut needed),
+                    None,
+                )
+            };
+            match code {
+                0 => break,
+                c if c == windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER.0 => {
+                    buf = vec![0u64; (needed as usize).div_ceil(8)];
+                }
+                c if c == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0 => return Ok(None),
+                c => return Err(Error::from_hresult(WIN32_ERROR(c).to_hresult())),
+            }
+        }
+        let set = unsafe { &*(buf.as_ptr() as *const HTTP_SERVICE_CONFIG_SSL_SET) };
+        let p = &set.ParamDesc;
+        Ok(Some(unsafe {
+            SslBinding {
+                hash: if p.pSslHash.is_null() {
+                    Vec::new()
+                } else {
+                    core::slice::from_raw_parts(p.pSslHash.cast::<u8>(), p.SslHashLength as usize).to_vec()
+                },
+                app_id: p.AppId,
+                store: if p.pSslCertStoreName.is_null() {
+                    String::new()
+                } else {
+                    p.pSslCertStoreName.to_string().unwrap_or_default()
+                },
+                flags: p.DefaultFlags,
+            }
+        }))
     }
 }
 
@@ -1784,5 +2099,228 @@ mod tests {
         block_on(req.respond(Response::new(200), b"hello".to_vec())).0.unwrap();
         let out = c.join().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "200", "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Polls `accept` for up to `wait`; `None` if no request came.
+    fn accept_within(server: &HttpServer, wait: Duration) -> Option<HttpRequest> {
+        let mut accept = Box::pin(server.accept());
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let started = std::time::Instant::now();
+        loop {
+            if let std::task::Poll::Ready(r) = accept.as_mut().poll(&mut cx) {
+                return Some(r.unwrap());
+            }
+            if started.elapsed() > wait {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_named_queue_is_shared_with_whoever_opens_it() {
+        let (port, url) = prefix("named");
+        let name = format!("winasync-test-{}-{port}", std::process::id());
+        let owner = HttpServer::bind_named(&name, &[&url]).unwrap();
+        assert!(HttpServer::bind_named(&name, &[&url]).is_err(), "the name was given out twice");
+        let worker = HttpServer::open(&name).unwrap();
+        assert!(HttpServer::open("winasync-no-such-queue").is_err());
+        // The worker takes a request to the owner's URL and answers it.
+        let c = client(port, get(port, "/named/"));
+        let req = block_on(worker.accept()).unwrap();
+        block_on(req.respond(Response::new(200), b"worker".to_vec())).0.unwrap();
+        assert_eq!(split(&c.join().unwrap()).1, b"worker");
+        // And the owner still can.
+        assert_eq!(round_trip(&owner, port, "/named/", b"owner").1, b"owner");
+    }
+
+    /// A cached response is served by http.sys until it is flushed.
+    #[test]
+    fn a_cached_response_never_reaches_accept_again() {
+        let (port, url) = prefix("cache");
+        let server = HttpServer::bind(&[&url]).unwrap();
+        let c = client(port, get(port, "/cache/x"));
+        let req = block_on(server.accept()).unwrap();
+        let response = Response::new(200).header("Content-Type", "text/plain").cache_until_flushed();
+        block_on(req.respond(response, b"cached".to_vec())).0.unwrap();
+        assert_eq!(split(&c.join().unwrap()).1, b"cached");
+
+        let c = client(port, get(port, "/cache/x"));
+        let again = accept_within(&server, Duration::from_secs(1));
+        let (head, body) = split(&c.join().unwrap());
+        eprintln!("second GET: delivered={} head={head}", again.is_some());
+        assert!(again.is_none(), "the cached URL reached accept");
+        assert_eq!(body, b"cached");
+
+        server.flush_cache(&format!("http://localhost:{port}/cache/x"), false).unwrap();
+        assert_eq!(round_trip(&server, port, "/cache/x", b"fresh").1, b"fresh");
+    }
+
+    #[test]
+    fn a_fragment_is_sent_from_the_cache() {
+        let (port, url) = prefix("frag");
+        let server = HttpServer::bind(&[&url]).unwrap();
+        let name = format!("http://localhost:{port}/frag/piece");
+        server.add_fragment(&name, b"from the cache", None).unwrap();
+
+        let c = client(port, get(port, "/frag/"));
+        let req = block_on(server.accept()).unwrap();
+        block_on(req.respond_fragment(Response::new(200), &name)).unwrap();
+        let (head, body) = split(&c.join().unwrap());
+        eprintln!("fragment response head:\n{head}");
+        assert_eq!(body, b"from the cache");
+
+        let c = client(port, get(port, "/frag/"));
+        let req = block_on(server.accept()).unwrap();
+        block_on(req.start_response(Response::new(200).header("Content-Length", "20"))).unwrap();
+        block_on(req.send_body(b"head: ".to_vec(), false)).0.unwrap();
+        block_on(req.send_fragment(&name, true)).unwrap();
+        assert_eq!(split(&c.join().unwrap()).1, b"head: from the cache");
+
+        server.flush_cache(&name, false).unwrap();
+        let c = client(port, get(port, "/frag/"));
+        let req = block_on(server.accept()).unwrap();
+        let r = block_on(req.respond_fragment(Response::new(200), &name));
+        eprintln!("flushed fragment: {r:?}");
+        assert!(r.is_err(), "a flushed fragment was sent");
+        drop(req);
+        let _ = c.join();
+    }
+
+    /// Digest with credentials http.sys cannot verify (curl `--digest`):
+    /// the realm-only challenge comes back completed, and the answer is
+    /// delivered marked as failed. Measured: a bare 401 gets no challenge
+    /// appended, for Digest as for the others.
+    #[test]
+    fn digest_is_verified_by_http_sys() {
+        let curl = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32").join("curl.exe");
+        if !curl.exists() {
+            eprintln!("no system curl; skipped");
+            return;
+        }
+        let (port, url) = prefix("digest");
+        let server = HttpServer::bind(&[&url]).unwrap();
+        server.set_authentication(AuthSchemes::DIGEST, "winasync", "localhost").unwrap();
+        let target = format!("http://localhost:{port}/digest/");
+        let c = std::thread::spawn(move || {
+            std::process::Command::new(curl)
+                .args(["--digest", "-u", "bogus:nope", "-v", "-s", "-o", "NUL", "-w", "%{http_code}", &target])
+                .output()
+                .unwrap()
+        });
+        let mut rounds = Vec::new();
+        let outcome = loop {
+            let Some(req) = accept_within(&server, Duration::from_secs(10)) else {
+                break None;
+            };
+            let auth = req.auth.as_ref().expect("no auth record");
+            rounds.push((auth.status, auth.scheme, auth.sec_status));
+            if auth.status != AuthStatus::NotAuthenticated {
+                assert!(auth.token.is_none());
+                block_on(req.respond(Response::new(403), b"no".to_vec())).0.unwrap();
+                break Some((auth.status, auth.scheme));
+            }
+            block_on(req.respond(Response::challenge(AuthSchemes::DIGEST, "winasync"), Vec::new())).0.unwrap();
+        };
+        let out = c.join().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprintln!("digest rounds {rounds:?}; curl {}", String::from_utf8_lossy(&out.stdout));
+        assert_eq!(outcome, Some((AuthStatus::Failure, AuthScheme::Digest)), "{err}");
+        // The challenge the client saw was http.sys's completed one.
+        assert!(err.contains("nonce=") && err.contains("qop=\"auth\""), "{err}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "403");
+    }
+
+    /// Whether this process is elevated: the SSL binding needs it.
+    fn is_elevated() -> bool {
+        use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = HANDLE::default();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+            return false;
+        }
+        let mut info = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                Some((&mut info as *mut TOKEN_ELEVATION).cast()),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        ok.is_ok() && info.TokenIsElevated != 0
+    }
+
+    /// HTTPS end to end when elevated: a self-signed certificate, bound to
+    /// the port, serving `https://localhost`. Unelevated, measures what the
+    /// binding call says.
+    #[test]
+    fn https_serves_with_a_bound_certificate() {
+        let (port, _) = prefix("tls");
+        let url = format!("https://localhost:{port}/tls/");
+        let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        let app_id = windows_core::GUID::from_u128(0x6f2d2f3a_7b1e_4c3c_9d1a_5e8b1c0a2f11);
+        if !is_elevated() {
+            let fake = [0u8; 20];
+            let e = ssl::bind_certificate(addr, &fake, app_id, "MY").unwrap_err();
+            eprintln!("unelevated bind_certificate: {e:?}");
+            let q = ssl::query_certificate(addr);
+            eprintln!("unelevated query_certificate: {q:?}");
+            let reg = HttpServer::bind(&[&url]);
+            eprintln!("unelevated https:// registration: {:?}", reg.as_ref().err());
+            return;
+        }
+        let ps = |script: &str| {
+            let out = std::process::Command::new("powershell.exe").args(["-NoProfile", "-Command", script]).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let thumb = ps("(New-SelfSignedCertificate -DnsName localhost -CertStoreLocation Cert:\\LocalMachine\\My -FriendlyName winasync-test).Thumbprint");
+        let hash: Vec<u8> = (0..thumb.len()).step_by(2).map(|i| u8::from_str_radix(&thumb[i..i + 2], 16).unwrap()).collect();
+        assert_eq!(hash.len(), 20);
+        let cleanup = |thumb: &str| {
+            let _ = ssl::unbind_certificate(addr);
+            ps(&format!("Remove-Item Cert:\\LocalMachine\\My\\{thumb}"));
+        };
+        if let Err(e) = ssl::bind_certificate(addr, &hash, app_id, "MY") {
+            cleanup(&thumb);
+            panic!("bind_certificate: {e:?}");
+        }
+        let bound = ssl::query_certificate(addr).unwrap();
+        eprintln!("bound: {bound:?}");
+        assert_eq!(bound.as_ref().map(|b| b.hash.as_slice()), Some(hash.as_slice()));
+
+        let server = match HttpServer::bind(&[&url]) {
+            Ok(s) => s,
+            Err(e) => {
+                cleanup(&thumb);
+                panic!("https bind: {e:?}");
+            }
+        };
+        let curl = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32").join("curl.exe");
+        let target = url.clone();
+        let c = std::thread::spawn(move || {
+            std::process::Command::new(curl).args(["-k", "-s", &target]).output().unwrap()
+        });
+        let req = accept_within(&server, Duration::from_secs(15));
+        let Some(req) = req else {
+            let out = c.join().unwrap();
+            cleanup(&thumb);
+            panic!("no https request; curl: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        eprintln!("https request: ssl_protocol={:?}", req.ssl_protocol);
+        let tls = req.ssl_protocol;
+        block_on(req.respond(Response::new(200), b"secure".to_vec())).0.unwrap();
+        let out = c.join().unwrap();
+        drop(server);
+        cleanup(&thumb);
+        assert_eq!(out.stdout, b"secure");
+        assert!(tls.is_some(), "no TLS parameters on an https request");
     }
 }

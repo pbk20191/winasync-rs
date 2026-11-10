@@ -1099,8 +1099,23 @@ tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
   `Negotiate`/패키지 `NTLM`/토큰. System32의 curl은 `--ntlm`이 빌드에 없고 `--negotiate -u :`는
   `SEC_E_NO_CREDENTIALS`로 첫 401에서 멈춘다.
 - `AuthInfo.token`은 `OwnedHandle`: 앱이 닫아야 하는 핸들이므로 drop이 닫는다.
-- 아직 없는 것: HTTPS(인증서 바인딩은 `HttpSetServiceConfiguration`, 관리자 필요), 이름 있는 요청 큐(프로세스 간
-  공유), 응답 캐시, Digest 챌린지(nonce 추적 필요).
+### 이름 있는 큐, 응답 캐시, Digest, HTTPS (2026-11-11)
+
+- **이름 있는 요청 큐**: `bind_named(name, urls)` / `open(name)`(+`open_on`, `open_to_port`). 같은 이름을 두 번
+  만들면 실패, 없는 이름을 열면 실패(측정). 연 쪽은 URL 없이 큐만 공유하며, 요청은 먼저 `accept`한 쪽이 가져간다.
+- **응답 캐시**: `Response::cache_for(ttl)` / `cache_until_flushed()`가 `HttpSendHttpResponse`의 캐시 정책으로
+  간다. **측정**: 캐시된 URL의 두 번째 GET은 `accept`에 오지 않고 http.sys가 답했다. `flush_cache(prefix, recursive)`
+  뒤에는 다시 온다. 조각(`add_fragment` → `respond_fragment`/`send_fragment`): http.sys가 `Content-Length`를 스스로
+  붙이고, flush된 조각을 보내면 `ERROR_PATH_NOT_FOUND`(0x80070003).
+- **Digest(측정)**: bare 401에는 http.sys가 아무 헤더도 붙이지 않는다(다른 스킴과 같다). 그러나 서버가
+  `WWW-Authenticate: Digest realm="x"`만 보내면 http.sys가 **그 헤더를 nonce, qop="auth", algorithm=MD5-sess로
+  다시 써서** 내보내고, 클라이언트 응답을 검증해 `Failure`/`Digest`(SecStatus 0xC0000192)로 전달한다. 그래서
+  `Response::challenge`에 Digest는 realm만 넣는다. 클라이언트는 curl `--digest -u bogus:nope`.
+- **HTTPS**: `http::ssl::{bind_certificate, unbind_certificate, query_certificate}`(`HttpSetServiceConfiguration`,
+  `HTTP_INITIALIZE_CONFIG`). **측정(비승격)**: bind는 `ERROR_ACCESS_DENIED`, query는 되고(`None`),
+  `https://localhost:P/` URL 등록은 승격 없이도 된다. 승격 시에만 도는 테스트가 자체 서명 인증서를 만들어 바인딩하고
+  `curl -k`로 받은 뒤 `ssl_protocol`을 확인한다 — GitHub 런너는 관리자라 CI에서 돈다.
+- 아직 없는 것: 로깅 속성, 채널 바인딩/확장 인증, 요청 위임(`HttpDelegateRequestEx`), 클라이언트 인증서.
 
 ## 커밋 상태
 
