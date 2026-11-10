@@ -636,7 +636,7 @@ pipe 리스너에도 클라이언트가 접속할 수 있다. 전달은 핸들�
   적용되지 않는다" 참고). DACL만 쓴다. owner와 SACL은 바꾸는 데 특권이 필요하므로 쓰지 않는다. DACL이 없는
   SDDL은 NULL DACL(모두 허용)로 바꾸지 않고, 상속받은 DACL을 그대로 둔다.
 - Hyper-V 리스너에는 없다. VM 소켓에 누가 닿는지는 VM 설정(HCS)에서 정한다.
-- tp에는 `bind_with_security(rt, name, &SecurityDescriptor)`가 있다.
+- tp에서는 `NamedPipeOptions::security`로 준다(아래 "API 정리" 참고).
 
 **누가 접속했나 — `IConnectionReceivedArgs.RemoteProcessId` / `RemoteUserSid`**
 
@@ -707,7 +707,7 @@ access violation으로 이어진다는 것을 보였기 때문이다. 남은 것
 ## named pipe 옵션 (2026-11-10)
 
 `CreateNamedPipeW`/`WaitNamedPipeW`의 모드 중 고정돼 있던 것을 열었다. tp는
-`NamedPipeOptions` + `NamedPipeListener::bind_with_options`, comio는
+`NamedPipeOptions` + `NamedPipeListener::bind`, comio는
 `INamedPipeListenerSettings`(bind 전에만 설정, 이후 `E_ILLEGAL_METHOD_CALL`)다.
 
 | 옵션 | 기본값 | 비고 |
@@ -875,6 +875,22 @@ I/O라면 사용자 버퍼로의 복사가, 풀 스레드가 패킷을 꺼낼 �
 - 스레드 1개 풀의 태스크 안에서 drop해도 5초 안에 끝난다. 처음 구현은 여기서 멈췄다.
 - 2000번 취소와 완료를 경쟁시켜도 300바이트가 빠지거나 겹치지 않는다.
 - TCP와 UDP 왕복, TCP의 늦은 데이터, 파일 오프셋과 EOF를 확인한다.
+
+## API 정리 (2026-11-10)
+
+릴리스 전이라 겹치던 생성자와 이름을 하나로 줄였다. 호환 별칭은 남기지 않았다.
+
+| 전 | 후 |
+| --- | --- |
+| tp `NamedPipeListener::bind` / `bind_with_security` / `bind_with_options` | `bind(rt, name, &NamedPipeOptions) -> Result` |
+| comio `NamedPipeListener::create` / `create_with_security` / `create_with_options` | `create(name, &NamedPipeOptions) -> Result` |
+| tp `UnixListener::bind` / `bind_with_security`, comio `UnixStreamListener::bind` / `bind_with_security` / `bind_inner` | `bind(..., path, Option<&SecurityDescriptor>)` |
+| `TcpListener::bind` / `bind_with_flags`, `TcpStream::connect` / `connect_with_flags`, `UdpSocket::bind` / `bind_reuse_addr` | `bind` / `connect`가 `&SocketOptions`(`wsa_flags`, `reuse_address`)를 받는다 |
+| 메시지 파이프 `read_message(max) -> Vec`, `read_message_into(buf)`, `transact(req, max) -> Vec`, `transact_into(req, reply)` | 버퍼를 받는 쪽이 기본 이름이다: `read_message(buf)`, `transact(req, reply)`. 할당해서 돌려주는 쪽은 `read_message_vec(max)`, `transact_vec(req, max)` |
+
+`SocketOptions::reuse_address`는 UDP에서만 받는다. TCP `bind`/`connect`에서 켜면 `E_INVALIDARG`다.
+Windows의 `SO_REUSEADDR`는 나중 소켓이 이미 listen 중인 포트를 가져가게 하기 때문이다. 멀티캐스트 수신처럼
+UDP에서만 의미가 있다. comio는 같은 `NamedPipeOptions`를 `comio::NamedPipeOptions`로도 내보낸다.
 
 ## 커밋 상태
 

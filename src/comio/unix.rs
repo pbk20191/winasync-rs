@@ -98,28 +98,20 @@ pub struct UnixStreamListener {
 impl UnixStreamListener {
     /// Binds a new AF_UNIX socket to `path` and starts listening. AF_UNIX
     /// `bind` fails if a socket file already exists at `path`; callers that
-    /// need to rebind a stale path should remove it first (as the test
-    /// below does). Who may connect is decided by the socket file's DACL,
-    /// which it inherits from the directory.
-    pub fn bind(path: &str) -> Result<Self> {
-        Self::bind_inner(path, None)
-    }
-
-    /// [`bind`](Self::bind), with `security`'s DACL written onto the socket
-    /// file. It is applied between `bind` and `listen`: a connect before
-    /// `listen` is refused anyway, so no client ever sees the inherited DACL.
+    /// need to rebind a stale path should remove it first (as the tests do).
     ///
-    /// Treat this as defence in depth, not as the boundary. On the
-    /// development machine the file's DACL refused every connect it should
-    /// have; on GitHub-hosted runners it was enforced in some jobs and not in
-    /// others -- same image, same token, same code -- and no cause was found.
-    /// A named pipe's descriptor was enforced everywhere. Where the boundary
-    /// must hold, use a named pipe, or check the peer's SID at accept.
-    pub fn bind_with_security(path: &str, security: &SecurityDescriptor) -> Result<Self> {
-        Self::bind_inner(path, Some(security))
-    }
-
-    pub(crate) fn bind_inner(path: &str, security: Option<&SecurityDescriptor>) -> Result<Self> {
+    /// `security`, if given, has its DACL written onto the socket file
+    /// between `bind` and `listen` -- a connect before `listen` is refused
+    /// anyway, so no client ever sees the inherited DACL. Without it, who may
+    /// connect is decided by the DACL the file inherits from its directory.
+    ///
+    /// Treat that DACL as defence in depth, not as the boundary. On the
+    /// development machine it refused every connect it should have; on
+    /// GitHub-hosted runners it was enforced in some jobs and not in others --
+    /// same image, same token, same code -- and no cause was found. A named
+    /// pipe's descriptor was enforced everywhere. Where the boundary must
+    /// hold, use a named pipe, or check the peer's SID at accept.
+    pub fn bind(path: &str, security: Option<&SecurityDescriptor>) -> Result<Self> {
         let sock = new_socket()?;
         let register = || -> Result<Arc<IoReg>> {
             let (sa, addrlen) = sockaddr_un(path)?;
@@ -525,7 +517,7 @@ mod tests {
         let p = path.to_string_lossy().into_owned();
         let sp = p.clone();
         let server = std::thread::spawn(move || {
-            let l = UnixStreamListener::bind(&sp).unwrap();
+            let l = UnixStreamListener::bind(&sp, None).unwrap();
             let s = block_on(l.accept()).unwrap();
             let input: IInputStream = s.cast().unwrap();
             let output: IOutputStream = s.cast().unwrap();
@@ -596,7 +588,7 @@ mod tests {
         let payload_for_server = payload.clone();
 
         let server = std::thread::spawn(move || {
-            let l = UnixStreamListener::bind(&sp).unwrap();
+            let l = UnixStreamListener::bind(&sp, None).unwrap();
             let s = block_on(l.accept()).unwrap();
             let input: IInputStream = s.cast().unwrap();
             let output: IOutputStream = s.cast().unwrap();
@@ -713,7 +705,7 @@ mod tests {
         let path = dir.join(format!("comio_unix_accept_cancel_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let p = path.to_string_lossy().into_owned();
-        let listener = UnixStreamListener::bind(&p).unwrap();
+        let listener = UnixStreamListener::bind(&p, None).unwrap();
 
         for _ in 0..500 {
             issue_then_drop(listener.accept());
@@ -738,7 +730,7 @@ mod tests {
         let path = dir.join(format!("comio_unix_connect_cancel_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let p = path.to_string_lossy().into_owned();
-        let listener = UnixStreamListener::bind(&p).unwrap();
+        let listener = UnixStreamListener::bind(&p, None).unwrap();
 
         for _ in 0..200 {
             issue_then_drop(UnixConnector::connect(&p));

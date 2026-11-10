@@ -50,6 +50,54 @@ use windows::Win32::Networking::WinSock::{
 
 /// Creates an overlapped socket of the given family/type/protocol. `WSASocketW`
 /// is wrapped by the `windows` crate to map `INVALID_SOCKET` to an `Err`.
+/// How a TCP or UDP socket is created. [`SocketOptions::new()`] for the
+/// defaults, which is what almost every caller wants.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SocketOptions {
+    pub(super) wsa_flags: u32,
+    pub(super) reuse_address: bool,
+}
+
+impl SocketOptions {
+    /// The defaults: no extra flags, no address reuse.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Extra `WSASocketW` flags -- on a TCP listener, on its listen socket
+    /// *and* on every socket `accept` creates.
+    ///
+    /// For composing with another completion engine: create the sockets the
+    /// way that engine needs, do the handshake here, hand the connected
+    /// socket over. This module never interprets them.
+    pub fn wsa_flags(mut self, flags: u32) -> Self {
+        self.wsa_flags = flags;
+        self
+    }
+
+    /// `SO_REUSEADDR`, set before `bind`, so several sockets on this host can
+    /// hold the same port -- the usual arrangement for multicast receivers.
+    ///
+    /// UDP only: a TCP `bind` or `connect` with it fails with `E_INVALIDARG`.
+    /// On Windows the option lets a *later* socket take over a port another
+    /// is listening on, which for TCP is a hijack, not a convenience.
+    pub fn reuse_address(mut self, on: bool) -> Self {
+        self.reuse_address = on;
+        self
+    }
+
+    /// Refuses what a TCP socket must not have.
+    pub(super) fn for_tcp(&self) -> windows_core::Result<&Self> {
+        if self.reuse_address {
+            return Err(windows_core::Error::new(
+                windows::Win32::Foundation::E_INVALIDARG,
+                "SO_REUSEADDR lets another socket take over a TCP port; it is for UDP only",
+            ));
+        }
+        Ok(self)
+    }
+}
+
 pub(super) fn new_socket(
     family: ADDRESS_FAMILY,
     socktype: WINSOCK_SOCKET_TYPE,

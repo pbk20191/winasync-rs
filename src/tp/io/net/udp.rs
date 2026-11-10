@@ -70,29 +70,18 @@ impl UdpSocket {
         crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
-    /// Binds a UDP socket to `addr` (IPv4 or IPv6).
-    pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<UdpSocket> {
-        Self::bind_impl(rt, addr, false)
-    }
-
-    /// Binds with `SO_REUSEADDR`, so several sockets on this host can hold the
-    /// same port — the usual arrangement for multicast receivers, where more
-    /// than one process wants the same group's stream.
-    ///
-    /// It is a separate constructor rather than a setter because the option
-    /// only has meaning *before* `bind`: setting it afterwards succeeds and
-    /// does nothing.
-    pub fn bind_reuse_addr(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<UdpSocket> {
-        Self::bind_impl(rt, addr, true)
-    }
-
-    fn bind_impl(
+    /// Binds a UDP socket to `addr` (IPv4 or IPv6), created as `options`
+    /// says -- [`SocketOptions::reuse_address`] for several receivers on one
+    /// port. Options that only mean something before `bind` are why this
+    /// takes them here rather than offering setters.
+    pub fn bind(
         rt: &Runtime,
         addr: SocketAddr,
-        reuse_addr: bool,
+        options: &SocketOptions,
     ) -> windows_core::Result<UdpSocket> {
         let family = family_of(&addr);
-        let sock = new_socket(family, SOCK_DGRAM, IPPROTO_UDP)?;
+        let sock = new_socket_with(family, SOCK_DGRAM, IPPROTO_UDP, options.wsa_flags)?;
+        let reuse_addr = options.reuse_address;
         let register = || -> windows_core::Result<Arc<IoRes>> {
             if reuse_addr {
                 let v: u32 = 1;

@@ -50,7 +50,11 @@ fn main() {
 
         // Async TCP echo (AcceptEx / ConnectEx / WSARecv / WSASend)
         let listener =
-            tp::TcpListener::bind(&rt2, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+            tp::TcpListener::bind(
+                &rt2,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &tp::SocketOptions::new(),
+            ).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = rt2.spawn(async move {
             let s = listener.accept().await.unwrap();
@@ -58,7 +62,7 @@ fn main() {
             let n = n.unwrap();
             s.write(b[..n].to_vec()).await.0.unwrap();
         });
-        let client = tp::TcpStream::connect(&rt2, addr).await.unwrap();
+        let client = tp::TcpStream::connect(&rt2, addr, &tp::SocketOptions::new()).await.unwrap();
         client.write(b"ping".to_vec()).await.0.unwrap();
         let (n, b) = client.read(vec![0u8; 64]).await;
         server.await.unwrap();

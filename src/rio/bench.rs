@@ -26,7 +26,7 @@ use super::cq::RioCq;
 use super::rq::RqConfig;
 use super::socket::RioUdpSocket;
 use crate::common::block_on;
-use crate::tp::io::net::UdpSocket;
+use crate::tp::io::net::{SocketOptions, UdpSocket};
 use crate::tp::Runtime;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
@@ -40,8 +40,8 @@ fn v4() -> SocketAddr {
 
 /// Datagrams per second for the overlapped engine at a given queue depth.
 fn overlapped_rate(rt: &Runtime, depth: usize) -> f64 {
-    let server = UdpSocket::bind(rt, v4()).unwrap();
-    let client = UdpSocket::bind(rt, v4()).unwrap();
+    let server = UdpSocket::bind(rt, v4(), &SocketOptions::new()).unwrap();
+    let client = UdpSocket::bind(rt, v4(), &SocketOptions::new()).unwrap();
     let addr = server.local_addr().unwrap();
     // The engine's own fast path, so the comparison is against its best.
     let _ = server.set_skip_completion_on_success();

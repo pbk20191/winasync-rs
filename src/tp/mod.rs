@@ -55,15 +55,15 @@ pub use io::async_rw::{
 pub use io::file::{File, PageBuffers};
 #[allow(unused_imports)]
 pub use io::net::{
-    parse_ip_pktinfo, ReceivedMsg, ReusableSocket, TcpListener, TcpStream, TransmitFlags,
-    TransmitPackets, UdpSocket,
+    parse_ip_pktinfo, ReceivedMsg, ReusableSocket, SocketOptions, TcpListener, TcpStream,
+    TransmitFlags, TransmitPackets, UdpSocket,
 };
 #[allow(unused_imports)]
 pub use io::pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeOptions, NamedPipeStream};
 #[allow(unused_imports)]
 pub use io::serial::SerialPort;
 pub use io::unix::{UnixListener, UnixStream};
-// Who may connect to a listener, for `bind_with_security` on the local
+// Who may connect to a listener, for the `bind`s of the local
 // transports.
 pub use crate::common::security::SecurityDescriptor;
 #[allow(unused_imports)]

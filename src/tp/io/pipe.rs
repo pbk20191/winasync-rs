@@ -12,7 +12,7 @@ use super::{submit, IoRes, Issue};
 use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 pub use crate::common::pipe::NamedPipeOptions;
 use crate::common::pipe::{self as server, PipeServer, ReplenishOnExit, Slot};
-use crate::common::security::{self, SecurityDescriptor};
+use crate::common::security;
 use crate::tp::Runtime;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Pipes::{ConnectNamedPipe, PeekNamedPipe, TransactNamedPipe};
 use windows_core::{Error, HSTRING};
 
-/// Largest single read `read_message` issues before it knows a message's
+/// Largest single read `read_message_vec` issues before it knows a message's
 /// size; anything longer is finished with one more read of exactly the rest.
 const FIRST_READ: usize = 64 * 1024;
 
@@ -68,7 +68,7 @@ impl NamedPipeStream {
     ///
     /// On a message-mode pipe this returns at most one message, and a message
     /// longer than `buf` arrives over several reads with nothing to say where
-    /// it ends. Use [`read_message`](Self::read_message) to keep the
+    /// it ends. Use [`read_message_vec`](Self::read_message_vec) to keep the
     /// boundaries.
     pub fn read<B: IoBufMut + 'static>(
         &self,
@@ -152,9 +152,9 @@ impl NamedPipeStream {
     /// `E_ILLEGAL_METHOD_CALL` on a byte-mode pipe, which has no messages to
     /// read.
     ///
-    /// Allocates the result; [`read_message_into`](Self::read_message_into)
+    /// Allocates the result; [`read_message`](Self::read_message)
     /// reads into a buffer of the caller's.
-    pub async fn read_message(&self, max_len: usize) -> windows_core::Result<Vec<u8>> {
+    pub async fn read_message_vec(&self, max_len: usize) -> windows_core::Result<Vec<u8>> {
         self.message_mode()?;
         let (result, message) = self.read_part(Vec::with_capacity(max_len.min(FIRST_READ))).await;
         let (n, more) = result?;
@@ -165,9 +165,12 @@ impl NamedPipeStream {
     /// ([`IoBuf::bytes_total`]); resolves to its length and hands `buf` back.
     ///
     /// A message too long for `buf` is read to its end and discarded, as in
-    /// [`read_message`](Self::read_message), and this fails with
+    /// [`read_message_vec`](Self::read_message_vec), and this fails with
     /// `ERROR_MORE_DATA` -- `buf` then holds its first part.
-    pub async fn read_message_into<B: IoBufMut + 'static>(&self, buf: B) -> (windows_core::Result<usize>, B) {
+    pub async fn read_message<B: IoBufMut + 'static>(
+        &self,
+        buf: B,
+    ) -> (windows_core::Result<usize>, B) {
         if let Err(e) = self.message_mode() {
             return (Err(e), buf);
         }
@@ -184,11 +187,11 @@ impl NamedPipeStream {
     /// only with nothing unread in the pipe -- the kernel refuses a
     /// transaction that would read a stale message as its reply. A reply
     /// longer than `max_response` is read to its end and discarded, as in
-    /// [`read_message`](Self::read_message).
+    /// [`read_message_vec`](Self::read_message_vec).
     ///
-    /// Allocates the reply; [`transact_into`](Self::transact_into) reads it
+    /// Allocates the reply; [`transact`](Self::transact) reads it
     /// into a buffer of the caller's.
-    pub async fn transact<I: IoBuf + 'static>(
+    pub async fn transact_vec<I: IoBuf + 'static>(
         &self,
         request: I,
         max_response: usize,
@@ -200,11 +203,11 @@ impl NamedPipeStream {
         self.finish_message(mark_read(Some(n), reply), more, max_response).await
     }
 
-    /// [`transact`](Self::transact), with the reply read into `reply`, which
+    /// [`transact_vec`](Self::transact_vec), with the reply read into `reply`, which
     /// must have room for it; resolves to the reply's length and hands both
     /// buffers back. A reply too long for `reply` is discarded as in
-    /// [`read_message_into`](Self::read_message_into).
-    pub async fn transact_into<I: IoBuf + 'static, O: IoBufMut + 'static>(
+    /// [`read_message`](Self::read_message).
+    pub async fn transact<I: IoBuf + 'static, O: IoBufMut + 'static>(
         &self,
         request: I,
         reply: O,
@@ -393,35 +396,15 @@ pub struct NamedPipeListener {
 }
 
 impl NamedPipeListener {
-    /// Binds a listener to `name` (e.g. `\\.\pipe\foo`), with the default
-    /// options -- including the default security: this process's account,
-    /// administrators and SYSTEM. No instance is created until the first
-    /// `accept`, which is also where a name already held by another server is
-    /// reported.
-    pub fn bind(rt: &Runtime, name: &str) -> NamedPipeListener {
-        NamedPipeListener {
-            rt: rt.clone(),
-            server: PipeServer::new(name, NamedPipeOptions::new()),
-        }
-    }
-
-    /// [`bind`](Self::bind), with `security` on every instance. See
-    /// [`NamedPipeOptions::security`].
-    pub fn bind_with_security(
-        rt: &Runtime,
-        name: &str,
-        security: &SecurityDescriptor,
-    ) -> NamedPipeListener {
-        NamedPipeListener {
-            rt: rt.clone(),
-            server: PipeServer::new(name, NamedPipeOptions::new().security(security)),
-        }
-    }
-
-    /// [`bind`](Self::bind), with `options`. Fails with `E_INVALIDARG` for
-    /// options no pipe can have: an instance limit outside 1..=255, or remote
-    /// clients without a descriptor.
-    pub fn bind_with_options(
+    /// Binds a listener to `name` (e.g. `\\.\pipe\foo`) with `options` --
+    /// [`NamedPipeOptions::new()`] for the defaults, including the default
+    /// security: this process's account, administrators and SYSTEM.
+    ///
+    /// No instance is created until the first `accept`, which is also where a
+    /// name already held by another server is reported. Fails here with
+    /// `E_INVALIDARG` for options no pipe can have: an instance limit outside
+    /// 1..=255, or remote clients without a descriptor.
+    pub fn bind(
         rt: &Runtime,
         name: &str,
         options: &NamedPipeOptions,
@@ -539,6 +522,7 @@ impl NamedPipeConnector {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::security::SecurityDescriptor;
     use super::super::super::{block_on, timeout, Runtime};
     use super::*;
 
@@ -549,7 +533,7 @@ mod tests {
         let rt2 = rt.clone();
         let sname = name.clone();
         let server = std::thread::spawn(move || {
-            let listener = NamedPipeListener::bind(&rt2, &sname);
+            let listener = NamedPipeListener::bind(&rt2, &sname, &NamedPipeOptions::new()).unwrap();
             let s = block_on(listener.accept()).unwrap();
             let (n, b) = block_on(s.read(vec![0u8; 16]));
             let n = n.unwrap();
@@ -586,7 +570,11 @@ mod tests {
     fn each_end_identifies_the_other() {
         let rt = Runtime::new();
         let name = unique("peer");
-        let server = accept_one(&rt, NamedPipeListener::bind(&rt, &name));
+        let server = accept_one(&rt, NamedPipeListener::bind(
+            &rt,
+            &name,
+            &NamedPipeOptions::new(),
+        ).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(100));
         let client = NamedPipeConnector::connect(&rt, &name).unwrap();
         let server = server.join().unwrap().unwrap();
@@ -622,7 +610,11 @@ mod tests {
             )
         };
         assert!(!squatter.is_invalid());
-        let err = block_on(NamedPipeListener::bind(&rt, &name).accept()).err().unwrap();
+        let err = block_on(NamedPipeListener::bind(
+            &rt,
+            &name,
+            &NamedPipeOptions::new(),
+        ).unwrap().accept()).err().unwrap();
         assert_eq!(err.code(), windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult());
         unsafe { CloseHandle(squatter).unwrap() };
     }
@@ -639,7 +631,11 @@ mod tests {
         };
         let rt = Runtime::new();
         let name = unique("held");
-        let listener = Arc::new(NamedPipeListener::bind(&rt, &name));
+        let listener = Arc::new(NamedPipeListener::bind(
+            &rt,
+            &name,
+            &NamedPipeOptions::new(),
+        ).unwrap());
         let l2 = listener.clone();
         let server = std::thread::spawn(move || block_on(l2.accept()));
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -674,7 +670,7 @@ mod tests {
         };
         let rt = Runtime::new();
         let name = unique("dropped");
-        let listener = NamedPipeListener::bind(&rt, &name);
+        let listener = NamedPipeListener::bind(&rt, &name, &NamedPipeOptions::new()).unwrap();
         let timed_out = block_on(crate::tp::timeout(
             &rt,
             std::time::Duration::from_millis(100),
@@ -707,7 +703,11 @@ mod tests {
         let rt = Runtime::new();
         let name = unique("deny");
         let system_only = SecurityDescriptor::from_sddl("D:P(A;;GA;;;SY)").unwrap();
-        let listener = NamedPipeListener::bind_with_security(&rt, &name, &system_only);
+        let listener = NamedPipeListener::bind(
+            &rt,
+            &name,
+            &NamedPipeOptions::new().security(&system_only),
+        ).unwrap();
         // Nobody is let in, so the accept only ends by timing out -- which
         // drops it and cancels its operation, rather than leaving one live
         // for the leak checks elsewhere in this process to trip over.
@@ -732,7 +732,11 @@ mod tests {
         let rt = Runtime::new();
         let name = unique("allow");
         let owner_only = SecurityDescriptor::from_sddl("D:P(A;;GA;;;OW)").unwrap();
-        let server = accept_one(&rt, NamedPipeListener::bind_with_security(&rt, &name, &owner_only));
+        let server = accept_one(&rt, NamedPipeListener::bind(
+            &rt,
+            &name,
+            &NamedPipeOptions::new().security(&owner_only),
+        ).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _client = NamedPipeConnector::connect(&rt, &name).unwrap();
         server.join().unwrap().unwrap();
@@ -773,7 +777,7 @@ mod tests {
     fn the_default_descriptor_keeps_out_anonymous_readers() {
         let rt = Runtime::new();
         let name = unique("anon");
-        let listener = NamedPipeListener::bind(&rt, &name);
+        let listener = NamedPipeListener::bind(&rt, &name, &NamedPipeOptions::new()).unwrap();
         let rt2 = rt.clone();
         let server = std::thread::spawn(move || {
             block_on(crate::tp::timeout(
@@ -794,7 +798,7 @@ mod tests {
     fn message_pair(rt: &Runtime, options: NamedPipeOptions) -> (NamedPipeStream, NamedPipeStream) {
         let name = unique("msg");
         let listener =
-            NamedPipeListener::bind_with_options(rt, &name, &options.message_mode(true)).unwrap();
+            NamedPipeListener::bind(rt, &name, &options.message_mode(true)).unwrap();
         let server = accept_one(rt, listener);
         std::thread::sleep(std::time::Duration::from_millis(100));
         let client = NamedPipeConnector::connect(rt, &name).unwrap();
@@ -824,7 +828,7 @@ mod tests {
             })
         };
         for m in &sent {
-            assert_eq!(&block_on(server.read_message(1 << 20)).unwrap(), m);
+            assert_eq!(&block_on(server.read_message_vec(1 << 20)).unwrap(), m);
         }
         drop(writer.join().unwrap());
     }
@@ -855,9 +859,9 @@ mod tests {
             block_on(client.write(b"next".to_vec())).0.unwrap();
             client
         });
-        let err = block_on(server.read_message(10)).unwrap_err();
+        let err = block_on(server.read_message_vec(10)).unwrap_err();
         assert_eq!(err.code(), ERROR_MORE_DATA.to_hresult());
-        assert_eq!(block_on(server.read_message(10)).unwrap(), b"next");
+        assert_eq!(block_on(server.read_message_vec(10)).unwrap(), b"next");
         drop(writer.join().unwrap());
     }
 
@@ -865,13 +869,17 @@ mod tests {
     fn a_byte_pipe_has_no_messages() {
         let rt = Runtime::new();
         let name = unique("bytes");
-        let server = accept_one(&rt, NamedPipeListener::bind(&rt, &name));
+        let server = accept_one(&rt, NamedPipeListener::bind(
+            &rt,
+            &name,
+            &NamedPipeOptions::new(),
+        ).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(100));
         let client = NamedPipeConnector::connect(&rt, &name).unwrap();
         let server = server.join().unwrap().unwrap();
         assert!(!client.is_message_mode());
         assert_eq!(
-            block_on(server.read_message(16)).unwrap_err().code(),
+            block_on(server.read_message_vec(16)).unwrap_err().code(),
             E_ILLEGAL_METHOD_CALL
         );
     }
@@ -885,7 +893,7 @@ mod tests {
             NamedPipeOptions::new().max_instances(256),
             NamedPipeOptions::new().accept_remote_clients(true),
         ] {
-            let err = NamedPipeListener::bind_with_options(&rt, &unique("bad"), &options)
+            let err = NamedPipeListener::bind(&rt, &unique("bad"), &options)
                 .err()
                 .unwrap();
             assert_eq!(err.code(), invalid, "{options:?}");
@@ -902,7 +910,7 @@ mod tests {
     fn remote_clients_are_refused_by_default() {
         let rt = Runtime::new();
         let name = unique("remote_no");
-        let listener = NamedPipeListener::bind(&rt, &name);
+        let listener = NamedPipeListener::bind(&rt, &name, &NamedPipeOptions::new()).unwrap();
         let rt2 = rt.clone();
         let server = std::thread::spawn(move || {
             block_on(crate::tp::timeout(
@@ -929,7 +937,7 @@ mod tests {
         let options = NamedPipeOptions::new()
             .security(&only_me)
             .accept_remote_clients(true);
-        let listener = NamedPipeListener::bind_with_options(&rt, &name, &options).unwrap();
+        let listener = NamedPipeListener::bind(&rt, &name, &options).unwrap();
         let server = accept_one(&rt, listener);
         std::thread::sleep(std::time::Duration::from_millis(100));
         let client = NamedPipeConnector::connect(&rt, &remote_name(&name)).unwrap();
@@ -954,7 +962,7 @@ mod tests {
         let name = unique("limit");
         let options = NamedPipeOptions::new().max_instances(1);
         let listener =
-            Arc::new(NamedPipeListener::bind_with_options(&rt, &name, &options).unwrap());
+            Arc::new(NamedPipeListener::bind(&rt, &name, &options).unwrap());
 
         let l = listener.clone();
         let first = std::thread::spawn(move || block_on(l.accept()));
@@ -1005,7 +1013,7 @@ mod tests {
         let name = unique("limit_squat");
         let options = NamedPipeOptions::new().max_instances(1);
         let listener =
-            Arc::new(NamedPipeListener::bind_with_options(&rt, &name, &options).unwrap());
+            Arc::new(NamedPipeListener::bind(&rt, &name, &options).unwrap());
         let l = listener.clone();
         let first = std::thread::spawn(move || block_on(l.accept()));
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1036,7 +1044,7 @@ mod tests {
         let rt = Runtime::new();
         let name = unique("busy");
         let options = NamedPipeOptions::new().max_instances(1);
-        let listener = NamedPipeListener::bind_with_options(&rt, &name, &options).unwrap();
+        let listener = NamedPipeListener::bind(&rt, &name, &options).unwrap();
         let server = accept_one(&rt, listener);
         std::thread::sleep(std::time::Duration::from_millis(100));
         let _client = NamedPipeConnector::connect(&rt, &name).unwrap();
@@ -1061,7 +1069,7 @@ mod tests {
         reply: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            while let Ok(m) = block_on(server.read_message(1 << 20)) {
+            while let Ok(m) = block_on(server.read_message_vec(1 << 20)) {
                 if block_on(server.write(reply(&m))).0.is_err() {
                     break;
                 }
@@ -1081,10 +1089,10 @@ mod tests {
                 m.to_ascii_uppercase()
             }
         });
-        assert_eq!(block_on(client.transact(b"ping".to_vec(), 64)).unwrap(), b"PING");
-        let big = block_on(client.transact(b"big".to_vec(), 1 << 20)).unwrap();
+        assert_eq!(block_on(client.transact_vec(b"ping".to_vec(), 64)).unwrap(), b"PING");
+        let big = block_on(client.transact_vec(b"big".to_vec(), 1 << 20)).unwrap();
         assert_eq!(big, (0..150_000u32).map(|i| i as u8).collect::<Vec<_>>());
-        assert_eq!(block_on(client.transact(b"again".to_vec(), 64)).unwrap(), b"AGAIN");
+        assert_eq!(block_on(client.transact_vec(b"again".to_vec(), 64)).unwrap(), b"AGAIN");
         drop(client);
         server.join().unwrap();
     }
@@ -1098,9 +1106,9 @@ mod tests {
         let server = answering(server, |m| {
             if m == b"big" { vec![9u8; 100_000] } else { m.to_vec() }
         });
-        let err = block_on(client.transact(b"big".to_vec(), 10)).unwrap_err();
+        let err = block_on(client.transact_vec(b"big".to_vec(), 10)).unwrap_err();
         assert_eq!(err.code(), ERROR_MORE_DATA.to_hresult());
-        assert_eq!(block_on(client.transact(b"small".to_vec(), 10)).unwrap(), b"small");
+        assert_eq!(block_on(client.transact_vec(b"small".to_vec(), 10)).unwrap(), b"small");
         drop(client);
         server.join().unwrap();
     }
@@ -1109,12 +1117,16 @@ mod tests {
     fn a_byte_pipe_has_no_transactions() {
         let rt = Runtime::new();
         let name = unique("bytes_tx");
-        let server = accept_one(&rt, NamedPipeListener::bind(&rt, &name));
+        let server = accept_one(&rt, NamedPipeListener::bind(
+            &rt,
+            &name,
+            &NamedPipeOptions::new(),
+        ).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(100));
         let client = NamedPipeConnector::connect(&rt, &name).unwrap();
         let _server = server.join().unwrap().unwrap();
         assert_eq!(
-            block_on(client.transact(b"x".to_vec(), 16)).unwrap_err().code(),
+            block_on(client.transact_vec(b"x".to_vec(), 16)).unwrap_err().code(),
             E_ILLEGAL_METHOD_CALL
         );
     }
@@ -1122,7 +1134,11 @@ mod tests {
     /// A connected byte-mode pair, server end first.
     fn byte_pair(rt: &Runtime) -> (NamedPipeStream, NamedPipeStream) {
         let name = unique("own");
-        let server = accept_one(rt, NamedPipeListener::bind(rt, &name));
+        let server = accept_one(rt, NamedPipeListener::bind(
+            rt,
+            &name,
+            &NamedPipeOptions::new(),
+        ).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(100));
         let client = NamedPipeConnector::connect(rt, &name).unwrap();
         (server.join().unwrap().unwrap(), client)
@@ -1224,11 +1240,11 @@ mod tests {
             client
         });
         let pool = SlabPool::new(16, 1).unwrap();
-        let (n, buf) = block_on(server.read_message_into(pool.acquire().unwrap()));
+        let (n, buf) = block_on(server.read_message(pool.acquire().unwrap()));
         assert_eq!(&buf[..n.unwrap()], b"fits");
-        let (err, buf) = block_on(server.read_message_into(buf));
+        let (err, buf) = block_on(server.read_message(buf));
         assert_eq!(err.unwrap_err().code(), ERROR_MORE_DATA.to_hresult());
-        let (n, _) = block_on(server.read_message_into(buf));
+        let (n, _) = block_on(server.read_message(buf));
         assert_eq!(n.unwrap(), 4);
         drop(writer.join().unwrap());
     }
@@ -1240,7 +1256,7 @@ mod tests {
         let server = answering(server, |m| m.to_ascii_uppercase());
         let request: Arc<[u8]> = Arc::from(&b"shout"[..]);
         let (n, _request, reply) =
-            block_on(client.transact_into(request, Vec::with_capacity(32)));
+            block_on(client.transact(request, Vec::with_capacity(32)));
         assert_eq!(n.unwrap(), 5);
         assert_eq!(reply, b"SHOUT");
         drop(client);

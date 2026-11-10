@@ -36,22 +36,14 @@ impl TcpListener {
         crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
-    /// Binds and listens on `addr` (IPv4 or IPv6).
-    pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpListener> {
-        Self::bind_with_flags(rt, addr, 0)
-    }
-
-    /// [`bind`](Self::bind) with extra `WSASocketW` flags on the listen
-    /// socket *and* on every socket `accept` creates.
-    ///
-    /// For composing with another completion engine: create the sockets the
-    /// way that engine needs, do the handshake here, hand the connected
-    /// socket over. This module never interprets `extra_flags`.
-    pub fn bind_with_flags(
+    /// Binds and listens on `addr` (IPv4 or IPv6), creating sockets as
+    /// `options` says.
+    pub fn bind(
         rt: &Runtime,
         addr: SocketAddr,
-        extra_flags: u32,
+        options: &SocketOptions,
     ) -> windows_core::Result<TcpListener> {
+        let extra_flags = options.for_tcp()?.wsa_flags;
         let family = family_of(&addr);
         let sock = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
         let register = || -> windows_core::Result<Arc<IoRes>> {
@@ -281,19 +273,14 @@ impl TcpStream {
         }
     }
 
-    /// Connects to `addr` (IPv4 or IPv6).
-    pub async fn connect(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<TcpStream> {
-        Self::connect_with_flags(rt, addr, 0).await
-    }
-
-    /// [`connect`](Self::connect) with extra `WSASocketW` flags on the
-    /// socket — the connect-side counterpart of
-    /// [`TcpListener::bind_with_flags`].
-    pub async fn connect_with_flags(
+    /// Connects to `addr` (IPv4 or IPv6), creating the socket as `options`
+    /// says.
+    pub async fn connect(
         rt: &Runtime,
         addr: SocketAddr,
-        extra_flags: u32,
+        options: &SocketOptions,
     ) -> windows_core::Result<TcpStream> {
+        let extra_flags = options.for_tcp()?.wsa_flags;
         let family = family_of(&addr);
         let sock = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
         let prepared = (|| -> windows_core::Result<(ConnectExFn, TcpStream)> {

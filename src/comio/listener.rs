@@ -176,7 +176,7 @@ impl AcceptSource for UnixSource {
     fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<Option<OpHandle>> {
         let mut guard = self.listener.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(super::UnixStreamListener::bind_inner(
+            *guard = Some(super::UnixStreamListener::bind(
                 &self.path,
                 self.security.as_ref(),
             )?);

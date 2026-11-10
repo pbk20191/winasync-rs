@@ -9,6 +9,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -39,7 +40,7 @@
             });
 
             // Client: send a payload, read the echo back, then half-close.
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             // The client's peer address is the listener's address.
             assert_eq!(client.peer_addr().unwrap().port(), addr.port());
             let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 231) as u8).collect();
@@ -75,6 +76,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -88,7 +90,7 @@
                 stream.write(b[..n].to_vec()).await.0.unwrap();
             });
 
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             assert!(matches!(client.peer_addr().unwrap(), SocketAddr::V6(_)));
             client.write(b"v6ping".to_vec()).await.0.unwrap();
             let (n, b) = client.read(vec![0u8; 64]).await;
@@ -105,11 +107,13 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -142,11 +146,13 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -168,11 +174,13 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -210,6 +218,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -222,7 +231,7 @@
                 n
             });
 
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let mut got = Vec::new();
             loop {
                 let (n, b) = client.read(vec![0u8; 8192]).await;
@@ -258,6 +267,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -272,7 +282,7 @@
                 n
             });
 
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let mut got = Vec::new();
             loop {
                 let (n, b) = client.read(vec![0u8; 8192]).await;
@@ -300,10 +310,11 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let s1 = listener.accept().await.unwrap();
             // DisconnectEx is graceful: it completes once the peer has closed too,
             // so close the server side first (the connection is finished).
@@ -339,13 +350,13 @@
         let rt = Runtime::new();
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
             let loopback = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-            let listener = TcpListener::bind(&rt, loopback).unwrap();
+            let listener = TcpListener::bind(&rt, loopback, &SocketOptions::new()).unwrap();
             let addr = listener.local_addr().unwrap();
-            let second = TcpListener::bind(&rt, loopback).unwrap();
+            let second = TcpListener::bind(&rt, loopback, &SocketOptions::new()).unwrap();
             let addr2 = second.local_addr().unwrap();
 
             // First connection on a fresh client socket.
-            let client = TcpStream::connect(&rt, addr)
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new())
                 .await
                 .expect("first connect");
             let local = client.local_addr().ok();
@@ -380,11 +391,12 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let c1 = TcpStream::connect(&rt, addr).await.unwrap();
+            let c1 = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let s1 = listener.accept().await.unwrap();
             c1.write(b"a".to_vec()).await.0.unwrap();
             let (n, b) = s1.read(vec![0u8; 4]).await;
@@ -397,7 +409,7 @@
             s1.disconnect(true).await.unwrap();
             let reusable = s1.into_reusable();
 
-            let c2 = TcpStream::connect(&rt, addr).await.unwrap();
+            let c2 = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let s2 = listener.accept_into(reusable).await.unwrap();
             c2.write(b"b".to_vec()).await.0.unwrap();
             let (n, b) = s2.read(vec![0u8; 4]).await;
@@ -413,12 +425,14 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             server.set_recv_pktinfo(true).unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -443,6 +457,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -465,7 +480,7 @@
                 echoed
             });
 
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             client.set_skip_completion_on_success().unwrap();
             for i in 0..16u8 {
                 let msg = vec![i; 8];
@@ -522,6 +537,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -532,7 +548,7 @@
                 data
             });
 
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             client.write(b"GET / HTTP/1.1".to_vec()).await.0.unwrap();
             let data = server.await.unwrap();
             assert_eq!(&data, b"GET / HTTP/1.1");
@@ -553,11 +569,13 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -602,11 +620,13 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -643,11 +663,13 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -699,9 +721,10 @@
         let group: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 99);
         let result = block_on(timeout(&rt, Duration::from_secs(5), async {
             // SO_REUSEADDR at bind time — several receivers may share the port.
-            let rx = UdpSocket::bind_reuse_addr(
+            let rx = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                &SocketOptions::new().reuse_address(true),
             )
             .unwrap();
             let port = rx.local_addr().unwrap().port();
@@ -717,6 +740,7 @@
             let tx = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             // TTL 0: delivered on this host, never forwarded off it.
@@ -744,9 +768,10 @@
         let rt = Runtime::new();
         let group: Ipv4Addr = Ipv4Addr::new(232, 1, 2, 3); // SSM range
         let source: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
-        let sock = UdpSocket::bind_reuse_addr(
+        let sock = UdpSocket::bind(
             &rt,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            &SocketOptions::new().reuse_address(true),
         )
         .unwrap();
         match sock.join_multicast_source_v4(group, source, Ipv4Addr::UNSPECIFIED) {
@@ -802,6 +827,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -811,7 +837,7 @@
                 let n = n.unwrap();
                 assert_eq!(&b[..n], b"slab");
             });
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let mut out = pool.acquire().unwrap();
             out[..4].copy_from_slice(b"slab");
             out.set_len(4);
@@ -824,11 +850,13 @@
             let rx = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let tx = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let rx_addr = rx.local_addr().unwrap();
@@ -857,11 +885,13 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -902,11 +932,13 @@
             let server = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let client = UdpSocket::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let server_addr = server.local_addr().unwrap();
@@ -942,6 +974,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -954,7 +987,7 @@
                 let read = b2[..n2.unwrap()].to_vec();
                 (peeked, read)
             });
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             client.write(b"peekme".to_vec()).await.0.unwrap();
             let (peeked, read) = server.await.unwrap();
             assert_eq!(peeked, b"peekme");
@@ -970,6 +1003,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -988,7 +1022,7 @@
             });
 
             // Client gather-writes three buffers as one contiguous send.
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let (w, bufs) = client
                 .write_vectored(vec![b"abc".to_vec(), b"def".to_vec(), b"ghi".to_vec()])
                 .await;
@@ -1007,6 +1041,7 @@
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1025,7 +1060,7 @@
                     listener.accept().await.unwrap()
                 }
             });
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let server = server_task.await.unwrap();
             for _ in 0..1000 {
                 drop(client.read(vec![0u8; 1024]));
@@ -1059,7 +1094,11 @@
     #[test]
     fn ioctl_output_survives_an_immediate_completion() {
         let rt = Runtime::new();
-        let udp = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        let udp = UdpSocket::bind(
+            &rt,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &SocketOptions::new(),
+        )
             .unwrap();
         // Spare capacity, not zeroed bytes: the length ends where the output
         // does.
@@ -1077,11 +1116,15 @@
         let rt = Runtime::new();
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
             let listener =
-                TcpListener::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+                TcpListener::bind(
+                    &rt,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                    &SocketOptions::new(),
+                )
                     .unwrap();
             let addr = listener.local_addr().unwrap();
             let server = rt.spawn(async move { listener.accept().await.unwrap() });
-            let client = TcpStream::connect(&rt, addr).await.unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let _server = server.await.unwrap();
             let vals: Vec<u8> = [1u32, 10_000, 1_000].iter().flat_map(|v| v.to_ne_bytes()).collect();
             client.ioctl(SIO_KEEPALIVE_VALS, vals, Vec::new()).await.0
@@ -1094,7 +1137,11 @@
     #[test]
     fn a_waiting_ioctl_is_cancelled_by_drop() {
         let rt = Runtime::new();
-        let udp = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        let udp = UdpSocket::bind(
+            &rt,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &SocketOptions::new(),
+        )
             .unwrap();
         let waited = block_on(timeout(
             &rt,
@@ -1123,10 +1170,14 @@
     fn unchecked_socket_ops_take_borrowed_buffers() {
         let rt = Runtime::new();
         let listener =
-            TcpListener::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+            TcpListener::bind(
+                &rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
+            ).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || block_on(listener.accept()).unwrap());
-        let client = block_on(TcpStream::connect(&rt, addr)).unwrap();
+        let client = block_on(TcpStream::connect(&rt, addr, &SocketOptions::new())).unwrap();
         let server = server.join().unwrap();
 
         let mut buf = [0u8; 16];
@@ -1145,8 +1196,16 @@
         let (n, _) = block_on(unsafe { server.read_unchecked(&mut buf[..]) });
         assert_eq!(&buf[..n.unwrap()], b"hello");
 
-        let a = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let b = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let a = UdpSocket::bind(
+            &rt,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &SocketOptions::new(),
+        ).unwrap();
+        let b = UdpSocket::bind(
+            &rt,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &SocketOptions::new(),
+        ).unwrap();
         a.connect(b.local_addr().unwrap()).unwrap();
         b.connect(a.local_addr().unwrap()).unwrap();
         let mut got = [0u8; 8];

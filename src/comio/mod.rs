@@ -86,7 +86,7 @@ pub mod waitop;
 // `#[allow(unused_imports)]` alongside the module's existing
 // `#![allow(dead_code)]` — both are re-export/API-shape warnings, not bugs.
 #[allow(unused_imports)]
-pub use pipe::{NamedPipeConnector, NamedPipeListener};
+pub use pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeOptions};
 // The WinRT-native, `StreamSocketListener`-shaped surface (`listener.rs`):
 // one shared interface, one concrete type per transport, so each exposes only
 // the bind its addressing supports.
@@ -121,7 +121,7 @@ pub(crate) use crate::common::check::check;
 
 #[cfg(test)]
 mod tests {
-    use super::pipe::{NamedPipeConnector, NamedPipeListener};
+    use super::pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeOptions};
     use crate::comio::buffer::new_buffer;
     use crate::common::block_on;
     use std::future::IntoFuture;
@@ -144,7 +144,7 @@ mod tests {
         let name = format!(r"\\.\pipe\comio_datareader_{}", std::process::id());
         let sname = name.clone();
         let server = std::thread::spawn(move || {
-            let listener = NamedPipeListener::create(&sname);
+            let listener = NamedPipeListener::create(&sname, &NamedPipeOptions::new()).unwrap();
             let stream = block_on(listener.accept()).unwrap();
             let input: IInputStream = stream.cast().unwrap();
             // `DataReader::CreateDataReader` wraps any `IInputStream` —
@@ -199,7 +199,7 @@ mod tests {
         // for the whole cancel storm below.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
-            let listener = NamedPipeListener::create(&sname);
+            let listener = NamedPipeListener::create(&sname, &NamedPipeOptions::new()).unwrap();
             let _stream = block_on(listener.accept()).unwrap();
             let _ = done_rx.recv();
         });

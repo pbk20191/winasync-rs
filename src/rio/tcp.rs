@@ -442,7 +442,7 @@ mod tests {
 #[cfg(feature = "tp")]
 mod compose {
     use super::*;
-    use crate::tp::io::net::{TcpListener as TpListener, TcpStream as TpStream};
+    use crate::tp::io::net::{SocketOptions, TcpListener as TpListener, TcpStream as TpStream};
     use crate::tp::Runtime;
     use windows::Win32::Networking::WinSock::WSA_FLAG_REGISTERED_IO;
 
@@ -456,7 +456,11 @@ mod compose {
         /// Binds, creating sockets RIO can use.
         pub fn bind(rt: &Runtime, addr: SocketAddr) -> windows_core::Result<Self> {
             Ok(Self {
-                inner: TpListener::bind_with_flags(rt, addr, WSA_FLAG_REGISTERED_IO)?,
+                inner: TpListener::bind(
+                    rt,
+                    addr,
+                    &SocketOptions::new().wsa_flags(WSA_FLAG_REGISTERED_IO),
+                )?,
             })
         }
 
@@ -497,7 +501,11 @@ mod compose {
             config: RqConfig,
         ) -> windows_core::Result<Self> {
             let stream =
-                TpStream::connect_with_flags(rt, addr, WSA_FLAG_REGISTERED_IO).await?;
+                TpStream::connect(
+                    rt,
+                    addr,
+                    &SocketOptions::new().wsa_flags(WSA_FLAG_REGISTERED_IO),
+                ).await?;
             Self::from_tp(stream, cq, config)
         }
 

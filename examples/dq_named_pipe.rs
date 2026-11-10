@@ -21,13 +21,13 @@ fn main() {
     // (comio is runtime-agnostic) — mirrors `dq::integration::dq_named_pipe_echo`.
     let server = std::thread::spawn(move || {
         use comio::buffer::new_buffer;
-        use comio::NamedPipeListener;
+        use comio::{NamedPipeListener, NamedPipeOptions};
         use std::future::IntoFuture;
         use tp::block_on;
         use windows::Storage::Streams::{IBuffer, IInputStream, IOutputStream, InputStreamOptions};
         use windows_core::Interface;
 
-        let l = NamedPipeListener::create(&sname);
+        let l = NamedPipeListener::create(&sname, &NamedPipeOptions::new()).unwrap();
         let s = block_on(l.accept()).unwrap();
         let i: IInputStream = s.cast().unwrap();
         let o: IOutputStream = s.cast().unwrap();

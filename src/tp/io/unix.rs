@@ -334,31 +334,20 @@ impl UnixListener {
     }
 
     /// Binds and listens on the AF_UNIX path (the caller is responsible for
-    /// removing any stale socket file first). Who may connect is decided by
-    /// the socket file's DACL, which it inherits from the directory.
-    pub fn bind(rt: &Runtime, path: &str) -> windows_core::Result<UnixListener> {
-        Self::bind_inner(rt, path, None)
-    }
-
-    /// [`bind`](Self::bind), with `security`'s DACL written onto the socket
-    /// file. It is applied between `bind` and `listen`: a connect before
-    /// `listen` is refused anyway, so no client ever sees the inherited DACL.
+    /// removing any stale socket file first).
     ///
-    /// Treat this as defence in depth, not as the boundary. On the
-    /// development machine the file's DACL refused every connect it should
-    /// have; on GitHub-hosted runners it was enforced in some jobs and not in
-    /// others -- same image, same token, same code -- and no cause was found.
-    /// A named pipe's descriptor was enforced everywhere. Where the boundary
-    /// must hold, use a named pipe, or check the peer's SID at accept.
-    pub fn bind_with_security(
-        rt: &Runtime,
-        path: &str,
-        security: &SecurityDescriptor,
-    ) -> windows_core::Result<UnixListener> {
-        Self::bind_inner(rt, path, Some(security))
-    }
-
-    fn bind_inner(
+    /// `security`, if given, has its DACL written onto the socket file
+    /// between `bind` and `listen` -- a connect before `listen` is refused
+    /// anyway, so no client ever sees the inherited DACL. Without it, who may
+    /// connect is decided by the DACL the file inherits from its directory.
+    ///
+    /// Treat that DACL as defence in depth, not as the boundary. On the
+    /// development machine it refused every connect it should have; on
+    /// GitHub-hosted runners it was enforced in some jobs and not in others --
+    /// same image, same token, same code -- and no cause was found. A named
+    /// pipe's descriptor was enforced everywhere. Where the boundary must
+    /// hold, use a named pipe, or check the peer's SID at accept.
+    pub fn bind(
         rt: &Runtime,
         path: &str,
         security: Option<&SecurityDescriptor>,
@@ -447,7 +436,7 @@ mod tests {
             .into_owned();
         let _ = std::fs::remove_file(&path);
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
-            let listener = UnixListener::bind(&rt, &path).unwrap();
+            let listener = UnixListener::bind(&rt, &path, None).unwrap();
             let p2 = path.clone();
             let server = rt.spawn(async move {
                 let s = listener.accept().await.unwrap();
@@ -481,7 +470,7 @@ mod tests {
         let rt = Runtime::new();
         let path = temp_path("peer");
         let result = block_on(timeout(&rt, Duration::from_secs(10), async {
-            let listener = UnixListener::bind(&rt, &path).unwrap();
+            let listener = UnixListener::bind(&rt, &path, None).unwrap();
             let server = rt.spawn(async move { listener.accept().await.unwrap() });
             let client = UnixStream::connect(&rt, &path).await.unwrap();
             let server = server.await.unwrap();
@@ -502,7 +491,7 @@ mod tests {
         let rt = Runtime::new();
         let path = temp_path("deny");
         let system_only = SecurityDescriptor::from_sddl("D:P(A;;GA;;;SY)").unwrap();
-        let listener = UnixListener::bind_with_security(&rt, &path, &system_only).unwrap();
+        let listener = UnixListener::bind(&rt, &path, Some(&system_only)).unwrap();
         let result =
             block_on(timeout(&rt, Duration::from_secs(10), UnixStream::connect(&rt, &path)))
                 .expect("timed out");

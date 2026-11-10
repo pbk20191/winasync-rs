@@ -526,7 +526,7 @@ mod futures_compat {
 #[cfg(test)]
 mod tests {
     use super::super::super::{block_on, timeout, Runtime};
-    use super::super::net::{TcpListener, TcpStream};
+    use super::super::net::{SocketOptions, TcpListener, TcpStream};
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
@@ -538,6 +538,7 @@ mod tests {
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -556,7 +557,11 @@ mod tests {
                 len
             });
 
-            let mut io = TcpStream::connect(&rt, addr).await.unwrap().into_io();
+            let mut io = TcpStream::connect(
+                &rt,
+                addr,
+                &SocketOptions::new(),
+            ).await.unwrap().into_io();
             let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 253) as u8).collect();
             io.write_all(&(payload.len() as u32).to_be_bytes()).await.unwrap();
             io.write_all(&payload).await.unwrap();
@@ -588,6 +593,7 @@ mod tests {
             let listener = TcpListener::bind(
                 &rt,
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
@@ -603,7 +609,11 @@ mod tests {
 
             // Client: split, then write (on a spawned task) and read
             // concurrently — impossible without split, since both need &mut.
-            let (mut r, mut w) = TcpStream::connect(&rt, addr).await.unwrap().into_io().split();
+            let (mut r, mut w) = TcpStream::connect(
+                &rt,
+                addr,
+                &SocketOptions::new(),
+            ).await.unwrap().into_io().split();
             let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
             let p2 = payload.clone();
             let writer = rt.spawn(async move {

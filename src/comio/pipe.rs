@@ -21,7 +21,7 @@ pub use crate::common::pipe::NamedPipeOptions;
 use crate::common::pipe::{
     self as server, ClientEnd, Instance, PipeServer, ReplenishOnExit, Slot, SlotWaiter,
 };
-use crate::common::security::{PeerIdentity, SecurityDescriptor};
+use crate::common::security::PeerIdentity;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows::Win32::Foundation::{
@@ -62,25 +62,11 @@ pub struct NamedPipeListener {
 }
 
 impl NamedPipeListener {
-    /// A listener for `name`, with the default options -- including the
-    /// default security: this process's account, administrators and SYSTEM.
-    pub fn create(name: &str) -> Self {
-        Self {
-            server: PipeServer::new(name, NamedPipeOptions::new()),
-        }
-    }
-
-    /// [`create`](Self::create), with `security` on every instance. See
-    /// [`NamedPipeOptions::security`].
-    pub fn create_with_security(name: &str, security: &SecurityDescriptor) -> Self {
-        Self {
-            server: PipeServer::new(name, NamedPipeOptions::new().security(security)),
-        }
-    }
-
-    /// [`create`](Self::create), with `options`. Fails with `E_INVALIDARG`
-    /// for options no pipe can have.
-    pub fn create_with_options(name: &str, options: &NamedPipeOptions) -> Result<Self> {
+    /// A listener for `name` with `options` -- [`NamedPipeOptions::new()`]
+    /// for the defaults, including the default security: this process's
+    /// account, administrators and SYSTEM. Fails with `E_INVALIDARG` for
+    /// options no pipe can have.
+    pub fn create(name: &str, options: &NamedPipeOptions) -> Result<Self> {
         options.validate()?;
         Ok(Self {
             server: PipeServer::new(name, options.clone()),
@@ -389,7 +375,7 @@ mod tests {
         let name = format!(r"\\.\pipe\comio_pipe_echo_{}", std::process::id());
         let sname = name.clone();
         let server = std::thread::spawn(move || {
-            let listener = NamedPipeListener::create(&sname);
+            let listener = NamedPipeListener::create(&sname, &NamedPipeOptions::new()).unwrap();
             let stream = block_on(listener.accept()).unwrap();
             let input: IInputStream = stream.cast().unwrap();
             let output: IOutputStream = stream.cast().unwrap();
@@ -448,7 +434,7 @@ mod tests {
             r"\\.\pipe\comio_pipe_preconnected_{}",
             std::process::id()
         );
-        let listener = NamedPipeListener::create(&name);
+        let listener = NamedPipeListener::create(&name, &NamedPipeOptions::new()).unwrap();
         // Force the server's pipe instance to exist first so the client's
         // `CreateFileW` can succeed, then connect the client *before*
         // `accept` is ever called — guaranteeing `ConnectNamedPipe` will
