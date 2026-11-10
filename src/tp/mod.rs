@@ -62,6 +62,8 @@ pub use io::net::{
 pub use io::pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeOptions, NamedPipeStream};
 #[allow(unused_imports)]
 pub use io::serial::SerialPort;
+#[cfg(feature = "http")]
+pub use io::http::{HttpRequest, HttpServer, Response};
 pub use io::watch::{
     filetime, iter_changes, iter_extended_changes, Change, ChangeKind, DirectoryWatcher,
     ExtendedChange, NotifyFilter,

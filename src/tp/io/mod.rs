@@ -11,6 +11,8 @@ pub mod async_rw;
 pub mod device;
 pub mod file;
 pub mod hvsock;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod net;
 pub mod pipe;
 pub mod serial;

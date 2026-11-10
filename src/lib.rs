@@ -7,6 +7,7 @@
 //! | `dq` | a single-threaded runtime whose executor is a WinRT `DispatcherQueue` |
 //! | `comio` | WinRT-shaped COM streams over overlapped IO, for transports WinRT itself does not expose |
 //! | `rio` | Registered I/O: registered buffers plus a drained completion queue (experimental) |
+//! | `http` | an HTTP server on http.sys, its requests and responses overlapped on `tp`'s pool |
 //! | `iocp` | completion ports for a caller's own loop, and waits on any object that complete into them |
 //! | `ioring` | I/O rings: batched file reads, writes and flushes through a submission and a completion queue |
 //!

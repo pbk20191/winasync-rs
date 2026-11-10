@@ -212,6 +212,10 @@ iocp = [
     "windows/Win32_System_Threading",
 ]
 
+# An HTTP server on http.sys, the kernel's HTTP stack: overlapped request,
+# body and response calls on a request queue registered with tp's pool.
+http = ["tp", "windows/Win32_Networking_HttpServer"]
+
 # DispatcherQueue (WinUI 3) runtime.
 dq = [
     "dep:winio-winui3",

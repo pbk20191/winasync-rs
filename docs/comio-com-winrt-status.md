@@ -994,6 +994,27 @@ HTTP(http.sys, WinHTTP, WinINet)는 셋을 함께 검토할 때까지 보류한�
 `JOB_OBJECT_MSG_*`는 이 `windows` 버전에 없어서 숫자로 직접 정의했다. Windows는 한도 알림 말고는 메시지 전달을
 보장하지 않으므로, 문서에 "감사 기록이 아니라 신호로 다룰 것"이라고 적었다.
 
+## http.sys 서버: `http` 피처 (2026-11-11)
+
+WinHTTP와 WinINet은 하지 않기로 했다. 클라이언트 쪽은 콜백 기반이고, 소켓과 비동기 DNS로 이미 할 수 있다.
+http.sys 서버만 넣었다(참조: kuzalekon/win-http-server). 참조 구현은 동기 방식이었고, 여기서는 요청 큐 핸들을
+tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
+
+- `HttpServer::bind(rt, urls)`가 세션, URL 그룹, 요청 큐를 만들고 바인딩한다. `accept()`가 `HttpRequest`를 돌려준다.
+  `HttpRequest`에는 메서드, raw URL과 디코드된 URL·경로·쿼리, 헤더(알려진 41종 + 나머지), 주소가 담긴다.
+  `read_body(buf)`(아무 `IoBufMut`)와 `read_body_to_end`로 본문을 읽고, `respond(Response, body)` 또는
+  `start_response` + `send_body`로 응답한다. 응답하지 않은 요청을 drop하면 `HttpCancelHttpRequest`로 끝낸다.
+  이 호출은 `hEvent|1` 이벤트로 기다려서 포트에 패킷이 가지 않는다.
+- **등록 권한(측정)**: 관리자가 아닌 계정으로 `http://localhost:P/`와 `http://127.0.0.1:P/`는 등록되고, `+`와
+  `*`는 `ERROR_ACCESS_DENIED`다(urlacl 예약이 필요하다).
+- **버퍼보다 큰 요청(측정)**: overlapped 수신은 `IO_PENDING`을 돌려주고, 완료 패킷에 `ERROR_MORE_DATA`와 필요한
+  크기가 실린다. 부분 버퍼에 요청 ID가 들어 있어서, 그 ID로 다시 받으면 같은 요청이 온다. 참조 구현은 재시도 때
+  `HTTP_NULL_ID`를 넘기는데, 그러면 다음 요청을 꺼내 이 요청을 잃는다.
+- **http.sys가 먼저 거르는 것**: 헤더 하나가 기본 한도 16KiB(`MaxFieldLength`)를 넘으면 http.sys가 400을 돌려주고
+  요청을 큐에 넘기지 않는다. 테스트에서 20000바이트 헤더로 확인했다.
+- **빈 본문**: 길이 0인 데이터 청크를 붙이면 `E_INVALIDARG`다(204 응답에서 확인). 빈 본문이면 청크를 붙이지 않고,
+  1xx/204/304에는 `Content-Length`를 자동으로 넣지 않는다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |
