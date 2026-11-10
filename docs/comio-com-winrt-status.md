@@ -631,7 +631,9 @@ pipe 리스너에도 클라이언트가 접속할 수 있다. 전달은 핸들�
   이 디스크립터로 검사받기 때문이다.
 - **AF_UNIX**: 소켓에는 디스크립터가 없고, connect는 소켓 파일의 DACL로 검사받는다.
   그래서 `bind`와 `listen` 사이에 파일에 DACL을 쓴다. listen 전의 connect는 어차피 거부되므로
-  틈이 없다. DACL만 쓴다. owner와 SACL은 바꾸는 데 특권이 필요하므로 쓰지 않는다. DACL이 없는
+  틈이 없다. 다만 이 DACL은 **승격된 관리자를 막지 못한다.** GitHub 러너는 승격된 상태로
+  도는데, 거기서 SYSTEM 전용 DACL을 걸어도 connect가 통과했다. 같은 실행에서 pipe의 디스크립터는
+  막았다. 테스트는 승격된 프로세스에서 이 단언을 건너뛴다. DACL만 쓴다. owner와 SACL은 바꾸는 데 특권이 필요하므로 쓰지 않는다. DACL이 없는
   SDDL은 NULL DACL(모두 허용)로 바꾸지 않고, 상속받은 DACL을 그대로 둔다.
 - Hyper-V 리스너에는 없다. VM 소켓에 누가 닿는지는 VM 설정(HCS)에서 정한다.
 - tp에는 `bind_with_security(rt, name, &SecurityDescriptor)`가 있다.
@@ -650,7 +652,7 @@ pipe 리스너에도 클라이언트가 접속할 수 있다. 전달은 핸들�
   쓸 수 있고, 클라이언트 쪽에서는 내가 접속한 서버가 기대한 계정인지 확인하는 데 쓴다.
 
 측정으로 확인한 것: 같은 사용자의 클라이언트가 SYSTEM 전용 DACL에 막히는 것(pipe는
-`ERROR_ACCESS_DENIED`, AF_UNIX는 `WSAEACCES`), 선점된 이름에서 bind가 실패하는 것, 연결이
+`ERROR_ACCESS_DENIED`, AF_UNIX는 비승격일 때 `WSAEACCES`), 선점된 이름에서 bind가 실패하는 것, 연결이
 끝난 뒤에도 이름이 유지되고 `Close`하면 풀리는 것, impersonation으로 읽은 SID가 프로세스
 토큰의 SID와 같은 것.
 

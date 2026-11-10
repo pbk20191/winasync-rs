@@ -234,6 +234,11 @@ impl UnixListener {
     /// [`bind`](Self::bind), with `security`'s DACL written onto the socket
     /// file. It is applied between `bind` and `listen`: a connect before
     /// `listen` is refused anyway, so no client ever sees the inherited DACL.
+    ///
+    /// The DACL is the whole of the check, and it does not stop an elevated
+    /// administrator: on a GitHub-hosted runner, which runs elevated, a
+    /// SYSTEM-only DACL let the connect through. A named pipe's descriptor
+    /// held in the same run.
     pub fn bind_with_security(
         rt: &Runtime,
         path: &str,
@@ -387,12 +392,18 @@ mod tests {
         let path = temp_path("deny");
         let system_only = SecurityDescriptor::from_sddl("D:P(A;;GA;;;SY)").unwrap();
         let listener = UnixListener::bind_with_security(&rt, &path, &system_only).unwrap();
-        let err = block_on(timeout(&rt, Duration::from_secs(10), UnixStream::connect(&rt, &path)))
-            .expect("timed out")
-            .err()
-            .expect("connected through a DACL that does not grant this account");
+        let result =
+            block_on(timeout(&rt, Duration::from_secs(10), UnixStream::connect(&rt, &path)))
+                .expect("timed out");
         drop(listener);
         let _ = std::fs::remove_file(&path);
+        // An elevated administrator is not kept out by the socket file's DACL
+        // (measured on a GitHub-hosted runner); report rather than assert.
+        if security::process_is_elevated() {
+            eprintln!("elevated: AF_UNIX connect through a SYSTEM-only DACL -> {:?}", result.as_ref().map(|_| ()));
+            return;
+        }
+        let err = result.err().expect("connected through a DACL that does not grant this account");
         // WSAEACCES
         assert_eq!(err.code(), windows_core::HRESULT::from_win32(10013), "{err}");
     }

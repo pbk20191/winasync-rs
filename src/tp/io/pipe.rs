@@ -348,13 +348,23 @@ mod tests {
         let rt = Runtime::new();
         let name = unique("deny");
         let system_only = SecurityDescriptor::from_sddl("D:P(A;;GA;;;SY)").unwrap();
-        let listener = Arc::new(NamedPipeListener::bind_with_security(&rt, &name, &system_only));
-        let l2 = listener.clone();
-        // Never completes: nobody is let in. Leaked with the thread.
-        std::thread::spawn(move || block_on(l2.accept()));
+        let listener = NamedPipeListener::bind_with_security(&rt, &name, &system_only);
+        // Nobody is let in, so the accept only ends by timing out -- which
+        // drops it and cancels its operation, rather than leaving one live
+        // for the leak checks elsewhere in this process to trip over.
+        let rt2 = rt.clone();
+        let server = std::thread::spawn(move || {
+            block_on(crate::tp::timeout(
+                &rt2,
+                std::time::Duration::from_millis(500),
+                listener.accept(),
+            ))
+            .is_err()
+        });
         std::thread::sleep(std::time::Duration::from_millis(100));
         let err = NamedPipeConnector::connect(&rt, &name).err().unwrap();
         assert_eq!(err.code(), windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult());
+        assert!(server.join().unwrap(), "the accept completed for a client it should refuse");
     }
 
     /// And one that does grant it lets it in.

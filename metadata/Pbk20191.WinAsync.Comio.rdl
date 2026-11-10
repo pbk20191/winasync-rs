@@ -194,7 +194,9 @@ mod Pbk20191 {
             // is "the owner and SYSTEM, nothing inherited". For a named pipe
             // the descriptor goes on every instance; for AF_UNIX its DACL goes
             // on the socket file, between `bind` and `listen`, so there is no
-            // moment a client could connect under the old one.
+            // moment a client could connect under the old one. That file DACL
+            // does not stop an elevated administrator (measured on a
+            // GitHub-hosted runner, which runs elevated); a pipe's does.
             //
             // A pipe descriptor must grant the server's own account
             // `FILE_CREATE_PIPE_INSTANCE` (GA does): every instance after the

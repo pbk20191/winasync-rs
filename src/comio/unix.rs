@@ -108,6 +108,11 @@ impl UnixStreamListener {
     /// [`bind`](Self::bind), with `security`'s DACL written onto the socket
     /// file. It is applied between `bind` and `listen`: a connect before
     /// `listen` is refused anyway, so no client ever sees the inherited DACL.
+    ///
+    /// The DACL is the whole of the check, and it does not stop an elevated
+    /// administrator: on a GitHub-hosted runner, which runs elevated, a
+    /// SYSTEM-only DACL let the connect through. A named pipe's descriptor
+    /// held in the same run.
     pub fn bind_with_security(path: &str, security: &SecurityDescriptor) -> Result<Self> {
         Self::bind_inner(path, Some(security))
     }

@@ -1133,11 +1133,21 @@ mod security_tests {
         unix.set_security_descriptor(&HSTRING::from(SYSTEM_ONLY)).unwrap();
         unix.connection_received(&handler).unwrap();
         block_on(unix.bind(&HSTRING::from(&path)).unwrap().into_future()).unwrap();
-        let err = block_on(crate::comio::UnixConnector::connect(&path)).unwrap_err();
-        // WSAEACCES
-        assert_eq!(err.code(), HRESULT::from_win32(10013), "{err}");
+        let result = block_on(crate::comio::UnixConnector::connect(&path));
         unix.cast::<IClosable>().unwrap().Close().unwrap();
         let _ = std::fs::remove_file(&path);
+        // An elevated administrator is not kept out by the socket file's DACL
+        // (measured on a GitHub-hosted runner); report rather than assert.
+        if crate::common::security::process_is_elevated() {
+            eprintln!(
+                "elevated: AF_UNIX connect through a SYSTEM-only DACL -> {:?}",
+                result.as_ref().map(|_| ())
+            );
+            return;
+        }
+        let err = result.unwrap_err();
+        // WSAEACCES
+        assert_eq!(err.code(), HRESULT::from_win32(10013), "{err}");
     }
 
     /// A name another server already holds is reported by the bind that
