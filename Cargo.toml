@@ -74,6 +74,9 @@ version = "0.62.2"
 default-features = false
 features = [
     "Win32_System_ApplicationInstallationAndServicing",
+    # `ioring`'s tests bind a handle to a completion port to show the ring
+    # refusing it; the engine itself never touches one.
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
 ]
