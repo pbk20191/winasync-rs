@@ -292,6 +292,136 @@ impl WaitPacket {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Job object notifications
+// ---------------------------------------------------------------------------
+
+/// A job object whose events -- a process joining or leaving, limits
+/// reached, the last process gone -- arrive at a [`CompletionPort`] as
+/// completions; [`JobMessage::from_completion`] reads them.
+///
+/// Windows does not promise every message (only limit notifications are
+/// guaranteed), so treat them as prompts, not as an audit log.
+pub struct Job {
+    handle: OwnedHandle,
+}
+
+impl Job {
+    /// A new, unnamed job.
+    pub fn new() -> Result<Job> {
+        use windows::Win32::System::JobObjects::CreateJobObjectW;
+        let job = unsafe { CreateJobObjectW(None, windows_core::PCWSTR::null())? };
+        Ok(Job {
+            handle: unsafe { OwnedHandle::from_raw_handle(job.0) },
+        })
+    }
+
+    fn raw(&self) -> HANDLE {
+        HANDLE(self.handle.as_raw_handle())
+    }
+
+    /// Sends this job's messages to `port`, tagged with `key`. A job reports
+    /// to one port, and the association cannot be moved.
+    pub fn notify(&self, port: &CompletionPort, key: usize) -> Result<()> {
+        use windows::Win32::System::JobObjects::{
+            JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JobObjectAssociateCompletionPortInformation,
+            SetInformationJobObject,
+        };
+        let info = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: key as *mut core::ffi::c_void,
+            CompletionPort: port.raw(),
+        };
+        unsafe {
+            SetInformationJobObject(
+                self.raw(),
+                JobObjectAssociateCompletionPortInformation,
+                (&info as *const JOBOBJECT_ASSOCIATE_COMPLETION_PORT).cast(),
+                size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+            )
+        }
+    }
+
+    /// Ends every process in the job when the job's last handle closes --
+    /// so dropping this `Job` takes its processes with it.
+    pub fn kill_on_close(&self) -> Result<()> {
+        use windows::Win32::System::JobObjects::{
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                self.raw(),
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        }
+    }
+
+    /// Adds a process. Processes it creates join too, unless created to
+    /// break away.
+    pub fn assign(&self, process: BorrowedHandle<'_>) -> Result<()> {
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+        unsafe { AssignProcessToJobObject(self.raw(), HANDLE(process.as_raw_handle())) }
+    }
+
+    /// Ends every process in the job with `exit_code`.
+    pub fn terminate(&self, exit_code: u32) -> Result<()> {
+        use windows::Win32::System::JobObjects::TerminateJobObject;
+        unsafe { TerminateJobObject(self.raw(), exit_code) }
+    }
+}
+
+impl AsHandle for Job {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.handle.as_handle()
+    }
+}
+
+/// A job's message, read from the completion that carried it: the message
+/// ID comes as the byte count and the process ID, where there is one, as
+/// the `OVERLAPPED` value (`JOB_OBJECT_MSG_*` in winnt.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobMessage {
+    /// A process joined the job (`JOB_OBJECT_MSG_NEW_PROCESS`).
+    NewProcess(u32),
+    /// A process left by exiting (`JOB_OBJECT_MSG_EXIT_PROCESS`).
+    ExitProcess(u32),
+    /// A process left by an unhandled exception or the like.
+    AbnormalExitProcess(u32),
+    /// The job has no processes left.
+    ActiveProcessZero,
+    ActiveProcessLimit,
+    EndOfJobTime,
+    EndOfProcessTime(u32),
+    ProcessMemoryLimit(u32),
+    JobMemoryLimit(u32),
+    NotificationLimit,
+    /// A message this crate does not name.
+    Other { id: u32, process_id: u32 },
+}
+
+impl JobMessage {
+    pub fn from_completion(completion: &Completion) -> JobMessage {
+        let pid = completion.overlapped as u32;
+        match completion.bytes {
+            1 => Self::EndOfJobTime,
+            2 => Self::EndOfProcessTime(pid),
+            3 => Self::ActiveProcessLimit,
+            4 => Self::ActiveProcessZero,
+            6 => Self::NewProcess(pid),
+            7 => Self::ExitProcess(pid),
+            8 => Self::AbnormalExitProcess(pid),
+            9 => Self::ProcessMemoryLimit(pid),
+            10 => Self::JobMemoryLimit(pid),
+            11 => Self::NotificationLimit,
+            id => Self::Other { id, process_id: pid },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +560,53 @@ mod tests {
         let mut keys: Vec<_> = got.iter().map(|c| c.key).collect();
         keys.sort();
         assert_eq!(keys, [1, 2]);
+    }
+
+    /// A process's arrival and departure, and the job emptying, arrive as
+    /// completions on the job's port.
+    #[test]
+    fn a_job_reports_its_processes() {
+        let port = CompletionPort::new(0).unwrap();
+        let job = Job::new().unwrap();
+        job.notify(&port, 77).unwrap();
+        // Long enough to assign before it exits.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping", "-n", "2", "127.0.0.1", ">nul"])
+            .spawn()
+            .unwrap();
+        job.assign(child.as_handle()).unwrap();
+        let pid = child.id();
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !seen.contains(&JobMessage::ActiveProcessZero) && std::time::Instant::now() < deadline {
+            if let Some(c) = port.dequeue(Some(Duration::from_millis(500))).unwrap() {
+                assert_eq!(c.key, 77);
+                seen.push(JobMessage::from_completion(&c));
+            }
+        }
+        child.wait().unwrap();
+        assert!(seen.contains(&JobMessage::NewProcess(pid)), "{seen:?}");
+        assert!(seen.contains(&JobMessage::ExitProcess(pid)), "{seen:?}");
+        assert!(seen.contains(&JobMessage::ActiveProcessZero), "{seen:?}");
+    }
+
+    /// With kill-on-close, dropping the job ends what it holds.
+    #[test]
+    fn dropping_a_kill_on_close_job_ends_its_processes() {
+        let job = Job::new().unwrap();
+        job.kill_on_close().unwrap();
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1", ">nul"])
+            .spawn()
+            .unwrap();
+        job.assign(child.as_handle()).unwrap();
+        drop(job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut exited = None;
+        while exited.is_none() && std::time::Instant::now() < deadline {
+            exited = child.try_wait().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(exited.is_some(), "the process outlived its job");
     }
 }

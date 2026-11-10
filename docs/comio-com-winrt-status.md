@@ -979,6 +979,21 @@ tringi/win32-iocp-events). ntdll 함수는 처음 쓸 때 이름으로 찾고, �
 299바이트를 받아 실패했다. 읽기가 완료되는 순간 future가 drop되면, 커널은 이미 데이터를 파이프에서 꺼낸 뒤라 돌려줄
 곳이 없다. 모든 완료 기반 읽기가 그렇다. 테스트는 이제 중복이나 순서 꼬임이 없는지만 단언한다.
 
+## 확장 디렉터리 감시, 잡 오브젝트 알림 (2026-11-11)
+
+HTTP(http.sys, WinHTTP, WinINet)는 셋을 함께 검토할 때까지 보류한다. 그 밖에 남아 있던 두 가지를 넣었다.
+
+**`DirectoryWatcher::read_extended`** (`ReadDirectoryChangesExW`, Windows 10 1709+). `iter_extended_changes`가
+`ExtendedChange`를 돌려준다. 담긴 정보는 파일 ID, 부모 ID, 크기, 할당 크기, 속성, 네 가지 시각(FILETIME)이고, `filetime()`이
+시각을 `SystemTime`으로 바꾼다. 레코드에 64비트 필드가 있어서 버퍼는 8바이트 정렬을 요구한다. 파서는 비정렬 읽기를 쓴다.
+테스트에서 이름을 바꾼 앞뒤 레코드의 파일 ID가 같은 것, 쓴 크기(5)가 보고되는 것을 확인했다.
+
+**`iocp::Job`**. `notify(port, key)`로 잡의 메시지를 `CompletionPort`로 보내고, `JobMessage::from_completion`이 그것을 해석한다.
+메시지 ID는 바이트 수 자리에, 프로세스 ID는 OVERLAPPED 자리에 온다. `assign`, `kill_on_close`, `terminate`도 있다. 테스트는
+`NewProcess(pid)`, `ExitProcess(pid)`, `ActiveProcessZero`를 받는지, `kill_on_close` 잡을 drop하면 프로세스가 끝나는지 확인한다.
+`JOB_OBJECT_MSG_*`는 이 `windows` 버전에 없어서 숫자로 직접 정의했다. Windows는 한도 알림 말고는 메시지 전달을
+보장하지 않으므로, 문서에 "감사 기록이 아니라 신호로 다룰 것"이라고 적었다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

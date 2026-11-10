@@ -115,6 +115,75 @@ pub fn iter_changes(bytes: &[u8]) -> impl Iterator<Item = Change> + '_ {
     })
 }
 
+/// One change with everything `ReadDirectoryChangesExW` reports about the
+/// file. Times are `FILETIME`s (100 ns since 1601; see [`filetime`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtendedChange {
+    pub kind: ChangeKind,
+    pub path: PathBuf,
+    /// The file's ID on its volume -- stable across renames, so a
+    /// [`ChangeKind::RenamedFrom`] and its [`ChangeKind::RenamedTo`] share it.
+    pub file_id: i64,
+    pub parent_file_id: i64,
+    pub size: i64,
+    pub allocated_size: i64,
+    pub attributes: u32,
+    pub created: i64,
+    pub last_written: i64,
+    pub last_changed: i64,
+    pub last_accessed: i64,
+}
+
+/// A `FILETIME` as a `SystemTime`; `None` before the Unix epoch.
+pub fn filetime(ft: i64) -> Option<std::time::SystemTime> {
+    // 100 ns intervals between 1601-01-01 and 1970-01-01.
+    const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
+    let since_unix = ft.checked_sub(UNIX_EPOCH_AS_FILETIME)?;
+    let since_unix = u64::try_from(since_unix).ok()?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(since_unix.saturating_mul(100)))
+}
+
+/// The changes in the first `n` bytes a [`DirectoryWatcher::read_extended`]
+/// filled. Stops at a malformed record rather than reading past the buffer.
+pub fn iter_extended_changes(bytes: &[u8]) -> impl Iterator<Item = ExtendedChange> + '_ {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Storage::FileSystem::FILE_NOTIFY_EXTENDED_INFORMATION;
+    let name_at = core::mem::offset_of!(FILE_NOTIFY_EXTENDED_INFORMATION, FileName);
+    let mut at = Some(0usize);
+    std::iter::from_fn(move || {
+        let start = at?;
+        // The fixed part, read unaligned so the caller's buffer alignment is
+        // not this parser's problem.
+        let fixed = bytes.get(start..start + name_at)?;
+        let mut record = FILE_NOTIFY_EXTENDED_INFORMATION::default();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                fixed.as_ptr(),
+                (&mut record as *mut FILE_NOTIFY_EXTENDED_INFORMATION).cast::<u8>(),
+                name_at,
+            )
+        };
+        let name_len = record.FileNameLength as usize;
+        let name = bytes.get(start + name_at..start + name_at + name_len)?;
+        let wide: Vec<u16> = name.as_chunks::<2>().0.iter().map(|&c| u16::from_ne_bytes(c)).collect();
+        let next = record.NextEntryOffset as usize;
+        at = (next != 0).then_some(start + next);
+        Some(ExtendedChange {
+            kind: record.Action.into(),
+            path: PathBuf::from(std::ffi::OsString::from_wide(&wide)),
+            file_id: record.FileId,
+            parent_file_id: record.ParentFileId,
+            size: record.FileSize,
+            allocated_size: record.AllocatedLength,
+            attributes: record.FileAttributes,
+            created: record.CreationTime,
+            last_written: record.LastModificationTime,
+            last_changed: record.LastChangeTime,
+            last_accessed: record.LastAccessTime,
+        })
+    })
+}
+
 /// A directory being watched for changes.
 pub struct DirectoryWatcher {
     res: Arc<IoRes>,
@@ -173,24 +242,55 @@ impl DirectoryWatcher {
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        self.read_with(buf, false)
+    }
+
+    /// [`read`](Self::read), with records that also carry each file's ID,
+    /// its parent's, its size, attributes and timestamps
+    /// (`ReadDirectoryChangesExW`, Windows 10 1709 and later); parse them
+    /// with [`iter_extended_changes`]. The buffer must be 8-byte aligned,
+    /// as the records hold 64-bit fields.
+    pub fn read_extended<B: IoBufMut + 'static>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        self.read_with(buf, true)
+    }
+
+    fn read_with<B: IoBufMut + 'static>(
+        &self,
+        buf: B,
+        extended: bool,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        use windows::Win32::Storage::FileSystem::{
+            ReadDirectoryChangesExW, ReadDirectoryNotifyExtendedInformation,
+        };
         let handle = self.res.handle;
         let (recursive, filter) = (self.recursive, FILE_NOTIFY_CHANGE(self.filter.0));
+        let align = if extended { 8 } else { 4 };
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let ptr = buf.stable_mut_ptr();
-                if !(ptr as usize).is_multiple_of(4) {
+                if !(ptr as usize).is_multiple_of(align) {
                     return Issue::Failed(E_INVALIDARG);
                 }
-                match ReadDirectoryChangesW(
-                    handle,
-                    ptr.cast(),
-                    IoBuf::bytes_total(buf) as u32,
-                    recursive,
-                    filter,
-                    None,
-                    Some(ovl),
-                    None,
-                ) {
+                let len = IoBuf::bytes_total(buf) as u32;
+                let issued = if extended {
+                    ReadDirectoryChangesExW(
+                        handle,
+                        ptr.cast(),
+                        len,
+                        recursive,
+                        filter,
+                        None,
+                        Some(ovl),
+                        None,
+                        ReadDirectoryNotifyExtendedInformation,
+                    )
+                } else {
+                    ReadDirectoryChangesW(handle, ptr.cast(), len, recursive, filter, None, Some(ovl), None)
+                };
+                match issued {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
                     Err(e) => Issue::Failed(e.code()),
@@ -339,6 +439,50 @@ mod tests {
         let buf = Vec::with_capacity(128).slice(1..);
         let (r, _) = block_on(watcher.read(buf));
         assert_eq!(r.unwrap_err().code(), E_INVALIDARG);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Extended records carry the file's identity: a rename keeps its ID,
+    /// and the size shows up once written.
+    #[test]
+    fn extended_records_carry_ids_and_sizes() {
+        let rt = Runtime::new();
+        let dir = temp_dir("extended");
+        let watcher = DirectoryWatcher::open(
+            &rt,
+            dir.to_str().unwrap(),
+            false,
+            NotifyFilter::FILE_NAME | NotifyFilter::SIZE | NotifyFilter::LAST_WRITE,
+        )
+        .unwrap();
+        let writer = std::thread::spawn({
+            let dir = dir.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                std::fs::write(dir.join("e.txt"), b"12345").unwrap();
+                std::fs::rename(dir.join("e.txt"), dir.join("f.txt")).unwrap();
+            }
+        });
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let done = |seen: &[ExtendedChange]| seen.iter().any(|c| c.kind == ChangeKind::RenamedTo);
+        while !done(&seen) && Instant::now() < deadline {
+            if let Ok((n, buf)) =
+                block_on(timeout(&rt, Duration::from_millis(500), watcher.read_extended(Vec::with_capacity(8192))))
+            {
+                let n = n.unwrap();
+                seen.extend(iter_extended_changes(&buf[..n]));
+            }
+        }
+        writer.join().unwrap();
+        let from = seen.iter().find(|c| c.kind == ChangeKind::RenamedFrom).expect("no rename-from");
+        let to = seen.iter().find(|c| c.kind == ChangeKind::RenamedTo).expect("no rename-to");
+        assert_eq!(to.path, PathBuf::from("f.txt"));
+        assert_ne!(to.file_id, 0);
+        assert_eq!(from.file_id, to.file_id, "a rename changed the file ID");
+        assert_ne!(to.parent_file_id, 0);
+        assert_eq!(to.size, 5, "saw {seen:?}");
+        assert!(filetime(to.last_written).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

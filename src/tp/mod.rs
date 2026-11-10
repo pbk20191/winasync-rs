@@ -62,7 +62,10 @@ pub use io::net::{
 pub use io::pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeOptions, NamedPipeStream};
 #[allow(unused_imports)]
 pub use io::serial::SerialPort;
-pub use io::watch::{iter_changes, Change, ChangeKind, DirectoryWatcher, NotifyFilter};
+pub use io::watch::{
+    filetime, iter_changes, iter_extended_changes, Change, ChangeKind, DirectoryWatcher,
+    ExtendedChange, NotifyFilter,
+};
 pub use io::unix::{UnixListener, UnixStream};
 // Who may connect to a listener, for the `bind`s of the local
 // transports.

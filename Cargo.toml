@@ -204,7 +204,10 @@ ioring = [
 # to a port like an I/O completion. Standalone.
 iocp = [
     "windows/Win32_Foundation",
+    # `CreateJobObjectW` takes security attributes.
+    "windows/Win32_Security",
     "windows/Win32_System_IO",
+    "windows/Win32_System_JobObjects",
     "windows/Win32_System_LibraryLoader",
     "windows/Win32_System_Threading",
 ]
