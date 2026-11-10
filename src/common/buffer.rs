@@ -114,6 +114,15 @@ pub unsafe trait IoBuf: Send {
         self.len() == 0
     }
 
+    /// Where this buffer sits among an I/O ring's registered buffers, if it
+    /// is one. An engine that can address registered memory by index uses
+    /// this instead of the pointer; everything else ignores it. `None` for
+    /// every buffer but the ones a ring hands out.
+    #[doc(hidden)]
+    fn ring_registration(&self) -> Option<RingRegistration> {
+        None
+    }
+
     /// A view of `range` of this buffer, which an operation takes in its
     /// place and hands back whole: read into the second half of a `Vec`, or
     /// send a frame out of a larger one, without splitting or copying it.
@@ -200,6 +209,18 @@ unsafe impl IoBufMut for Vec<u8> {
     }
 }
 
+/// A registered buffer's place in its ring: which ring, which registration
+/// of it (a ring can replace its buffers, and an index is only good for the
+/// registration it came from), which buffer, and how far into it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingRegistration {
+    pub ring: usize,
+    pub generation: u64,
+    pub index: u32,
+    pub offset: u32,
+}
+
 /// A range of an owned buffer; see [`IoBuf::slice`].
 ///
 /// An operation on it uses only `begin..end` and hands the whole `Slice`
@@ -241,6 +262,15 @@ unsafe impl<B: IoBuf> IoBuf for Slice<B> {
     }
     fn bytes_total(&self) -> usize {
         self.end - self.begin
+    }
+    /// The underlying buffer's registration, moved along by where the range
+    /// starts -- so part of a registered buffer is still addressed as
+    /// registered memory.
+    fn ring_registration(&self) -> Option<RingRegistration> {
+        self.buf.ring_registration().map(|r| RingRegistration {
+            offset: r.offset + self.begin as u32,
+            ..r
+        })
     }
 }
 

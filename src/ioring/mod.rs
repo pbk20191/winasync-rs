@@ -36,6 +36,30 @@
 //! has finished. That needs no pool thread, so it cannot deadlock the way a
 //! wait for a callback could.
 //!
+//! # Registered files and buffers
+//!
+//! [`IoRing::register_files`] and [`IoRing::register_buffers`] (or
+//! [`register_slab`](IoRing::register_slab)) give the kernel a table to name
+//! files and memory by index, saving the handle lookup and the page probing
+//! each operation would otherwise do. Nothing about the operations changes:
+//! a [`RegisteredFile`] is a [`RingHandle`], a [`RingBuffer`] -- or a
+//! `Slice` of one -- is an `IoBuf`, and `read` / `write` notice and use the
+//! index.
+//!
+//! Measured, and built around:
+//!
+//! * the kernel keeps no reference to a registered handle, so the table
+//!   keeps the handles (and the memory) itself;
+//! * registering again *replaces* the whole table, and an old index would
+//!   silently name the new table's entry -- so every index carries the
+//!   registration it came from, and a replaced one is refused with
+//!   `E_INVALIDARG`;
+//! * a replacement takes effect only when its completion arrives, so
+//!   operations that need a registration wait while one is pending; one
+//!   that fails leaves no registration at all;
+//! * an empty table is refused, so there is no unregistering -- replace, or
+//!   drop the ring.
+//!
 //! # Capacity
 //!
 //! The completion queue is twice the submission queue, and no more
@@ -54,10 +78,12 @@ use windows::Win32::Foundation::{
     IORING_E_SUBMISSION_QUEUE_FULL, S_FALSE,
 };
 use windows::Win32::Storage::FileSystem::{
-    BuildIoRingCancelRequest, BuildIoRingFlushFile, BuildIoRingReadFile, BuildIoRingWriteFile,
+    BuildIoRingCancelRequest, BuildIoRingFlushFile, BuildIoRingReadFile, BuildIoRingRegisterBuffers,
+    BuildIoRingRegisterFileHandles, BuildIoRingWriteFile, IORING_BUFFER_INFO,
     CloseIoRing, CreateFileW, CreateIoRing, FILE_ATTRIBUTE_NORMAL, FILE_FLUSH_DEFAULT,
     FILE_SHARE_READ, FILE_WRITE_FLAGS_NONE, HIORING, IORING_BUFFER_REF, IORING_BUFFER_REF_0,
     IORING_CQE, IORING_CREATE_FLAGS, IORING_HANDLE_REF, IORING_HANDLE_REF_0, IORING_REF_RAW,
+    IORING_REF_REGISTERED, IORING_REGISTERED_BUFFER,
     IORING_VERSION_3, IOSQE_FLAGS_NONE, CREATE_ALWAYS, OPEN_EXISTING, PopIoRingCompletion,
     SetIoRingCompletionEvent, SubmitIoRing,
 };
@@ -188,6 +214,22 @@ impl File {
 /// `AsHandle` has.
 pub unsafe trait RingHandle: Send + Sync {
     fn raw_handle(&self) -> HANDLE;
+
+    /// Where this handle sits among a ring's registered files, if it is one
+    /// ([`RegisteredFile`]); `None` for everything else.
+    #[doc(hidden)]
+    fn ring_registration(&self) -> Option<FileRegistration> {
+        None
+    }
+}
+
+/// A registered file's place in its ring; see [`RegisteredFile`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileRegistration {
+    pub ring: usize,
+    pub generation: u64,
+    pub index: u32,
 }
 
 unsafe impl RingHandle for File {
@@ -220,11 +262,19 @@ unsafe impl RingHandle for std::os::windows::io::BorrowedHandle<'_> {
     }
 }
 
+/// The reference an entry names `file` by: its registered index, or its raw
+/// handle. Not validated -- [`BuildCtx::file_ref`] is what checks.
 fn handle_ref<H: RingHandle>(file: &H) -> IORING_HANDLE_REF {
-    IORING_HANDLE_REF {
-        Kind: IORING_REF_RAW,
-        Handle: IORING_HANDLE_REF_0 {
-            Handle: file.raw_handle(),
+    match file.ring_registration() {
+        Some(r) => IORING_HANDLE_REF {
+            Kind: IORING_REF_REGISTERED,
+            Handle: IORING_HANDLE_REF_0 { Index: r.index },
+        },
+        None => IORING_HANDLE_REF {
+            Kind: IORING_REF_RAW,
+            Handle: IORING_HANDLE_REF_0 {
+                Handle: file.raw_handle(),
+            },
         },
     }
 }
@@ -264,9 +314,94 @@ struct Ring {
     in_flight: u32,
     /// The completion queue's size: `in_flight` never exceeds it.
     capacity: u32,
-    /// Operations waiting for `in_flight` to drop below `capacity`.
+    /// Operations waiting to be built: for `in_flight` to drop below
+    /// `capacity`, or for a registration to be confirmed.
     room_waiters: Vec<Waker>,
+    /// This ring's identity, which registered files and buffers carry so one
+    /// ring's indexes cannot be used on another.
+    id: usize,
+    /// Every registration gets the next number; an index is valid only with
+    /// the number of the registration that is active.
+    next_generation: u64,
+    files: Registration,
+    buffers: Registration,
 }
+
+/// One kind of registration (files, or buffers) on a ring.
+///
+/// Registering again *replaces* the table (measured: index 0 then names the
+/// new table's first entry, and the old indexes past its end are out of
+/// range), so an index from an earlier registration would silently name
+/// something else. Hence the generation. And a replacement is only known to
+/// have taken when its completion arrives, so until then the registration
+/// is `pending` and the operations that need it wait.
+///
+/// One that *fails* does not leave the old table usable either. Measured:
+/// after the kernel refused an empty table, index 0 of the previous one was
+/// "out of range" at build -- the ring's own record of the table had
+/// already been replaced. So a failure leaves no registration at all, and
+/// every index, old or new, is refused until the next one succeeds.
+#[derive(Default)]
+struct Registration {
+    /// The active registration's number; 0 for none.
+    generation: u64,
+    /// Keeps the active table -- its handles, its memory -- alive while the
+    /// kernel may use it.
+    active: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    pending: Option<PendingRegistration>,
+}
+
+struct PendingRegistration {
+    user_data: usize,
+    generation: u64,
+    table: Arc<dyn core::any::Any + Send + Sync>,
+}
+
+impl Registration {
+    /// Whether an entry registered as `generation` on ring `owner` may be
+    /// built on ring `ring` now.
+    fn check(&self, ring: usize, owner: usize, generation: u64) -> core::result::Result<(), BuildStop> {
+        if owner != ring {
+            return Err(BuildStop::Fail(Error::new(
+                windows::Win32::Foundation::E_INVALIDARG,
+                "registered on a different ring",
+            )));
+        }
+        if self.pending.is_some() {
+            return Err(BuildStop::Wait);
+        }
+        if generation != self.generation {
+            return Err(BuildStop::Fail(Error::new(
+                windows::Win32::Foundation::E_INVALIDARG,
+                "that registration has been replaced",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Settles a pending registration whose completion is `user_data`.
+    /// Returns whether it was this registration's.
+    fn settle(&mut self, user_data: usize, result: HRESULT) -> bool {
+        match &self.pending {
+            Some(p) if p.user_data == user_data => {
+                let p = self.pending.take().unwrap();
+                if result.is_ok() {
+                    self.generation = p.generation;
+                    self.active = Some(p.table);
+                } else {
+                    // Generations start at 1, so nothing matches 0.
+                    self.generation = 0;
+                    self.active = None;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Every ring's [`Ring::id`].
+static NEXT_RING_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 struct Slot {
     generation: u32,
@@ -396,6 +531,10 @@ impl IoRing {
                 in_flight: 0,
                 capacity,
                 room_waiters: Vec::new(),
+                id: NEXT_RING_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                next_generation: 1,
+                files: Registration::default(),
+                buffers: Registration::default(),
             }),
             event,
             pump: Mutex::new(None),
@@ -516,6 +655,13 @@ fn drain_locked(ring: &mut Ring) -> (usize, Vec<Waker>, Vec<Kept>) {
         if cqe.UserData == CANCEL_TAG {
             continue;
         }
+        // A registration's completion confirms (or refuses) it before its
+        // future hears; either way the operations waiting on it may build.
+        if ring.files.settle(cqe.UserData, cqe.ResultCode)
+            | ring.buffers.settle(cqe.UserData, cqe.ResultCode)
+        {
+            wake.append(&mut ring.room_waiters);
+        }
         let (index, generation) = unpack(cqe.UserData);
         let Some(slot) = ring.slots.get_mut(index as usize) else {
             continue;
@@ -609,6 +755,80 @@ fn build_with_retry(ring: &mut Ring, build: impl Fn(HIORING) -> Result<()>) -> R
 }
 
 // ---------------------------------------------------------------------------
+// Building entries
+// ---------------------------------------------------------------------------
+
+/// Why an operation was not built.
+#[doc(hidden)]
+pub enum BuildStop {
+    /// Not yet: a registration it uses is still being confirmed.
+    Wait,
+    /// Never: resolve the future with this error.
+    Fail(Error),
+}
+
+impl From<Error> for BuildStop {
+    fn from(e: Error) -> Self {
+        BuildStop::Fail(e)
+    }
+}
+
+/// What an operation builds its entry with: the ring, under its lock, and
+/// the `UserData` its completion will carry.
+#[doc(hidden)]
+pub struct BuildCtx<'a> {
+    ring: &'a mut Ring,
+    user_data: usize,
+}
+
+impl BuildCtx<'_> {
+    /// How the entry names `file`, checked against the ring's registered
+    /// files if it is one of them.
+    fn file_ref<H: RingHandle>(&self, file: &H) -> core::result::Result<IORING_HANDLE_REF, BuildStop> {
+        if let Some(r) = file.ring_registration() {
+            self.ring.files.check(self.ring.id, r.ring, r.generation)?;
+        }
+        Ok(handle_ref(file))
+    }
+
+    /// How the entry names `len` bytes of `buf` starting at `ptr`: by
+    /// registered index and offset if `buf` is registered memory of this
+    /// ring, else by address.
+    fn buffer_ref<B: IoBuf + ?Sized>(
+        &self,
+        buf: &B,
+        ptr: *mut core::ffi::c_void,
+    ) -> core::result::Result<IORING_BUFFER_REF, BuildStop> {
+        match buf.ring_registration() {
+            Some(r) => {
+                self.ring.buffers.check(self.ring.id, r.ring, r.generation)?;
+                Ok(IORING_BUFFER_REF {
+                    Kind: IORING_REF_REGISTERED,
+                    Buffer: IORING_BUFFER_REF_0 {
+                        IndexAndOffset: IORING_REGISTERED_BUFFER {
+                            BufferIndex: r.index,
+                            Offset: r.offset,
+                        },
+                    },
+                })
+            }
+            None => Ok(IORING_BUFFER_REF {
+                Kind: IORING_REF_RAW,
+                Buffer: IORING_BUFFER_REF_0 { Address: ptr },
+            }),
+        }
+    }
+
+    /// Builds the entry, submitting once and retrying if the submission
+    /// queue is full.
+    fn entry(&mut self, build: impl Fn(HIORING, usize) -> Result<()>) -> core::result::Result<(), BuildStop> {
+        let user_data = self.user_data;
+        build_with_retry(self.ring, |h| build(h, user_data))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
 
@@ -624,7 +844,7 @@ pub trait RingOperation: Send + Sized {
     /// Builds the submission entry. `self` is at its final address: the
     /// payload has been boxed into the ring already.
     #[doc(hidden)]
-    fn build(&mut self, ring: HIORING, user_data: usize) -> Result<()>;
+    fn build(&mut self, ctx: &mut BuildCtx<'_>) -> core::result::Result<(), BuildStop>;
 
     /// The result: `information` is the completion's `Information` field.
     #[doc(hidden)]
@@ -649,17 +869,15 @@ impl<H: RingHandle, B: IoBufMut> RingOperation for ReadOp<H, B> {
         handle_ref(&self.file)
     }
 
-    fn build(&mut self, ring: HIORING, user_data: usize) -> Result<()> {
+    fn build(&mut self, ctx: &mut BuildCtx<'_>) -> core::result::Result<(), BuildStop> {
         let len = self.buf.bytes_total() as u32;
-        let data = IORING_BUFFER_REF {
-            Kind: IORING_REF_RAW,
-            Buffer: IORING_BUFFER_REF_0 {
-                Address: self.buf.stable_mut_ptr().cast(),
-            },
-        };
-        unsafe {
-            BuildIoRingReadFile(ring, handle_ref(&self.file), data, len, self.offset, user_data, IOSQE_FLAGS_NONE)
-        }
+        let file = ctx.file_ref(&self.file)?;
+        let ptr = self.buf.stable_mut_ptr().cast();
+        let data = ctx.buffer_ref(&self.buf, ptr)?;
+        let offset = self.offset;
+        ctx.entry(|h, user_data| unsafe {
+            BuildIoRingReadFile(h, file, data, len, offset, user_data, IOSQE_FLAGS_NONE)
+        })
     }
 
     fn finish(self, result: HRESULT, information: usize) -> Self::Output {
@@ -691,27 +909,16 @@ impl<H: RingHandle, B: IoBuf> RingOperation for WriteOp<H, B> {
         handle_ref(&self.file)
     }
 
-    fn build(&mut self, ring: HIORING, user_data: usize) -> Result<()> {
+    fn build(&mut self, ctx: &mut BuildCtx<'_>) -> core::result::Result<(), BuildStop> {
         let len = IoBuf::len(&self.buf) as u32;
-        let data = IORING_BUFFER_REF {
-            Kind: IORING_REF_RAW,
-            Buffer: IORING_BUFFER_REF_0 {
-                // One pointer type for both directions; a write only reads it.
-                Address: self.buf.stable_ptr() as *mut core::ffi::c_void,
-            },
-        };
-        unsafe {
-            BuildIoRingWriteFile(
-                ring,
-                handle_ref(&self.file),
-                data,
-                len,
-                self.offset,
-                FILE_WRITE_FLAGS_NONE,
-                user_data,
-                IOSQE_FLAGS_NONE,
-            )
-        }
+        let file = ctx.file_ref(&self.file)?;
+        // One pointer type for both directions; a write only reads it.
+        let ptr = self.buf.stable_ptr() as *mut core::ffi::c_void;
+        let data = ctx.buffer_ref(&self.buf, ptr)?;
+        let offset = self.offset;
+        ctx.entry(|h, user_data| unsafe {
+            BuildIoRingWriteFile(h, file, data, len, offset, FILE_WRITE_FLAGS_NONE, user_data, IOSQE_FLAGS_NONE)
+        })
     }
 
     fn finish(self, result: HRESULT, information: usize) -> Self::Output {
@@ -735,8 +942,11 @@ impl<H: RingHandle> RingOperation for FlushOp<H> {
         handle_ref(&self.file)
     }
 
-    fn build(&mut self, ring: HIORING, user_data: usize) -> Result<()> {
-        unsafe { BuildIoRingFlushFile(ring, handle_ref(&self.file), FILE_FLUSH_DEFAULT, user_data, IOSQE_FLAGS_NONE) }
+    fn build(&mut self, ctx: &mut BuildCtx<'_>) -> core::result::Result<(), BuildStop> {
+        let file = ctx.file_ref(&self.file)?;
+        ctx.entry(|h, user_data| unsafe {
+            BuildIoRingFlushFile(h, file, FILE_FLUSH_DEFAULT, user_data, IOSQE_FLAGS_NONE)
+        })
     }
 
     fn finish(self, result: HRESULT, _information: usize) -> Self::Output {
@@ -761,7 +971,8 @@ pub struct RingOp<O: RingOperation> {
 }
 
 enum Stage<O> {
-    /// Not built yet: the completion queue was full.
+    /// Not built yet: the completion queue was full, or a registration it
+    /// uses was still being confirmed.
     Unbuilt(O),
     /// In the ring, slot `index` of generation `generation`.
     Built {
@@ -779,6 +990,15 @@ unsafe impl<O: RingOperation> Send for RingOp<O> {}
 impl<O: RingOperation> Unpin for RingOp<O> {}
 
 impl<O: RingOperation> RingOp<O> {
+    /// An operation that resolves to `error` without being built.
+    fn failed(inner: &Arc<Inner>, op: O, error: Error) -> Self {
+        RingOp {
+            inner: inner.clone(),
+            stage: Stage::Failed(op, error),
+            wait_on_drop: false,
+        }
+    }
+
     fn new(inner: &Arc<Inner>, op: O, wait_on_drop: bool) -> Self {
         let mut this = RingOp {
             inner: inner.clone(),
@@ -807,7 +1027,7 @@ impl<O: RingOperation> RingOp<O> {
         let payload = kept.ptr.cast::<O>();
         // SAFETY: the payload is boxed in the slot and stays there until the
         // completion is popped; nothing else touches it meanwhile.
-        let built = build_with_retry(ring, |h| unsafe { (*payload).build(h, user_data) });
+        let built = unsafe { (*payload).build(&mut BuildCtx { ring, user_data }) };
         match built {
             Ok(()) => {
                 ring.in_flight += 1;
@@ -818,7 +1038,7 @@ impl<O: RingOperation> RingOp<O> {
                     file,
                 };
             }
-            Err(e) => {
+            Err(stop) => {
                 let SlotState::Waiting { kept, .. } =
                     std::mem::replace(&mut ring.slots[index as usize].state, SlotState::Free)
                 else {
@@ -826,7 +1046,12 @@ impl<O: RingOperation> RingOp<O> {
                 };
                 ring.release(index);
                 // SAFETY: made from an `O` just above.
-                self.stage = Stage::Failed(unsafe { kept.take::<O>() }, e);
+                let op = unsafe { kept.take::<O>() };
+                self.stage = match stop {
+                    // Back to waiting; `poll` registers the waker.
+                    BuildStop::Wait => Stage::Unbuilt(op),
+                    BuildStop::Fail(e) => Stage::Failed(op, e),
+                };
             }
         }
     }
@@ -942,6 +1167,389 @@ impl<O: RingOperation> Drop for RingOp<O> {
             std::thread::yield_now();
             ring = self.inner.ring.lock().unwrap();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registered files and buffers
+// ---------------------------------------------------------------------------
+
+/// Files registered with a ring: see [`IoRing::register_files`].
+///
+/// A registered file is named to the kernel by index instead of by handle,
+/// which saves looking the handle up on every operation. The ring keeps the
+/// handles open itself -- measured, a registration does not: closing the
+/// caller's handle after registering made the index fail with
+/// `ERROR_INVALID_HANDLE`.
+#[derive(Clone)]
+pub struct RegisteredFiles {
+    table: Arc<FileTable>,
+}
+
+struct FileTable {
+    ring: usize,
+    generation: u64,
+    handles: Vec<HANDLE>,
+    /// Whatever keeps each handle open.
+    _keep: Vec<Box<dyn core::any::Any + Send + Sync>>,
+}
+
+// Handle values and the owners that keep them open; never mutated.
+unsafe impl Send for FileTable {}
+unsafe impl Sync for FileTable {}
+
+impl RegisteredFiles {
+    /// The `index`th registered file, as a handle operations take.
+    pub fn get(&self, index: usize) -> Option<RegisteredFile> {
+        (index < self.table.handles.len()).then(|| RegisteredFile {
+            table: self.table.clone(),
+            index: index as u32,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.handles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.handles.is_empty()
+    }
+}
+
+/// One registered file; any operation that takes a [`RingHandle`] takes
+/// this, and names the file by index. Valid on its own ring while its
+/// registration is the active one: once [`IoRing::register_files`] replaces
+/// it, operations on this fail with `E_INVALIDARG` rather than reach
+/// whatever the new table has at the same index.
+#[derive(Clone)]
+pub struct RegisteredFile {
+    table: Arc<FileTable>,
+    index: u32,
+}
+
+unsafe impl RingHandle for RegisteredFile {
+    fn raw_handle(&self) -> HANDLE {
+        self.table.handles[self.index as usize]
+    }
+
+    fn ring_registration(&self) -> Option<FileRegistration> {
+        Some(FileRegistration {
+            ring: self.table.ring,
+            generation: self.table.generation,
+            index: self.index,
+        })
+    }
+}
+
+/// Registers `files` as one table: see [`IoRing::register_files`].
+pub struct RegisterFilesOp {
+    table: Arc<FileTable>,
+}
+
+impl RingOperation for RegisterFilesOp {
+    type Output = Result<RegisteredFiles>;
+
+    fn file(&self) -> IORING_HANDLE_REF {
+        IORING_HANDLE_REF::default()
+    }
+
+    fn build(&mut self, ctx: &mut BuildCtx<'_>) -> core::result::Result<(), BuildStop> {
+        // One replacement at a time: a second would race the first's
+        // confirmation.
+        if ctx.ring.files.pending.is_some() {
+            return Err(BuildStop::Wait);
+        }
+        let table = self.table.clone();
+        ctx.entry(|h, user_data| unsafe { BuildIoRingRegisterFileHandles(h, &table.handles, user_data) })?;
+        ctx.ring.files.pending = Some(PendingRegistration {
+            user_data: ctx.user_data,
+            generation: self.table.generation,
+            table: self.table.clone(),
+        });
+        Ok(())
+    }
+
+    fn finish(self, result: HRESULT, _information: usize) -> Self::Output {
+        result.ok().map(|()| RegisteredFiles { table: self.table })
+    }
+
+    fn fail(self, error: Error) -> Self::Output {
+        Err(error)
+    }
+}
+
+/// Buffers registered with a ring: see [`IoRing::register_buffers`].
+///
+/// Registered memory is named to the kernel by index and offset instead of
+/// by address. Each buffer is handed out whole, one holder at a time, as a
+/// [`RingBuffer`] -- which is how the registered memory stays out of two
+/// writers' hands -- and comes back when that is dropped.
+#[derive(Clone)]
+pub struct RegisteredBuffers {
+    table: Arc<BufferTable>,
+}
+
+struct BufferTable {
+    ring: usize,
+    generation: u64,
+    infos: Vec<IORING_BUFFER_INFO>,
+    /// The owners of the memory; only ever dropped.
+    _keep: Vec<Box<dyn core::any::Any + Send>>,
+    free: Mutex<Vec<u32>>,
+}
+
+// The memory is reached only through `RingBuffer`s, one per buffer at a
+// time; the owners are never touched again until dropped.
+unsafe impl Send for BufferTable {}
+unsafe impl Sync for BufferTable {}
+
+impl RegisteredBuffers {
+    /// Any free buffer, or `None` when every one is out.
+    pub fn take(&self) -> Option<RingBuffer> {
+        let index = self.table.free.lock().unwrap().pop()?;
+        Some(RingBuffer {
+            table: self.table.clone(),
+            index,
+            len: 0,
+        })
+    }
+
+    /// The `index`th buffer, if it is free.
+    pub fn take_index(&self, index: usize) -> Option<RingBuffer> {
+        let mut free = self.table.free.lock().unwrap();
+        let at = free.iter().position(|&i| i as usize == index)?;
+        free.swap_remove(at);
+        Some(RingBuffer {
+            table: self.table.clone(),
+            index: index as u32,
+            len: 0,
+        })
+    }
+
+    /// How many buffers were registered.
+    pub fn len(&self) -> usize {
+        self.table.infos.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.infos.is_empty()
+    }
+
+    /// How many are free right now.
+    pub fn available(&self) -> usize {
+        self.table.free.lock().unwrap().len()
+    }
+}
+
+/// One registered buffer, held exclusively until dropped. An [`IoBuf`] and
+/// [`IoBufMut`] like any other -- reads and writes on its ring address it by
+/// index, everything else by its address -- and so is a
+/// [`Slice`](crate::common::buffer::Slice) of it.
+///
+/// Starts empty: `len` is what holds data, and a read sets it.
+pub struct RingBuffer {
+    table: Arc<BufferTable>,
+    index: u32,
+    len: usize,
+}
+
+impl RingBuffer {
+    /// Sets how much of the buffer holds data, up to its size: before a
+    /// write of what was filled in by hand.
+    pub fn set_len(&mut self, len: usize) {
+        self.len = len.min(self.capacity());
+    }
+
+    /// The buffer's registered size.
+    pub fn capacity(&self) -> usize {
+        self.table.infos[self.index as usize].Length as usize
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.table.infos[self.index as usize].Address.cast()
+    }
+}
+
+impl core::ops::Deref for RingBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.base(), self.len) }
+    }
+}
+
+impl core::ops::DerefMut for RingBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.base(), self.len) }
+    }
+}
+
+impl Drop for RingBuffer {
+    fn drop(&mut self) {
+        self.table.free.lock().unwrap().push(self.index);
+    }
+}
+
+unsafe impl IoBuf for RingBuffer {
+    fn stable_ptr(&self) -> *const u8 {
+        self.base()
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn bytes_total(&self) -> usize {
+        self.capacity()
+    }
+    fn ring_registration(&self) -> Option<crate::common::buffer::RingRegistration> {
+        Some(crate::common::buffer::RingRegistration {
+            ring: self.table.ring,
+            generation: self.table.generation,
+            index: self.index,
+            offset: 0,
+        })
+    }
+}
+
+unsafe impl IoBufMut for RingBuffer {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.base()
+    }
+    unsafe fn set_init(&mut self, n: usize) {
+        self.len = self.len.max(n);
+    }
+}
+
+/// Registers buffers as one table: see [`IoRing::register_buffers`].
+pub struct RegisterBuffersOp {
+    table: Arc<BufferTable>,
+}
+
+impl RingOperation for RegisterBuffersOp {
+    type Output = Result<RegisteredBuffers>;
+
+    fn file(&self) -> IORING_HANDLE_REF {
+        IORING_HANDLE_REF::default()
+    }
+
+    fn build(&mut self, ctx: &mut BuildCtx<'_>) -> core::result::Result<(), BuildStop> {
+        if ctx.ring.buffers.pending.is_some() {
+            return Err(BuildStop::Wait);
+        }
+        let table = self.table.clone();
+        ctx.entry(|h, user_data| unsafe { BuildIoRingRegisterBuffers(h, &table.infos, user_data) })?;
+        ctx.ring.buffers.pending = Some(PendingRegistration {
+            user_data: ctx.user_data,
+            generation: self.table.generation,
+            table: self.table.clone(),
+        });
+        Ok(())
+    }
+
+    fn finish(self, result: HRESULT, _information: usize) -> Self::Output {
+        result.ok().map(|()| RegisteredBuffers { table: self.table })
+    }
+
+    fn fail(self, error: Error) -> Self::Output {
+        Err(error)
+    }
+}
+
+impl IoRing {
+    /// Registers `files`, replacing any files registered before; resolves to
+    /// the table, from which [`RegisteredFile`]s are taken. If the kernel
+    /// refuses it, no files are registered afterwards -- the previous table
+    /// is gone too.
+    ///
+    /// The ring keeps a clone of each handle for as long as the table is
+    /// registered or in use. Operations on files of the replaced table fail
+    /// with `E_INVALIDARG` from then on; operations that need registered
+    /// files wait while a registration is being confirmed. The kernel has no
+    /// way to register nothing (an empty table is refused), so there is no
+    /// unregister: replace, or drop the ring.
+    pub fn register_files<H: RingHandle + Clone + 'static>(&self, files: &[H]) -> RingOp<RegisterFilesOp> {
+        let mut ring = self.inner.ring.lock().unwrap();
+        let generation = ring.next_generation;
+        ring.next_generation += 1;
+        let table = Arc::new(FileTable {
+            ring: ring.id,
+            generation,
+            handles: files.iter().map(RingHandle::raw_handle).collect(),
+            _keep: files
+                .iter()
+                .map(|f| Box::new(f.clone()) as Box<dyn core::any::Any + Send + Sync>)
+                .collect(),
+        });
+        drop(ring);
+        RingOp::new(&self.inner, RegisterFilesOp { table }, false)
+    }
+
+    /// Registers `buffers` -- any owned buffers, each by its whole
+    /// [`IoBuf::bytes_total`] -- replacing any registered before; resolves to
+    /// the table, from which [`RingBuffer`]s are taken.
+    ///
+    /// The memory stays registered, and owned by the table, until the table
+    /// is replaced and every `RingBuffer` and operation using it is gone.
+    /// Fails with `E_INVALIDARG` for a buffer over 4 GiB, which a
+    /// registration cannot describe.
+    pub fn register_buffers<B: IoBufMut + 'static>(&self, buffers: Vec<B>) -> RingOp<RegisterBuffersOp> {
+        let mut infos = Vec::with_capacity(buffers.len());
+        let mut keep: Vec<Box<dyn core::any::Any + Send>> = Vec::with_capacity(buffers.len());
+        let mut too_big = false;
+        for mut b in buffers {
+            let Ok(len) = u32::try_from(b.bytes_total()) else {
+                too_big = true;
+                break;
+            };
+            infos.push(IORING_BUFFER_INFO {
+                Address: b.stable_mut_ptr().cast(),
+                Length: len,
+            });
+            keep.push(Box::new(b));
+        }
+        self.register_infos(infos, keep, too_big)
+    }
+
+    /// Registers one region of `count` buffers of `size` bytes each -- a slab
+    /// carved from a single page-aligned allocation.
+    pub fn register_slab(&self, size: u32, count: u32) -> Result<RingOp<RegisterBuffersOp>> {
+        let total = (size as usize)
+            .checked_mul(count as usize)
+            .ok_or_else(|| Error::new(windows::Win32::Foundation::E_INVALIDARG, "slab too large"))?;
+        let region = crate::common::buffer::Region::new(total.max(1))?;
+        let infos = (0..count)
+            .map(|i| IORING_BUFFER_INFO {
+                Address: unsafe { region.base().add(i as usize * size as usize) }.cast(),
+                Length: size,
+            })
+            .collect();
+        Ok(self.register_infos(infos, vec![Box::new(region)], false))
+    }
+
+    fn register_infos(
+        &self,
+        infos: Vec<IORING_BUFFER_INFO>,
+        keep: Vec<Box<dyn core::any::Any + Send>>,
+        too_big: bool,
+    ) -> RingOp<RegisterBuffersOp> {
+        let mut ring = self.inner.ring.lock().unwrap();
+        let generation = ring.next_generation;
+        ring.next_generation += 1;
+        let count = infos.len() as u32;
+        let table = Arc::new(BufferTable {
+            ring: ring.id,
+            generation,
+            infos,
+            _keep: keep,
+            free: Mutex::new((0..count).rev().collect()),
+        });
+        drop(ring);
+        if too_big {
+            return RingOp::failed(
+                &self.inner,
+                RegisterBuffersOp { table },
+                Error::new(windows::Win32::Foundation::E_INVALIDARG, "a buffer over 4 GiB"),
+            );
+        }
+        RingOp::new(&self.inner, RegisterBuffersOp { table }, false)
     }
 }
 
@@ -1393,6 +2001,117 @@ mod tests {
         unsafe {
             let _ = CloseHandle(port);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn registered_files_are_read_by_index() {
+        let ring = IoRing::new(8).unwrap();
+        let (path, file) = temp_file("regfile", b"by index");
+        let files = block_on(ring.register_files(std::slice::from_ref(&file))).unwrap();
+        assert_eq!(files.len(), 1);
+        let registered = files.get(0).unwrap();
+        // The caller's handle can go: the ring keeps its own.
+        drop(file);
+        let (n, got) = block_on(ring.read(&registered, Vec::with_capacity(16), 0));
+        assert_eq!(&got[..n.unwrap()], b"by index");
+        assert!(files.get(1).is_none());
+        drop((registered, files, ring));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A slab and arbitrary owned buffers, both ways, and part of one.
+    #[test]
+    fn registered_buffers_go_both_ways() {
+        let ring = IoRing::new(8).unwrap();
+        let (path, file) = temp_file("regbuf", b"");
+        let slab = block_on(ring.register_slab(4096, 4).unwrap()).unwrap();
+        assert_eq!((slab.len(), slab.available()), (4, 4));
+
+        let mut out = slab.take().unwrap();
+        out.set_len(12);
+        out.copy_from_slice(b"registered!!");
+        let (n, out) = block_on(ring.write(&file, out, 0));
+        assert_eq!(n.unwrap(), 12);
+        drop(out);
+        assert_eq!(slab.available(), 4, "a buffer did not come back");
+
+        let (n, back) = block_on(ring.read(&file, slab.take().unwrap(), 0));
+        assert_eq!(n.unwrap(), 12);
+        assert_eq!(&back[..], b"registered!!");
+        drop(back);
+
+        // Part of a registered buffer is still addressed as registered.
+        let (n, part) = block_on(ring.read(&file, slab.take().unwrap().slice(100..104), 2));
+        assert_eq!(n.unwrap(), 4);
+        let part = part.into_inner();
+        assert_eq!(part.len(), 104);
+        assert_eq!(&part[100..104], b"gist");
+
+        // Any owned buffers, replacing the slab.
+        let vecs = block_on(ring.register_buffers(vec![vec![0u8; 64], vec![0u8; 64]])).unwrap();
+        let (n, got) = block_on(ring.read(&file, vecs.take_index(1).unwrap(), 0));
+        assert_eq!(&got[..n.unwrap()], b"registered!!");
+        // The slab's buffers belong to the replaced registration now.
+        let (r, _) = block_on(ring.read(&file, slab.take().unwrap(), 0));
+        assert_eq!(r.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A replaced table's indexes are refused -- including by operations
+    /// issued before the replacement was confirmed, which wait for it --
+    /// rather than reaching what the new table has at the same index.
+    #[test]
+    fn a_replaced_registration_is_refused() {
+        let ring = IoRing::new(8).unwrap();
+        let (pa, a) = temp_file("repl_a", b"AAAA");
+        let (pb, b) = temp_file("repl_b", b"BBBB");
+        let first = block_on(ring.register_files(std::slice::from_ref(&a))).unwrap();
+        let old = first.get(0).unwrap();
+
+        let replacing = ring.register_files(std::slice::from_ref(&b));
+        let stale = ring.read(&old, vec![0u8; 4], 0); // built while pending
+        let second = block_on(replacing).unwrap();
+        let (r, _) = block_on(stale);
+        assert_eq!(r.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+
+        let (n, got) = block_on(ring.read(&second.get(0).unwrap(), vec![0u8; 4], 0));
+        assert_eq!(&got[..n.unwrap()], b"BBBB");
+        drop((a, b));
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    /// A registration the kernel refuses (an empty table, measured) leaves
+    /// none in force: the old indexes are refused, not handed a table in an
+    /// unknown state.
+    #[test]
+    fn a_refused_registration_leaves_none() {
+        let ring = IoRing::new(8).unwrap();
+        let (path, file) = temp_file("refused", b"kept");
+        let files = block_on(ring.register_files(std::slice::from_ref(&file))).unwrap();
+        let empty: [File; 0] = [];
+        assert!(block_on(ring.register_files(&empty)).is_err());
+        let (r, _) = block_on(ring.read(&files.get(0).unwrap(), vec![0u8; 8], 0));
+        assert_eq!(r.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+        // A fresh registration works again.
+        let again = block_on(ring.register_files(std::slice::from_ref(&file))).unwrap();
+        let (n, got) = block_on(ring.read(&again.get(0).unwrap(), vec![0u8; 8], 0));
+        assert_eq!(&got[..n.unwrap()], b"kept");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn another_rings_registration_is_refused() {
+        let one = IoRing::new(4).unwrap();
+        let two = IoRing::new(4).unwrap();
+        let (path, file) = temp_file("cross", b"x");
+        let slab = block_on(one.register_slab(64, 1).unwrap()).unwrap();
+        let (r, _) = block_on(two.read(&file, slab.take().unwrap(), 0));
+        assert_eq!(r.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+        drop(file);
         let _ = std::fs::remove_file(&path);
     }
 }
