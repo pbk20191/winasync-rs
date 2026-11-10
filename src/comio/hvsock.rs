@@ -130,7 +130,7 @@ impl HvStreamListener {
                 setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
             })?;
             let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
-            Ok(stream::from_reg(reg))
+            Ok(stream::from_reg(reg, stream::Peer::Opaque))
         };
         match finish() {
             Ok(s) => Ok(s),
@@ -180,7 +180,7 @@ impl HvStreamListener {
                             let remote = peer_addr_of(accept_sock).ok();
                             let reg = IoReg::register(HANDLE(accept_sock.0 as *mut c_void), true)?;
                             Ok(Accepted {
-                                stream: stream::from_reg(reg),
+                                stream: stream::from_reg(reg, stream::Peer::Opaque),
                                 remote: remote.map(|a| HSTRING::from(a.to_string())),
                                 // Neither a process nor an account crosses
                                 // VMBus; the partition is the identity.
@@ -277,7 +277,7 @@ impl HyperVConnector {
         .await;
         result?;
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None) })?;
-        Ok(stream::from_reg(reg))
+        Ok(stream::from_reg(reg, stream::Peer::Opaque))
     }
 
     /// Callback-based counterpart to [`connect`](Self::connect), for the COM
@@ -324,7 +324,7 @@ impl HyperVConnector {
                     drop(remote_box);
                     let res = if ioresult == 0 {
                         sock_check(setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None))
-                            .map(|()| stream::from_reg(reg_for_stream))
+                            .map(|()| stream::from_reg(reg_for_stream, stream::Peer::Opaque))
                     } else {
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };

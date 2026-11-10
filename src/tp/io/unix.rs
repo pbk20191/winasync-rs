@@ -235,10 +235,12 @@ impl UnixListener {
     /// file. It is applied between `bind` and `listen`: a connect before
     /// `listen` is refused anyway, so no client ever sees the inherited DACL.
     ///
-    /// The DACL is the whole of the check, and it does not stop an elevated
-    /// administrator: on a GitHub-hosted runner, which runs elevated, a
-    /// SYSTEM-only DACL let the connect through. A named pipe's descriptor
-    /// held in the same run.
+    /// Treat this as defence in depth, not as the boundary. On the
+    /// development machine the file's DACL refused every connect it should
+    /// have; on GitHub-hosted runners it was enforced in some jobs and not in
+    /// others -- same image, same token, same code -- and no cause was found.
+    /// A named pipe's descriptor was enforced everywhere. Where the boundary
+    /// must hold, use a named pipe, or check the peer's SID at accept.
     pub fn bind_with_security(
         rt: &Runtime,
         path: &str,
@@ -397,10 +399,8 @@ mod tests {
                 .expect("timed out");
         drop(listener);
         let _ = std::fs::remove_file(&path);
-        // An elevated administrator is not kept out by the socket file's DACL
-        // (measured on a GitHub-hosted runner); report rather than assert.
-        if security::process_is_elevated() {
-            eprintln!("elevated: AF_UNIX connect through a SYSTEM-only DACL -> {:?}", result.as_ref().map(|_| ()));
+        if !security::afunix_dacl_is_reliable_here() {
+            eprintln!("AF_UNIX connect through a SYSTEM-only DACL -> {:?}", result.as_ref().map(|_| ()));
             return;
         }
         let err = result.err().expect("connected through a DACL that does not grant this account");

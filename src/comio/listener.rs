@@ -1031,7 +1031,7 @@ mod security_tests {
     use std::future::IntoFuture;
     use std::sync::mpsc;
     use windows::Foundation::IClosable;
-    use windows_core::HSTRING;
+    use windows_core::{HSTRING, Interface};
 
     use super::super::bindings::Pbk20191::WinAsync::Comio::IListenerSecurity;
 
@@ -1093,6 +1093,46 @@ mod security_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// `ITransportPeer` from both ends of both local transports: the server's
+    /// stream names the client, and the client's names the server -- which is
+    /// how a client checks it reached the server it meant.
+    #[test]
+    fn streams_name_their_peer_from_either_end() {
+        use super::super::bindings::Pbk20191::WinAsync::Comio::ITransportPeer;
+        let peer_of = |s: &ITransportStream| {
+            let p: ITransportPeer = s.cast().unwrap();
+            (p.RemoteProcessId().unwrap(), p.RemoteUserSid().unwrap().to_string())
+        };
+        // The server ends are delivered on a pool thread; ask there.
+        let (tx, rx) = mpsc::channel();
+        let handler = ConnectionHandler::new(move |_s, args| {
+            let stream = args.as_ref().unwrap().Stream()?;
+            let p: super::super::bindings::Pbk20191::WinAsync::Comio::ITransportPeer = stream.cast()?;
+            let _ = tx.send((p.RemoteProcessId()?, p.RemoteUserSid()?.to_string()));
+            std::mem::forget(stream);
+            Ok(())
+        });
+
+        let name = pipe_name("streampeer");
+        let pipe = NamedPipeConnectionListener::new();
+        pipe.connection_received(&handler).unwrap();
+        block_on(pipe.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        let client = block_on(crate::comio::NamedPipeConnector::connect(&name)).unwrap();
+        assert_eq!(peer_of(&client), me(), "pipe client end");
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), me(), "pipe server end");
+        pipe.cast::<IClosable>().unwrap().Close().unwrap();
+
+        let path = sock_path("streampeer");
+        let unix = UnixConnectionListener::new();
+        unix.connection_received(&handler).unwrap();
+        block_on(unix.bind(&HSTRING::from(&path)).unwrap().into_future()).unwrap();
+        let client = block_on(crate::comio::UnixConnector::connect(&path)).unwrap();
+        assert_eq!(peer_of(&client), me(), "unix client end");
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), me(), "unix server end");
+        unix.cast::<IClosable>().unwrap().Close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The property round-trips, rejects what is not SDDL, and is fixed once
     /// the listener is bound.
     #[test]
@@ -1136,11 +1176,9 @@ mod security_tests {
         let result = block_on(crate::comio::UnixConnector::connect(&path));
         unix.cast::<IClosable>().unwrap().Close().unwrap();
         let _ = std::fs::remove_file(&path);
-        // An elevated administrator is not kept out by the socket file's DACL
-        // (measured on a GitHub-hosted runner); report rather than assert.
-        if crate::common::security::process_is_elevated() {
+        if !crate::common::security::afunix_dacl_is_reliable_here() {
             eprintln!(
-                "elevated: AF_UNIX connect through a SYSTEM-only DACL -> {:?}",
+                "AF_UNIX connect through a SYSTEM-only DACL -> {:?}",
                 result.as_ref().map(|_| ())
             );
             return;

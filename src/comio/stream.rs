@@ -10,7 +10,8 @@ use crate::comio::unload::ModuleRef;
 use super::asyncop::IoAsyncOp;
 use super::buffer::buffer_ptr;
 use super::bindings;
-use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream_Impl;
+use super::bindings::Pbk20191::WinAsync::Comio::{ITransportPeer_Impl, ITransportStream_Impl};
+use crate::common::security;
 use super::tpio::{IoReg, Issue};
 use std::sync::Arc;
 use windows::Foundation::IClosable_Impl;
@@ -75,12 +76,28 @@ unsafe impl Send for AcceptSockGuard {}
     bindings::Pbk20191::WinAsync::Comio::TransportStream,
     IInputStream,
     IOutputStream,
-    windows::Foundation::IClosable
+    windows::Foundation::IClosable,
+    bindings::Pbk20191::WinAsync::Comio::ITransportPeer
 )]
 pub struct TransportStream {
     reg: Arc<IoReg>,
     closed: std::sync::atomic::AtomicBool,
+    peer: Peer,
     _module: ModuleRef,
+}
+
+/// What kind of handle a stream wraps, which decides how `ITransportPeer`
+/// asks who is at the other end.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Peer {
+    /// The server end of a named pipe: asks for the client.
+    PipeServer,
+    /// The client end of a named pipe: asks for the server.
+    PipeClient,
+    /// Either end of an AF_UNIX connection.
+    Unix,
+    /// Nothing to ask (Hyper-V): 0 and an empty SID.
+    Opaque,
 }
 
 /// Wraps an already-registered handle/socket as a WinRT stream object.
@@ -89,10 +106,14 @@ pub struct TransportStream {
 /// an accept produces -- the interface rather than this class, so that a
 /// composed stream (a TLS wrapper, say) travels the same path. A caller that
 /// wants `IInputStream`/`IOutputStream` casts from it as before.
-pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Pbk20191::WinAsync::Comio::ITransportStream {
+pub(crate) fn from_reg(
+    reg: Arc<IoReg>,
+    peer: Peer,
+) -> bindings::Pbk20191::WinAsync::Comio::ITransportStream {
     let object = ComObject::new(TransportStream {
         reg,
         closed: std::sync::atomic::AtomicBool::new(false),
+        peer,
         _module: ModuleRef::new(),
     });
     // A `QueryInterface` that cannot fail: `ITransportStream` is this class's
@@ -111,6 +132,37 @@ pub(crate) fn from_reg(reg: Arc<IoReg>) -> bindings::Pbk20191::WinAsync::Comio::
 // The generated trait requires exactly those three, which this type already
 // implements, so there is nothing to write.
 impl ITransportStream_Impl for TransportStream_Impl {}
+
+// Asked of the live handle each time, so it answers for as long as the
+// connection exists -- including after `Close`, which only refuses new I/O.
+// A peer the transport cannot name answers 0 and an empty string, as in
+// `IConnectionReceivedArgs`; the transport's error is not surfaced, because a
+// script asking "who is this" wants an answer it can compare, not an
+// exception for the ordinary case of a process it may not open.
+impl ITransportPeer_Impl for TransportStream_Impl {
+    fn RemoteProcessId(&self) -> Result<u32> {
+        let handle = self.reg.handle;
+        Ok(match self.peer {
+            Peer::PipeServer => security::pipe_peer_pid(handle, true),
+            Peer::PipeClient => security::pipe_peer_pid(handle, false),
+            Peer::Unix => security::unix_peer_pid(SOCKET(handle.0 as usize)),
+            Peer::Opaque => Ok(0),
+        }
+        .unwrap_or(0))
+    }
+
+    fn RemoteUserSid(&self) -> Result<windows_core::HSTRING> {
+        let sid = match self.peer {
+            Peer::PipeServer => security::pipe_client_sid(self.reg.handle),
+            Peer::PipeClient | Peer::Unix => match self.RemoteProcessId()? {
+                0 => Ok(String::new()),
+                pid => security::process_user_sid(pid),
+            },
+            Peer::Opaque => Ok(String::new()),
+        };
+        Ok(windows_core::HSTRING::from(sid.unwrap_or_default()))
+    }
+}
 
 impl IClosable_Impl for TransportStream_Impl {
     /// Releases this stream's own reference to the underlying registration;
@@ -277,8 +329,8 @@ pub(crate) mod tests {
             )
         }
         .unwrap();
-        let s = from_reg(IoReg::register(server, false).unwrap());
-        let c = from_reg(IoReg::register(client, false).unwrap());
+        let s = from_reg(IoReg::register(server, false).unwrap(), Peer::Opaque);
+        let c = from_reg(IoReg::register(client, false).unwrap(), Peer::Opaque);
         let s_out: IOutputStream = s.cast().unwrap();
         let c_in: IInputStream = c.cast().unwrap();
 
@@ -351,8 +403,8 @@ pub(crate) mod tests {
         }
         .unwrap();
         // Both ends stay open, so nothing but the cancel can end the read.
-        let _s = from_reg(IoReg::register(server, false).unwrap());
-        let c = from_reg(IoReg::register(client, false).unwrap());
+        let _s = from_reg(IoReg::register(server, false).unwrap(), Peer::Opaque);
+        let c = from_reg(IoReg::register(client, false).unwrap(), Peer::Opaque);
 
         let read = c
             .cast::<IInputStream>()
@@ -438,8 +490,8 @@ pub(crate) mod tests {
             )
         }
         .unwrap();
-        let s = from_reg(IoReg::register(server, false).unwrap());
-        let c = from_reg(IoReg::register(client, false).unwrap());
+        let s = from_reg(IoReg::register(server, false).unwrap(), Peer::Opaque);
+        let c = from_reg(IoReg::register(client, false).unwrap(), Peer::Opaque);
         (s, c)
     }
 

@@ -128,12 +128,33 @@ mod Pbk20191 {
                 + Windows::Foundation::IClosable {
             }
 
+            // Who is at the other end of a stream, asked of the stream itself,
+            // so it works from either end: a server learns who connected, and a
+            // client checks that the server it reached is the one it meant --
+            // which the pipe name alone cannot promise.
+            //
+            // Its own interface rather than members of `ITransportStream`, so a
+            // composed stream is not obliged to answer it; ask with a
+            // `QueryInterface`. Read when asked, not cached.
+            //
+            // Named pipes report both from either end; a server reads the SID
+            // from the client's own token. AF_UNIX reports only the peer's
+            // process id, so its SID is that process's token, and empty when it
+            // cannot be opened. A Hyper-V stream answers 0 and an empty string.
+            #[Version(1)]
+            #[guid(auto)]
+            interface ITransportPeer {
+                #[get] RemoteProcessId: u32;
+                #[get] RemoteUserSid: String;
+            }
+
             #[Version(1)]
             class TransportStream {
                 ITransportStream,
                 Windows::Storage::Streams::IInputStream,
                 Windows::Storage::Streams::IOutputStream,
                 Windows::Foundation::IClosable,
+                ITransportPeer,
             }
 
             // ---------------------------------------------------------------------
@@ -195,8 +216,10 @@ mod Pbk20191 {
             // the descriptor goes on every instance; for AF_UNIX its DACL goes
             // on the socket file, between `bind` and `listen`, so there is no
             // moment a client could connect under the old one. That file DACL
-            // does not stop an elevated administrator (measured on a
-            // GitHub-hosted runner, which runs elevated); a pipe's does.
+            // is defence in depth only: GitHub-hosted runners enforced it in
+            // some jobs and not in others, for no cause found, while a pipe's
+            // descriptor held everywhere. Where the boundary must hold, use a
+            // pipe, or check `RemoteUserSid` at accept.
             //
             // A pipe descriptor must grant the server's own account
             // `FILE_CREATE_PIPE_INSTANCE` (GA does): every instance after the

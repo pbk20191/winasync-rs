@@ -8,7 +8,7 @@
 
 use super::{submit, IoRes, Issue};
 use crate::common::buffer::{IoBuf, IoBufMut};
-use crate::common::pipe::PipeServer;
+use crate::common::pipe::{PipeServer, ReplenishOnExit};
 use crate::common::security::{self, SecurityDescriptor};
 use crate::tp::Runtime;
 use std::sync::Arc;
@@ -136,6 +136,7 @@ impl NamedPipeListener {
                 return Err(e);
             }
         };
+        let _replenish = ReplenishOnExit(&self.server);
         let h = handle;
         let fut = unsafe {
             submit(&res, (), move |ovl, _| {
@@ -152,10 +153,6 @@ impl NamedPipeListener {
             })
         };
         let (result, ()) = fut.await;
-        // Made before this instance leaves the listening pool, connected or
-        // not, so the name is held throughout. (A future dropped mid-wait
-        // closes its instance without this; the next accept starts over.)
-        self.server.replenish();
         match result {
             Ok(_) => {}
             Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {}
@@ -340,6 +337,45 @@ mod tests {
         };
         assert!(squatter.is_invalid(), "the name was free between accepts");
         drop(listener);
+    }
+
+    /// An accept dropped before anyone connects -- here by a timeout -- still
+    /// leaves the name held: its instance is replaced on the way out.
+    #[test]
+    fn a_dropped_accept_keeps_the_name() {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX,
+        };
+        use windows::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        };
+        let rt = Runtime::new();
+        let name = unique("dropped");
+        let listener = NamedPipeListener::bind(&rt, &name);
+        let timed_out = block_on(crate::tp::timeout(
+            &rt,
+            std::time::Duration::from_millis(100),
+            listener.accept(),
+        ))
+        .is_err();
+        assert!(timed_out);
+        let squatter = unsafe {
+            CreateNamedPipeW(
+                &HSTRING::from(&name),
+                FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_FIRST_PIPE_INSTANCE.0),
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                0,
+                0,
+                0,
+                None,
+            )
+        };
+        assert!(squatter.is_invalid(), "the name was free after a dropped accept");
+        // And the reserved instance still serves the next accept.
+        let server = accept_one(&rt, listener);
+        let _client = NamedPipeConnector::connect(&rt, &name).unwrap();
+        server.join().unwrap().unwrap();
     }
 
     /// A descriptor that does not grant this account keeps it out.

@@ -15,7 +15,7 @@ use super::bindings::Pbk20191::WinAsync::Comio::{
 use super::stream;
 use super::tpio::{self, IoReg, Issue, OpHandle};
 use super::waitop::await_io;
-use crate::common::pipe::PipeServer;
+use crate::common::pipe::{PipeServer, ReplenishOnExit};
 use crate::common::security::{PeerIdentity, SecurityDescriptor};
 use std::sync::Arc;
 use windows::Win32::Foundation::{
@@ -69,6 +69,7 @@ impl NamedPipeListener {
             }
         };
 
+        let _replenish = ReplenishOnExit(&self.server);
         let result = await_io(&reg, move |ovl| unsafe {
             // On an overlapped handle, `ConnectNamedPipe` returning `Ok(())`
             // or `ERROR_IO_PENDING` both mean a completion packet is (or
@@ -95,12 +96,8 @@ impl NamedPipeListener {
             }
         })
         .await;
-        // Made before this instance leaves the listening pool, connected or
-        // not, so the name is held throughout. (A future dropped mid-wait
-        // closes its instance without this; the next accept starts over.)
-        self.server.replenish();
         result?;
-        Ok(stream::from_reg(reg))
+        Ok(stream::from_reg(reg, stream::Peer::PipeServer))
     }
 }
 
@@ -156,7 +153,7 @@ pub(crate) fn arm_accept(
                 let res = if ioresult == 0 || ioresult == ERROR_PIPE_CONNECTED.0 {
                     let peer = PeerIdentity::of_pipe_client(reg_for_complete.handle);
                     Ok(super::listener::Accepted::local(
-                        stream::from_reg(reg_for_complete),
+                        stream::from_reg(reg_for_complete, stream::Peer::PipeServer),
                         peer,
                     ))
                 } else {
@@ -213,7 +210,7 @@ impl NamedPipeConnector {
                 return Err(e);
             }
         };
-        Ok(stream::from_reg(reg))
+        Ok(stream::from_reg(reg, stream::Peer::PipeClient))
     }
 
     /// One synchronous open attempt, with no `ERROR_PIPE_BUSY` wait: the
@@ -221,7 +218,7 @@ impl NamedPipeConnector {
     pub(crate) fn try_open(wname: &HSTRING) -> Result<ITransportStream> {
         let handle = Self::open(wname)?;
         match IoReg::register(handle, false) {
-            Ok(reg) => Ok(stream::from_reg(reg)),
+            Ok(reg) => Ok(stream::from_reg(reg, stream::Peer::PipeClient)),
             Err(e) => {
                 unsafe {
                     let _ = CloseHandle(handle);

@@ -109,10 +109,12 @@ impl UnixStreamListener {
     /// file. It is applied between `bind` and `listen`: a connect before
     /// `listen` is refused anyway, so no client ever sees the inherited DACL.
     ///
-    /// The DACL is the whole of the check, and it does not stop an elevated
-    /// administrator: on a GitHub-hosted runner, which runs elevated, a
-    /// SYSTEM-only DACL let the connect through. A named pipe's descriptor
-    /// held in the same run.
+    /// Treat this as defence in depth, not as the boundary. On the
+    /// development machine the file's DACL refused every connect it should
+    /// have; on GitHub-hosted runners it was enforced in some jobs and not in
+    /// others -- same image, same token, same code -- and no cause was found.
+    /// A named pipe's descriptor was enforced everywhere. Where the boundary
+    /// must hold, use a named pipe, or check the peer's SID at accept.
     pub fn bind_with_security(path: &str, security: &SecurityDescriptor) -> Result<Self> {
         Self::bind_inner(path, Some(security))
     }
@@ -188,7 +190,7 @@ impl UnixStreamListener {
                 setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val))
             })?;
             let reg = IoReg::register(HANDLE(sock.0 as *mut c_void), true)?;
-            Ok(stream::from_reg(reg))
+            Ok(stream::from_reg(reg, stream::Peer::Unix))
         };
         match finish() {
             Ok(s) => Ok(s),
@@ -257,7 +259,7 @@ impl UnixStreamListener {
                             // accept context above).
                             let peer = PeerIdentity::of_unix_peer(accept_sock);
                             let reg = IoReg::register(HANDLE(accept_sock.0 as *mut c_void), true)?;
-                            Ok(Accepted::local(stream::from_reg(reg), peer))
+                            Ok(Accepted::local(stream::from_reg(reg, stream::Peer::Unix), peer))
                         };
                         match finish() {
                             Ok(s) => Ok(s),
@@ -355,7 +357,7 @@ impl UnixConnector {
         .await;
         result?;
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None) })?;
-        Ok(stream::from_reg(reg))
+        Ok(stream::from_reg(reg, stream::Peer::Unix))
     }
 
     /// Callback-based counterpart to [`connect`](Self::connect), for the COM
@@ -402,7 +404,7 @@ impl UnixConnector {
                     drop(remote_box);
                     let res = if ioresult == 0 {
                         sock_check(setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, None))
-                            .map(|()| stream::from_reg(reg_for_stream))
+                            .map(|()| stream::from_reg(reg_for_stream, stream::Peer::Unix))
                     } else {
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };

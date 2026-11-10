@@ -1236,6 +1236,121 @@ pub mod Pbk20191 {
                 ) -> windows_core::HRESULT,
             }
             windows_core::imp::define_interface!(
+                ITransportPeer,
+                ITransportPeer_Vtbl,
+                0xba0616f7_923a_5ddc_a8a3_cabd4c772267
+            );
+            impl windows_core::RuntimeType for ITransportPeer {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                ITransportPeer,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl ITransportPeer {
+                pub fn RemoteProcessId(&self) -> windows_core::Result<u32> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteProcessId)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn RemoteUserSid(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteUserSid)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+            }
+            impl windows_core::RuntimeName for ITransportPeer {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.ITransportPeer";
+            }
+            pub trait ITransportPeer_Impl: windows_core::IUnknownImpl {
+                fn RemoteProcessId(&self) -> windows_core::Result<u32>;
+                fn RemoteUserSid(&self) -> windows_core::Result<windows_core::HSTRING>;
+            }
+            impl ITransportPeer_Vtbl {
+                pub const fn new<Identity: ITransportPeer_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn RemoteProcessId<
+                        Identity: ITransportPeer_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match ITransportPeer_Impl::RemoteProcessId(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn RemoteUserSid<
+                        Identity: ITransportPeer_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match ITransportPeer_Impl::RemoteUserSid(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            ITransportPeer,
+                            OFFSET,
+                        >(),
+                        RemoteProcessId: RemoteProcessId::<Identity, OFFSET>,
+                        RemoteUserSid: RemoteUserSid::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<ITransportPeer as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct ITransportPeer_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub RemoteProcessId: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut u32,
+                )
+                    -> windows_core::HRESULT,
+                pub RemoteUserSid: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
                 ITransportStream,
                 ITransportStream_Vtbl,
                 0xad413f92_1757_501d_b24a_765e6b4e883c
@@ -1757,7 +1872,8 @@ pub mod Pbk20191 {
                 TransportStream,
                 windows::Foundation::IClosable,
                 windows::Storage::Streams::IInputStream,
-                windows::Storage::Streams::IOutputStream
+                windows::Storage::Streams::IOutputStream,
+                ITransportPeer
             );
             impl TransportStream {
                 pub fn Close(&self) -> windows_core::Result<()> {
@@ -1832,6 +1948,28 @@ pub mod Pbk20191 {
                             &mut result__,
                         )
                         .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn RemoteProcessId(&self) -> windows_core::Result<u32> {
+                    let this = &windows_core::Interface::cast::<ITransportPeer>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteProcessId)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn RemoteUserSid(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = &windows_core::Interface::cast::<ITransportPeer>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteUserSid)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
                     }
                 }
             }

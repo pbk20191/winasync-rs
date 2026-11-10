@@ -615,7 +615,7 @@ named pipe와 AF_UNIX는 로컬 서비스가 쓰는 전송이다. 그래서 "누
 | --- | --- | --- |
 | 원격 클라이언트 | SMB로 접속 가능 | `PIPE_REJECT_REMOTE_CLIENTS` |
 | 파이프 선점 | 남이 먼저 만든 이름에 인스턴스를 보탰다 | 첫 인스턴스는 `FILE_FLAG_FIRST_PIPE_INSTANCE`. 이미 누가 쥐고 있으면 bind가 `ERROR_ACCESS_DENIED` |
-| 이름의 빈틈 | 연결이 끝나면 이름이 사라질 수 있었다 | 연결이 성사되면 다음 인스턴스를 먼저 만든다. `Close`까지 이름을 놓지 않는다 |
+| 이름의 빈틈 | 연결이 끝나면 이름이 사라질 수 있었다 | 인스턴스가 대기 풀을 떠나기 전에(연결, 실패, 취소, future drop 모두) 다음 인스턴스를 먼저 만든다. `Close`까지 이름을 놓지 않는다 |
 | 클라이언트 impersonation | 기본 레벨(impersonation). 악성 서버가 클라이언트 권한으로 행동할 수 있었다 | `SECURITY_SQOS_PRESENT \| SECURITY_IDENTIFICATION`. 서버는 확인만 할 수 있다 |
 
 이름을 계속 쥐고 있는 대가로 동작이 하나 바뀌었다. 핸들러를 모두 떼어 일시정지한
@@ -631,9 +631,8 @@ pipe 리스너에도 클라이언트가 접속할 수 있다. 전달은 핸들�
   이 디스크립터로 검사받기 때문이다.
 - **AF_UNIX**: 소켓에는 디스크립터가 없고, connect는 소켓 파일의 DACL로 검사받는다.
   그래서 `bind`와 `listen` 사이에 파일에 DACL을 쓴다. listen 전의 connect는 어차피 거부되므로
-  틈이 없다. 다만 이 DACL은 **승격된 관리자를 막지 못한다.** GitHub 러너는 승격된 상태로
-  도는데, 거기서 SYSTEM 전용 DACL을 걸어도 connect가 통과했다. 같은 실행에서 pipe의 디스크립터는
-  막았다. 테스트는 승격된 프로세스에서 이 단언을 건너뛴다. DACL만 쓴다. owner와 SACL은 바꾸는 데 특권이 필요하므로 쓰지 않는다. DACL이 없는
+  틈이 없다. 다만 이 DACL은 **심층 방어로만 본다** (아래 "AF_UNIX DACL이 일관되게
+  적용되지 않는다" 참고). DACL만 쓴다. owner와 SACL은 바꾸는 데 특권이 필요하므로 쓰지 않는다. DACL이 없는
   SDDL은 NULL DACL(모두 허용)로 바꾸지 않고, 상속받은 DACL을 그대로 둔다.
 - Hyper-V 리스너에는 없다. VM 소켓에 누가 닿는지는 VM 설정(HCS)에서 정한다.
 - tp에는 `bind_with_security(rt, name, &SecurityDescriptor)`가 있다.
@@ -648,13 +647,38 @@ pipe 리스너에도 클라이언트가 접속할 수 있다. 전달은 핸들�
   `SO_PEERCRED`는 없다. SID는 그 프로세스의 토큰에서 읽는다. 같은 사용자일 때만 열 수 있고,
   열지 못하면 빈 문자열이다. PID는 재사용될 수 있다는 점도 문서에 적었다.
 - Hyper-V는 0과 빈 문자열이다. 신원은 `RemoteEndpoint`의 파티션이다.
+- **스트림에서도 묻는다 — `ITransportPeer`**: `TransportStream`이 같은 두 속성을 답한다. 그래서
+  양쪽 끝에서 쓸 수 있다. 클라이언트는 이걸로 접속한 서버가 기대한 계정인지 확인한다. 파이프
+  이름만으로는 그걸 보장할 수 없다. 별도 인터페이스라서 합성한 스트림(TLS 래퍼 등)은 구현하지
+  않아도 된다. 물을 때마다 읽고 캐시하지 않는다.
 - tp에서는 스트림의 `peer_process_id()` / `peer_user_sid()`로 얻는다. 양쪽 끝에서 모두
   쓸 수 있고, 클라이언트 쪽에서는 내가 접속한 서버가 기대한 계정인지 확인하는 데 쓴다.
 
 측정으로 확인한 것: 같은 사용자의 클라이언트가 SYSTEM 전용 DACL에 막히는 것(pipe는
-`ERROR_ACCESS_DENIED`, AF_UNIX는 비승격일 때 `WSAEACCES`), 선점된 이름에서 bind가 실패하는 것, 연결이
+어디서나 `ERROR_ACCESS_DENIED`, AF_UNIX는 개발 머신에서 `WSAEACCES`), 선점된 이름에서 bind가 실패하는 것, 연결이
 끝난 뒤에도 이름이 유지되고 `Close`하면 풀리는 것, impersonation으로 읽은 SID가 프로세스
 토큰의 SID와 같은 것.
+
+### AF_UNIX DACL이 일관되게 적용되지 않는다 (2026-11-10, 원인 미상)
+
+처음에는 "승격된 관리자는 AF_UNIX 파일 DACL을 통과한다"고 적었다. GitHub 러너가 승격된
+상태로 돌고, 거기서 SYSTEM 전용 DACL을 걸었는데도 connect가 통과했기 때문이다. 이 설명은
+틀렸다. 임시 브랜치에서 측정한 결과는 다음과 같다(`windows-2025-vs2026 20261103.629`, 모든 잡이
+같은 이미지).
+
+- **토큰과 무관**: 승격 토큰, Administrators를 deny-only로 바꾼 토큰, 특권을 모두 뺀 토큰,
+  medium 무결성 토큰이 모두 같은 결과였다. 결과는 잡마다 달랐다.
+- **API와 무관**: 블로킹 `connect`, autobind 후 `connect`, `ConnectEx`가 같은 결과였다.
+- **타이밍과 무관**: bind 직후, 1/5/20/100/200ms 뒤가 모두 같은 결과였다.
+- **잡마다 다르다**: 어떤 잡은 끝까지 거부하고, 어떤 잡은 처음부터 끝까지(부팅 후 500~800초
+  구간 내내) 통과시켰다. 한 잡 안에서 거부하다가 통과로 바뀐 경우도 있었다. 파일의 DACL은 그때도
+  `D:P(A;;FA;;;SY)`로 읽혔다.
+- **pipe는 항상 거부**: 같은 잡, 같은 토큰에서 pipe의 SYSTEM 전용 디스크립터는 매번 거부했다.
+- **개발 머신은 항상 거부**: Windows 11 26320에서 수십 번 돌려 전부 `WSAEACCES`였다.
+
+결론: AF_UNIX 소켓 파일 DACL은 경계로 믿지 않는다. 경계가 반드시 지켜져야 하면 named pipe를
+쓰거나, accept 시점에 `RemoteUserSid`를 확인한다. 테스트는 개발 머신에서는 거부를 단언하고,
+GitHub Actions(`GITHUB_ACTIONS`)에서는 결과를 출력만 한다.
 
 ## 커밋 상태
 

@@ -124,6 +124,22 @@ impl PipeServer {
     }
 }
 
+/// Replenishes `server` when dropped, whichever way the accept holding it
+/// ends: connected, failed, or its future dropped mid-wait.
+///
+/// A future-based accept creates this right after registering its instance,
+/// so it is declared *after* that registration and drops *before* it: the
+/// next instance is created while this one still holds the name. An explicit
+/// call at the end would miss the dropped-future case, which closes the
+/// instance on its way out.
+pub(crate) struct ReplenishOnExit<'a>(pub(crate) &'a PipeServer);
+
+impl Drop for ReplenishOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.replenish();
+    }
+}
+
 impl Drop for PipeServer {
     fn drop(&mut self) {
         if let Some(Spare(h)) = self.spare.get_mut().unwrap().take() {
