@@ -106,6 +106,7 @@ default = ["tp", "dq", "comio"]
 tp = [
     "windows/Win32_Foundation",
     "windows/Win32_Security",
+    "windows/Win32_Security_Authorization",
     "windows/Win32_System_Threading",
     "windows/Win32_System_IO",
     "windows/Win32_Storage_FileSystem",
@@ -132,6 +133,8 @@ comio = [
     "windows/Win32_System_Pipes",
     "windows/Win32_System_WinRT",
     "windows/Win32_Security",
+    # SDDL parsing and SID strings, for listener security and peer identity.
+    "windows/Win32_Security_Authorization",
     # The activation path: class factories and the entry points COM finds
     # them through.
     "windows/Win32_System_Com",

@@ -18,8 +18,10 @@ use super::bindings::Pbk20191::WinAsync::Comio::{
     ConnectionReceivedArgs as ConnectionReceivedArgsClass, IConnectionListener,
     IConnectionReceivedArgs,
     IConnectionListener_Impl, IConnectionReceivedArgs_Impl, ITransport_Impl, IHyperVBind_Impl,
-    INamedPipeBind_Impl, ITransportStream, IUnixBind_Impl,
+    IListenerSecurity_Impl, INamedPipeBind_Impl, ITransportStream, IUnixBind_Impl,
 };
+use crate::common::pipe::PipeServer;
+use crate::common::security::{PeerIdentity, SecurityDescriptor};
 // Queried for by the tests below, which check that each listener exposes only
 // the bind its addressing supports.
 #[cfg(test)]
@@ -32,6 +34,9 @@ pub(crate) const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
 
 /// E_POINTER — a null out-parameter from a COM caller.
 const E_POINTER: HRESULT = HRESULT(0x80004003u32 as i32);
+
+/// E_ILLEGAL_METHOD_CALL — a member called in a state it does not apply to.
+const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
 
 // The interfaces are no longer declared here: they live in
 // `metadata/winasync.rdl` and are generated into `super::bindings`.
@@ -50,6 +55,7 @@ pub(crate) type ConnectionHandler =
 struct ConnectionReceivedArgs {
     stream: ITransportStream,
     endpoint: HSTRING,
+    peer: PeerIdentity,
     _module: ModuleRef,
 }
 
@@ -61,6 +67,14 @@ impl IConnectionReceivedArgs_Impl for ConnectionReceivedArgs_Impl {
     fn RemoteEndpoint(&self) -> Result<HSTRING> {
         Ok(self.endpoint.clone())
     }
+
+    fn RemoteProcessId(&self) -> Result<u32> {
+        Ok(self.peer.process_id)
+    }
+
+    fn RemoteUserSid(&self) -> Result<HSTRING> {
+        Ok(HSTRING::from(&self.peer.user_sid))
+    }
 }
 
 /// One accepted connection, as a transport hands it back.
@@ -70,23 +84,38 @@ impl IConnectionReceivedArgs_Impl for ConnectionReceivedArgs_Impl {
 /// which is the thing a host service authorizes on. A named pipe or an
 /// AF_UNIX client has no address to report, so those pass `None` and the
 /// event falls back to the listener's own bound endpoint, as before.
+///
+/// `peer` is the other half of that: who connected, for the transports that
+/// have no address but do have a process and an account (named pipes,
+/// AF_UNIX). Read on the accept path, while the connection is fresh.
 pub(crate) struct Accepted {
     pub(crate) stream: ITransportStream,
     pub(crate) remote: Option<HSTRING>,
+    pub(crate) peer: PeerIdentity,
 }
 
 impl Accepted {
-    /// A connection from a transport with no peer name.
-    pub(crate) fn unnamed(stream: ITransportStream) -> Self {
-        Self { stream, remote: None }
+    /// A connection from a local transport: no peer address, but a peer
+    /// process and account.
+    pub(crate) fn local(stream: ITransportStream, peer: PeerIdentity) -> Self {
+        Self {
+            stream,
+            remote: None,
+            peer,
+        }
     }
 }
 
 /// Constructs the `Pbk20191.WinAsync.Comio.ConnectionReceivedArgs` the event carries.
-pub(crate) fn new_args(stream: ITransportStream, endpoint: HSTRING) -> ConnectionReceivedArgsClass {
+pub(crate) fn new_args(
+    stream: ITransportStream,
+    endpoint: HSTRING,
+    peer: PeerIdentity,
+) -> ConnectionReceivedArgsClass {
     ConnectionReceivedArgs {
         stream,
         endpoint,
+        peer,
         _module: ModuleRef::new(),
     }
     .into()
@@ -100,7 +129,8 @@ pub(crate) fn new_args(stream: ITransportStream, endpoint: HSTRING) -> Connectio
 /// every other line of this module.
 ///
 /// No transport does kernel work when it is bound. The named-pipe source
-/// holds only the name (each `arm` creates a fresh instance); the socket
+/// holds only the name until its first `arm` (which creates the first
+/// instance, and from the first connection on keeps one in reserve); the socket
 /// sources hold the address and bind/listen *lazily* on the first `arm`, then
 /// reuse the one listen socket. Deferring that bind is what makes handler
 /// gating complete: with no handler the chain never arms, so no listen socket
@@ -118,7 +148,10 @@ pub(crate) trait AcceptSource: Send + Sync {
     fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle>;
 }
 
-struct PipeSource(String);
+/// The pipe's name and its instances. Dropping it -- on `Close`, or when a
+/// rebind replaces it -- closes the instance held in reserve, which is what
+/// gives the name up.
+struct PipeSource(Arc<PipeServer>);
 
 impl AcceptSource for PipeSource {
     fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
@@ -128,6 +161,7 @@ impl AcceptSource for PipeSource {
 
 struct UnixSource {
     path: String,
+    security: Option<SecurityDescriptor>,
     /// `None` until the first `arm` binds the persistent listen socket.
     listener: Mutex<Option<super::UnixStreamListener>>,
 }
@@ -136,7 +170,10 @@ impl AcceptSource for UnixSource {
     fn arm(&self, on_result: Box<dyn FnOnce(Result<Accepted>) + Send>) -> Result<OpHandle> {
         let mut guard = self.listener.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(super::UnixStreamListener::bind(&self.path)?);
+            *guard = Some(super::UnixStreamListener::bind_inner(
+                &self.path,
+                self.security.as_ref(),
+            )?);
         }
         guard.as_ref().unwrap().arm_accept(on_result)
     }
@@ -198,6 +235,9 @@ struct ListenerState {
     /// Live `ConnectionReceived` tokens — `windows_core::Event` exposes no
     /// count, so handler presence (the gating predicate) is tracked here.
     handlers: Mutex<HashSet<i64>>,
+    /// Who may connect, set through `IListenerSecurity` before the bind that
+    /// uses it. `None` is the transport's default.
+    security: Mutex<Option<SecurityDescriptor>>,
     /// Whether an accept chain is logically active. See the type-level
     /// "Handler gating" note.
     running: AtomicBool,
@@ -215,6 +255,7 @@ impl ListenerState {
             source: Mutex::new(None),
             current_op: Mutex::new(None),
             handlers: Mutex::new(HashSet::new()),
+            security: Mutex::new(None),
             running: AtomicBool::new(false),
             restart_pending: AtomicBool::new(false),
         }
@@ -297,7 +338,59 @@ impl ListenerCore {
         }
         self.state.event.clear();
         self.state.handlers.lock().unwrap().clear();
+        // Let go of the endpoint: a pipe source holds a listening instance in
+        // reserve, and the name stays ours until that is closed.
+        self.state.source.lock().unwrap().take();
         Ok(())
+    }
+
+    /// The descriptor set through `IListenerSecurity`, as SDDL; empty for
+    /// the default.
+    fn security_descriptor(&self) -> Result<HSTRING> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        Ok(self
+            .state
+            .security
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|sd| HSTRING::from(sd.sddl()))
+            .unwrap_or_default())
+    }
+
+    /// Sets who may connect. Only before the first bind: what is already
+    /// listening keeps the descriptor it was created with, and a setting that
+    /// silently applied to some instances and not others would be worse than
+    /// none. Malformed SDDL is `E_INVALIDARG`.
+    fn set_security_descriptor(&self, sddl: &HSTRING) -> Result<()> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(RO_E_CLOSED));
+        }
+        if self.state.source.lock().unwrap().is_some() {
+            return Err(Error::new(
+                E_ILLEGAL_METHOD_CALL,
+                "set SecurityDescriptor before binding",
+            ));
+        }
+        let parsed = if sddl.is_empty() {
+            None
+        } else {
+            Some(SecurityDescriptor::from_sddl(&sddl.to_string()).map_err(|e| {
+                Error::new(
+                    windows::Win32::Foundation::E_INVALIDARG,
+                    format!("not a security descriptor: {}", e.message()),
+                )
+            })?)
+        };
+        *self.state.security.lock().unwrap() = parsed;
+        Ok(())
+    }
+
+    /// The descriptor a bind should use.
+    fn security(&self) -> Option<SecurityDescriptor> {
+        self.state.security.lock().unwrap().clone()
     }
 
     /// Shared tail of every bind: swap in the accept source and (re)start the
@@ -432,6 +525,7 @@ macro_rules! listener_impls {
     bindings::Pbk20191::WinAsync::Comio::NamedPipeConnectionListener,
     bindings::Pbk20191::WinAsync::Comio::ITransport,
     bindings::Pbk20191::WinAsync::Comio::INamedPipeBind,
+    bindings::Pbk20191::WinAsync::Comio::IListenerSecurity,
     windows::Foundation::IClosable
 )]
 pub struct NamedPipeConnectionListener {
@@ -447,6 +541,7 @@ pub struct NamedPipeConnectionListener {
     bindings::Pbk20191::WinAsync::Comio::UnixConnectionListener,
     bindings::Pbk20191::WinAsync::Comio::ITransport,
     bindings::Pbk20191::WinAsync::Comio::IUnixBind,
+    bindings::Pbk20191::WinAsync::Comio::IListenerSecurity,
     windows::Foundation::IClosable
 )]
 pub struct UnixConnectionListener {
@@ -506,6 +601,28 @@ impl IUnixBind_Impl for UnixConnectionListener_Impl {
     }
 }
 
+// Who may connect, on the two local transports. Not on the Hyper-V listener:
+// who may reach a VM socket is configured with the VM.
+impl IListenerSecurity_Impl for NamedPipeConnectionListener_Impl {
+    fn SecurityDescriptor(&self) -> Result<HSTRING> {
+        self.core.security_descriptor()
+    }
+
+    fn SetSecurityDescriptor(&self, sddl: &HSTRING) -> Result<()> {
+        self.core.set_security_descriptor(sddl)
+    }
+}
+
+impl IListenerSecurity_Impl for UnixConnectionListener_Impl {
+    fn SecurityDescriptor(&self) -> Result<HSTRING> {
+        self.core.security_descriptor()
+    }
+
+    fn SetSecurityDescriptor(&self, sddl: &HSTRING) -> Result<()> {
+        self.core.set_security_descriptor(sddl)
+    }
+}
+
 // The string forms, which are what the metadata declares — see the RDL for
 // why this endpoint crosses a projection as text rather than as the pair of
 // GUIDs the transport takes. A malformed endpoint is `E_INVALIDARG`: the
@@ -538,11 +655,20 @@ listener_impls!(HyperVConnectionListener, HyperVConnectionListener_Impl);
 impl NamedPipeConnectionListener {
     /// Binds to a pipe name such as `\\.\pipe\example`.
     ///
-    /// No pipe instance exists until the accept chain starts; each accept
-    /// creates a fresh one.
-        pub fn bind(&self, name: &HSTRING) -> Result<IAsyncAction> {
+    /// No pipe instance exists until the accept chain starts. The first one
+    /// claims the name, and from then on one listening instance is kept until
+    /// `Close` (see `common::pipe`), so the name is never free for another
+    /// server to take. A client may therefore connect while no handler is
+    /// registered; it is delivered once one is.
+    pub fn bind(&self, name: &HSTRING) -> Result<IAsyncAction> {
+        let server = PipeServer::new(&name.to_string(), self.core.security());
         self.core
-            .install_source(Arc::new(PipeSource(name.to_string())), name.clone())
+            .install_source(Arc::new(PipeSource(Arc::new(server))), name.clone())
+    }
+
+    /// Typed Rust equivalent of the vtable's `SecurityDescriptor` setter.
+    pub fn set_security_descriptor(&self, sddl: &HSTRING) -> Result<()> {
+        self.core.set_security_descriptor(sddl)
     }
 }
 
@@ -552,14 +678,20 @@ impl UnixConnectionListener {
     /// The socket is bound lazily on the first accept, so a stale socket file
     /// surfaces as an error from whichever of this call or the first
     /// `ConnectionReceived` completes the gating condition.
-        pub fn bind(&self, path: &HSTRING) -> Result<IAsyncAction> {
+    pub fn bind(&self, path: &HSTRING) -> Result<IAsyncAction> {
         self.core.install_source(
             Arc::new(UnixSource {
                 path: path.to_string(),
+                security: self.core.security(),
                 listener: Mutex::new(None),
             }),
             path.clone(),
         )
+    }
+
+    /// Typed Rust equivalent of the vtable's `SecurityDescriptor` setter.
+    pub fn set_security_descriptor(&self, sddl: &HSTRING) -> Result<()> {
+        self.core.set_security_descriptor(sddl)
     }
 }
 
@@ -807,7 +939,7 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
                         .clone()
                         .unwrap_or_default()
                 });
-                fire_event(&state_cb, accepted.stream, endpoint);
+                fire_event(&state_cb, accepted.stream, endpoint, accepted.peer);
                 // Re-arm on a *fresh* pool stack, continuing to own `running`
                 // (`drive(.., true)`). Handing the re-arm to the pool bounds
                 // chain depth to O(1) even when completions arrive synchronously
@@ -856,8 +988,13 @@ fn try_arm(state: &Arc<ListenerState>) -> Result<bool> {
 /// sender — the connection is carried by `args`, not the (nonexistent)
 /// sender object. Guards against a panicking consumer handler unwinding
 /// across this FFI-adjacent boundary.
-fn fire_event(state: &Arc<ListenerState>, stream: ITransportStream, endpoint: HSTRING) {
-    let args = new_args(stream, endpoint);
+fn fire_event(
+    state: &Arc<ListenerState>,
+    stream: ITransportStream,
+    endpoint: HSTRING,
+    peer: PeerIdentity,
+) {
+    let args = new_args(stream, endpoint, peer);
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         state.event.call(|h| h.Invoke(None, &args));
     }));
@@ -874,12 +1011,216 @@ mod tests {
     fn args_exposes_stream_and_endpoint() {
         let (stream, _other_end) = crate::comio::stream::tests::pipe_pair();
         let args: IConnectionReceivedArgs =
-            new_args(stream.clone(), windows_core::HSTRING::from("pipe://x"))
+            new_args(stream.clone(), windows_core::HSTRING::from("pipe://x"), PeerIdentity::default())
                 .cast()
                 .unwrap();
         // Stream() returns the same object identity.
         assert_eq!(args.Stream().unwrap(), stream);
         assert_eq!(args.RemoteEndpoint().unwrap().to_string(), "pipe://x");
+    }
+}
+
+/// Who may connect (`IListenerSecurity`), who did (`RemoteProcessId` /
+/// `RemoteUserSid`), and the pipe-name policy, through the ABI a projection
+/// uses.
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use crate::common::block_on;
+    use crate::common::security::process_user_sid;
+    use std::future::IntoFuture;
+    use std::sync::mpsc;
+    use windows::Foundation::IClosable;
+    use windows_core::HSTRING;
+
+    use super::super::bindings::Pbk20191::WinAsync::Comio::IListenerSecurity;
+
+    fn pipe_name(tag: &str) -> String {
+        format!(r"\\.\pipe\comio_sec_{tag}_{}", std::process::id())
+    }
+
+    fn sock_path(tag: &str) -> String {
+        let p = std::env::temp_dir()
+            .join(format!("comio_sec_{tag}_{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// A handler reporting `(RemoteProcessId, RemoteUserSid)` per connection,
+    /// keeping each delivered stream alive until the test ends.
+    fn identity_handler() -> (ConnectionHandler, mpsc::Receiver<(u32, String)>) {
+        let (tx, rx) = mpsc::channel();
+        let handler = ConnectionHandler::new(move |_s, args| {
+            let args = args.as_ref().unwrap();
+            std::mem::forget(args.Stream()?);
+            let _ = tx.send((args.RemoteProcessId()?, args.RemoteUserSid()?.to_string()));
+            Ok(())
+        });
+        (handler, rx)
+    }
+
+    fn me() -> (u32, String) {
+        let pid = std::process::id();
+        (pid, process_user_sid(pid).unwrap())
+    }
+
+    #[test]
+    fn pipe_args_name_the_client() {
+        let name = pipe_name("peer");
+        let listener = NamedPipeConnectionListener::new();
+        let (handler, rx) = identity_handler();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        let _client = block_on(crate::comio::NamedPipeConnector::connect(&name)).unwrap();
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(got, me());
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+    }
+
+    #[test]
+    fn unix_args_name_the_client() {
+        let path = sock_path("peer");
+        let listener = UnixConnectionListener::new();
+        let (handler, rx) = identity_handler();
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&path)).unwrap().into_future()).unwrap();
+        let _client = block_on(crate::comio::UnixConnector::connect(&path)).unwrap();
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(got, me());
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The property round-trips, rejects what is not SDDL, and is fixed once
+    /// the listener is bound.
+    #[test]
+    fn the_descriptor_is_validated_and_fixed_at_bind() {
+        let listener = NamedPipeConnectionListener::new();
+        let security: IListenerSecurity = listener.cast().unwrap();
+        assert_eq!(security.SecurityDescriptor().unwrap(), "");
+        security.SetSecurityDescriptor(&HSTRING::from("D:P(A;;GA;;;OW)")).unwrap();
+        assert_eq!(security.SecurityDescriptor().unwrap(), "D:P(A;;GA;;;OW)");
+        assert_eq!(
+            security.SetSecurityDescriptor(&HSTRING::from("not sddl")).unwrap_err().code(),
+            windows::Win32::Foundation::E_INVALIDARG
+        );
+        block_on(listener.bind(&HSTRING::from(pipe_name("fixed"))).unwrap().into_future()).unwrap();
+        assert_eq!(
+            security.SetSecurityDescriptor(&HSTRING::new()).unwrap_err().code(),
+            E_ILLEGAL_METHOD_CALL
+        );
+    }
+
+    /// SYSTEM only: this account is kept out, on both local transports.
+    #[test]
+    fn a_descriptor_keeps_out_who_it_does_not_grant() {
+        const SYSTEM_ONLY: &str = "D:P(A;;GA;;;SY)";
+        let (handler, _rx) = identity_handler();
+
+        let name = pipe_name("deny");
+        let pipe = NamedPipeConnectionListener::new();
+        pipe.set_security_descriptor(&HSTRING::from(SYSTEM_ONLY)).unwrap();
+        pipe.connection_received(&handler).unwrap();
+        block_on(pipe.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        let err = block_on(crate::comio::NamedPipeConnector::connect(&name)).unwrap_err();
+        assert_eq!(err.code(), windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult());
+        pipe.cast::<IClosable>().unwrap().Close().unwrap();
+
+        let path = sock_path("deny");
+        let unix = UnixConnectionListener::new();
+        unix.set_security_descriptor(&HSTRING::from(SYSTEM_ONLY)).unwrap();
+        unix.connection_received(&handler).unwrap();
+        block_on(unix.bind(&HSTRING::from(&path)).unwrap().into_future()).unwrap();
+        let err = block_on(crate::comio::UnixConnector::connect(&path)).unwrap_err();
+        // WSAEACCES
+        assert_eq!(err.code(), HRESULT::from_win32(10013), "{err}");
+        unix.cast::<IClosable>().unwrap().Close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A name another server already holds is reported by the bind that
+    /// starts accepting, not joined.
+    #[test]
+    fn a_squatted_name_fails_the_bind() {
+        use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX};
+        use windows::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        };
+        let name = pipe_name("squat");
+        let squatter = unsafe {
+            CreateNamedPipeW(
+                &HSTRING::from(&name),
+                FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0),
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                0,
+                0,
+                0,
+                None,
+            )
+        };
+        assert!(!squatter.is_invalid());
+        let listener = NamedPipeConnectionListener::new();
+        let (handler, _rx) = identity_handler();
+        listener.connection_received(&handler).unwrap();
+        let err = listener.bind(&HSTRING::from(&name)).unwrap_err();
+        assert_eq!(err.code(), windows::Win32::Foundation::ERROR_ACCESS_DENIED.to_hresult());
+        unsafe { windows::Win32::Foundation::CloseHandle(squatter).unwrap() };
+    }
+
+    /// `Close` gives the name up: the reserved instance goes with it.
+    #[test]
+    fn close_releases_the_name() {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX,
+        };
+        use windows::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        };
+        let claim = |name: &str| unsafe {
+            CreateNamedPipeW(
+                &HSTRING::from(name),
+                FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_FIRST_PIPE_INSTANCE.0),
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                0,
+                0,
+                0,
+                None,
+            )
+        };
+        let name = pipe_name("release");
+        let listener = NamedPipeConnectionListener::new();
+        // Drops each delivered stream at once, so after the one connection
+        // below only the reserved instance holds the name.
+        let (tx, rx) = mpsc::channel();
+        let handler = ConnectionHandler::new(move |_s, _args| {
+            let _ = tx.send(());
+            Ok(())
+        });
+        listener.connection_received(&handler).unwrap();
+        block_on(listener.bind(&HSTRING::from(&name)).unwrap().into_future()).unwrap();
+        drop(block_on(crate::comio::NamedPipeConnector::connect(&name)).unwrap());
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+
+        // Bound and open: the name is not free.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(claim(&name).is_invalid(), "the name was free while the listener was open");
+
+        listener.cast::<IClosable>().unwrap().Close().unwrap();
+        // The cancelled accept's completion runs on the pool; give it a beat.
+        let mut taken = claim(&name);
+        for _ in 0..50 {
+            if !taken.is_invalid() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            taken = claim(&name);
+        }
+        assert!(!taken.is_invalid(), "Close kept the name");
+        unsafe { windows::Win32::Foundation::CloseHandle(taken).unwrap() };
     }
 }
 
@@ -1443,10 +1784,15 @@ mod listener_tests {
     }
 
     /// Handler gating is reversible: removing the *last* `ConnectionReceived`
-    /// handler pauses accepting (the in-flight accept is cancelled, so the pipe
-    /// instance disappears and a client can no longer connect), and registering
-    /// a handler again resumes it. This exercises the remove-then-re-add
-    /// handoff (`restart_pending`) and a lazily re-created pipe instance.
+    /// handler pauses delivery (the in-flight accept is cancelled), and
+    /// registering a handler again resumes it. This exercises the
+    /// remove-then-re-add handoff (`restart_pending`).
+    ///
+    /// A paused pipe listener still holds the name: one listening instance is
+    /// kept in reserve from the first connection until `Close`, so no other
+    /// server can take the name in the meantime (see `common::pipe`). A client
+    /// can therefore connect while it is paused; nothing is delivered until a
+    /// handler returns, and then that client is.
     #[test]
     fn pause_and_resume_on_handler_toggle() {
         let name = format!(r"\\.\pipe\comio_listener_toggle_{}", std::process::id());
@@ -1486,21 +1832,21 @@ mod listener_tests {
         let _s1 = unsafe { IInspectable::from_raw(raw1 as *mut core::ffi::c_void) };
         drop(c1);
 
-        // Remove the last handler => chain pauses. Give the cancellation time
-        // to tear the pipe instance down, then a connect must fail.
+        // Remove the last handler => chain pauses. A client connects to the
+        // reserved instance, and nothing is delivered for it.
         listener.remove_connection_received(token).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(150));
+        let c2 = connect_once(&name).expect("the paused listener gave up its name");
         assert!(
-            block_on(crate::comio::NamedPipeConnector::connect(&name)).is_err(),
-            "listener kept accepting after its last handler was removed"
+            rx1.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "a connection was delivered after the last handler was removed"
         );
 
-        // Re-add a handler => chain resumes (restart_pending handoff / lazy
-        // re-arm), and a connection is delivered again.
+        // Re-add a handler => chain resumes (restart_pending handoff), and
+        // the client that connected while paused is delivered.
         let (tx2, rx2) = mpsc::channel::<usize>();
         let h2 = make_handler(tx2);
         listener.connection_received(&h2).unwrap();
-        let c2 = connect_once(&name).expect("connect failed after re-adding a handler");
         let raw2 = rx2
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("no delivery after the chain resumed");

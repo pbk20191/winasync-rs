@@ -10,6 +10,7 @@ use super::net::{
 };
 use super::{submit, IoRes};
 use crate::common::buffer::{IoBuf, IoBufMut};
+use crate::common::security::{self, SecurityDescriptor};
 use crate::tp::{Runtime, RuntimeInner};
 use crate::common::winsock::{connectex, ConnectExFn};
 use core::ffi::c_void;
@@ -120,6 +121,22 @@ impl UnixStream {
         Ok(stream)
     }
 
+    /// The process id at the other end (`SIO_AF_UNIX_GETPEERPID`), from
+    /// either end of the connection.
+    pub fn peer_process_id(&self) -> windows_core::Result<u32> {
+        security::unix_peer_pid(self.res.socket())
+    }
+
+    /// The account the peer process runs as, as a string SID.
+    ///
+    /// Windows reports only the peer's process id for AF_UNIX, so this is
+    /// that process's token: it needs the right to open the process (usually
+    /// only when both run as the same user), and names whoever holds the id
+    /// at the time of the call.
+    pub fn peer_user_sid(&self) -> windows_core::Result<String> {
+        security::process_user_sid(self.peer_process_id()?)
+    }
+
     /// Receives into `buf`; resolves to the byte count (0 = peer closed).
     pub fn read<B: IoBufMut>(
         &self,
@@ -208,12 +225,35 @@ pub struct UnixListener {
 
 impl UnixListener {
     /// Binds and listens on the AF_UNIX path (the caller is responsible for
-    /// removing any stale socket file first).
+    /// removing any stale socket file first). Who may connect is decided by
+    /// the socket file's DACL, which it inherits from the directory.
     pub fn bind(rt: &Runtime, path: &str) -> windows_core::Result<UnixListener> {
+        Self::bind_inner(rt, path, None)
+    }
+
+    /// [`bind`](Self::bind), with `security`'s DACL written onto the socket
+    /// file. It is applied between `bind` and `listen`: a connect before
+    /// `listen` is refused anyway, so no client ever sees the inherited DACL.
+    pub fn bind_with_security(
+        rt: &Runtime,
+        path: &str,
+        security: &SecurityDescriptor,
+    ) -> windows_core::Result<UnixListener> {
+        Self::bind_inner(rt, path, Some(security))
+    }
+
+    fn bind_inner(
+        rt: &Runtime,
+        path: &str,
+        security: Option<&SecurityDescriptor>,
+    ) -> windows_core::Result<UnixListener> {
         let sock = unix_socket()?;
         let register = || -> windows_core::Result<Arc<IoRes>> {
             let (sa, len) = sockaddr_un(path)?;
             sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
+            if let Some(security) = security {
+                security.apply_dacl_to_file(path)?;
+            }
             sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
             IoRes::register(&rt.inner, HANDLE(sock.0 as *mut c_void), true)
         };
@@ -308,5 +348,52 @@ mod tests {
         }));
         let _ = std::fs::remove_file(&path);
         result.expect("unix echo timed out");
+    }
+
+    fn temp_path(tag: &str) -> String {
+        let path = std::env::temp_dir()
+            .join(format!("tp_unix_{tag}_{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// Both ends report the other's process, and through it the account.
+    #[test]
+    fn each_end_identifies_the_other() {
+        let rt = Runtime::new();
+        let path = temp_path("peer");
+        let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+            let listener = UnixListener::bind(&rt, &path).unwrap();
+            let server = rt.spawn(async move { listener.accept().await.unwrap() });
+            let client = UnixStream::connect(&rt, &path).await.unwrap();
+            let server = server.await.unwrap();
+            let me = std::process::id();
+            let my_sid = security::process_user_sid(me).unwrap();
+            assert_eq!(server.peer_process_id().unwrap(), me);
+            assert_eq!(server.peer_user_sid().unwrap(), my_sid);
+            assert_eq!(client.peer_process_id().unwrap(), me);
+        }));
+        let _ = std::fs::remove_file(&path);
+        result.expect("timed out");
+    }
+
+    /// The socket file's DACL is what `connect` is checked against, so a
+    /// descriptor that does not grant this account keeps it out.
+    #[test]
+    fn a_descriptor_keeps_out_who_it_does_not_grant() {
+        let rt = Runtime::new();
+        let path = temp_path("deny");
+        let system_only = SecurityDescriptor::from_sddl("D:P(A;;GA;;;SY)").unwrap();
+        let listener = UnixListener::bind_with_security(&rt, &path, &system_only).unwrap();
+        let err = block_on(timeout(&rt, Duration::from_secs(10), UnixStream::connect(&rt, &path)))
+            .expect("timed out")
+            .err()
+            .expect("connected through a DACL that does not grant this account");
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+        // WSAEACCES
+        assert_eq!(err.code(), windows_core::HRESULT::from_win32(10013), "{err}");
     }
 }

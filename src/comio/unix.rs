@@ -12,6 +12,7 @@
 //! memory alive until the op's real completion, not merely until the
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
+use crate::common::security::{PeerIdentity, SecurityDescriptor};
 use crate::common::winsock::ExtFnCache;
 use crate::comio::unload::ModuleRef;
 use crate::common::winsock::{
@@ -98,12 +99,27 @@ impl UnixStreamListener {
     /// Binds a new AF_UNIX socket to `path` and starts listening. AF_UNIX
     /// `bind` fails if a socket file already exists at `path`; callers that
     /// need to rebind a stale path should remove it first (as the test
-    /// below does).
+    /// below does). Who may connect is decided by the socket file's DACL,
+    /// which it inherits from the directory.
     pub fn bind(path: &str) -> Result<Self> {
+        Self::bind_inner(path, None)
+    }
+
+    /// [`bind`](Self::bind), with `security`'s DACL written onto the socket
+    /// file. It is applied between `bind` and `listen`: a connect before
+    /// `listen` is refused anyway, so no client ever sees the inherited DACL.
+    pub fn bind_with_security(path: &str, security: &SecurityDescriptor) -> Result<Self> {
+        Self::bind_inner(path, Some(security))
+    }
+
+    pub(crate) fn bind_inner(path: &str, security: Option<&SecurityDescriptor>) -> Result<Self> {
         let sock = new_socket()?;
         let register = || -> Result<Arc<IoReg>> {
             let (sa, addrlen) = sockaddr_un(path)?;
             sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, addrlen) })?;
+            if let Some(security) = security {
+                security.apply_dacl_to_file(path)?;
+            }
             sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
             IoReg::register(HANDLE(sock.0 as *mut c_void), true)
         };
@@ -224,15 +240,19 @@ impl UnixStreamListener {
                     drop(addr_buf);
                     let res = if ioresult == 0 {
                         let listen_val = listen_sock.0.to_ne_bytes();
-                        let finish = || -> Result<ITransportStream> {
+                        let finish = || -> Result<Accepted> {
                             sock_check(setsockopt(
                                 accept_sock,
                                 SOL_SOCKET,
                                 SO_UPDATE_ACCEPT_CONTEXT,
                                 Some(&listen_val),
                             ))?;
+                            // Who connected, read while the socket is still
+                            // ours to query (and only valid after the
+                            // accept context above).
+                            let peer = PeerIdentity::of_unix_peer(accept_sock);
                             let reg = IoReg::register(HANDLE(accept_sock.0 as *mut c_void), true)?;
-                            Ok(stream::from_reg(reg))
+                            Ok(Accepted::local(stream::from_reg(reg), peer))
                         };
                         match finish() {
                             Ok(s) => Ok(s),
@@ -245,7 +265,7 @@ impl UnixStreamListener {
                         closesocket(accept_sock);
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };
-                    on_result(res.map(Accepted::unnamed));
+                    on_result(res);
                 }),
                 move |ovl| {
                     let mut bytes = 0u32;

@@ -27,6 +27,12 @@ pub mod buffer;
 // The thread-pool callback-context convention.
 #[cfg(any(feature = "tp", feature = "rio"))]
 pub mod tpctx;
+// Access control and peer identity for the local transports (named pipes,
+// AF_UNIX), and the named-pipe instance policy built on it.
+#[cfg(any(feature = "tp", feature = "comio"))]
+pub mod security;
+#[cfg(any(feature = "tp", feature = "comio"))]
+pub(crate) mod pipe;
 // SOCKADDR conversions: neutral, used by every socket engine.
 #[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 pub mod sockaddr;

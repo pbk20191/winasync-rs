@@ -182,6 +182,9 @@ impl HvStreamListener {
                             Ok(Accepted {
                                 stream: stream::from_reg(reg),
                                 remote: remote.map(|a| HSTRING::from(a.to_string())),
+                                // Neither a process nor an account crosses
+                                // VMBus; the partition is the identity.
+                                peer: Default::default(),
                             })
                         };
                         match finish() {

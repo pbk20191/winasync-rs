@@ -2,6 +2,10 @@
 //! `TransportStream`s (via `stream::from_reg`) over Win32 named
 //! pipes, the first end-to-end transport built on the `comio` overlapped-IO
 //! engine.
+//!
+//! Instance creation follows `common::pipe`: the first instance claims the
+//! name, one listening instance is always kept, remote clients are refused.
+//! The connector opens at identification level.
 
 use crate::comio::unload::ModuleRef;
 use super::bindings;
@@ -11,53 +15,47 @@ use super::bindings::Pbk20191::WinAsync::Comio::{
 use super::stream;
 use super::tpio::{self, IoReg, Issue, OpHandle};
 use super::waitop::await_io;
+use crate::common::pipe::PipeServer;
+use crate::common::security::{PeerIdentity, SecurityDescriptor};
+use std::sync::Arc;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
-use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
-    PIPE_WAIT,
-};
+use windows::Win32::System::Pipes::{ConnectNamedPipe, WaitNamedPipeW};
 use windows_core::{Error, Result, HRESULT, HSTRING};
 
-/// Server (listener) side of a named pipe. Each `accept()` creates a fresh
-/// overlapped pipe instance and waits for a client to connect to it.
+/// Server (listener) side of a named pipe. Each `accept()` waits for a
+/// client on a listening instance.
 pub struct NamedPipeListener {
-    name: HSTRING,
+    server: PipeServer,
 }
 
 impl NamedPipeListener {
+    /// A listener for `name`, with the default security: the creator,
+    /// administrators and SYSTEM.
     pub fn create(name: &str) -> Self {
         Self {
-            name: HSTRING::from(name),
+            server: PipeServer::new(name, None),
         }
     }
 
-    /// Creates a new instance of the named pipe and asynchronously waits for
-    /// a client to connect, returning the connected instance as a duplex
-    /// WinRT stream.
-    pub async fn accept(&self) -> Result<ITransportStream> {
-        let handle = unsafe {
-            CreateNamedPipeW(
-                &self.name,
-                FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0),
-                PIPE_TYPE_BYTE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
-                4096,
-                4096,
-                0,
-                None,
-            )
-        };
-        // `CreateNamedPipeW` returns a bare `HANDLE`, not a `Result` —
-        // failure is `INVALID_HANDLE_VALUE` plus `GetLastError()`.
-        if handle.is_invalid() {
-            return Err(Error::from_thread());
+    /// [`create`](Self::create), with `security` on every instance. It must
+    /// grant this process's own account `FILE_CREATE_PIPE_INSTANCE` (`GA`
+    /// does): every instance after the first is checked against it.
+    pub fn create_with_security(name: &str, security: &SecurityDescriptor) -> Self {
+        Self {
+            server: PipeServer::new(name, Some(security.clone())),
         }
+    }
+
+    /// Waits for a client on a listening instance, returning the connected
+    /// instance as a duplex WinRT stream.
+    pub async fn accept(&self) -> Result<ITransportStream> {
+        let handle = self.server.instance()?;
         let reg = match IoReg::register(handle, false) {
             Ok(reg) => reg,
             Err(e) => {
@@ -71,7 +69,7 @@ impl NamedPipeListener {
             }
         };
 
-        await_io(&reg, move |ovl| unsafe {
+        let result = await_io(&reg, move |ovl| unsafe {
             // On an overlapped handle, `ConnectNamedPipe` returning `Ok(())`
             // or `ERROR_IO_PENDING` both mean a completion packet is (or
             // will be) queued to the thread pool's IOCP — same as
@@ -96,8 +94,12 @@ impl NamedPipeListener {
                 Err(e) => Issue::Failed(e.code()),
             }
         })
-        .await?;
-
+        .await;
+        // Made before this instance leaves the listening pool, connected or
+        // not, so the name is held throughout. (A future dropped mid-wait
+        // closes its instance without this; the next accept starts over.)
+        self.server.replenish();
+        result?;
         Ok(stream::from_reg(reg))
     }
 }
@@ -120,29 +122,18 @@ impl NamedPipeListener {
 ///
 /// A synchronous failure to create/register the pipe instance itself is
 /// returned as `Err` directly, without ever invoking `on_result` — mirroring
-/// `accept()`'s own synchronous-failure behavior — so a bad pipe name (for
-/// instance) surfaces to the immediate caller rather than through the
-/// callback.
+/// `accept()`'s own synchronous-failure behavior — so a bad pipe name, or one
+/// another server already holds, surfaces to the immediate caller rather
+/// than through the callback.
+///
+/// On a connection the completion reads who connected, then creates the
+/// next listening instance before handing the connected one on.
 pub(crate) fn arm_accept(
-    name: &str,
+    server: &Arc<PipeServer>,
     on_result: Box<dyn FnOnce(Result<super::listener::Accepted>) + Send>,
 ) -> Result<OpHandle> {
-    let wname = HSTRING::from(name);
-    let handle = unsafe {
-        CreateNamedPipeW(
-            &wname,
-            FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0),
-            PIPE_TYPE_BYTE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,
-            4096,
-            4096,
-            0,
-            None,
-        )
-    };
-    if handle.is_invalid() {
-        return Err(Error::from_thread());
-    }
+    let handle = server.instance()?;
+    let server = server.clone();
     let reg = match IoReg::register(handle, false) {
         Ok(reg) => reg,
         Err(e) => {
@@ -157,12 +148,21 @@ pub(crate) fn arm_accept(
         tpio::submit(
             &reg,
             Box::new(move |ioresult: u32, _bytes: usize| {
+                // Whatever happened, this instance is about to leave the
+                // listening pool -- handed on as a stream, or closed after a
+                // failure or a cancellation -- so the next one is made first,
+                // while this one still holds the name.
+                server.replenish();
                 let res = if ioresult == 0 || ioresult == ERROR_PIPE_CONNECTED.0 {
-                    Ok(stream::from_reg(reg_for_complete))
+                    let peer = PeerIdentity::of_pipe_client(reg_for_complete.handle);
+                    Ok(super::listener::Accepted::local(
+                        stream::from_reg(reg_for_complete),
+                        peer,
+                    ))
                 } else {
                     Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                 };
-                on_result(res.map(super::listener::Accepted::unnamed));
+                on_result(res);
             }),
             move |ovl| match ConnectNamedPipe(handle, Some(ovl)) {
                 Ok(()) => Issue::SyncSuccess,
@@ -233,6 +233,11 @@ impl NamedPipeConnector {
 
     /// Opening the client end is a plain synchronous `CreateFileW` — only
     /// the server's `accept` needs an overlapped `ConnectNamedPipe`.
+    ///
+    /// Identification level, not the default impersonation: the server may
+    /// learn who we are, but cannot act as us. Without
+    /// `SECURITY_SQOS_PRESENT` a client grants full impersonation to whatever
+    /// answers on the name.
     fn open(wname: &HSTRING) -> Result<HANDLE> {
         unsafe {
             CreateFileW(
@@ -241,7 +246,7 @@ impl NamedPipeConnector {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 None,
             )
         }
@@ -304,6 +309,10 @@ mod tests {
     use crate::common::block_on;
     use std::future::IntoFuture;
     use windows::Storage::Streams::{IBuffer, IInputStream, IOutputStream, InputStreamOptions};
+    use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
     use windows_core::Interface;
 
     #[test]
@@ -377,7 +386,7 @@ mod tests {
         // observe `ERROR_PIPE_CONNECTED` rather than pending.
         let handle = unsafe {
             CreateNamedPipeW(
-                &listener.name,
+                listener.server.name(),
                 FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0),
                 PIPE_TYPE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,

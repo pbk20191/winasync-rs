@@ -603,6 +603,57 @@ TLS를 구현하지 않기로 했으면 **가져와서 감쌀 수 있어야** �
 이름 기반 WinRT out-of-process(MSIX `outOfProcessServer`)는 시도하지 않았다. 데이터 중계
 형태라면 같은 이유로 의미가 없다.
 
+## 로컬 전송의 보안 (2026-11-10)
+
+named pipe와 AF_UNIX는 로컬 서비스가 쓰는 전송이다. 그래서 "누가 접속할 수 있나"와
+"누가 접속했나"에 답할 수 있어야 한다. 전에는 둘 다 답할 수 없었고, 기본값에도 구멍이
+있었다. 코드는 `common::security`와 `common::pipe`에 있고, tp와 comio가 같이 쓴다.
+
+**기본값 (설정 없음, 항상 켜짐)**
+
+| | 전 | 후 |
+| --- | --- | --- |
+| 원격 클라이언트 | SMB로 접속 가능 | `PIPE_REJECT_REMOTE_CLIENTS` |
+| 파이프 선점 | 남이 먼저 만든 이름에 인스턴스를 보탰다 | 첫 인스턴스는 `FILE_FLAG_FIRST_PIPE_INSTANCE`. 이미 누가 쥐고 있으면 bind가 `ERROR_ACCESS_DENIED` |
+| 이름의 빈틈 | 연결이 끝나면 이름이 사라질 수 있었다 | 연결이 성사되면 다음 인스턴스를 먼저 만든다. `Close`까지 이름을 놓지 않는다 |
+| 클라이언트 impersonation | 기본 레벨(impersonation). 악성 서버가 클라이언트 권한으로 행동할 수 있었다 | `SECURITY_SQOS_PRESENT \| SECURITY_IDENTIFICATION`. 서버는 확인만 할 수 있다 |
+
+이름을 계속 쥐고 있는 대가로 동작이 하나 바뀌었다. 핸들러를 모두 떼어 일시정지한
+pipe 리스너에도 클라이언트가 접속할 수 있다. 전달은 핸들러가 돌아온 뒤에 된다. 이름을
+지키는 것과 "핸들러 없이는 접속 불가"는 함께 성립할 수 없고, 이름을 지키는 쪽을 골랐다.
+
+**누가 접속할 수 있나 — `IListenerSecurity.SecurityDescriptor` (SDDL)**
+
+- bind 전에만 설정할 수 있다. 그 뒤에는 `E_ILLEGAL_METHOD_CALL`이고, SDDL이 아니면
+  `E_INVALIDARG`다. 빈 문자열은 기본값이다.
+- **pipe**: 모든 인스턴스의 `SECURITY_ATTRIBUTES`로 들어간다. 디스크립터는 서버 자신의
+  계정에 `FILE_CREATE_PIPE_INSTANCE`를 줘야 한다(`GA`면 된다). 두 번째 인스턴스부터는
+  이 디스크립터로 검사받기 때문이다.
+- **AF_UNIX**: 소켓에는 디스크립터가 없고, connect는 소켓 파일의 DACL로 검사받는다.
+  그래서 `bind`와 `listen` 사이에 파일에 DACL을 쓴다. listen 전의 connect는 어차피 거부되므로
+  틈이 없다. DACL만 쓴다. owner와 SACL은 바꾸는 데 특권이 필요하므로 쓰지 않는다. DACL이 없는
+  SDDL은 NULL DACL(모두 허용)로 바꾸지 않고, 상속받은 DACL을 그대로 둔다.
+- Hyper-V 리스너에는 없다. VM 소켓에 누가 닿는지는 VM 설정(HCS)에서 정한다.
+- tp에는 `bind_with_security(rt, name, &SecurityDescriptor)`가 있다.
+
+**누가 접속했나 — `IConnectionReceivedArgs.RemoteProcessId` / `RemoteUserSid`**
+
+- **pipe**: PID는 `GetNamedPipeClientProcessId`로 얻는다. SID는 클라이언트를 identification
+  레벨로 impersonate해서 그 토큰에서 읽는다. 클라이언트가 접속할 때 쓴 계정이므로 위조할
+  수 없다. impersonate한 뒤 `RevertToSelf`가 실패하면 프로세스를 끝낸다. 남의 신원을 쓴 채로
+  남은 풀 스레드에서는 계속할 방법이 없다.
+- **AF_UNIX**: Windows가 알려 주는 것은 `SIO_AF_UNIX_GETPEERPID`(PID)뿐이고
+  `SO_PEERCRED`는 없다. SID는 그 프로세스의 토큰에서 읽는다. 같은 사용자일 때만 열 수 있고,
+  열지 못하면 빈 문자열이다. PID는 재사용될 수 있다는 점도 문서에 적었다.
+- Hyper-V는 0과 빈 문자열이다. 신원은 `RemoteEndpoint`의 파티션이다.
+- tp에서는 스트림의 `peer_process_id()` / `peer_user_sid()`로 얻는다. 양쪽 끝에서 모두
+  쓸 수 있고, 클라이언트 쪽에서는 내가 접속한 서버가 기대한 계정인지 확인하는 데 쓴다.
+
+측정으로 확인한 것: 같은 사용자의 클라이언트가 SYSTEM 전용 DACL에 막히는 것(pipe는
+`ERROR_ACCESS_DENIED`, AF_UNIX는 `WSAEACCES`), 선점된 이름에서 bind가 실패하는 것, 연결이
+끝난 뒤에도 이름이 유지되고 `Close`하면 풀리는 것, impersonation으로 읽은 SID가 프로세스
+토큰의 SID와 같은 것.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

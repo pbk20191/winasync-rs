@@ -62,6 +62,9 @@ pub use io::net::{
 pub use io::pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeStream};
 #[allow(unused_imports)]
 pub use io::unix::{UnixListener, UnixStream};
+// Who may connect to a listener, for `bind_with_security` on the local
+// transports.
+pub use crate::common::security::SecurityDescriptor;
 #[allow(unused_imports)]
 pub use pool::{Pool, PoolBuilder, Priority, Scope};
 #[allow(unused_imports)]

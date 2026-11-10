@@ -43,6 +43,28 @@ pub mod Pbk20191 {
                         .map(|| core::mem::transmute(result__))
                     }
                 }
+                pub fn RemoteProcessId(&self) -> windows_core::Result<u32> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteProcessId)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn RemoteUserSid(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteUserSid)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
             }
             impl windows_core::RuntimeType for ConnectionReceivedArgs {
                 const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -426,7 +448,7 @@ pub mod Pbk20191 {
             windows_core::imp::define_interface!(
                 IConnectionReceivedArgs,
                 IConnectionReceivedArgs_Vtbl,
-                0x661712ac_63e3_5243_a91a_6409d33fc02b
+                0x18f87759_dfc3_5734_ad70_72993466d18f
             );
             impl windows_core::RuntimeType for IConnectionReceivedArgs {
                 const SIGNATURE: windows_core::imp::ConstBuffer =
@@ -460,6 +482,28 @@ pub mod Pbk20191 {
                         .map(|| core::mem::transmute(result__))
                     }
                 }
+                pub fn RemoteProcessId(&self) -> windows_core::Result<u32> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteProcessId)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn RemoteUserSid(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteUserSid)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
             }
             impl windows_core::RuntimeName for IConnectionReceivedArgs {
                 const NAME: &'static str = "Pbk20191.WinAsync.Comio.IConnectionReceivedArgs";
@@ -467,6 +511,8 @@ pub mod Pbk20191 {
             pub trait IConnectionReceivedArgs_Impl: windows_core::IUnknownImpl {
                 fn Stream(&self) -> windows_core::Result<ITransportStream>;
                 fn RemoteEndpoint(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn RemoteProcessId(&self) -> windows_core::Result<u32>;
+                fn RemoteUserSid(&self) -> windows_core::Result<windows_core::HSTRING>;
             }
             impl IConnectionReceivedArgs_Vtbl {
                 pub const fn new<Identity: IConnectionReceivedArgs_Impl, const OFFSET: isize>(
@@ -511,6 +557,45 @@ pub mod Pbk20191 {
                             }
                         }
                     }
+                    unsafe extern "system" fn RemoteProcessId<
+                        Identity: IConnectionReceivedArgs_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IConnectionReceivedArgs_Impl::RemoteProcessId(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn RemoteUserSid<
+                        Identity: IConnectionReceivedArgs_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IConnectionReceivedArgs_Impl::RemoteUserSid(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
                     Self {
                         base__: windows_core::IInspectable_Vtbl::new::<
                             Identity,
@@ -519,6 +604,8 @@ pub mod Pbk20191 {
                         >(),
                         Stream: Stream::<Identity, OFFSET>,
                         RemoteEndpoint: RemoteEndpoint::<Identity, OFFSET>,
+                        RemoteProcessId: RemoteProcessId::<Identity, OFFSET>,
+                        RemoteUserSid: RemoteUserSid::<Identity, OFFSET>,
                     }
                 }
                 pub fn matches(iid: &windows_core::GUID) -> bool {
@@ -534,6 +621,16 @@ pub mod Pbk20191 {
                     *mut *mut core::ffi::c_void,
                 ) -> windows_core::HRESULT,
                 pub RemoteEndpoint: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub RemoteProcessId: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut u32,
+                )
+                    -> windows_core::HRESULT,
+                pub RemoteUserSid: unsafe extern "system" fn(
                     *mut core::ffi::c_void,
                     *mut *mut core::ffi::c_void,
                 )
@@ -764,6 +861,124 @@ pub mod Pbk20191 {
                     *mut core::ffi::c_void,
                     *mut core::ffi::c_void,
                     *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                IListenerSecurity,
+                IListenerSecurity_Vtbl,
+                0x869ce86b_87f1_5f0d_8df8_0d7b9cf4c9ee
+            );
+            impl windows_core::RuntimeType for IListenerSecurity {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IListenerSecurity,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IListenerSecurity {
+                pub fn SecurityDescriptor(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).SecurityDescriptor)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn SetSecurityDescriptor(
+                    &self,
+                    value: &windows_core::HSTRING,
+                ) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetSecurityDescriptor)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(value),
+                        )
+                        .ok()
+                    }
+                }
+            }
+            impl windows_core::RuntimeName for IListenerSecurity {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IListenerSecurity";
+            }
+            pub trait IListenerSecurity_Impl: windows_core::IUnknownImpl {
+                fn SecurityDescriptor(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn SetSecurityDescriptor(
+                    &self,
+                    value: &windows_core::HSTRING,
+                ) -> windows_core::Result<()>;
+            }
+            impl IListenerSecurity_Vtbl {
+                pub const fn new<Identity: IListenerSecurity_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn SecurityDescriptor<
+                        Identity: IListenerSecurity_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IListenerSecurity_Impl::SecurityDescriptor(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn SetSecurityDescriptor<
+                        Identity: IListenerSecurity_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        value: *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            IListenerSecurity_Impl::SetSecurityDescriptor(
+                                this,
+                                core::mem::transmute(&value),
+                            )
+                            .into()
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            IListenerSecurity,
+                            OFFSET,
+                        >(),
+                        SecurityDescriptor: SecurityDescriptor::<Identity, OFFSET>,
+                        SetSecurityDescriptor: SetSecurityDescriptor::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IListenerSecurity as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IListenerSecurity_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub SecurityDescriptor: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub SetSecurityDescriptor: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
                 )
                     -> windows_core::HRESULT,
             }
@@ -1330,6 +1545,7 @@ pub mod Pbk20191 {
             windows_core::imp::required_hierarchy!(
                 NamedPipeConnectionListener,
                 windows::Foundation::IClosable,
+                IListenerSecurity,
                 INamedPipeBind,
                 ITransport
             );
@@ -1398,6 +1614,30 @@ pub mod Pbk20191 {
                             &mut result__,
                         )
                         .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn SecurityDescriptor(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = &windows_core::Interface::cast::<IListenerSecurity>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).SecurityDescriptor)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn SetSecurityDescriptor(
+                    &self,
+                    value: &windows_core::HSTRING,
+                ) -> windows_core::Result<()> {
+                    let this = &windows_core::Interface::cast::<IListenerSecurity>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetSecurityDescriptor)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(value),
+                        )
+                        .ok()
                     }
                 }
                 pub fn BindAsync(
@@ -1618,6 +1858,7 @@ pub mod Pbk20191 {
             windows_core::imp::required_hierarchy!(
                 UnixConnectionListener,
                 windows::Foundation::IClosable,
+                IListenerSecurity,
                 ITransport,
                 IUnixBind
             );
@@ -1686,6 +1927,30 @@ pub mod Pbk20191 {
                             &mut result__,
                         )
                         .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn SecurityDescriptor(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = &windows_core::Interface::cast::<IListenerSecurity>(self)?;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).SecurityDescriptor)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn SetSecurityDescriptor(
+                    &self,
+                    value: &windows_core::HSTRING,
+                ) -> windows_core::Result<()> {
+                    let this = &windows_core::Interface::cast::<IListenerSecurity>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetSecurityDescriptor)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(value),
+                        )
+                        .ok()
                     }
                 }
                 pub fn Transport(&self) -> windows_core::Result<windows_core::HSTRING> {
