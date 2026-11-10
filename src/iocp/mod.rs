@@ -30,6 +30,20 @@ use windows::Win32::System::IO::{
 };
 use windows_core::{Error, HRESULT, Result};
 
+/// Refuses the key the overlapped core's own operations arrive under:
+/// a completion forged with it would be dereferenced by
+/// [`CompletionPort::dispatch`] as an operation of the crate's.
+fn not_reserved(key: usize) -> Result<()> {
+    if key == crate::common::overlapped::port_key() {
+        Err(Error::new(
+            windows::Win32::Foundation::E_INVALIDARG,
+            "this completion key is reserved for the crate's own operations",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// One completion, as a port delivers it.
 ///
 /// `overlapped` is the `OVERLAPPED` pointer as an address: for a completion
@@ -58,8 +72,16 @@ impl From<&OVERLAPPED_ENTRY> for Completion {
 }
 
 /// An I/O completion port.
+///
+/// Besides handles the caller associates, it can carry this crate's own
+/// overlapped operations (`http::HttpServer::bind_to_port`): those arrive
+/// under a key of the crate's, and the loop hands every completion to
+/// [`dispatch`](Self::dispatch), which finishes the ones that are the
+/// crate's and returns `false` for the rest.
 pub struct CompletionPort {
-    handle: OwnedHandle,
+    // Shared with the crate's registrations on this port, which must not
+    // outlive it.
+    handle: std::sync::Arc<OwnedHandle>,
 }
 
 impl CompletionPort {
@@ -68,18 +90,39 @@ impl CompletionPort {
     pub fn new(concurrency: u32) -> Result<CompletionPort> {
         let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, concurrency)? };
         Ok(CompletionPort {
-            handle: unsafe { OwnedHandle::from_raw_handle(port.0) },
+            handle: std::sync::Arc::new(unsafe { OwnedHandle::from_raw_handle(port.0) }),
         })
     }
 
-    fn raw(&self) -> HANDLE {
+    pub(crate) fn raw(&self) -> HANDLE {
         HANDLE(self.handle.as_raw_handle())
+    }
+
+    /// What a registration on this port holds to keep it open.
+    #[cfg(feature = "http")]
+    pub(crate) fn keepalive(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        self.handle.clone()
+    }
+
+    /// Finishes `completion` if it is one of this crate's own operations
+    /// queued here -- runs its completion and wakes its future -- and
+    /// returns `true`; returns `false`, touching nothing, for any other.
+    /// Every completion dequeued from a port the crate's operations use must
+    /// come through here, or those operations never finish.
+    pub fn dispatch(&self, completion: &Completion) -> bool {
+        // SAFETY: only the overlapped core associates or posts under its
+        // key -- `associate`, `post` and the wait and job registrations here
+        // refuse it -- so a completion carrying it is the core's.
+        unsafe {
+            crate::common::overlapped::dispatch(completion.key, completion.overlapped as *mut OVERLAPPED)
+        }
     }
 
     /// Associates `handle` -- opened for overlapped I/O -- so its
     /// completions arrive here with `key`. A handle can be associated with
     /// one port, for good.
     pub fn associate(&self, handle: BorrowedHandle<'_>, key: usize) -> Result<()> {
+        not_reserved(key)?;
         unsafe { CreateIoCompletionPort(HANDLE(handle.as_raw_handle()), Some(self.raw()), key, 0)? };
         Ok(())
     }
@@ -87,6 +130,7 @@ impl CompletionPort {
     /// Queues `completion` as if an operation had finished. Its `status` is
     /// not carried: a posted completion always reads as 0.
     pub fn post(&self, completion: Completion) -> Result<()> {
+        not_reserved(completion.key)?;
         unsafe {
             PostQueuedCompletionStatus(
                 self.raw(),
@@ -253,6 +297,7 @@ impl WaitPacket {
         target: BorrowedHandle<'_>,
         completion: Completion,
     ) -> Result<bool> {
+        not_reserved(completion.key)?;
         let api = nt()?;
         let mut already = 0u8;
         let status = unsafe {
@@ -323,6 +368,7 @@ impl Job {
     /// Sends this job's messages to `port`, tagged with `key`. A job reports
     /// to one port, and the association cannot be moved.
     pub fn notify(&self, port: &CompletionPort, key: usize) -> Result<()> {
+        not_reserved(key)?;
         use windows::Win32::System::JobObjects::{
             JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JobObjectAssociateCompletionPortInformation,
             SetInformationJobObject,

@@ -29,7 +29,7 @@ use windows::Win32::System::Threading::{
     CancelThreadpoolIo, CloseThreadpoolIo, CreateThreadpoolIo, StartThreadpoolIo,
     PTP_CALLBACK_INSTANCE, PTP_IO, TP_CALLBACK_ENVIRON_V3,
 };
-use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::IO::{CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, OVERLAPPED};
 
 /// Number of live op blocks -- leak tests assert this settles back to 0, and
 /// `comio::unload::can_unload` refuses to unload the module while it is
@@ -65,7 +65,10 @@ pub static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 /// A handle registered with a pool's TP_IO; owns the kernel handle + TP_IO.
 pub struct IoReg {
     pub handle: HANDLE,
-    io: PTP_IO,
+    /// `None` for a handle associated with a caller's completion port
+    /// ([`register_on_port`](Self::register_on_port)): nothing to arm, and
+    /// completions arrive through [`dispatch`].
+    io: Option<PTP_IO>,
     is_socket: bool,
     /// Set once [`set_skip_completion_on_success`](Self::set_skip_completion_on_success)
     /// succeeds; read by issue closures to decide whether a synchronous success
@@ -92,10 +95,32 @@ impl IoReg {
         let io = unsafe { CreateThreadpoolIo(handle, Some(io_complete), None, env)? };
         Ok(Arc::new(Self {
             handle,
-            io,
+            io: Some(io),
             is_socket,
             skip_on_success: AtomicBool::new(false),
             _keepalive: keepalive,
+        }))
+    }
+
+    /// Associates `handle` with the completion port `port` instead of a
+    /// pool: its completions are queued there under [`port_key`], and
+    /// whoever drains the port hands them to [`dispatch`]. `keepalive` must
+    /// keep the port open for the registration's life -- a port closed under
+    /// a pending operation loses its completion, and the operation with it.
+    /// Takes ownership of `handle` on success.
+    pub fn register_on_port(
+        handle: HANDLE,
+        is_socket: bool,
+        port: HANDLE,
+        keepalive: Arc<dyn Any + Send + Sync>,
+    ) -> windows_core::Result<Arc<Self>> {
+        unsafe { CreateIoCompletionPort(handle, Some(port), port_key(), 0)? };
+        Ok(Arc::new(Self {
+            handle,
+            io: None,
+            is_socket,
+            skip_on_success: AtomicBool::new(false),
+            _keepalive: Some(keepalive),
         }))
     }
 
@@ -145,7 +170,9 @@ impl Drop for IoReg {
         // may run at the tail of the last completion callback, so
         // WaitForThreadpoolIoCallbacks is NOT used (it would self-deadlock).
         unsafe {
-            CloseThreadpoolIo(self.io);
+            if let Some(io) = self.io {
+                CloseThreadpoolIo(io);
+            }
             if self.is_socket {
                 closesocket(self.socket());
             } else {
@@ -242,6 +269,16 @@ unsafe extern "system" fn io_complete(
     bytes: usize,
     _io: PTP_IO,
 ) {
+    unsafe { complete(overlapped, ioresult, bytes) }
+}
+
+/// Finishes the op whose block starts at `overlapped`: runs its callback and
+/// drops the kernel's reference.
+///
+/// # Safety
+/// `overlapped` is an op block's `OVERLAPPED` whose completion was delivered
+/// and not finished before.
+unsafe fn complete(overlapped: *mut c_void, ioresult: u32, bytes: usize) {
     let header = unsafe { &(*(overlapped as *mut Op<()>)).header };
     let cb = {
         let mut s = header.shared.lock().unwrap();
@@ -252,6 +289,44 @@ unsafe extern "system" fn io_complete(
         let _ = catch_unwind(AssertUnwindSafe(move || cb(Completion::Done(ioresult, bytes))));
     }
     unsafe { release_ref(overlapped) };
+}
+
+/// The completion key every handle of [`IoReg::register_on_port`] is
+/// associated under: the address of a private static, so no other code has
+/// a reason to hold it. Code that associates or posts under arbitrary keys
+/// (the `iocp` module) refuses this one, which is what lets [`dispatch`]
+/// trust a completion that carries it.
+pub fn port_key() -> usize {
+    static ANCHOR: u8 = 0;
+    &ANCHOR as *const u8 as usize
+}
+
+/// Finishes an operation of a port-associated handle from the completion
+/// its port delivered: `key` and `overlapped` as dequeued. Returns `false`,
+/// touching nothing, when the key is not [`port_key`] -- the completion is
+/// someone else's.
+///
+/// # Safety
+/// A completion carrying [`port_key`] must be one the port delivered for a
+/// handle registered through [`IoReg::register_on_port`], dispatched once.
+/// What the `iocp` module lets safe code put on a port cannot carry the key.
+pub unsafe fn dispatch(key: usize, overlapped: *mut OVERLAPPED) -> bool {
+    if key != port_key() || overlapped.is_null() {
+        return false;
+    }
+    // The port reports an NTSTATUS; the Win32 code the callbacks expect is
+    // what `GetOverlappedResult` makes of it.
+    // The byte count is read straight from the block: on a warning such as
+    // `ERROR_MORE_DATA` it is still the count the operation reported.
+    let header = unsafe { &(*(overlapped as *mut Op<()>)).header };
+    let bytes = unsafe { (*overlapped).InternalHigh };
+    let mut ignored = 0u32;
+    let ioresult = match unsafe { GetOverlappedResult(header.reg.handle, overlapped, &mut ignored, false) } {
+        Ok(()) => 0,
+        Err(e) => windows::Win32::Foundation::WIN32_ERROR::from_error(&e).map_or(e.code().0 as u32, |w| w.0),
+    };
+    unsafe { complete(overlapped.cast(), ioresult, bytes) };
+    true
 }
 
 /// Opaque handle to an in-flight op (for cancellation + payload retrieval).
@@ -326,7 +401,9 @@ pub unsafe fn submit<P>(
     #[cfg(any(test, feature = "counters"))]
     LIVE_OPS.fetch_add(1, Ordering::Relaxed);
 
-    unsafe { StartThreadpoolIo(reg.io) };
+    if let Some(io) = reg.io {
+        unsafe { StartThreadpoolIo(io) };
+    }
     let outcome = unsafe {
         let p = (*(*op).payload.get()).as_mut().unwrap();
         issue(&raw mut (*op).overlapped, p)
@@ -356,7 +433,9 @@ pub unsafe fn submit<P>(
     };
     if let Some(completion) = inline {
         unsafe {
-            CancelThreadpoolIo(reg.io);
+            if let Some(io) = reg.io {
+                CancelThreadpoolIo(io);
+            }
             let cb = {
                 let mut s = (*op).header.shared.lock().unwrap();
                 s.fired = true;

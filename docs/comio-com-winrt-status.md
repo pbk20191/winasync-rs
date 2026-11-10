@@ -1015,6 +1015,34 @@ tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
 - **빈 본문**: 길이 0인 데이터 청크를 붙이면 `E_INVALIDARG`다(204 응답에서 확인). 빈 본문이면 청크를 붙이지 않고,
   1xx/204/304에는 `Content-Length`를 자동으로 넣지 않는다.
 
+### tp에서 분리, 나머지 기능 (2026-11-11)
+
+- **`http`는 이제 독립 피처다**(`tp`에 의존하지 않는다). 모듈도 `tp::io::http`에서 `crate::http`로 옮겼다.
+  완료를 어디서 처리할지는 바인드할 때 고른다(핸들은 완료 포트 하나에만 묶이므로 나중에 못 바꾼다).
+  - `HttpServer::bind(urls)`: 프로세스 기본 스레드풀(환경 `NULL`의 TP_IO). 아무 executor에서나 await할 수 있다.
+  - `bind_on(rt, urls)`(`tp`): tp 런타임의 풀. 서버가 런타임을 붙잡는다.
+  - `bind_to_port(port, urls)`(`iocp`): 호출자가 비우는 `CompletionPort`. 꺼낸 완료는 모두
+    `CompletionPort::dispatch`에 넘겨야 한다.
+- **사용자 IOCP 경로**는 `common::overlapped`에 넣었다. `IoReg::register_on_port`가 핸들을 crate 전용 키
+  (`port_key()`, private static의 주소)로 포트에 연결하고, `overlapped::dispatch`가 그 키의 완료를 op 블록으로 끝낸다
+  (상태는 `GetOverlappedResult`로 Win32 코드로, 바이트 수는 `InternalHigh`에서 읽는다 — `ERROR_MORE_DATA`일
+  때도 크기가 남는다). `iocp`의 `associate`/`post`/`WaitPacket::associate*`/`Job::notify`는 이 키를 거부한다.
+  안전한 코드로 이 키를 단 가짜 완료를 만들 수 없게 해서 `dispatch`를 safe로 둘 수 있다. http 외의 overlapped
+  객체도 같은 경로로 붙일 수 있다.
+- tp의 op Future 계층(`OpFuture`, `MessageOp`)은 `common::opfuture`로 옮겨 http와 같이 쓴다.
+- **HttpInitialize 대칭**: `ApiInit` 가드가 `HttpInitialize` 한 번과 `HttpTerminate` 한 번을 짝짓는다. API가
+  호출 횟수를 세므로 서버마다 하나씩 들고, 세션·URL 그룹을 닫은 뒤에 해제된다.
+- 추가한 것: `shutdown`(`HttpShutdownRequestQueue`, 대기 중 accept는 `ERROR_OPERATION_ABORTED`로 끝남, 측정),
+  `add_url`/`remove_url`(제거된 접두사는 http.sys가 404로 답함, 측정), `set_enabled`(비활성이면 503, 측정),
+  `set_timeouts`, `set_queue_length`, `set_503_verbosity`, `HttpRequest::wait_for_disconnect`
+  (`HttpWaitForDisconnect`), `respond_file`/`send_file`(파일 핸들 청크, 커널이 직접 읽음).
+- **타임아웃(측정)**: 서버 세션에 건다. 요청을 한 번이라도 보낸 연결에만 적용된다 — 아무것도 안 보낸 연결은 아직
+  어느 서버에도 속하지 않아 기계 전체 기본값을 따른다. 판정이 거칠다: 유휴 1초로 걸었더니 5초 뒤에 끊겼다.
+- 응답 계열 Future가 `!Send`였던 것을 고쳤다(레코드의 raw 포인터 때문). 모든 핸들러 Future가 `Send`인지
+  컴파일로 확인하는 테스트를 넣었다.
+- 아직 없는 것: HTTPS(인증서 바인딩은 `HttpSetServiceConfiguration`, 관리자 필요), Windows 인증
+  (`HttpServerAuthenticationProperty`), 이름 있는 요청 큐(프로세스 간 공유), 응답 캐시.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

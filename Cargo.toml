@@ -204,6 +204,9 @@ ioring = [
 # to a port like an I/O completion. Standalone.
 iocp = [
     "windows/Win32_Foundation",
+    # The overlapped core, whose port-associated handles `dispatch` finishes.
+    "windows/Win32_Networking_WinSock",
+    "windows/Win32_Storage_FileSystem",
     # `CreateJobObjectW` takes security attributes.
     "windows/Win32_Security",
     "windows/Win32_System_IO",
@@ -213,8 +216,22 @@ iocp = [
 ]
 
 # An HTTP server on http.sys, the kernel's HTTP stack: overlapped request,
-# body and response calls on a request queue registered with tp's pool.
-http = ["tp", "windows/Win32_Networking_HttpServer"]
+# body and response calls on a request queue. Standalone -- completions run
+# on the process default pool -- and with `tp` on a runtime's pool, with
+# `iocp` on a caller's completion port.
+http = [
+    "windows/Win32_Foundation",
+    "windows/Win32_Networking_HttpServer",
+    "windows/Win32_Networking_WinSock",
+    # Request queues and events take security attributes.
+    "windows/Win32_Security",
+    "windows/Win32_Storage_FileSystem",
+    "windows/Win32_System_IO",
+    # The owned buffers' page-aligned allocations.
+    "windows/Win32_System_Memory",
+    "windows/Win32_System_SystemInformation",
+    "windows/Win32_System_Threading",
+]
 
 # DispatcherQueue (WinUI 3) runtime.
 dq = [

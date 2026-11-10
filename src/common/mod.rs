@@ -5,24 +5,27 @@
 pub mod oneshot;
 
 // Overlapped IO + its calling-thread driver are only needed by the overlapped
-// runtimes (tp / comio), not by the DispatcherQueue runtime (dq).
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring"))]
+// runtimes (tp / comio / http), not by the DispatcherQueue runtime (dq).
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring", feature = "iocp", feature = "http"))]
 pub mod block_on;
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring", feature = "iocp", feature = "http"))]
 pub mod check;
 // AF_HYPERV addressing: pure declarations, shared by both overlapped runtimes'
 // Hyper-V socket transports.
 #[cfg(any(feature = "tp", feature = "comio"))]
 pub mod hvaddr;
-#[cfg(any(feature = "tp", feature = "comio"))]
+// `iocp` for dispatching what the core queues on a caller's port.
+#[cfg(any(feature = "tp", feature = "comio", feature = "iocp", feature = "http"))]
 pub mod overlapped;
+#[cfg(any(feature = "tp", feature = "http"))]
+pub mod opfuture;
 // Winsock error mapping + the overlapped-issue classifier, shared by every
 // socket transport in both overlapped runtimes.
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "http"))]
 pub mod winsock;
 // Owned buffers for completion-based IO, plus a slab pool. Not for `comio`,
 // whose streams speak WinRT `IBuffer` instead.
-#[cfg(any(feature = "tp", feature = "rio", feature = "ioring"))]
+#[cfg(any(feature = "tp", feature = "rio", feature = "ioring", feature = "http"))]
 pub mod buffer;
 // The thread-pool callback-context convention.
 #[cfg(any(feature = "tp", feature = "rio", feature = "ioring"))]
@@ -34,15 +37,15 @@ pub mod security;
 #[cfg(any(feature = "tp", feature = "comio"))]
 pub mod pipe;
 // SOCKADDR conversions: neutral, used by every socket engine.
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "http"))]
 pub mod sockaddr;
 
 // Short paths for the two most-used items. Same note as elsewhere: unused
 // *here* only because this is a bin crate with no external consumer.
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring", feature = "iocp", feature = "http"))]
 #[allow(unused_imports)]
 pub use block_on::block_on;
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring", feature = "iocp", feature = "http"))]
 #[allow(unused_imports)]
 pub use check::check;
 
