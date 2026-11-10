@@ -56,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        features: [comio, tp, rio, "tp,rio", dq]
+        features: [comio, tp, rio, "tp,rio", ioring, "tp,ioring", dq]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

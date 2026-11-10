@@ -7,6 +7,7 @@
 //! | `dq` | a single-threaded runtime whose executor is a WinRT `DispatcherQueue` |
 //! | `comio` | WinRT-shaped COM streams over overlapped IO, for transports WinRT itself does not expose |
 //! | `rio` | Registered I/O: registered buffers plus a drained completion queue (experimental) |
+//! | `ioring` | I/O rings: batched file reads, writes and flushes through a submission and a completion queue |
 //!
 //! They share [`common`]: the overlapped core, Winsock plumbing, `SOCKADDR`
 //! conversions, AF_HYPERV addressing, owned IO buffers, and the thread-pool
@@ -28,6 +29,8 @@ pub mod common;
 pub mod comio;
 #[cfg(feature = "dq")]
 pub mod dq;
+#[cfg(feature = "ioring")]
+pub mod ioring;
 #[cfg(feature = "rio")]
 pub mod rio;
 #[cfg(feature = "tp")]

@@ -181,6 +181,18 @@ counters = []
 # the DLL": the separate package says that structurally.
 dylib = ["comio", "counters"]
 
+# I/O rings (`ioringapi.h`): batched file I/O through a submission and a
+# completion queue shared with the kernel. Standalone -- its pump runs on the
+# process default pool -- and with `tp` also on a runtime's pool.
+ioring = [
+    "windows/Win32_Foundation",
+    "windows/Win32_Security",
+    "windows/Win32_Storage_FileSystem",
+    "windows/Win32_System_Threading",
+    "windows/Win32_System_Memory",
+    "windows/Win32_System_SystemInformation",
+]
+
 # DispatcherQueue (WinUI 3) runtime.
 dq = [
     "dep:winio-winui3",

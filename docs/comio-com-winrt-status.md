@@ -892,6 +892,36 @@ I/O라면 사용자 버퍼로의 복사가, 풀 스레드가 패킷을 꺼낼 �
 Windows의 `SO_REUSEADDR`는 나중 소켓이 이미 listen 중인 포트를 가져가게 하기 때문이다. 멀티캐스트 수신처럼
 UDP에서만 의미가 있다. comio는 같은 `NamedPipeOptions`를 `comio::NamedPipeOptions`로도 내보낸다.
 
+## I/O Ring 엔진: `ioring` (2026-11-10)
+
+새 피처 `ioring`, 모듈 `winasync::ioring`이다. `rio`처럼 독립 엔진이다. `ioringapi.h`의 링은 커널과
+공유하는 제출 큐와 완료 큐다. 연산을 시스템 콜 없이 제출 큐에 쌓고, `SubmitIoRing` 한 번으로 넘기고,
+결과를 완료 큐에서 꺼낸다. 다루는 것은 파일뿐이다(소켓·파이프 연산은 OS에 없다). 연산은 read, write,
+flush다.
+
+**측정(26320)**: `QueryIoRingCapabilities`가 버전 400을 돌려줬고, 사용자 모드 에뮬레이션이 아닌 커널
+구현이었다. read, write, flush, cancel, 파일·버퍼 등록을 모두 지원한다. 큐는 제출 최대 65536, 완료 최대
+131072다. 생성은 `IORING_VERSION_3`(write·flush가 들어온 버전)으로 한다.
+
+- **배치**: 연산은 future를 만들 때 제출 큐에 쌓이고, 처음 poll되거나 `IoRing::submit()`이 불릴 때 한 번에
+  제출된다. 테스트는 16개를 만든 뒤 `submit()`이 16을 돌려주는지 확인한다.
+- **완료 펌프**: `SetIoRingCompletionEvent`(자동 리셋 이벤트) + `TP_WAIT`. 기본은 프로세스 기본 풀이고,
+  `tp`가 켜져 있으면 `IoRing::with_runtime`으로 런타임 풀을 쓴다. 컨텍스트는 `rio`처럼 `CtxHeader`로
+  시작한다. `IoRing::manual`은 펌프 없이 `drive()`로 구동한다.
+- **버퍼**: safe 연산은 `IoBuf`/`IoBufMut + 'static`(`Vec`의 남는 용량, `Slice`, `RawBuf`, `bytes` 포함)을
+  받는다. 버퍼는 링 슬롯에 들어가 결과와 함께 돌아온다. 그래서 future를 drop하면 취소 요청만 내고, 버퍼는
+  CQE가 올 때까지 슬롯에 남는다. `unsafe read_unchecked`/`write_unchecked`는 빌린 버퍼를 받는다. drop하면
+  취소한 뒤 **drop하는 스레드가 직접** 완료를 꺼내 자기 CQE가 올 때까지 기다린다. 풀 스레드가 필요 없어서
+  tp `*_unchecked`에서 겪은 교착 문제가 처음부터 생기지 않는다.
+- **용량**: 완료 큐는 제출 큐의 두 배다. 진행 중 연산(취소 요청 포함)이 그 크기를 넘지 않게 하고, 한계에서
+  만든 연산은 자리가 날 때까지 빌드를 미룬다. 제출 큐가 차면(`IORING_E_SUBMISSION_QUEUE_FULL`) 제출하고 다시
+  빌드한다.
+- **해체**: 마지막 소유자가 놓으면 남은(버려진) 연산의 CQE를 최대 5초 기다린 뒤 링을 닫는다. 그래도 남은
+  것은 버퍼를 해제하지 않고 누수시킨다. 커널이 아직 쓸 수 있는 메모리를 풀어 주는 것보다 낫다. 펌프 콜백
+  안에서 마지막 소유자가 놓으면 대기를 다른 스레드로 넘긴다(`rio`와 같다).
+
+등록 파일·등록 버퍼(`IORING_REF_REGISTERED`)와 `tp::File` 대비 벤치마크는 보류했다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

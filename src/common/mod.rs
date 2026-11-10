@@ -6,9 +6,9 @@ pub mod oneshot;
 
 // Overlapped IO + its calling-thread driver are only needed by the overlapped
 // runtimes (tp / comio), not by the DispatcherQueue runtime (dq).
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring"))]
 pub mod block_on;
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring"))]
 pub mod check;
 // AF_HYPERV addressing: pure declarations, shared by both overlapped runtimes'
 // Hyper-V socket transports.
@@ -22,10 +22,10 @@ pub mod overlapped;
 pub mod winsock;
 // Owned buffers for completion-based IO, plus a slab pool. Not for `comio`,
 // whose streams speak WinRT `IBuffer` instead.
-#[cfg(any(feature = "tp", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "rio", feature = "ioring"))]
 pub mod buffer;
 // The thread-pool callback-context convention.
-#[cfg(any(feature = "tp", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "rio", feature = "ioring"))]
 pub mod tpctx;
 // Access control and peer identity for the local transports (named pipes,
 // AF_UNIX), and the named-pipe instance policy built on it.
@@ -39,10 +39,10 @@ pub mod sockaddr;
 
 // Short paths for the two most-used items. Same note as elsewhere: unused
 // *here* only because this is a bin crate with no external consumer.
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring"))]
 #[allow(unused_imports)]
 pub use block_on::block_on;
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "ioring"))]
 #[allow(unused_imports)]
 pub use check::check;
 
