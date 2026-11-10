@@ -307,11 +307,13 @@ impl<B: IoBufMut> VectoredPayload<B> {
     }
 }
 
+mod resolve;
 mod tcp;
 mod udp;
 #[cfg(test)]
 mod tests;
 
+pub use resolve::resolve;
 pub use tcp::{ReusableSocket, TcpListener, TcpStream, TransmitPackets};
 // Consumed by tests and by callers of this crate, not by the binary itself.
 #[allow(unused_imports)]

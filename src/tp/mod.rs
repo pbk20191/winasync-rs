@@ -55,7 +55,7 @@ pub use io::async_rw::{
 pub use io::file::{File, PageBuffers};
 #[allow(unused_imports)]
 pub use io::net::{
-    parse_ip_pktinfo, ReceivedMsg, ReusableSocket, SocketOptions, TcpListener, TcpStream,
+    parse_ip_pktinfo, resolve, ReceivedMsg, ReusableSocket, SocketOptions, TcpListener, TcpStream,
     TransmitFlags, TransmitPackets, UdpSocket,
 };
 #[allow(unused_imports)]

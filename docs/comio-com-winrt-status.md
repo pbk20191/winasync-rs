@@ -922,6 +922,30 @@ flush다.
 
 등록 파일·등록 버퍼(`IORING_REF_REGISTERED`)와 `tp::File` 대비 벤치마크는 보류했다.
 
+## 링 핸들, 디렉터리 감시, 파일 잠금, 비동기 DNS (2026-11-10)
+
+**I/O Ring의 핸들.** 연산이 `RingHandle`(unsafe trait, `AsHandle`과 같은 계약)을 받는다. 구현은
+`ioring::File`, `Arc<T: AsHandle>`(`Arc<std::fs::File>` 등)이고, `*_unchecked`는 빌린 핸들
+(`&std::fs::File`, `BorrowedHandle`)도 받는다. 측정해 보니 링은 overlapped 핸들과 동기 핸들 모두에서 동작했다.
+**완료 포트에 묶인 핸들은 `E_INVALIDARG`로 즉시 완료**됐고 포트로 패킷이 가지 않았다. 그래서 `tp::File`을
+넘기면 잘못 전달되지 않고 깔끔하게 거부된다.
+
+**`tp::DirectoryWatcher`** (`ReadDirectoryChangesW`). `read(buf)` 결과를 `iter_changes`로 파싱한다. 버퍼가
+넘치면 0바이트로 보고하며, 다시 훑으라는 뜻이다. 빈 성공과 `ERROR_NOTIFY_ENUM_DIR` 둘 다 0으로 바꾼다.
+버퍼는 4바이트 정렬이어야 하고, 아니면 `E_INVALIDARG`다. 커널 쪽 버퍼 크기는 첫 read의 크기로 정해진다.
+
+**`tp::File::lock` / `try_lock`** (`LockFileEx`). 반환하는 `FileLock`은 drop하면 해제된다. 요청 상태를 future와
+완료 콜백이 공유한다. 그래서 승인되는 순간 future가 사라져도 마지막 소유자가 해제한다. 테스트는 이런 "주인
+없는 승인"이 풀리는지 확인한다. 해제(`UnlockFileEx`)는 `hEvent|1` 이벤트로 동기 처리해서 포트에 패킷이 가지
+않는다. **측정된 예외**: `LOCKFILE_FAIL_IMMEDIATELY`가 `ERROR_LOCK_VIOLATION`으로 동기 실패해도 그
+`OVERLAPPED`의 실패 패킷이 포트에 들어온다. 일반 동기 실패로 처리하면 op 블록을 해제한 뒤 그 패킷이 도착해서
+접근 위반이 났다(테스트에서 실제로 났다). 그래서 pending으로 분류한다.
+
+**`tp::resolve(rt, host, port)`** (`GetAddrInfoExW` + `OVERLAPPED`). 완료 루틴 없이 `OVERLAPPED`의 이벤트로
+완료를 받고, 그 이벤트를 `tp::wait`로 기다린다. drop하면 `GetAddrInfoExCancel` 후 이벤트를 직접 기다린다. 풀
+스레드는 필요 없다. 위에 `TcpStream::connect_host(rt, host, port, &SocketOptions)`를 얹었다. 주소를 차례로
+시도하고, 모두 실패하면 마지막 오류를 돌려준다. 없는 이름은 `WSAHOST_NOT_FOUND`(11001)다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |
