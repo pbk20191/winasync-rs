@@ -261,7 +261,6 @@ dependencies = [
  "windows-core",
  "windows-future",
  "windows-link 0.2.1",
- "windows-threading 0.2.1",
  "winio-winui3",
 ]
 

@@ -1,22 +1,18 @@
 //! Demo binary for the engines in this crate's library.
 
-// Only the three-engine demo tail below consumes it.
+// Only the three-engine demo below consumes these.
 #[cfg(all(feature = "tp", feature = "comio", feature = "dq"))]
 use winasync::comio;
-#[cfg(feature = "dq")]
+#[cfg(all(feature = "tp", feature = "comio", feature = "dq"))]
 use winasync::dq;
 #[cfg(feature = "tp")]
 use winasync::tp;
 
 // All of these feed the `dq`-only WinUI demo tail in `main`.
 #[cfg(feature = "dq")]
-use windows::System::Threading::{ThreadPool, WorkItemHandler};
-#[cfg(feature = "dq")]
-use windows_threading::Pool;
-#[cfg(feature = "dq")]
 use winui3::bootstrap::{PackageDependency, WindowsAppSDKVersion};
 #[cfg(feature = "dq")]
-use winui3::Microsoft::UI::Dispatching::{DispatcherQueue, DispatcherQueueHandler};
+use winui3::Microsoft::UI::Dispatching::{DispatcherQueue, DispatcherQueueController, DispatcherQueueHandler};
 
 /// Demo of the TP_* based async runtime in `src/tp/`.
 #[cfg(feature = "tp")]
@@ -187,52 +183,14 @@ fn main() {
 
     #[cfg(feature = "dq")]
     {
-  //  initialize().unwrap();
-    //
-    // IAsyncAction
-
-    // windows::System::Threading::Core::PreallocatedWorkItem
-    // let tp = windows::System::Threading::ThreadPool;
-    // tp.RunAsync(handler);
-    let mut controller = winui3::Microsoft::UI::Dispatching::DispatcherQueueController::CreateOnCurrentThread().unwrap();
+    // A queue controller can be shut down and a second one created on the
+    // same thread; each runs its own event loop to completion.
+    let mut controller = DispatcherQueueController::CreateOnCurrentThread().unwrap();
     let mut dispatch_queue = controller.DispatcherQueue().unwrap();
     dispatch_queue.EnsureSystemDispatcherQueue().unwrap();
-    // ICoreWindowInterop
-    // winui3::Microsoft::UI::Xaml::FrameworkElement
-
-    // CoreW
-    // let t = IAsyncAction::
-    {
-        let server = windows::Networking::Sockets::StreamSocketListener::new().unwrap();
-        server.Information().unwrap();
-        let queue = DispatcherQueue::GetForCurrentThread().unwrap();
-        queue.TryEnqueue(&DispatcherQueueHandler::new(move || {
-            // server.
-            Ok(())
-        })).unwrap();
-        windows::Web::Http::HttpClient::new().unwrap().Close().unwrap();
-        // server.TransferOwnership()
-        
-        // server.BindServiceNameWithProtectionLevelAndAdapterAsync()
-        server.Close().unwrap();
-    }
-    // API-existence scratch (kept as notes, like the line below):
-    // windows::Networking::Sockets::DatagramSocket::new;
-   // windows::Storage::FileIO::AppendLinesAsync;
-// windows::Networking::Sockets::StreamSocketListener::new;
-    ThreadPool::RunAsync(&WorkItemHandler::new(move |_x| {
-
-        Ok(())
-    })).unwrap();
-    Pool::new().scope(|_pool| {
-   //   pool.0;
-
-          
-    });
- //   winui3::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread().unwrap();
     dispatch_queue.TryEnqueue(&DispatcherQueueHandler::new(move || {
         println!("Hello, world!");
-        let dispatch_queue = winui3::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread().unwrap();
+        let dispatch_queue = DispatcherQueue::GetForCurrentThread().unwrap();
         dispatch_queue.EnqueueEventLoopExit().unwrap();
 
         Ok(())
@@ -241,14 +199,14 @@ fn main() {
     controller.ShutdownQueue().unwrap();
     drop(controller);
     drop(dispatch_queue);
-    controller = winui3::Microsoft::UI::Dispatching::DispatcherQueueController::CreateOnCurrentThread().unwrap();
+    controller = DispatcherQueueController::CreateOnCurrentThread().unwrap();
 
     dispatch_queue = controller.DispatcherQueue().unwrap();
     println!("new controller created");
     dispatch_queue.EnsureSystemDispatcherQueue().unwrap();
     dispatch_queue.TryEnqueue(&DispatcherQueueHandler::new(move || {
         println!("Hello, world! next");
-        let dispatch_queue = winui3::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread().unwrap();
+        let dispatch_queue = DispatcherQueue::GetForCurrentThread().unwrap();
         dispatch_queue.EnqueueEventLoopExit().unwrap();
         Ok(())
     })).unwrap();

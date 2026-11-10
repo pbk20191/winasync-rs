@@ -29,7 +29,7 @@ members = ["dll", "tools/winmdgen"]
 # convention into a fact about the build.
 
 # Renamed off the package name because the cdylib now claims
-# `winasydylib-featuredylib-featurenc.pdb`, which a bin of the same name would also emit —
+# `winasync.pdb`, which a bin of the same name would also emit —
 # cargo warns on the collision and says it may become a hard error. There is
 # still only one bin, so `cargo run` is unaffected.
 [[bin]]
@@ -51,6 +51,10 @@ features = []
 
 # Test-only Windows APIs, scoped here so the library never carries them.
 #
+# Registry and LibraryLoader are for the comio tests, which load the real DLL
+# and write the CLSID keys an installer would. They used to sit on `comio`
+# itself, which made every consumer of the rlib compile them for nothing.
+#
 # `tests/activation.rs` loads the reg-free manifest with `CreateActCtxW` /
 # `ActivateActCtx`, the run-time form a host like `python.exe` needs. The
 # library itself never calls them -- the manifest is something a *consumer*
@@ -60,19 +64,27 @@ features = []
 [dev-dependencies.windows]
 version = "0.62.2"
 default-features = false
-features = ["Win32_System_ApplicationInstallationAndServicing"]
+features = [
+    "Win32_System_ApplicationInstallationAndServicing",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+]
+
+# `dq`'s tests await an `IAsyncOperation` to prove a wake from a pool thread
+# resumes on the queue thread; the library itself never needs the crate.
+[dev-dependencies.windows-future]
+version = "0.3.2"
 
 [dependencies.windows-future]
 version = "0.3.2"
 optional = true
 
+# `UI_Dispatching` is the only part of WinUI that `dq` touches: the queue, its
+# controller and its timer. `UI_Xaml` and `UI_Composition` would each drag in
+# dozens of `windows` namespaces for nothing.
 [dependencies.winio-winui3]
 version = "0.4.0"
-features = ["UI_Dispatching", "UI_Composition", "UI_Xaml"]
-optional = true
-
-[dependencies.windows-threading]
-version = "0.2.1"
+features = ["UI_Dispatching"]
 optional = true
 
 [dependencies.futures-io]
@@ -113,11 +125,8 @@ comio = [
     "windows/Win32_System_WinRT",
     "windows/Win32_Security",
     # The activation path: class factories and the entry points COM finds
-    # them through. Registry and LibraryLoader are for the tests, which load
-    # the real DLL and write the CLSID keys an installer would.
+    # them through.
     "windows/Win32_System_Com",
-    "windows/Win32_System_Registry",
-    "windows/Win32_System_LibraryLoader",
 ]
 
 # Diagnostic counters: live op blocks, inline completions, pump releases.
@@ -154,24 +163,7 @@ dylib = ["comio", "counters"]
 # DispatcherQueue (WinUI 3) runtime; also carries the main.rs WinUI demo tail.
 dq = [
     "dep:winio-winui3",
-    "dep:windows-threading",
-    "dep:windows-future",
     "windows/Foundation",
-    "windows/System",
-    "windows/System_Threading",
-    "windows/System_Threading_Core",
-    "windows/Networking_Sockets",
-    "windows/Storage_Streams",
-    "windows/Security_Credentials",
-    "windows/Security_Cryptography_Certificates",
-    "windows/ApplicationModel_Background",
-    "windows/Networking_Connectivity",
-    "windows/Web_Http",
-    "windows/Web_UI_Interop",
-    "windows/Web_UI",
-    "windows/Win32_Foundation",
-    "windows/Win32_System_WinRT",
-    "windows/Win32_System_ApplicationInstallationAndServicing",
 ]
 
 # Registered I/O (RIO) sub-engine: a separate completion engine beside the
