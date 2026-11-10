@@ -99,6 +99,11 @@ optional = true
 version = "0.3"
 optional = true
 
+# `Bytes` / `BytesMut` as owned IO buffers (`common::buffer`).
+[dependencies.bytes]
+version = "1"
+optional = true
+
 [features]
 default = ["tp", "dq", "comio"]
 
@@ -199,3 +204,8 @@ rio = [
 
 # tp's optional futures-io interop (AsyncRead/AsyncWrite <-> futures_io).
 futures-io = ["tp", "dep:futures-io"]
+
+# `bytes::Bytes` and `BytesMut` as IO buffers, beside `Vec<u8>`. Off by
+# default: the buffer traits are open to any owned memory, and this is only
+# the most common crate that has some.
+bytes = ["dep:bytes"]

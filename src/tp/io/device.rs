@@ -13,6 +13,7 @@
 //! bytes the driver wrote into the output buffer.
 
 use super::{submit, IoRes, Issue, OpFuture};
+use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::Runtime;
 use std::sync::Arc;
 use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE};
@@ -25,9 +26,9 @@ use windows::Win32::System::IO::DeviceIoControl;
 /// Input and output buffers of an in-flight ioctl. Both live in the op block
 /// for its whole duration — the driver may write into `output` at any point
 /// before completion.
-struct IoctlPayload {
-    input: Vec<u8>,
-    output: Vec<u8>,
+struct IoctlPayload<I, O> {
+    input: I,
+    output: O,
 }
 
 /// A handle opened for overlapped `DeviceIoControl`.
@@ -83,40 +84,36 @@ impl Device {
     /// Resolves to the number of bytes the driver wrote into `output`, plus
     /// both buffers handed back (the input one too — a control code may be
     /// re-issued with the same request, and the allocation is worth keeping).
-    /// Pass an empty `Vec` for a direction the code does not use.
+    /// Any owned buffer will do; pass an empty `Vec` for a direction the code
+    /// does not use. `output` may be `Vec::with_capacity(n)`: the driver
+    /// fills its spare capacity and its length is set to cover what it wrote.
     ///
     /// A driver that needs a bigger output buffer reports
     /// `ERROR_MORE_DATA` / `ERROR_INSUFFICIENT_BUFFER`; retry with a larger
     /// one.
-    pub fn ioctl(
+    pub fn ioctl<I: IoBuf, O: IoBufMut>(
         &self,
         code: u32,
-        input: Vec<u8>,
-        output: Vec<u8>,
-    ) -> impl Future<Output = (windows_core::Result<usize>, Vec<u8>, Vec<u8>)> + Send + use<> {
+        input: I,
+        output: O,
+    ) -> impl Future<Output = (windows_core::Result<usize>, I, O)> + Send + use<I, O> {
         let handle = self.res.handle;
-        let fut: OpFuture<IoctlPayload> = unsafe {
+        let fut: OpFuture<IoctlPayload<I, O>> = unsafe {
             submit(&self.res, IoctlPayload { input, output }, move |ovl, p| {
                 // Empty buffers must be passed as NULL, not as a dangling
                 // one-past-the-end pointer: some drivers validate the pointer
                 // even for a zero length.
-                let in_ptr = if p.input.is_empty() {
-                    None
-                } else {
-                    Some(p.input.as_ptr() as *const core::ffi::c_void)
-                };
-                let out_ptr = if p.output.is_empty() {
-                    None
-                } else {
-                    Some(p.output.as_mut_ptr() as *mut core::ffi::c_void)
-                };
+                let in_len = IoBuf::len(&p.input);
+                let out_len = IoBuf::bytes_total(&p.output);
+                let in_ptr = (in_len != 0).then(|| p.input.stable_ptr().cast());
+                let out_ptr = (out_len != 0).then(|| p.output.stable_mut_ptr().cast());
                 match DeviceIoControl(
                     handle,
                     code,
                     in_ptr,
-                    p.input.len() as u32,
+                    in_len as u32,
                     out_ptr,
-                    p.output.len() as u32,
+                    out_len as u32,
                     None,
                     Some(ovl),
                 ) {
@@ -128,7 +125,9 @@ impl Device {
         };
         async move {
             let (result, payload) = fut.await;
-            (result, payload.input, payload.output)
+            let n = result.as_ref().ok().copied();
+            let output = crate::common::buffer::mark_read(n, payload.output);
+            (result, payload.input, output)
         }
     }
 }

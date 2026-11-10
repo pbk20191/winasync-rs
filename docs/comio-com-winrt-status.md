@@ -814,6 +814,38 @@ Winsock이 사용자 모드에서 답하는 코드도 패킷이 왔다. 그래�
 `WINASYNC_TEST_COM`(예: `COM3`)이 있을 때만 돌고, `GITHUB_ACTIONS`에서는 건너뛴다. **실제 포트에서는
 아직 한 번도 돌리지 않았다.**
 
+## tp 버퍼 소유권 넓히기 (2026-11-10)
+
+빌린 `&mut [u8]`를 safe API로 커널에 넘기는 것은 하지 않는다. future를 drop하면 I/O를 취소할 수
+있지만 `mem::forget`은 safe라서 아무것도 취소하지 않는다. 그러면 빌림이 끝난 메모리에 커널이 쓸 수
+있다. tokio-uring과 monoio가 소유권 모델을 택한 이유와 같다. 대신 "가져올 수 있는 메모리"를 넓혔다.
+
+1. **두 가지 크기.** `IoBuf::len`은 쓰기가 보낼 데이터, `IoBuf::bytes_total`(기본값 `len`)은 읽기가
+   채울 수 있는 공간이다. `IoBufMut::set_init(n)`(기본값은 아무것도 안 함)은 읽기가 n바이트를 썼다고
+   알린다. `Vec`은 `bytes_total = capacity`이고 `set_init`은 길이를 늘리기만 한다. 그래서
+   `Vec::with_capacity(n)`에 0으로 채우지 않고 읽을 수 있고, 길이는 데이터 끝에 맞춰진다. 예전처럼
+   `vec![0; n]`을 넘기면 길이가 그대로라 기존 호출자는 바뀌지 않는다. tp의 읽기 경로 13곳
+   (file/tcp/udp/unix/hvsock/pipe/serial, vectored 포함)이 모두 `bytes_total`만큼 읽고 끝에 `set_init`을
+   부른다. scatter 읽기는 받은 바이트를 버퍼 순서대로 나눠 알린다.
+2. **`Slice<B>`** — `buf.slice(range)`. 범위만 I/O에 쓰고 버퍼 전체를 돌려준다. 범위는 `len`을 넘어
+   `bytes_total`까지 갈 수 있다. 그래서 이미 든 데이터 뒤의 남는 용량에 이어서 읽을 수 있다.
+   `read_message`의 나머지 읽기가 이것을 써서, 따로 읽은 뒤 복사하던 단계가 없어졌다.
+3. **`Vec`만 받던 API를 제네릭으로.** `Device::ioctl`과 소켓 `ioctl`은 `(code, input: impl IoBuf,
+   output: impl IoBufMut) -> (Result<usize>, I, O)`다. `TransmitPackets::bytes(impl IoBuf)`. 메시지
+   파이프는 메시지를 받아 할당해 돌려주는 `read_message`/`transact`를 그대로 두고, 호출자 버퍼에 채우는
+   `read_message_into`/`transact_into`를 추가했다. 버퍼가 작으면 메시지 나머지를 버리고
+   `ERROR_MORE_DATA`다. recv_msg의 control 버퍼는 작은 메타데이터라서 `Vec`으로 두었다.
+4. **구현 타입.** `Arc<[u8]>`, `Arc<Vec<u8>>`는 쓰기 전용이다. 한 할당을 여러 소켓에 복사 없이 보낸다.
+   그 밖에 `&'static [u8]`, `&'static mut [u8]`가 있고, `bytes` 피처(선택)로 `Bytes`와 `BytesMut`가
+   들어온다. `BytesMut`도 남는 용량으로 읽는다.
+5. **`RawBuf`** — `unsafe fn from_raw_parts(ptr, len, total, keeper)`. 매핑된 섹션이나 C 할당자
+   메모리를 그 수명을 쥔 객체와 함께 감싼다. 계약은 한 곳에 적었다.
+
+바운스 버퍼(빌린 슬라이스를 받아 내부 버퍼로 I/O 후 복사)는 넣지 않았다. 필요한 경우는 `Read`/
+`AsyncRead`처럼 `&mut [u8]` 시그니처를 강제하는 트레이트, FFI 콜백 버퍼, 스택 배열 정도다. 그중
+`futures-io`는 `tp::io::async_rw`가 이미 그렇게 구현한다. 나머지는 호출자가 소유 버퍼로 읽고 한 번
+복사하면 된다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

@@ -17,21 +17,23 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    /// Sends a Winsock control code (`WSAIoctl`, overlapped) and resolves to
-    /// the output it wrote, at most `output_len` bytes.
+    /// Sends a Winsock control code (`WSAIoctl`, overlapped) with `input`,
+    /// filling `output`; resolves to the bytes written into `output`, with
+    /// both buffers handed back.
     ///
-    /// The socket-level counterpart of [`Device::ioctl`](crate::tp::io::device::Device::ioctl).
-    /// Codes that finish at once (`SIO_KEEPALIVE_VALS`,
-    /// `SIO_ADDRESS_LIST_QUERY`) resolve straight away; codes that wait for
-    /// something (`SIO_ADDRESS_LIST_CHANGE`, `SIO_ROUTING_INTERFACE_CHANGE`)
-    /// resolve when it happens, and dropping the future cancels them.
-    pub fn ioctl(
+    /// The socket-level counterpart of [`Device::ioctl`](crate::tp::io::device::Device::ioctl),
+    /// and it takes buffers the same way. Codes that finish at once
+    /// (`SIO_KEEPALIVE_VALS`, `SIO_ADDRESS_LIST_QUERY`) resolve straight away;
+    /// codes that wait for something (`SIO_ADDRESS_LIST_CHANGE`,
+    /// `SIO_ROUTING_INTERFACE_CHANGE`) resolve when it happens, and dropping
+    /// the future cancels them.
+    pub fn ioctl<I: IoBuf, O: IoBufMut>(
         &self,
         code: u32,
-        input: Vec<u8>,
-        output_len: usize,
-    ) -> impl Future<Output = windows_core::Result<Vec<u8>>> + Send + use<> {
-        crate::tp::io::socket_ioctl(&self.res, code, input, output_len)
+        input: I,
+        output: O,
+    ) -> impl Future<Output = (windows_core::Result<usize>, I, O)> + Send + use<I, O> {
+        crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
     /// Binds and listens on `addr` (IPv4 or IPv6).
@@ -250,21 +252,23 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    /// Sends a Winsock control code (`WSAIoctl`, overlapped) and resolves to
-    /// the output it wrote, at most `output_len` bytes.
+    /// Sends a Winsock control code (`WSAIoctl`, overlapped) with `input`,
+    /// filling `output`; resolves to the bytes written into `output`, with
+    /// both buffers handed back.
     ///
-    /// The socket-level counterpart of [`Device::ioctl`](crate::tp::io::device::Device::ioctl).
-    /// Codes that finish at once (`SIO_KEEPALIVE_VALS`,
-    /// `SIO_ADDRESS_LIST_QUERY`) resolve straight away; codes that wait for
-    /// something (`SIO_ADDRESS_LIST_CHANGE`, `SIO_ROUTING_INTERFACE_CHANGE`)
-    /// resolve when it happens, and dropping the future cancels them.
-    pub fn ioctl(
+    /// The socket-level counterpart of [`Device::ioctl`](crate::tp::io::device::Device::ioctl),
+    /// and it takes buffers the same way. Codes that finish at once
+    /// (`SIO_KEEPALIVE_VALS`, `SIO_ADDRESS_LIST_QUERY`) resolve straight away;
+    /// codes that wait for something (`SIO_ADDRESS_LIST_CHANGE`,
+    /// `SIO_ROUTING_INTERFACE_CHANGE`) resolve when it happens, and dropping
+    /// the future cancels them.
+    pub fn ioctl<I: IoBuf, O: IoBufMut>(
         &self,
         code: u32,
-        input: Vec<u8>,
-        output_len: usize,
-    ) -> impl Future<Output = windows_core::Result<Vec<u8>>> + Send + use<> {
-        crate::tp::io::socket_ioctl(&self.res, code, input, output_len)
+        input: I,
+        output: O,
+    ) -> impl Future<Output = (windows_core::Result<usize>, I, O)> + Send + use<I, O> {
+        crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
     fn from_socket(rt: &Arc<RuntimeInner>, sock: SOCKET) -> windows_core::Result<TcpStream> {
@@ -343,7 +347,7 @@ impl TcpStream {
         let fut = unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
                 let wsabuf = WSABUF {
-                    len: IoBuf::len(&p.buf) as u32,
+                    len: IoBuf::bytes_total(&p.buf) as u32,
                     buf: windows_core::PSTR(p.buf.stable_mut_ptr()),
                 };
                 let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
@@ -352,7 +356,10 @@ impl TcpStream {
         };
         async move {
             let (result, payload) = fut.await;
-            (result, payload.buf)
+            {
+                let n = result.as_ref().ok().copied();
+                (result, crate::common::buffer::mark_read(n, payload.buf))
+            }
         }
     }
 
@@ -395,7 +402,7 @@ impl TcpStream {
                 },
                 move |ovl, p| {
                     let wsabuf = WSABUF {
-                        len: IoBuf::len(&p.buf) as u32,
+                        len: IoBuf::bytes_total(&p.buf) as u32,
                         buf: windows_core::PSTR(p.buf.stable_mut_ptr()),
                     };
                     let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
@@ -405,7 +412,10 @@ impl TcpStream {
         };
         async move {
             let (result, payload) = fut.await;
-            (result, payload.buf)
+            {
+                let n = result.as_ref().ok().copied();
+                (result, crate::common::buffer::mark_read(n, payload.buf))
+            }
         }
     }
 
@@ -426,7 +436,10 @@ impl TcpStream {
         };
         async move {
             let (result, payload) = fut.await;
-            (result, payload.bufs)
+            {
+                let n = result.as_ref().ok().copied();
+                (result, crate::common::buffer::mark_read_vectored(n, payload.bufs))
+            }
         }
     }
 
@@ -567,7 +580,9 @@ impl TcpStream {
                                 dwElFlags: TP_ELEMENT_MEMORY,
                                 cLength: buf.len() as u32,
                                 Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
-                                    pBuffer: buf.as_mut_ptr() as *mut c_void,
+                                    // One pointer type for both directions;
+                                    // a transmit never writes through it.
+                                    pBuffer: buf.stable_ptr() as *mut c_void,
                                 },
                             },
                             Elem::File {
@@ -691,7 +706,8 @@ pub struct ReusableSocket {
 /// One element of a [`TransmitPackets`] sequence: an owned memory buffer, or a
 /// range of an open file (kept alive via its `IoRes`).
 enum Elem {
-    Mem(Vec<u8>),
+    /// Any owned buffer: the kernel only reads it.
+    Mem(Box<dyn IoBuf>),
     File {
         /// Keeps the file handle valid for the op's lifetime.
         _keep: Arc<IoRes>,
@@ -714,9 +730,10 @@ impl TransmitPackets {
         Self { elems: Vec::new() }
     }
 
-    /// Appends an in-memory buffer (sent inline).
-    pub fn bytes(mut self, buf: Vec<u8>) -> Self {
-        self.elems.push(Elem::Mem(buf));
+    /// Appends an in-memory buffer (sent inline): any owned buffer, so a
+    /// shared `Arc<[u8]>` header can go out on many connections uncopied.
+    pub fn bytes(mut self, buf: impl IoBuf) -> Self {
+        self.elems.push(Elem::Mem(Box::new(buf)));
         self
     }
 

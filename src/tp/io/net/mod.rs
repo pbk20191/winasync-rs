@@ -252,7 +252,7 @@ impl<B: IoBufMut> VectoredPayload<B> {
         self.wsabufs.clear();
         for b in self.bufs.iter_mut() {
             self.wsabufs.push(WSABUF {
-                len: IoBuf::len(b) as u32,
+                len: IoBuf::bytes_total(b) as u32,
                 buf: windows_core::PSTR(b.stable_mut_ptr()),
             });
         }

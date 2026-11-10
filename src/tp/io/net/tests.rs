@@ -1061,7 +1061,10 @@
         let rt = Runtime::new();
         let udp = UdpSocket::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
             .unwrap();
-        let out = block_on(udp.ioctl(SIO_ADDRESS_LIST_QUERY, Vec::new(), 4096)).unwrap();
+        // Spare capacity, not zeroed bytes: the length ends where the output
+        // does.
+        let (n, _, out) = block_on(udp.ioctl(SIO_ADDRESS_LIST_QUERY, Vec::new(), Vec::with_capacity(4096)));
+        assert_eq!(n.unwrap(), out.len());
         // SOCKET_ADDRESS_LIST: an i32 count, then the entries.
         assert!(out.len() > 4, "no output from SIO_ADDRESS_LIST_QUERY: {out:?}");
         let count = i32::from_ne_bytes(out[..4].try_into().unwrap());
@@ -1081,9 +1084,9 @@
             let client = TcpStream::connect(&rt, addr).await.unwrap();
             let _server = server.await.unwrap();
             let vals: Vec<u8> = [1u32, 10_000, 1_000].iter().flat_map(|v| v.to_ne_bytes()).collect();
-            client.ioctl(SIO_KEEPALIVE_VALS, vals, 0).await
+            client.ioctl(SIO_KEEPALIVE_VALS, vals, Vec::new()).await.0
         }));
-        assert_eq!(result.expect("timed out").unwrap(), Vec::<u8>::new());
+        assert_eq!(result.expect("timed out").unwrap(), 0);
     }
 
     /// A code that waits (here for the machine's addresses to change) stays
@@ -1096,9 +1099,9 @@
         let waited = block_on(timeout(
             &rt,
             Duration::from_millis(200),
-            udp.ioctl(SIO_ADDRESS_LIST_CHANGE, Vec::new(), 0),
+            udp.ioctl(SIO_ADDRESS_LIST_CHANGE, Vec::new(), Vec::new()),
         ));
-        assert!(waited.is_err(), "SIO_ADDRESS_LIST_CHANGE completed: {waited:?}");
+        assert!(waited.is_err(), "SIO_ADDRESS_LIST_CHANGE completed: {:?}", waited.map(|r| r.0));
         drop(udp);
         for _ in 0..500 {
             if super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed) == 0 {

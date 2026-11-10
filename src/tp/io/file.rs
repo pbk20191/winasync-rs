@@ -239,7 +239,7 @@ impl File {
                 (*ovl).Anonymous.Anonymous.Offset = pos as u32;
                 (*ovl).Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
                 let slice =
-                    core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::len(buf));
+                    core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::bytes_total(buf));
                 match ReadFile(handle, Some(slice), None, Some(ovl)) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
@@ -261,7 +261,10 @@ impl File {
             let (result, buf) = fut.await;
             match result {
                 Err(e) if e.code() == ERROR_HANDLE_EOF.to_hresult() => (Ok(0), buf),
-                other => (other, buf),
+                other => {
+                    let n = other.as_ref().ok().copied();
+                    (other, crate::common::buffer::mark_read(n, buf))
+                }
             }
         }
     }

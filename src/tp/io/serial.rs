@@ -97,12 +97,17 @@ impl SerialPort {
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
         let handle = self.res.handle;
-        unsafe {
+        let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let slice =
-                    core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::len(buf));
+                    core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::bytes_total(buf));
                 classify(ReadFile(handle, Some(slice), None, Some(ovl)))
             })
+        };
+        async move {
+            let (result, buf) = fut.await;
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, buf))
         }
     }
 

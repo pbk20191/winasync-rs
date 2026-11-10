@@ -9,7 +9,7 @@
 //! as us, and matches its read mode to the pipe's.
 
 use super::{submit, IoRes, Issue};
-use crate::common::buffer::{IoBuf, IoBufMut};
+use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 pub use crate::common::pipe::NamedPipeOptions;
 use crate::common::pipe::{self as server, PipeServer, ReplenishOnExit, Slot};
 use crate::common::security::{self, SecurityDescriptor};
@@ -77,7 +77,9 @@ impl NamedPipeStream {
         let part = self.read_part(buf);
         async move {
             let (result, buf) = part.await;
-            (result.map(|(n, _more)| n), buf)
+            let result = result.map(|(n, _more)| n);
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, buf))
         }
     }
 
@@ -87,7 +89,7 @@ impl NamedPipeStream {
         unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let slice =
-                    core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::len(buf));
+                    core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::bytes_total(buf));
                 match ReadFile(handle, Some(slice), None, Some(ovl)) {
                     Ok(()) => Issue::SyncSuccess,
                     Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
@@ -112,14 +114,29 @@ impl NamedPipeStream {
     /// read return it as if it were a message of its own. Fails with
     /// `E_ILLEGAL_METHOD_CALL` on a byte-mode pipe, which has no messages to
     /// read.
+    ///
+    /// Allocates the result; [`read_message_into`](Self::read_message_into)
+    /// reads into a buffer of the caller's.
     pub async fn read_message(&self, max_len: usize) -> windows_core::Result<Vec<u8>> {
-        if !self.message_mode {
-            return Err(Error::new(E_ILLEGAL_METHOD_CALL, "not a message-mode pipe"));
-        }
-        let (result, mut message) = self.read_part(vec![0u8; max_len.min(FIRST_READ)]).await;
+        self.message_mode()?;
+        let (result, message) = self.read_part(Vec::with_capacity(max_len.min(FIRST_READ))).await;
         let (n, more) = result?;
-        message.truncate(n);
-        self.finish_message(message, more, max_len).await
+        self.finish_message(mark_read(Some(n), message), more, max_len).await
+    }
+
+    /// Reads one whole message into `buf`, which must have room for it
+    /// ([`IoBuf::bytes_total`]); resolves to its length and hands `buf` back.
+    ///
+    /// A message too long for `buf` is read to its end and discarded, as in
+    /// [`read_message`](Self::read_message), and this fails with
+    /// `ERROR_MORE_DATA` -- `buf` then holds its first part.
+    pub async fn read_message_into<B: IoBufMut>(&self, buf: B) -> (windows_core::Result<usize>, B) {
+        if let Err(e) = self.message_mode() {
+            return (Err(e), buf);
+        }
+        let (result, buf) = self.read_part(buf).await;
+        let (result, buf) = self.whole_or_discarded(result, buf).await;
+        (result, buf)
     }
 
     /// Writes `request` as one message and reads the reply, of at most
@@ -131,24 +148,57 @@ impl NamedPipeStream {
     /// transaction that would read a stale message as its reply. A reply
     /// longer than `max_response` is read to its end and discarded, as in
     /// [`read_message`](Self::read_message).
-    pub async fn transact(
+    ///
+    /// Allocates the reply; [`transact_into`](Self::transact_into) reads it
+    /// into a buffer of the caller's.
+    pub async fn transact<I: IoBuf>(
         &self,
-        request: Vec<u8>,
+        request: I,
         max_response: usize,
     ) -> windows_core::Result<Vec<u8>> {
-        if !self.message_mode {
-            return Err(Error::new(E_ILLEGAL_METHOD_CALL, "not a message-mode pipe"));
+        self.message_mode()?;
+        let reply = Vec::with_capacity(max_response.min(FIRST_READ));
+        let (result, (_request, reply)) = self.transact_part(request, reply).await;
+        let (n, more) = result?;
+        self.finish_message(mark_read(Some(n), reply), more, max_response).await
+    }
+
+    /// [`transact`](Self::transact), with the reply read into `reply`, which
+    /// must have room for it; resolves to the reply's length and hands both
+    /// buffers back. A reply too long for `reply` is discarded as in
+    /// [`read_message_into`](Self::read_message_into).
+    pub async fn transact_into<I: IoBuf, O: IoBufMut>(
+        &self,
+        request: I,
+        reply: O,
+    ) -> (windows_core::Result<usize>, I, O) {
+        if let Err(e) = self.message_mode() {
+            return (Err(e), request, reply);
         }
+        let (result, (request, reply)) = self.transact_part(request, reply).await;
+        let (result, reply) = self.whole_or_discarded(result, reply).await;
+        (result, request, reply)
+    }
+
+    fn message_mode(&self) -> windows_core::Result<()> {
+        if self.message_mode {
+            Ok(())
+        } else {
+            Err(Error::new(E_ILLEGAL_METHOD_CALL, "not a message-mode pipe"))
+        }
+    }
+
+    /// One `TransactNamedPipe`, reporting whether the reply goes on.
+    fn transact_part<I: IoBuf, O: IoBufMut>(&self, request: I, reply: O) -> super::MessageOp<(I, O)> {
         let handle = self.res.handle;
-        let reply = vec![0u8; max_response.min(FIRST_READ)];
-        let (result, (_request, mut reply)) = unsafe {
+        unsafe {
             submit(&self.res, (request, reply), move |ovl, (request, reply)| {
                 match TransactNamedPipe(
                     handle,
-                    Some(request.as_ptr().cast()),
-                    request.len() as u32,
-                    Some(reply.as_mut_ptr().cast()),
-                    reply.len() as u32,
+                    Some(request.stable_ptr().cast()),
+                    IoBuf::len(request) as u32,
+                    Some(reply.stable_mut_ptr().cast()),
+                    IoBuf::bytes_total(reply) as u32,
                     // Overlapped: the count comes with the completion, and
                     // the documentation allows null here for that case.
                     core::ptr::null_mut(),
@@ -164,15 +214,44 @@ impl NamedPipeStream {
             })
         }
         .message()
-        .await;
-        let (n, more) = result?;
-        reply.truncate(n);
-        self.finish_message(reply, more, max_response).await
+    }
+
+    /// The tail of a read into a caller's buffer: the message fit, or it did
+    /// not and the rest of it is discarded.
+    async fn whole_or_discarded<B: IoBufMut>(
+        &self,
+        result: windows_core::Result<(usize, bool)>,
+        buf: B,
+    ) -> (windows_core::Result<usize>, B) {
+        let (n, more) = match result {
+            Ok(r) => r,
+            Err(e) => return (Err(e), buf),
+        };
+        let buf = mark_read(Some(n), buf);
+        if !more {
+            return (Ok(n), buf);
+        }
+        let size = bytes_left_in_message(self.res.handle).map(|left| n + left);
+        if let Err(e) = self.discard_rest_of_message().await {
+            return (Err(e), buf);
+        }
+        let error = Error::new(
+            ERROR_MORE_DATA.to_hresult(),
+            match size {
+                Ok(size) => format!("a {size}-byte message does not fit in {n}; it was discarded"),
+                Err(_) => format!("a message does not fit in {n}; it was discarded"),
+            },
+        );
+        (Err(error), buf)
     }
 
     /// Reads the rest of a message whose first `message.len()` bytes are in
     /// hand, if `more` says there is a rest; discards it, and fails, if the
     /// whole would exceed `max_len`.
+    ///
+    /// The rest is read straight into `message`'s spare capacity -- a
+    /// [`Slice`](crate::common::buffer::Slice) past its end -- so nothing is
+    /// copied twice.
     async fn finish_message(
         &self,
         mut message: Vec<u8>,
@@ -191,9 +270,11 @@ impl NamedPipeStream {
                     ),
                 ));
             }
-            let (result, part) = self.read_part(vec![0u8; left.max(1)]).await;
+            let start = message.len();
+            message.reserve_exact(left.max(1));
+            let (result, rest) = self.read_part(message.slice(start..start + left.max(1))).await;
             let (n, m) = result?;
-            message.extend_from_slice(&part[..n]);
+            message = mark_read(Some(n), rest).into_inner();
             more = m;
         }
         Ok(message)
@@ -201,7 +282,7 @@ impl NamedPipeStream {
 
     async fn discard_rest_of_message(&self) -> windows_core::Result<()> {
         loop {
-            let (result, _) = self.read_part(vec![0u8; FIRST_READ]).await;
+            let (result, _) = self.read_part(Vec::with_capacity(FIRST_READ)).await;
             if !result?.1 {
                 return Ok(());
             }
@@ -968,5 +1049,133 @@ mod tests {
             block_on(client.transact(b"x".to_vec(), 16)).unwrap_err().code(),
             E_ILLEGAL_METHOD_CALL
         );
+    }
+
+    /// A connected byte-mode pair, server end first.
+    fn byte_pair(rt: &Runtime) -> (NamedPipeStream, NamedPipeStream) {
+        let name = unique("own");
+        let server = accept_one(rt, NamedPipeListener::bind(rt, &name));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let client = NamedPipeConnector::connect(rt, &name).unwrap();
+        (server.join().unwrap().unwrap(), client)
+    }
+
+    /// A read lands in spare capacity: no zeroed buffer, and the length ends
+    /// where the data does.
+    #[test]
+    fn a_read_fills_spare_capacity() {
+        let rt = Runtime::new();
+        let (server, client) = byte_pair(&rt);
+        block_on(client.write(b"hello".to_vec())).0.unwrap();
+        let (n, got) = block_on(server.read(Vec::with_capacity(64)));
+        assert_eq!(n.unwrap(), 5);
+        assert_eq!(got, b"hello", "the length did not follow the data");
+
+        // A zero-filled buffer keeps its length, as callers have relied on.
+        block_on(client.write(b"abc".to_vec())).0.unwrap();
+        let (n, got) = block_on(server.read(vec![0u8; 16]));
+        assert_eq!(n.unwrap(), 3);
+        assert_eq!(got.len(), 16);
+        assert_eq!(&got[..3], b"abc");
+    }
+
+    /// Reading into, and writing out of, part of one buffer.
+    #[test]
+    fn slices_read_and_write_part_of_a_buffer() {
+        use crate::common::buffer::IoBuf;
+        let rt = Runtime::new();
+        let (server, client) = byte_pair(&rt);
+
+        // Send bytes 2..5 of a larger frame.
+        let (n, frame) = block_on(client.write(b"xxPAYyy".to_vec().slice(2..5)));
+        assert_eq!(n.unwrap(), 3);
+        assert_eq!(frame.into_inner(), b"xxPAYyy");
+
+        // Append the read after what the buffer already holds.
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(b"head:");
+        let (n, rest) = block_on(server.read(buf.slice(5..)));
+        assert_eq!(n.unwrap(), 3);
+        assert_eq!(rest.into_inner(), b"head:PAY");
+    }
+
+    /// One shared allocation out on two connections, and memory that is
+    /// never freed.
+    #[test]
+    fn shared_and_static_buffers_can_be_sent() {
+        let rt = Runtime::new();
+        let (server_a, client_a) = byte_pair(&rt);
+        let (server_b, client_b) = byte_pair(&rt);
+        let shared: Arc<[u8]> = Arc::from(&b"shared"[..]);
+        block_on(client_a.write(shared.clone())).0.unwrap();
+        block_on(client_b.write(shared.clone())).0.unwrap();
+        static BANNER: &[u8] = b"!";
+        block_on(client_a.write(BANNER)).0.unwrap();
+        let (n, got) = block_on(server_a.read(Vec::with_capacity(16)));
+        assert_eq!(&got[..n.unwrap()], b"shared!");
+        let (_, got) = block_on(server_b.read(Vec::with_capacity(16)));
+        assert_eq!(got, b"shared");
+    }
+
+    /// Memory the crate does not own, kept alive by what does.
+    #[test]
+    fn a_raw_buffer_wraps_foreign_memory() {
+        use crate::common::buffer::{RawBuf, Region};
+        let rt = Runtime::new();
+        let (server, client) = byte_pair(&rt);
+        let region = Region::new(4096).unwrap();
+        let raw = unsafe { RawBuf::from_raw_parts(region.base(), 0, 4096, region) };
+        block_on(client.write(b"mapped".to_vec())).0.unwrap();
+        let (n, raw) = block_on(server.read(raw));
+        assert_eq!(n.unwrap(), 6);
+        assert_eq!(raw.as_slice(), b"mapped");
+    }
+
+    #[cfg(feature = "bytes")]
+    #[test]
+    fn bytes_buffers_go_both_ways() {
+        let rt = Runtime::new();
+        let (server, client) = byte_pair(&rt);
+        block_on(client.write(bytes::Bytes::from_static(b"from bytes"))).0.unwrap();
+        let (n, got) = block_on(server.read(bytes::BytesMut::with_capacity(64)));
+        assert_eq!(n.unwrap(), 10);
+        assert_eq!(&got[..], b"from bytes");
+    }
+
+    /// A message into a fixed buffer of the caller's: it fits, or it is
+    /// discarded whole and the next one is untouched.
+    #[test]
+    fn messages_into_the_callers_buffer() {
+        use crate::common::buffer::SlabPool;
+        let rt = Runtime::new();
+        let (server, client) = message_pair(&rt, NamedPipeOptions::new());
+        let writer = std::thread::spawn(move || {
+            for m in [&b"fits"[..], &[3u8; 100], b"next"] {
+                block_on(client.write(m.to_vec())).0.unwrap();
+            }
+            client
+        });
+        let pool = SlabPool::new(16, 1).unwrap();
+        let (n, buf) = block_on(server.read_message_into(pool.acquire().unwrap()));
+        assert_eq!(&buf[..n.unwrap()], b"fits");
+        let (err, buf) = block_on(server.read_message_into(buf));
+        assert_eq!(err.unwrap_err().code(), ERROR_MORE_DATA.to_hresult());
+        let (n, _) = block_on(server.read_message_into(buf));
+        assert_eq!(n.unwrap(), 4);
+        drop(writer.join().unwrap());
+    }
+
+    #[test]
+    fn transact_into_the_callers_buffers() {
+        let rt = Runtime::new();
+        let (server, client) = message_pair(&rt, NamedPipeOptions::new());
+        let server = answering(server, |m| m.to_ascii_uppercase());
+        let request: Arc<[u8]> = Arc::from(&b"shout"[..]);
+        let (n, _request, reply) =
+            block_on(client.transact_into(request, Vec::with_capacity(32)));
+        assert_eq!(n.unwrap(), 5);
+        assert_eq!(reply, b"SHOUT");
+        drop(client);
+        server.join().unwrap();
     }
 }

@@ -16,6 +16,7 @@ pub mod pipe;
 pub mod serial;
 pub mod unix;
 
+use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::common::overlapped::{self as ov, Completion, IoReg, OpHandle};
 use crate::tp::RuntimeInner;
 use std::ops::Deref;
@@ -84,15 +85,15 @@ impl IoRes {
 
 /// Buffers of an in-flight `WSAIoctl`, kept in the op block until it
 /// completes.
-struct SocketIoctl {
-    input: Vec<u8>,
-    output: Vec<u8>,
+struct SocketIoctl<I, O> {
+    input: I,
+    output: O,
     /// Where `WSAIoctl` writes the output length when it finishes at once.
     returned: u32,
 }
 
-/// Issues `WSAIoctl(code)` overlapped on a registered socket and resolves to
-/// the output it wrote.
+/// Issues `WSAIoctl(code)` overlapped on a registered socket; resolves to the
+/// bytes written into `output`, with both buffers handed back.
 ///
 /// Measured on 26320 (codes Winsock answers in user mode included --
 /// `SIO_GET_EXTENSION_FUNCTION_POINTER`, `FIONBIO` -- and ones the provider
@@ -101,28 +102,30 @@ struct SocketIoctl {
 /// succeeds at once reports its output length only through
 /// `lpcbBytesReturned`; the packet says 0. So the length is read from there
 /// when it is set, and from the packet otherwise.
-pub(crate) fn socket_ioctl(
+pub(crate) fn socket_ioctl<I: IoBuf, O: IoBufMut>(
     res: &Arc<IoRes>,
     code: u32,
-    input: Vec<u8>,
-    output_len: usize,
-) -> impl Future<Output = windows_core::Result<Vec<u8>>> + Send + use<> {
+    input: I,
+    output: O,
+) -> impl Future<Output = (windows_core::Result<usize>, I, O)> + Send + use<I, O> {
     use windows::Win32::Networking::WinSock::WSAIoctl;
     let sock = res.socket();
     let payload = SocketIoctl {
         input,
-        output: vec![0u8; output_len],
+        output,
         returned: 0,
     };
     let fut = unsafe {
         submit(res, payload, move |ovl, p| {
+            let in_len = IoBuf::len(&p.input);
+            let out_len = IoBuf::bytes_total(&p.output);
             let r = WSAIoctl(
                 sock,
                 code,
-                (!p.input.is_empty()).then(|| p.input.as_ptr().cast()),
-                p.input.len() as u32,
-                (!p.output.is_empty()).then(|| p.output.as_mut_ptr().cast()),
-                p.output.len() as u32,
+                (in_len != 0).then(|| p.input.stable_ptr().cast()),
+                in_len as u32,
+                (out_len != 0).then(|| p.output.stable_mut_ptr().cast()),
+                out_len as u32,
                 &mut p.returned,
                 Some(ovl),
                 None,
@@ -131,11 +134,11 @@ pub(crate) fn socket_ioctl(
         })
     };
     async move {
-        let (result, mut p) = fut.await;
-        let bytes = result?;
-        let n = if p.returned != 0 { p.returned as usize } else { bytes };
-        p.output.truncate(n);
-        Ok(p.output)
+        let (result, p) = fut.await;
+        let result = result.map(|bytes| if p.returned != 0 { p.returned as usize } else { bytes });
+        let n = result.as_ref().ok().copied();
+        let output = crate::common::buffer::mark_read(n, p.output);
+        (result, p.input, output)
     }
 }
 
