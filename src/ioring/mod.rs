@@ -134,14 +134,6 @@ impl File {
         })
     }
 
-    fn handle_ref(&self) -> IORING_HANDLE_REF {
-        IORING_HANDLE_REF {
-            Kind: IORING_REF_RAW,
-            Handle: IORING_HANDLE_REF_0 {
-                Handle: self.handle.0,
-            },
-        }
-    }
 }
 
 impl From<std::fs::File> for File {
@@ -150,6 +142,90 @@ impl From<std::fs::File> for File {
         File {
             handle: Arc::new(OwnedHandle(HANDLE(file.into_raw_handle()))),
         }
+    }
+}
+
+impl From<std::os::windows::io::OwnedHandle> for File {
+    fn from(handle: std::os::windows::io::OwnedHandle) -> Self {
+        use std::os::windows::io::IntoRawHandle;
+        File {
+            handle: Arc::new(OwnedHandle(HANDLE(handle.into_raw_handle()))),
+        }
+    }
+}
+
+impl File {
+    /// Takes ownership of `handle`: it is closed with the last clone and the
+    /// last operation that uses it.
+    ///
+    /// # Safety
+    /// `handle` must be an open file handle that nothing else will close.
+    pub unsafe fn from_raw_handle(handle: HANDLE) -> File {
+        File {
+            handle: Arc::new(OwnedHandle(handle)),
+        }
+    }
+}
+
+/// A handle a ring operation can work on.
+///
+/// An operation keeps a clone of it until the kernel is done, which is how
+/// a [`File`] or an `Arc<std::fs::File>` stays open for as long as the ring
+/// needs it. The safe operations want `'static` handles; the
+/// `*_unchecked` ones also take borrowed ones -- `&std::fs::File`, a
+/// `BorrowedHandle` -- because their futures wait for the kernel when
+/// dropped.
+///
+/// Any file handle works, opened with `FILE_FLAG_OVERLAPPED` or without,
+/// except one bound to an I/O completion port. Measured: an operation on
+/// such a handle completes at once with `E_INVALIDARG`, and nothing reaches
+/// the port. So a `tp::File`, which its runtime's pool owns, is refused this
+/// way rather than mis-delivered.
+///
+/// # Safety
+/// [`raw_handle`](Self::raw_handle) must return a handle that stays open for
+/// as long as the value it was called on exists -- the contract
+/// `AsHandle` has.
+pub unsafe trait RingHandle: Send + Sync {
+    fn raw_handle(&self) -> HANDLE;
+}
+
+unsafe impl RingHandle for File {
+    fn raw_handle(&self) -> HANDLE {
+        self.handle.0
+    }
+}
+
+/// Any shared owner of a handle: `Arc<std::fs::File>`, `Arc<OwnedHandle>`.
+unsafe impl<T: std::os::windows::io::AsHandle + Send + Sync> RingHandle for Arc<T> {
+    fn raw_handle(&self) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        HANDLE(self.as_handle().as_raw_handle())
+    }
+}
+
+/// A borrow: `&std::fs::File`. With a `'static` borrow any operation takes
+/// it; with a shorter one, only the `*_unchecked` operations.
+unsafe impl<T: std::os::windows::io::AsHandle + Sync> RingHandle for &T {
+    fn raw_handle(&self) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        HANDLE(self.as_handle().as_raw_handle())
+    }
+}
+
+unsafe impl RingHandle for std::os::windows::io::BorrowedHandle<'_> {
+    fn raw_handle(&self) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        HANDLE(self.as_raw_handle())
+    }
+}
+
+fn handle_ref<H: RingHandle>(file: &H) -> IORING_HANDLE_REF {
+    IORING_HANDLE_REF {
+        Kind: IORING_REF_RAW,
+        Handle: IORING_HANDLE_REF_0 {
+            Handle: file.raw_handle(),
+        },
     }
 }
 
@@ -348,18 +424,28 @@ impl IoRing {
 
     /// Reads into `buf` at `offset`; resolves to the bytes read (0 at end of
     /// file) and hands the buffer back.
-    pub fn read<B: IoBufMut + 'static>(&self, file: &File, buf: B, offset: u64) -> RingOp<ReadOp<B>> {
+    pub fn read<H: RingHandle + Clone + 'static, B: IoBufMut + 'static>(
+        &self,
+        file: &H,
+        buf: B,
+        offset: u64,
+    ) -> RingOp<ReadOp<H, B>> {
         RingOp::new(&self.inner, ReadOp { file: file.clone(), buf, offset }, false)
     }
 
     /// Writes `buf` at `offset`; resolves to the bytes written and hands the
     /// buffer back.
-    pub fn write<B: IoBuf + 'static>(&self, file: &File, buf: B, offset: u64) -> RingOp<WriteOp<B>> {
+    pub fn write<H: RingHandle + Clone + 'static, B: IoBuf + 'static>(
+        &self,
+        file: &H,
+        buf: B,
+        offset: u64,
+    ) -> RingOp<WriteOp<H, B>> {
         RingOp::new(&self.inner, WriteOp { file: file.clone(), buf, offset }, false)
     }
 
     /// Flushes `file`'s buffers to the device.
-    pub fn flush(&self, file: &File) -> RingOp<FlushOp> {
+    pub fn flush<H: RingHandle + Clone + 'static>(&self, file: &H) -> RingOp<FlushOp<H>> {
         RingOp::new(&self.inner, FlushOp { file: file.clone() }, false)
     }
 
@@ -376,7 +462,12 @@ impl IoRing {
     /// that frees tasks without dropping them). One that disappears without
     /// its `Drop` running leaves the kernel writing into memory the borrow
     /// has already given back.
-    pub unsafe fn read_unchecked<B: IoBufMut>(&self, file: &File, buf: B, offset: u64) -> RingOp<ReadOp<B>> {
+    pub unsafe fn read_unchecked<H: RingHandle + Clone, B: IoBufMut>(
+        &self,
+        file: &H,
+        buf: B,
+        offset: u64,
+    ) -> RingOp<ReadOp<H, B>> {
         RingOp::new(&self.inner, ReadOp { file: file.clone(), buf, offset }, true)
     }
 
@@ -386,7 +477,12 @@ impl IoRing {
     /// # Safety
     /// As for [`read_unchecked`](Self::read_unchecked): the future must be
     /// dropped or run to completion, never forgotten or leaked.
-    pub unsafe fn write_unchecked<B: IoBuf>(&self, file: &File, buf: B, offset: u64) -> RingOp<WriteOp<B>> {
+    pub unsafe fn write_unchecked<H: RingHandle + Clone, B: IoBuf>(
+        &self,
+        file: &H,
+        buf: B,
+        offset: u64,
+    ) -> RingOp<WriteOp<H, B>> {
         RingOp::new(&self.inner, WriteOp { file: file.clone(), buf, offset }, true)
     }
 }
@@ -540,17 +636,17 @@ pub trait RingOperation: Send + Sized {
 }
 
 /// A read: see [`IoRing::read`].
-pub struct ReadOp<B> {
-    file: File,
+pub struct ReadOp<H, B> {
+    file: H,
     buf: B,
     offset: u64,
 }
 
-impl<B: IoBufMut> RingOperation for ReadOp<B> {
+impl<H: RingHandle, B: IoBufMut> RingOperation for ReadOp<H, B> {
     type Output = (Result<usize>, B);
 
     fn file(&self) -> IORING_HANDLE_REF {
-        self.file.handle_ref()
+        handle_ref(&self.file)
     }
 
     fn build(&mut self, ring: HIORING, user_data: usize) -> Result<()> {
@@ -562,7 +658,7 @@ impl<B: IoBufMut> RingOperation for ReadOp<B> {
             },
         };
         unsafe {
-            BuildIoRingReadFile(ring, self.file.handle_ref(), data, len, self.offset, user_data, IOSQE_FLAGS_NONE)
+            BuildIoRingReadFile(ring, handle_ref(&self.file), data, len, self.offset, user_data, IOSQE_FLAGS_NONE)
         }
     }
 
@@ -582,17 +678,17 @@ impl<B: IoBufMut> RingOperation for ReadOp<B> {
 }
 
 /// A write: see [`IoRing::write`].
-pub struct WriteOp<B> {
-    file: File,
+pub struct WriteOp<H, B> {
+    file: H,
     buf: B,
     offset: u64,
 }
 
-impl<B: IoBuf> RingOperation for WriteOp<B> {
+impl<H: RingHandle, B: IoBuf> RingOperation for WriteOp<H, B> {
     type Output = (Result<usize>, B);
 
     fn file(&self) -> IORING_HANDLE_REF {
-        self.file.handle_ref()
+        handle_ref(&self.file)
     }
 
     fn build(&mut self, ring: HIORING, user_data: usize) -> Result<()> {
@@ -607,7 +703,7 @@ impl<B: IoBuf> RingOperation for WriteOp<B> {
         unsafe {
             BuildIoRingWriteFile(
                 ring,
-                self.file.handle_ref(),
+                handle_ref(&self.file),
                 data,
                 len,
                 self.offset,
@@ -628,19 +724,19 @@ impl<B: IoBuf> RingOperation for WriteOp<B> {
 }
 
 /// A flush: see [`IoRing::flush`].
-pub struct FlushOp {
-    file: File,
+pub struct FlushOp<H> {
+    file: H,
 }
 
-impl RingOperation for FlushOp {
+impl<H: RingHandle> RingOperation for FlushOp<H> {
     type Output = Result<()>;
 
     fn file(&self) -> IORING_HANDLE_REF {
-        self.file.handle_ref()
+        handle_ref(&self.file)
     }
 
     fn build(&mut self, ring: HIORING, user_data: usize) -> Result<()> {
-        unsafe { BuildIoRingFlushFile(ring, self.file.handle_ref(), FILE_FLUSH_DEFAULT, user_data, IOSQE_FLAGS_NONE) }
+        unsafe { BuildIoRingFlushFile(ring, handle_ref(&self.file), FILE_FLUSH_DEFAULT, user_data, IOSQE_FLAGS_NONE) }
     }
 
     fn finish(self, result: HRESULT, _information: usize) -> Self::Output {
@@ -1234,6 +1330,69 @@ mod tests {
         drop(ring);
         assert!(started.elapsed() < Duration::from_secs(5), "teardown hung");
         drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Shared std files, borrowed std files and borrowed handles, overlapped
+    /// or not.
+    #[test]
+    fn handles_of_every_kind() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsHandle;
+        let ring = IoRing::new(8).unwrap();
+        let (path, file) = temp_file("handles", b"handles!");
+        drop(file);
+
+        let shared = Arc::new(std::fs::File::open(&path).unwrap());
+        let (n, got) = block_on(ring.read(&shared, Vec::with_capacity(16), 0));
+        assert_eq!(&got[..n.unwrap()], b"handles!", "Arc<std::fs::File>");
+
+        let overlapped = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED.0)
+            .open(&path)
+            .unwrap();
+        let mut buf = [0u8; 16];
+        // SAFETY: each future is awaited to completion.
+        unsafe {
+            let (n, _) = block_on(ring.read_unchecked(&&overlapped, &mut buf[..], 0));
+            assert_eq!(&buf[..n.unwrap()], b"handles!", "&std::fs::File, overlapped");
+            let borrowed = overlapped.as_handle();
+            let (n, _) = block_on(ring.read_unchecked(&borrowed, &mut buf[..], 4));
+            assert_eq!(&buf[..n.unwrap()], b"les!", "BorrowedHandle");
+        }
+        drop((shared, overlapped));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A handle bound to a completion port is refused, not mis-delivered.
+    #[test]
+    fn a_port_bound_handle_is_refused() {
+        use windows::Win32::System::IO::CreateIoCompletionPort;
+        let ring = IoRing::new(4).unwrap();
+        let (path, file) = temp_file("port", b"bound");
+        drop(file);
+        let handle = unsafe {
+            CreateFileW(
+                &HSTRING::from(path.as_str()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED,
+                None,
+            )
+            .unwrap()
+        };
+        let port = unsafe { CreateIoCompletionPort(handle, None, 1, 1).unwrap() };
+        // SAFETY: a fresh handle this test owns and hands over.
+        let bound = unsafe { File::from_raw_handle(handle) };
+        let (r, _) = block_on(ring.read(&bound, vec![0u8; 8], 0));
+        assert_eq!(r.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+        drop(bound);
+        unsafe {
+            let _ = CloseHandle(port);
+        }
         let _ = std::fs::remove_file(&path);
     }
 }
