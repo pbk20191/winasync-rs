@@ -69,6 +69,18 @@ use windows::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
 
+/// What an operation on an owned buffer resolves to: the outcome, and the
+/// buffer handed back -- on success and on failure alike, since a failed
+/// or cancelled operation does not consume the memory. The shape
+/// `tokio-uring`, `monoio` and `compio` settled on for completion-based
+/// I/O, under the same name.
+///
+/// ```ignore
+/// let (n, buf) = stream.read(buf).await;
+/// let n = n?;
+/// ```
+pub type BufResult<T, B> = (windows_core::Result<T>, B);
+
 /// A buffer an operation can take ownership of.
 ///
 /// Two sizes, because a buffer is used two ways. A write sends

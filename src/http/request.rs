@@ -1,6 +1,7 @@
 //! One request: read out of http.sys's record in place, answered through
 //! the queue. The body sources a response can be built from live here too.
 
+use crate::common::buffer::BufResult;
 use super::*;
 
 /// A request's method, as http.sys names it.
@@ -306,7 +307,7 @@ impl HttpRequest {
     pub fn read_body<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let handle = self.server.queue.handle;
         let id = self.id;
         let fut = if self.has_body {
@@ -369,7 +370,7 @@ impl HttpRequest {
 
     /// Sends the whole response: `response`'s status and headers, then
     /// `body`. A `Content-Length` is added if the response has none.
-    pub async fn respond<B: IoBuf + 'static>(&self, response: Response, body: B) -> (Result<()>, B) {
+    pub async fn respond<B: IoBuf + 'static>(&self, response: Response, body: B) -> BufResult<(), B> {
         let response = with_length(response, IoBuf::len(&body) as u64);
         let (r, body) = self.send_head(response, Some(Memory(body)), false).await;
         (r, body.unwrap().0)
@@ -386,7 +387,7 @@ impl HttpRequest {
         file: F,
         start: u64,
         len: Option<u64>,
-    ) -> (Result<()>, F) {
+    ) -> BufResult<(), F> {
         let len = match len {
             Some(len) => len,
             None => match file_size(&file) {
@@ -425,7 +426,7 @@ impl HttpRequest {
 
     /// Sends part of the body; `last` ends the response. An empty `chunk`
     /// sends nothing, so `send_body(Vec::new(), true)` just ends it.
-    pub async fn send_body<B: IoBuf + 'static>(&self, chunk: B, last: bool) -> (Result<()>, B) {
+    pub async fn send_body<B: IoBuf + 'static>(&self, chunk: B, last: bool) -> BufResult<(), B> {
         let (r, chunk) = self.send_part(Memory(chunk), last).await;
         (r, chunk.0)
     }
@@ -439,7 +440,7 @@ impl HttpRequest {
         start: u64,
         len: Option<u64>,
         last: bool,
-    ) -> (Result<()>, F) {
+    ) -> BufResult<(), F> {
         let len = len.unwrap_or(HTTP_BYTE_RANGE_TO_EOF);
         let (r, part) = self.send_part(FileRange { file, start, len }, last).await;
         (r, part.file)

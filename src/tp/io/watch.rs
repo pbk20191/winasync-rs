@@ -10,6 +10,7 @@
 //! reports zero bytes: the caller has lost track and should rescan the
 //! directory.
 
+use crate::common::buffer::BufResult;
 use super::{submit, IoRes, Issue};
 use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 use crate::tp::Runtime;
@@ -191,6 +192,13 @@ pub struct DirectoryWatcher {
     filter: NotifyFilter,
 }
 
+impl std::os::windows::io::AsHandle for DirectoryWatcher {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // SAFETY: the registration owns the handle and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.res.handle.0) }
+    }
+}
+
 impl DirectoryWatcher {
     /// Watches `path` -- and, if `recursive`, everything under it -- for
     /// the changes `filter` names.
@@ -234,7 +242,7 @@ impl DirectoryWatcher {
     pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         self.read_with(buf, false)
     }
 
@@ -246,7 +254,7 @@ impl DirectoryWatcher {
     pub fn read_extended<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         self.read_with(buf, true)
     }
 
@@ -254,7 +262,7 @@ impl DirectoryWatcher {
         &self,
         buf: B,
         extended: bool,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         use windows::Win32::Storage::FileSystem::{
             ReadDirectoryChangesExW, ReadDirectoryNotifyExtendedInformation,
         };

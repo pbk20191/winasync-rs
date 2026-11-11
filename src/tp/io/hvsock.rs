@@ -12,6 +12,7 @@
 //! Streams mirror [`super::unix`]: `AcceptEx` / `ConnectEx` for the handshake,
 //! `WSARecv` / `WSASend` for data.
 
+use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
 use crate::common::winsock::ExtFnCache;
 use super::net::{
@@ -63,6 +64,13 @@ fn hv_socket() -> windows_core::Result<SOCKET> {
 /// A connected Hyper-V socket stream.
 pub struct HvStream {
     res: Arc<IoRes>,
+}
+
+impl std::os::windows::io::AsSocket for HvStream {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        // SAFETY: the registration owns the socket and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(self.res.socket().0 as std::os::windows::io::RawSocket) }
+    }
 }
 
 impl HvStream {
@@ -211,7 +219,7 @@ impl HvStream {
     pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
@@ -236,7 +244,7 @@ impl HvStream {
     pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let sock = self.res.socket();
         
         unsafe {
@@ -297,6 +305,13 @@ impl HvStream {
 pub struct HvListener {
     res: Arc<IoRes>,
     rt: Runtime,
+}
+
+impl std::os::windows::io::AsSocket for HvListener {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        // SAFETY: the registration owns the socket and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(self.res.socket().0 as std::os::windows::io::RawSocket) }
+    }
 }
 
 impl HvListener {

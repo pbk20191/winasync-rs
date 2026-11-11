@@ -68,6 +68,7 @@ pub use io::watch::{
 };
 pub use io::unix::{UnixListener, UnixStream};
 pub use io::io_event;
+pub use crate::common::buffer::BufResult;
 // Who may connect to a listener, for the `bind`s of the local
 // transports.
 pub use crate::common::security::SecurityDescriptor;

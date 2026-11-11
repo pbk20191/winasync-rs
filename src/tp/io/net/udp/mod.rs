@@ -1,6 +1,7 @@
 //! UDP over TP_IO: `UdpSocket` (WSARecvFrom / WSASendTo, plus connected-mode
 //! WSARecv / WSASend) and control messages (WSARecvMsg / WSASendMsg, IP_PKTINFO).
 
+use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
 use crate::common::winsock::ExtFnCache;
 use super::*;
@@ -51,7 +52,22 @@ pub struct UdpSocket {
     res: Arc<IoRes>,
 }
 
+impl std::os::windows::io::AsSocket for UdpSocket {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        // SAFETY: the registration owns the socket and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(self.res.socket().0 as std::os::windows::io::RawSocket) }
+    }
+}
+
 impl UdpSocket {
+    /// Takes over a socket the standard library made (see
+    /// [`TcpListener::from_std`](crate::tp::TcpListener::from_std)).
+    pub fn from_std(rt: &Runtime, socket: std::net::UdpSocket) -> windows_core::Result<UdpSocket> {
+        let owned: std::os::windows::io::OwnedSocket = socket.into();
+        let res = crate::tp::io::register_on(&rt.inner, owned)?;
+        Ok(UdpSocket { res })
+    }
+
     /// Sends a sequence of in-memory buffers and/or file ranges as one
     /// `TransmitPackets` call -- one datagram. Resolves to the number of
     /// bytes sent. See [`TransmitSequence`](crate::tp::TransmitSequence) for
@@ -147,7 +163,7 @@ impl UdpSocket {
         &self,
         buf: B,
         addr: SocketAddr,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let sock = self.res.socket();
         let mut to = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let to_len = write_sockaddr(&addr, &mut to);
@@ -331,7 +347,7 @@ impl UdpSocket {
     pub fn send<B: IoBuf + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
@@ -372,7 +388,7 @@ impl UdpSocket {
         &self,
         buf: B,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let sock = self.res.socket().0;
         super::super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let wsabuf = WSABUF {
@@ -390,7 +406,7 @@ impl UdpSocket {
     pub fn recv<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
@@ -434,7 +450,7 @@ impl UdpSocket {
         &self,
         buf: B,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let sock = self.res.socket().0;
         let fut = super::super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let wsabuf = WSABUF {

@@ -523,6 +523,7 @@ mod tests;
 
 use request::*;
 use response::*;
+pub use crate::common::buffer::BufResult;
 pub use request::HttpRequest;
 pub use response::{CachePolicy, Response};
 pub use types::{AuthInfo, AuthScheme, AuthSchemes, AuthStatus, SslProtocol, Timeouts, Verbosity503};

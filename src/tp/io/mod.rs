@@ -17,6 +17,7 @@ pub mod serial;
 pub mod unix;
 pub mod watch;
 
+use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::common::overlapped::{Binding, IoHandle, IoReg};
@@ -122,8 +123,9 @@ pub(crate) unsafe fn submit<P>(
 // ---------------------------------------------------------------------------
 
 /// What an unchecked operation's issue closure gets: the `OVERLAPPED`, and a
-/// flags word for the Winsock calls that write one back. Boxed, so both keep
-/// their address while the kernel holds them.
+/// flags word for the Winsock calls that write one back. They live in the
+/// future itself, which is pinned by the time the issue runs and stays
+/// put until the drop below has waited -- no allocation.
 pub(crate) struct EventedMem {
     pub(crate) ovl: OVERLAPPED,
     pub(crate) flags: u32,
@@ -135,7 +137,7 @@ pub(crate) struct EventedMem {
 /// waits for the event -- which is what makes it sound to hand the kernel a
 /// borrowed buffer: by the time this is gone, so is the kernel's use of it.
 struct Evented {
-    mem: Box<EventedMem>,
+    mem: EventedMem,
     /// The caller's; not closed here.
     event: HANDLE,
     handle: HANDLE,
@@ -200,7 +202,7 @@ pub(crate) fn evented<B: Send, E: AsHandle + Send, F: FnOnce(&mut EventedMem, &m
     buf: B,
     event: E,
     issue: F,
-) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E, F> {
+) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E, F> {
     use std::os::windows::io::AsRawHandle;
     let rt = crate::tp::Runtime {
         inner: res.runtime_inner().clone(),
@@ -217,10 +219,10 @@ pub(crate) fn evented<B: Send, E: AsHandle + Send, F: FnOnce(&mut EventedMem, &m
         let mut buf = buf;
         let raw_event = event.as_handle().as_raw_handle() as usize;
         let mut op = Evented {
-            mem: Box::new(EventedMem {
+            mem: EventedMem {
                 ovl: unsafe { std::mem::zeroed() },
                 flags: 0,
-            }),
+            },
             event: HANDLE(raw_event as *mut core::ffi::c_void),
             handle: HANDLE(handle as *mut core::ffi::c_void),
             in_flight: false,

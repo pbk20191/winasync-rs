@@ -8,6 +8,7 @@
 //! at identification level, so a server can tell who we are and cannot act
 //! as us, and matches its read mode to the pipe's.
 
+use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
 use super::{submit, IoRes, Issue};
 use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
@@ -35,6 +36,13 @@ pub struct NamedPipeStream {
     /// Which end this is, which decides how the peer is asked for.
     server_side: bool,
     message_mode: bool,
+}
+
+impl std::os::windows::io::AsHandle for NamedPipeStream {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // SAFETY: the registration owns the handle and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.res.handle.0) }
+    }
 }
 
 impl NamedPipeStream {
@@ -74,7 +82,7 @@ impl NamedPipeStream {
     pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let part = self.read_part(buf);
         async move {
             let (result, buf) = part.await;
@@ -107,7 +115,7 @@ impl NamedPipeStream {
         &self,
         buf: B,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let handle = self.res.handle.0 as usize;
         let fut = super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let slice =
@@ -176,7 +184,7 @@ impl NamedPipeStream {
     pub async fn read_message<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> (windows_core::Result<usize>, B) {
+    ) -> BufResult<usize, B> {
         if let Err(e) = self.message_mode() {
             return (Err(e), buf);
         }
@@ -268,7 +276,7 @@ impl NamedPipeStream {
         &self,
         result: windows_core::Result<(usize, bool)>,
         buf: B,
-    ) -> (windows_core::Result<usize>, B) {
+    ) -> BufResult<usize, B> {
         let (n, more) = match result {
             Ok(r) => r,
             Err(e) => return (Err(e), buf),
@@ -341,7 +349,7 @@ impl NamedPipeStream {
     pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let handle = self.res.handle;
 
         unsafe {
@@ -379,7 +387,7 @@ impl NamedPipeStream {
         &self,
         buf: B,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let handle = self.res.handle.0 as usize;
         super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));

@@ -1139,6 +1139,22 @@ Pillar 3 기준으로 거른 유일한 gap — WinRT에는 HTTP 서버가 없다
 - 테스트: Rust에서 WinRT 인터페이스로 왕복(POST + 본문 + 응답), 취소/닫기. 소비자(Python/Node/C#) 스크립트는
   그대로이고 CI의 프로젝션 생성이 새 타입을 받는지 본다.
 
+### 소유·빌림·수명 정리, 생태계에서 가져온 것 (2026-11-11)
+
+tokio-uring / monoio / compio / glommio를 기준으로 본 결과: 준비(readiness) 런타임은 빌리고(poll 한 번 동안만),
+완료(completion) 런타임은 소유하며 `(Result, Buf)`를 돌려준다. 우리 안전 경로는 후자와 같은 자리에 있고, 빌린
+I/O는 rio가 시도했다가 `mem::forget`에 unsound하다고 지적받은 설계라 `unsafe`로만 둔다(AsyncDrop이 안정화되면
+달라질 수 있음). 그 위에서 가져온 것:
+
+- **`BufResult<T, B>`** = `(Result<T>, B)` — 세 런타임이 쓰는 이름 그대로. `(windows_core::Result<usize>, B)`로
+  풀어 쓰던 시그니처 47곳을 이 별칭으로 통일했다. 의미는 같다: 성공이든 실패든 버퍼는 돌아온다.
+- **`evented`의 `Box<EventedMem>` 제거** — async 블록은 첫 poll 전에 핀되고 drop이 커널 완료를 기다리므로,
+  `OVERLAPPED`를 Future 상태(`Evented` 안)에 둬도 주소가 고정된다. unchecked 작업당 할당 1 → 0.
+- **std 상호운용** — `AsSocket`(소켓 7종)·`AsHandle`(파일/파이프/시리얼/디바이스/감시) 구현으로 빌린 핸들을 수명에
+  묶어 내주고, `TcpListener/TcpStream/UdpSocket::from_std`로 std 객체를 넘겨받는다. 건전한 이유: std는 모든
+  소켓을 `WSA_FLAG_OVERLAPPED`로 만든다. (std `File`은 `FILE_FLAG_OVERLAPPED`가 없어 받지 않는다.)
+- 빌린 읽기(`*_unchecked` 읽기 쪽)는 — 생태계엔 없지만 — 요청대로 유지.
+
 ### 남은 `dyn` Future 둘 (2026-11-11)
 
 - `tp::io::async_rw`의 `DynIoFut`(`Pin<Box<dyn Future>>`): `TcpStream::start_read/start_write`가 이름 있는

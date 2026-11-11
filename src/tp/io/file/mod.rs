@@ -2,6 +2,7 @@
 //! and read/written positionally with owned buffers (the buffer must live in
 //! the op block so cancellation can hand it to the completion callback).
 
+use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
 use super::{submit, IoRes, Issue, OpFuture};
 use crate::common::buffer::{page_size, IoBuf, IoBufMut, Region};
@@ -22,6 +23,13 @@ use windows::Win32::Storage::FileSystem::{
 /// An overlapped file handle bound to a [`Runtime`]'s pool.
 pub struct File {
     res: Arc<IoRes>,
+}
+
+impl std::os::windows::io::AsHandle for File {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // SAFETY: the registration owns the handle and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.res.handle.0) }
+    }
 }
 
 impl File {
@@ -150,7 +158,7 @@ impl File {
         &self,
         buf: B,
         pos: u64,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let fut = self.start_read(buf, pos);
         async move {
             let (result, buf) = fut.await;
@@ -188,7 +196,7 @@ impl File {
         buf: B,
         pos: u64,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let handle = self.res.handle.0 as usize;
         let fut = super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             mem.ovl.Anonymous.Anonymous.Offset = pos as u32;
@@ -219,7 +227,7 @@ impl File {
         &self,
         buf: B,
         pos: u64,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let handle = self.res.handle;
         unsafe {
             submit(&self.res, buf, move |ovl, buf| {
@@ -259,7 +267,7 @@ impl File {
         buf: B,
         pos: u64,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let handle = self.res.handle.0 as usize;
         super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             mem.ovl.Anonymous.Anonymous.Offset = pos as u32;

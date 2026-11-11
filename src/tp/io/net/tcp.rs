@@ -2,6 +2,7 @@
 //! WSARecv / WSASend), zero-copy sends (TransmitFile / TransmitPackets), and
 //! socket-handle reuse (DisconnectEx + TF_REUSE_SOCKET).
 
+use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
 use super::*;
 /// A listening TCP socket bound to a [`Runtime`]'s pool.
@@ -15,6 +16,13 @@ pub struct TcpListener {
     /// that engine can use. `AcceptEx` takes a socket the caller made, so
     /// unlike plain `accept()` nothing is inherited automatically.
     socket_flags: u32,
+}
+
+impl std::os::windows::io::AsSocket for TcpListener {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        // SAFETY: the registration owns the socket and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(self.res.socket().0 as std::os::windows::io::RawSocket) }
+    }
 }
 
 impl TcpListener {
@@ -58,6 +66,21 @@ impl TcpListener {
             res,
             family,
             socket_flags: extra_flags,
+        })
+    }
+
+    /// Takes over a listener the standard library made, registering its
+    /// socket with `rt`. Sound because `std` creates every socket with
+    /// `WSA_FLAG_OVERLAPPED`, which is what the registration needs; the
+    /// listener is consumed, and the socket closes when the result does.
+    pub fn from_std(rt: &Runtime, listener: std::net::TcpListener) -> windows_core::Result<TcpListener> {
+        let family = family_of(&listener.local_addr().map_err(windows_core::Error::from)?);
+        let owned: std::os::windows::io::OwnedSocket = listener.into();
+        let res = crate::tp::io::register_on(&rt.inner, owned)?;
+        Ok(TcpListener {
+            res,
+            family,
+            socket_flags: 0,
         })
     }
 
@@ -222,7 +245,21 @@ pub struct TcpStream {
     res: Arc<IoRes>,
 }
 
+impl std::os::windows::io::AsSocket for TcpStream {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        // SAFETY: the registration owns the socket and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(self.res.socket().0 as std::os::windows::io::RawSocket) }
+    }
+}
+
 impl TcpStream {
+    /// Takes over a connected stream the standard library made (see
+    /// [`TcpListener::from_std`]).
+    pub fn from_std(rt: &Runtime, stream: std::net::TcpStream) -> windows_core::Result<TcpStream> {
+        let owned: std::os::windows::io::OwnedSocket = stream.into();
+        TcpStream::from_socket(&rt.inner, owned.into())
+    }
+
     /// Sends a Winsock control code (`WSAIoctl`, overlapped) with `input`,
     /// filling `output`; resolves to the bytes written into `output`, with
     /// both buffers handed back.
@@ -294,7 +331,7 @@ impl TcpStream {
     pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let fut = self.start_read(buf);
         async move {
             let (result, payload) = fut.await;
@@ -343,7 +380,7 @@ impl TcpStream {
         &self,
         buf: B,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let sock = self.res.socket().0;
         let fut = super::super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let wsabuf = WSABUF {
@@ -364,7 +401,7 @@ impl TcpStream {
     pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         self.start_write(buf)
     }
 
@@ -406,7 +443,7 @@ impl TcpStream {
         &self,
         buf: B,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let sock = self.res.socket().0;
         super::super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let wsabuf = WSABUF {
@@ -424,7 +461,7 @@ impl TcpStream {
     pub fn peek<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(

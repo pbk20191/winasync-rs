@@ -9,6 +9,7 @@
 //! so the tests that need one run when `WINASYNC_TEST_COM` names a port and
 //! are skipped otherwise. See `tests` below.
 
+use crate::common::buffer::BufResult;
 use super::{submit, IoRes, Issue};
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::Runtime;
@@ -27,6 +28,13 @@ use windows::Win32::Devices::Communication::{
 /// An open serial port.
 pub struct SerialPort {
     res: Arc<IoRes>,
+}
+
+impl std::os::windows::io::AsHandle for SerialPort {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // SAFETY: the registration owns the handle and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.res.handle.0) }
+    }
 }
 
 impl SerialPort {
@@ -88,7 +96,7 @@ impl SerialPort {
     pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let handle = self.res.handle;
         let fut = unsafe {
             submit(&self.res, buf, move |ovl, buf| {
@@ -108,7 +116,7 @@ impl SerialPort {
     pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let handle = self.res.handle;
         unsafe {
             submit(&self.res, buf, move |ovl, buf| {

@@ -3,6 +3,7 @@
 //! `tp`'s `TcpListener`/`TcpStream` (AcceptEx / ConnectEx), with `SOCKADDR_UN`
 //! addressing; shares the socket helpers in `super::net`.
 
+use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
 use crate::common::winsock::ExtFnCache;
 use super::net::{
@@ -69,6 +70,13 @@ fn unix_socket() -> windows_core::Result<SOCKET> {
 /// A connected AF_UNIX stream socket.
 pub struct UnixStream {
     res: Arc<IoRes>,
+}
+
+impl std::os::windows::io::AsSocket for UnixStream {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        // SAFETY: the registration owns the socket and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(self.res.socket().0 as std::os::windows::io::RawSocket) }
+    }
 }
 
 impl UnixStream {
@@ -195,7 +203,7 @@ impl UnixStream {
     pub fn read<B: IoBufMut + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let sock = self.res.socket();
         let fut = unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
@@ -239,7 +247,7 @@ impl UnixStream {
         &self,
         buf: B,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let sock = self.res.socket().0;
         let fut = super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let wsabuf = WSABUF {
@@ -301,7 +309,7 @@ impl UnixStream {
     pub fn write<B: IoBuf + 'static>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
         let sock = self.res.socket();
         
         unsafe {
@@ -339,7 +347,7 @@ impl UnixStream {
         &self,
         buf: B,
         event: E,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
+    ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B, E> {
         let sock = self.res.socket().0;
         super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let wsabuf = WSABUF {
@@ -356,6 +364,13 @@ impl UnixStream {
 pub struct UnixListener {
     res: Arc<IoRes>,
     rt: Runtime,
+}
+
+impl std::os::windows::io::AsSocket for UnixListener {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        // SAFETY: the registration owns the socket and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(self.res.socket().0 as std::os::windows::io::RawSocket) }
+    }
 }
 
 impl UnixListener {

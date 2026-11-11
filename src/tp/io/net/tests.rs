@@ -1167,6 +1167,36 @@ use crate::tp::{FileRange, TransmitSequence};
     /// Borrowed buffers over TCP and connected UDP, and a dropped TCP read
     /// that leaves late data for the next read instead of writing it into a
     /// buffer the caller has taken back.
+    /// Sockets the standard library made, taken over: a listener, its accepted
+    /// stream, a client, and a UDP pair.
+    #[test]
+    fn std_sockets_are_taken_over() {
+        use std::io::Write;
+        let rt = Runtime::new();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let listener = TcpListener::from_std(&rt, std_listener).unwrap();
+        let mut std_client = std::net::TcpStream::connect(addr).unwrap();
+        let server = block_on(listener.accept()).unwrap();
+        std_client.write_all(b"from std").unwrap();
+        let (n, buf) = block_on(server.read(vec![0u8; 16]));
+        assert_eq!(&buf[..n.unwrap()], b"from std");
+        let client = TcpStream::from_std(&rt, std_client).unwrap();
+        block_on(client.write(b"back".to_vec())).0.unwrap();
+        let (n, buf) = block_on(server.read(vec![0u8; 16]));
+        assert_eq!(&buf[..n.unwrap()], b"back");
+        // The borrowed handle is tied to the stream's lifetime.
+        let _borrowed = std::os::windows::io::AsSocket::as_socket(&client);
+
+        let a = UdpSocket::from_std(&rt, std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+        let b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (n, _) = block_on(a.send_to(b"dgram".to_vec(), b.local_addr().unwrap()));
+        assert_eq!(n.unwrap(), 5);
+        let mut got = [0u8; 8];
+        let (n, _) = b.recv_from(&mut got).unwrap();
+        assert_eq!(&got[..n], b"dgram");
+    }
+
     #[test]
     fn unchecked_socket_ops_take_borrowed_buffers() {
         let rt = Runtime::new();

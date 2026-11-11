@@ -40,6 +40,13 @@ pub struct Device {
     res: Arc<IoRes>,
 }
 
+impl std::os::windows::io::AsHandle for Device {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        // SAFETY: the registration owns the handle and outlives this borrow.
+        unsafe { std::os::windows::io::BorrowedHandle::borrow_raw(self.res.handle.0) }
+    }
+}
+
 impl Device {
     /// Opens `path` with `FILE_FLAG_OVERLAPPED` and read/write access.
     ///
