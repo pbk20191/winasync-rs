@@ -3,10 +3,16 @@ use std::io::{Read, Write};
 use windows::Storage::Streams::Buffer;
 use windows_core::Interface;
 
+/// A port of this process's own, above the `http` module's tests
+/// (41000 + 3 * (pid % 2000), to ~47000) and below 49152, where the
+/// ephemeral range begins: `HttpAddUrl` answers `ERROR_SHARING_VIOLATION`
+/// for a port a transient client socket happens to hold, which the old
+/// `47000 + 3 * (pid % 2000)` reached for two thirds of all pids (seen
+/// once in six local runs, 2026-11-11).
 fn port() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    47000 + (std::process::id() % 2000) as u16 * 3 + NEXT.fetch_add(1, Ordering::Relaxed)
+    47100 + (std::process::id() % 640) as u16 * 3 + NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 #[test]
