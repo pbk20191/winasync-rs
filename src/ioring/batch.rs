@@ -21,15 +21,18 @@ use super::*;
 /// Dropped before it resolves, a batch cancels what is still in flight, as
 /// each [`RingOp`] does on its own.
 ///
-/// One completion wakes the batch, and the batch re-polls every operation
-/// still pending; that is a lock and a waker clone each, so a batch is for
-/// tens or hundreds of operations, not hundreds of thousands.
+/// One completion wakes the batch, and the batch pops the ring once and
+/// re-polls every operation still pending; that is a borrow and a waker
+/// clone each, so a batch is for tens or hundreds of operations, not
+/// hundreds of thousands.
 pub struct Batch<O: RingOperation> {
     /// `None` once the operation has resolved.
     ops: Vec<Option<RingOp<O>>>,
     /// The results, in the operations' order, filled in as they resolve.
     results: Vec<Option<O::Output>>,
     remaining: usize,
+    /// Whether the first poll, which submits, has happened.
+    submitted: bool,
 }
 
 impl<O: RingOperation> Batch<O> {
@@ -47,6 +50,19 @@ impl<O: RingOperation> Batch<O> {
     pub fn pending(&self) -> usize {
         self.remaining
     }
+
+    /// Polls every unresolved operation once, without popping, and keeps
+    /// the results of those that resolved.
+    fn pass(&mut self, cx: &mut Context<'_>) {
+        for (op, result) in self.ops.iter_mut().zip(self.results.iter_mut()) {
+            let Some(pending) = op else { continue };
+            if let Poll::Ready(out) = pending.poll_inner(cx, false) {
+                *result = Some(out);
+                *op = None;
+                self.remaining -= 1;
+            }
+        }
+    }
 }
 
 impl<O: RingOperation> FromIterator<RingOp<O>> for Batch<O> {
@@ -54,7 +70,7 @@ impl<O: RingOperation> FromIterator<RingOp<O>> for Batch<O> {
         let ops: Vec<Option<RingOp<O>>> = iter.into_iter().map(Some).collect();
         let remaining = ops.len();
         let results = ops.iter().map(|_| None).collect();
-        Batch { ops, results, remaining }
+        Batch { ops, results, remaining, submitted: false }
     }
 }
 
@@ -69,14 +85,21 @@ impl<O: RingOperation> Future for Batch<O> {
             this.remaining > 0 || this.ops.is_empty(),
             "Batch polled after completion"
         );
-        for (op, result) in this.ops.iter_mut().zip(this.results.iter_mut()) {
-            let Some(pending) = op else { continue };
-            if let Poll::Ready(out) = Pin::new(pending).poll(cx) {
-                *result = Some(out);
-                *op = None;
-                this.remaining -= 1;
-            }
+        // The first poll submits, by polling each operation; only then is
+        // there anything to pop. A cached read can complete inside
+        // `SubmitIoRing` itself, so popping right after the submission
+        // finds it without a round trip through the pump -- which is the
+        // difference between one wake and none at queue depth 1.
+        if !this.submitted {
+            this.submitted = true;
+            this.pass(cx);
         }
+        // One pop for the whole batch, then the operations look at their
+        // slots without popping again.
+        if let Some(any) = this.ops.iter().flatten().next() {
+            any.inner.pop_for(cx.waker());
+        }
+        this.pass(cx);
         if this.remaining > 0 {
             return Poll::Pending;
         }

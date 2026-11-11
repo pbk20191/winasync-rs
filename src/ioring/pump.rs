@@ -1,9 +1,17 @@
-//! The thread-pool wait that drains the ring when its event fires, and
-//! the teardown that has to reach it.
+//! The thread-pool wait that wakes the ring's driver when its event fires,
+//! and the ring's teardown.
+//!
+//! The pump touches nothing of the ring's: not its queues, not its slots.
+//! It holds the ring's event handle and a waker slot, and when the event
+//! fires it wakes whoever registered there -- the task that last polled an
+//! operation -- and re-arms. That task pops. This is what lets the ring be
+//! a single-owner object with no lock in it: the only state the pool thread
+//! shares with the owner is the waker slot, which is lock-free.
 
 use super::*;
+use crate::common::atomic_waker::AtomicWaker;
 
-/// The thread-pool wait that drains the ring when its event fires.
+/// The thread-pool wait that wakes the driver when the ring's event fires.
 pub(super) struct Pump {
     pub(super) wait: PTP_WAIT,
     /// The wait's context; valid until the wait is closed.
@@ -13,16 +21,13 @@ pub(super) struct Pump {
     pub(super) ctx_to_release: Option<*const PumpCtx>,
 }
 
-// A thread-pool object and a pointer this pump owns.
-unsafe impl Send for Pump {}
-
 /// The pump callback's context. Starts with a [`CtxHeader`] because a `tp`
 /// environment's finalization callback treats every context as one.
 #[repr(C)]
 pub(super) struct PumpCtx {
     pub(super) header: CtxHeader,
-    /// Weak: the ring's owners decide when it goes, not its pump.
-    pub(super) inner: Weak<Inner>,
+    /// Whom to wake: shared with the ring, which registers the driver.
+    pub(super) driver: Arc<AtomicWaker>,
     pub(super) event: HANDLE,
     /// Set by [`Pump::stop`] before it drains: a callback that runs during
     /// the drain must not re-arm the wait the close is about to find.
@@ -39,20 +44,14 @@ pub(super) unsafe fn release_ctx(ctx: *mut core::ffi::c_void) {
     unsafe { drop(Arc::from_raw(ctx as *const PumpCtx)) }
 }
 
-thread_local! {
-    /// Set while this thread runs a pump callback: a teardown reached from
-    /// inside one must not wait for the callback it is running in.
-    static IN_PUMP: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-}
-
 impl Pump {
-    pub(super) fn start(inner: &Arc<Inner>, pool: PoolRef) -> Result<Pump> {
+    pub(super) fn start(inner: &Rc<Inner>, pool: PoolRef) -> Result<Pump> {
         // Read before the pool moves into the context.
         let env = pool.env();
         let release_ourselves = !pool.finalizes();
         let ctx = Arc::into_raw(Arc::new(PumpCtx {
             header: unsafe { CtxHeader::new(release_ctx) },
-            inner: Arc::downgrade(inner),
+            driver: inner.driver.clone(),
             event: inner.event,
             closing: std::sync::atomic::AtomicBool::new(false),
             _pool: pool,
@@ -74,11 +73,10 @@ impl Pump {
         })
     }
 
-    /// Stops the wait and frees the context. Must not run inside the pump's
-    /// own callback.
+    /// Stops the wait and frees the context.
     ///
-    /// Drained, not cancelled: a callback already queued runs (and finds the
-    /// ring gone, or drains it one last time) before the wait is closed. See
+    /// Drained, not cancelled: a callback already queued runs (and wakes a
+    /// driver that will find nothing) before the wait is closed. See
     /// `close_wait_draining` for the pool stall this avoids.
     pub(super) fn stop(self) {
         unsafe {
@@ -93,48 +91,21 @@ impl Pump {
     }
 }
 
-pub(super) struct InPump;
-
-impl Drop for InPump {
-    fn drop(&mut self) {
-        IN_PUMP.with(|f| f.set(false));
-    }
-}
-
 unsafe extern "system" fn pump_callback(
-    instance: PTP_CALLBACK_INSTANCE,
+    _instance: PTP_CALLBACK_INSTANCE,
     ctx: *mut core::ffi::c_void,
     wait: PTP_WAIT,
     _result: u32,
 ) {
-    // A drain can run as long as completions keep coming.
-    let _ = unsafe { CallbackMayRunLong(instance) };
-    IN_PUMP.with(|f| f.set(true));
-    let _in_pump = InPump;
     let ctx = unsafe { &*(ctx as *const PumpCtx) };
-    let Some(inner) = ctx.inner.upgrade() else {
-        return;
-    };
-    let (wake, dead) = {
-        let mut ring = inner.ring.lock().unwrap();
-        let (_, wake, dead) = drain_locked(&mut ring);
-        // Re-armed while the ring is certainly alive, unless its teardown
-        // has begun. The event is signalled when the completion queue goes
-        // from empty to non-empty (measured, not documented), so having
-        // popped to empty, a completion posted after the last pop signals
-        // it and the wait fires again at once rather than missing it.
-        if !ctx.closing.load(std::sync::atomic::Ordering::Acquire) {
-            unsafe { SetThreadpoolWait(wait, Some(ctx.event), None) };
-        }
-        (wake, dead)
-    };
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wake.into_iter().for_each(Waker::wake);
-        drop(dead);
-    }));
-    // If this was the last owner, `Inner::drop` runs here, with `IN_PUMP`
-    // set, and leaves stopping this wait to another thread.
-    drop(inner);
+    // Re-armed first, unless the ring's teardown has begun. The event is
+    // signalled when the completion queue goes from empty to non-empty
+    // (measured, not documented); the driver pops to empty, so a completion
+    // landing after its last pop signals again and the wait fires at once.
+    if !ctx.closing.load(std::sync::atomic::Ordering::Acquire) {
+        unsafe { SetThreadpoolWait(wait, Some(ctx.event), None) };
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.driver.wake()));
 }
 
 // ---------------------------------------------------------------------------
@@ -143,8 +114,8 @@ unsafe extern "system" fn pump_callback(
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let pump = self.pump.get_mut().unwrap().take();
-        let ring = self.ring.get_mut().unwrap();
+        let pump = self.pump.get_mut().take();
+        let ring = self.ring.get_mut();
 
         // Every operation still in the ring belongs to a future that is gone,
         // and each was cancelled when its future dropped. Wait for the kernel
@@ -170,38 +141,14 @@ impl Drop for Inner {
             }
         }
 
-        let handle = ring.handle;
-        let event = self.event;
-        let close = move || unsafe {
-            let _ = CloseIoRing(handle);
-            let _ = CloseHandle(event);
-        };
-        match pump {
-            None => close(),
-            Some(pump) if IN_PUMP.with(|f| f.get()) => {
-                // Inside our own callback: waiting for it would be waiting
-                // for ourselves. Another thread stops it moments later.
-                struct Later(Pump, HIORING, HANDLE);
-                unsafe impl Send for Later {}
-                impl Later {
-                    fn run(self) {
-                        let Later(pump, handle, event) = self;
-                        pump.stop();
-                        unsafe {
-                            let _ = CloseIoRing(handle);
-                            let _ = CloseHandle(event);
-                        }
-                    }
-                }
-                let later = Later(pump, handle, event);
-                // A method call, so the closure captures `later` whole rather
-                // than its non-`Send` fields one by one.
-                std::thread::spawn(move || later.run());
-            }
-            Some(pump) => {
-                pump.stop();
-                close();
-            }
+        // The pump never holds the ring, so this cannot be running inside
+        // its own callback; stopping it here is a plain drain.
+        if let Some(pump) = pump {
+            pump.stop();
+        }
+        unsafe {
+            let _ = CloseIoRing(ring.handle);
+            let _ = CloseHandle(self.event);
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Registered files and buffers: tables the kernel addresses by index.
 
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Files registered with a ring: see [`IoRing::register_files`].
 ///
@@ -125,7 +126,10 @@ pub(super) struct BufferTable {
     /// The owners of the memory -- the caller's `Vec<B>`, or a slab's
     /// region -- boxed once for the table; only ever dropped.
     pub(super) _keep: Box<dyn Send>,
-    pub(super) free: Mutex<Vec<u32>>,
+    /// One flag per buffer, `true` while it is free. A buffer travels with
+    /// the operation's result and may be dropped on another thread, so this
+    /// is shared state; flags rather than a list keep it lock-free.
+    pub(super) free: Vec<AtomicBool>,
 }
 
 // The memory is reached only through `RingBuffer`s, one per buffer at a
@@ -133,23 +137,29 @@ pub(super) struct BufferTable {
 unsafe impl Send for BufferTable {}
 unsafe impl Sync for BufferTable {}
 
+impl BufferTable {
+    /// Claims buffer `index` if it is free.
+    fn claim(&self, index: usize) -> bool {
+        self.free
+            .get(index)
+            .is_some_and(|f| f.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_ok())
+    }
+}
+
 impl RegisteredBuffers {
     /// Any free buffer, or `None` when every one is out.
     pub fn take(&self) -> Option<RingBuffer> {
-        let index = self.table.free.lock().unwrap().pop()?;
+        let index = (0..self.table.free.len()).find(|&i| self.table.claim(i))?;
         Some(RingBuffer {
             table: self.table.clone(),
-            index,
+            index: index as u32,
             len: 0,
         })
     }
 
     /// The `index`th buffer, if it is free.
     pub fn take_index(&self, index: usize) -> Option<RingBuffer> {
-        let mut free = self.table.free.lock().unwrap();
-        let at = free.iter().position(|&i| i as usize == index)?;
-        free.swap_remove(at);
-        Some(RingBuffer {
+        self.table.claim(index).then(|| RingBuffer {
             table: self.table.clone(),
             index: index as u32,
             len: 0,
@@ -167,7 +177,7 @@ impl RegisteredBuffers {
 
     /// How many are free right now.
     pub fn available(&self) -> usize {
-        self.table.free.lock().unwrap().len()
+        self.table.free.iter().filter(|f| f.load(Ordering::Acquire)).count()
     }
 }
 
@@ -215,7 +225,7 @@ impl core::ops::DerefMut for RingBuffer {
 
 impl Drop for RingBuffer {
     fn drop(&mut self) {
-        self.table.free.lock().unwrap().push(self.index);
+        self.table.free[self.index as usize].store(true, Ordering::Release);
     }
 }
 
@@ -296,7 +306,7 @@ impl IoRing {
     /// way to register nothing (an empty table is refused), so there is no
     /// unregister: replace, or drop the ring.
     pub fn register_files<H: RingHandle + Clone + 'static>(&self, files: &[H]) -> RingOp<RegisterFilesOp> {
-        let mut ring = self.inner.ring.lock().unwrap();
+        let mut ring = self.inner.ring.borrow_mut();
         let generation = ring.next_generation;
         ring.next_generation += 1;
         let table = Arc::new(FileTable {
@@ -355,16 +365,16 @@ impl IoRing {
         keep: Box<dyn Send>,
         too_big: bool,
     ) -> RingOp<RegisterBuffersOp> {
-        let mut ring = self.inner.ring.lock().unwrap();
+        let mut ring = self.inner.ring.borrow_mut();
         let generation = ring.next_generation;
         ring.next_generation += 1;
-        let count = infos.len() as u32;
+        let count = infos.len();
         let table = Arc::new(BufferTable {
             ring: ring.id,
             generation,
             infos,
             _keep: keep,
-            free: Mutex::new((0..count).rev().collect()),
+            free: (0..count).map(|_| AtomicBool::new(true)).collect(),
         });
         drop(ring);
         if too_big {

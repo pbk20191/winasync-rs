@@ -87,7 +87,8 @@ impl Drop for RioTcpListener {
 ///
 /// Same engine caveats as [`super::socket::RioUdpSocket`]: posts fail with
 /// `WSAENOBUFS` when the request queue is full, dropping a future does not
-/// cancel, and operations on one stream are serialized.
+/// cancel, and the stream is `!Sync` -- one poster at a time, with no lock
+/// of its own; see there for how to split it across tasks.
 pub struct RioTcpStream {
     sock: SOCKET,
     rq: RequestQueue,
@@ -98,8 +99,9 @@ pub struct RioTcpStream {
     owner: Option<crate::tp::io::net::TcpStream>,
 }
 
+// A socket handle and a request queue, usable from any one thread at a time;
+// `Sync` is deliberately not implemented (the request queue is `!Sync`).
 unsafe impl Send for RioTcpStream {}
-unsafe impl Sync for RioTcpStream {}
 
 impl RioTcpStream {
     /// Connects (blocking) and attaches a request queue.

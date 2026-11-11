@@ -16,8 +16,16 @@
 //!   stop outstanding work is to drop the socket, and even then completions
 //!   arrive afterwards (with `WSAECONNABORTED`).
 //! * **One socket, one thread at a time.** Neither the request queue nor the
-//!   completion queue is internally synchronized, so sends and receives on
-//!   one socket are serialized here by a mutex.
+//!   completion queue is internally synchronized, and this crate adds no
+//!   lock of its own: the socket is `!Sync`, which is the kernel's rule
+//!   stated as a type. Every post is synchronous and the future it returns
+//!   borrows nothing, so a reader task and a writer task can still share
+//!   one socket behind a `Mutex` taken only for the post:
+//!
+//!   ```ignore
+//!   let fut = socket.lock().unwrap().recv(slice)?; // guard held for the post
+//!   let (n, slice) = fut.await;                      // not across the await
+//!   ```
 
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
@@ -47,8 +55,10 @@ pub struct RioUdpSocket {
     rq: RequestQueue,
 }
 
+// A socket handle, a request queue and shared pools, usable from any one
+// thread at a time; `Sync` is deliberately not implemented (the request
+// queue is `!Sync`).
 unsafe impl Send for RioUdpSocket {}
-unsafe impl Sync for RioUdpSocket {}
 
 impl RioUdpSocket {
     /// Binds a RIO UDP socket and attaches a request queue to `cq`.
@@ -225,10 +235,9 @@ impl RioUdpSocket {
     ///
     /// Microsoft documents this as the one request-queue entry point that
     /// does *not* need to be serialized with other sends — it may run on
-    /// another thread concurrently with a `RIOSend` on the same queue. This
-    /// implementation still takes the socket's lock, because the lock also
-    /// guards the queue handle itself and the cost is a non-issue next to the
-    /// dispatch.
+    /// another thread concurrently with a `RIOSend` on the same queue. The
+    /// socket being `!Sync` does not offer that, and it is not worth a
+    /// second type: the commit is one call next to the dispatch it releases.
     pub fn commit_sends(&self) -> windows_core::Result<()> {
         self.rq.commit_sends()
     }

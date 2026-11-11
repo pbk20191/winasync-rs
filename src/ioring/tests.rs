@@ -13,7 +13,7 @@ fn temp_file(tag: &str, contents: &[u8]) -> (String, File) {
 }
 
 fn in_flight(ring: &IoRing) -> u32 {
-    ring.inner.ring.lock().unwrap().in_flight
+    ring.inner.ring.borrow().in_flight
 }
 
 /// Waits for the ring to have nothing in flight -- cancelled operations
@@ -82,9 +82,9 @@ fn a_batch_submits_once_and_resolves_in_order() {
     // Added in reverse, so order of results is order of adding, not of offset.
     let batch = ring.read_batch(&file, (0..16u64).rev().map(|i| (vec![0u8; 512], i * 512)));
     assert_eq!(batch.len(), 16);
-    assert_eq!(ring.inner.ring.lock().unwrap().unsubmitted, 16, "built, not yet submitted");
+    assert_eq!(ring.inner.ring.borrow().unsubmitted, 16, "built, not yet submitted");
     let results = block_on(batch);
-    assert_eq!(ring.inner.ring.lock().unwrap().unsubmitted, 0);
+    assert_eq!(ring.inner.ring.borrow().unsubmitted, 0);
     assert_eq!(results.len(), 16);
     for (slot, (n, got)) in results.into_iter().enumerate() {
         let i = 15 - slot as u8;
@@ -135,25 +135,88 @@ fn operations_past_the_queue_wait_for_room() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Without a pump nothing arrives until the caller drives the ring.
+/// Without a pump, `drive` alone settles an operation nobody is polling,
+/// and a poll pops for itself: no pump thread is involved either way.
 #[test]
 fn a_manual_ring_delivers_when_driven() {
     let ring = IoRing::manual(4).unwrap();
     let (path, file) = temp_file("manual", b"driven");
     let mut op = ring.read(&file, Vec::with_capacity(16), 0);
+    ring.submit().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while in_flight(&ring) > 0 {
+        ring.drive();
+        assert!(Instant::now() < deadline, "never completed");
+    }
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
-    assert!(Pin::new(&mut op).poll(&mut cx).is_pending());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let Poll::Ready((n, got)) = Pin::new(&mut op).poll(&mut cx) else {
+        panic!("driven to completion, yet pending");
+    };
+    assert_eq!(&got[..n.unwrap()], b"driven");
+
+    // And a poll pops on its own: the read completes with nobody driving.
+    let mut op = ring.read(&file, Vec::with_capacity(16), 0);
     let (n, got) = loop {
-        ring.drive();
         if let Poll::Ready(r) = Pin::new(&mut op).poll(&mut cx) {
             break r;
         }
         assert!(Instant::now() < deadline, "never completed");
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     };
     assert_eq!(&got[..n.unwrap()], b"driven");
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Two tasks on one ring, each awaiting its own operation, polled by one
+/// executor: whichever the pump wakes pops and hands the other its result.
+/// The hand-off when a driver's operation finishes is what this exercises:
+/// the first task to finish must leave the second with a way to be woken.
+#[test]
+fn two_tasks_share_a_pumped_ring() {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::task::Wake;
+    let ring = IoRing::new(4).unwrap();
+    let (path, file) = temp_file("two_tasks", b"shared ring");
+
+    struct Flag(std::sync::atomic::AtomicBool);
+    impl Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let flags = [Arc::new(Flag(true.into())), Arc::new(Flag(true.into()))];
+    let wakers = [Waker::from(flags[0].clone()), Waker::from(flags[1].clone())];
+    let mut ops = [
+        Some(ring.read(&file, Vec::with_capacity(16), 0)),
+        Some(ring.read(&file, Vec::with_capacity(16), 7)),
+    ];
+    let results: [Cell<Option<Vec<u8>>>; 2] = Default::default();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // A two-task executor: poll whichever task was woken, and nothing else.
+    while ops.iter().any(Option::is_some) {
+        assert!(
+            Instant::now() < deadline,
+            "a task was never woken: {:?}",
+            ops.iter().map(Option::is_some).collect::<Vec<_>>()
+        );
+        for i in 0..2 {
+            if !flags[i].0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+            let Some(op) = &mut ops[i] else { continue };
+            let mut cx = Context::from_waker(&wakers[i]);
+            if let Poll::Ready((n, got)) = Pin::new(op).poll(&mut cx) {
+                results[i].set(Some(got[..n.unwrap()].to_vec()));
+                ops[i] = None;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(results[0].take().unwrap(), b"shared ring");
+    assert_eq!(results[1].take().unwrap(), b"ring");
     drop(file);
     let _ = std::fs::remove_file(&path);
 }

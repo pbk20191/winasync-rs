@@ -371,7 +371,12 @@ fn tp_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
 }
 
 // ---------------------------------------------------------------- file: winasync ioring
+/// `qd` concurrent read loops on one ring, each its own future, joined on
+/// the calling thread: a ring and its operations are `!Send`, so the
+/// executor is `block_on` plus a local join, not `tp::spawn`. The pump
+/// (on `rt`'s pool) only wakes; the futures pop.
 fn ioring_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
+    use winasync::common::block_on;
     use winasync::ioring::{File, IoRing};
     use winasync::tp::Runtime;
     let rt = Runtime::new();
@@ -380,13 +385,11 @@ fn ioring_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
     let file = File::open(path).unwrap();
     let per = reads / qd;
     let file_len = file_mb << 20;
-    let rt2 = rt.clone();
-    rt.block_on(async move {
-        let mut tasks = Vec::with_capacity(qd);
-        for i in 0..qd {
+    let loops: Vec<_> = (0..qd)
+        .map(|i| {
             let ring = ring.clone();
             let file = file.clone();
-            tasks.push(rt2.spawn(async move {
+            async move {
                 let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1));
                 let mut buf = vec![0u8; READ];
                 for _ in 0..per {
@@ -394,18 +397,38 @@ fn ioring_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
                     assert_eq!(n.unwrap(), READ);
                     buf = b;
                 }
-            }));
+            }
+        })
+        .collect();
+    block_on(join_all_local(loops));
+    (per * qd, Vec::new())
+}
+
+/// Polls every future each time any of them is woken; resolves when all
+/// have. Enough for a benchmark; a real local executor would track which.
+fn join_all_local<F: Future<Output = ()>>(futs: Vec<F>) -> impl Future<Output = ()> {
+    use std::pin::Pin;
+    use std::task::Poll;
+    let mut futs: Vec<Option<Pin<Box<F>>>> = futs.into_iter().map(|f| Some(Box::pin(f))).collect();
+    std::future::poll_fn(move |cx| {
+        let mut pending = false;
+        for slot in futs.iter_mut() {
+            if let Some(f) = slot {
+                if f.as_mut().poll(cx).is_ready() {
+                    *slot = None;
+                } else {
+                    pending = true;
+                }
+            }
         }
-        for t in tasks {
-            t.await.unwrap();
-        }
-        (per * qd, Vec::new())
+        if pending { Poll::Pending } else { Poll::Ready(()) }
     })
 }
 
 // ---------------------------------------------------------------- file: winasync ioring, batched
 /// One task, `qd` reads per `Batch`: one `SubmitIoRing` per `qd` reads.
 fn ioring_batch_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
+    use winasync::common::block_on;
     use winasync::ioring::{File, IoRing};
     use winasync::tp::Runtime;
     let rt = Runtime::new();
@@ -414,7 +437,7 @@ fn ioring_batch_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
     let file = File::open(path).unwrap();
     let rounds = reads / qd;
     let file_len = file_mb << 20;
-    rt.block_on(async move {
+    block_on(async move {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut bufs: Vec<Vec<u8>> = (0..qd).map(|_| vec![0u8; READ]).collect();
         for _ in 0..rounds {
@@ -432,6 +455,7 @@ fn ioring_batch_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
 /// `ioring_batch_file` with the file and the buffers registered: the kernel
 /// skips the handle lookup and the page probing per operation.
 fn ioring_reg_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
+    use winasync::common::block_on;
     use winasync::ioring::{File, IoRing};
     use winasync::tp::Runtime;
     let rt = Runtime::new();
@@ -440,7 +464,7 @@ fn ioring_reg_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
     let file = File::open(path).unwrap();
     let rounds = reads / qd;
     let file_len = file_mb << 20;
-    rt.block_on(async move {
+    block_on(async move {
         let files = ring.register_files(&[file]).await.unwrap();
         let file = files.get(0).unwrap();
         let slab = ring.register_slab(READ as u32, qd as u32).unwrap().await.unwrap();

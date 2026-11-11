@@ -1366,6 +1366,62 @@ qd=32에서 2.7배, qd=128에서 3.4배 — tp·compio와 같은 선에 올라�
 - 우리 펌프는 이미 S_FALSE까지 pop한 뒤 재무장하므로 2는 현재 코드에 맞다. 링을 소유 태스크가 drive하는 모드로
   바꿀 때(다음 작업) "깨어나면 빈 큐까지 pop"이 정확성 조건이 된다.
 
+### IoRing·RIO: 단일 소유자 객체, 락은 사용자 몫 (2026-11-11)
+
+RIO의 RQ/CQ와 IoRing은 커널 쪽에서 동기화가 없는 단일 소유자 객체다. 지금까지는 그 위에 우리 Mutex를 얹어
+`Send + Sync`로 팔았는데, 그 약속을 걷어내고 **타입이 커널의 규칙을 말하게** 했다. 동기화 책임은 사용자에게 간다.
+선례: MikeGrier/windows-ioring-sys의 `IoRing`이 `Send + !Sync`, 풀 연동은 "깨우기만 하는 TP_WAIT"(`CompletionWake`).
+tokio-uring/monoio/compio도 같은 모양(링과 op가 전부 한 스레드).
+
+**IoRing**
+
+- `IoRing { Rc<Inner> }`, `Inner.ring: RefCell<Ring>`. `IoRing`, `RingOp`, `Batch` 모두 `!Send + !Sync`(컴파일러가
+  자동으로; `compile_fail` doctest로 고정). 의미는 그대로: 생성 시 build, 첫 poll에 submit, drop=cancel, 용량 초과면
+  자리 대기, `*_unchecked` 빌린 버퍼.
+- **완료는 소유자가 꺼낸다.** op의 매 poll이 `PopIoRingCompletion`을 빈 큐까지 돌리고(유저 모드, syscall 0) 슬롯을
+  정산한다. `Batch`는 한 poll에 pop 한 번 + op 순회. `drive()`는 아무도 poll하지 않는 op를 정산할 때.
+- **펌프는 깨우기만 한다.** `PumpCtx`가 링을 전혀 안 만진다(`Weak<Inner>` 삭제). 들고 있는 건 이벤트 핸들과
+  `Arc<AtomicWaker>` 하나. 콜백 = 재무장 + `driver.wake()`. driver는 "마지막으로 op를 poll한 태스크"(매 poll마다
+  등록). 우리 쪽 크로스 스레드 상태는 그 waker 슬롯이 전부이고, `common::atomic_waker`(futures-util 모양, lock-free)로
+  구현. `tp::Runtime::block_on`/`spawn`은 `Send`를 요구하므로 못 쓰고, `common::block_on`·dq `spawn_local`에서 쓴다.
+- **바톤 넘기기.** 펌프가 한 태스크만 깨우므로, driver의 op가 끝나거나(Ready) 그 퓨처가 drop되면 다른 대기 op들의
+  waker를 전부 깨운다(`Ring::other_waiters`). 깨어난 태스크가 다시 poll하며 driver로 재등록한다. 같은 태스크의
+  waker(`will_wake`)는 건너뛰므로 `Batch`에는 스캔 비용뿐. 테스트 `two_tasks_share_a_pumped_ring`가 이 경로(driver의
+  op가 먼저 끝나고 다른 태스크가 남는 순서)를 두 태스크 실행기로 재현한다.
+- `Inner::drop`이 펌프 콜백 안에서 돌 수 없게 됐으므로(콜백이 Inner를 안 들고 있음) `IN_PUMP`/`Later` 스레드 우회가
+  사라졌다. 등록 버퍼 테이블의 `Mutex<Vec<u32>>` 프리리스트는 버퍼가 결과와 함께 다른 스레드로 갈 수 있어 공유
+  상태가 맞고, `Vec<AtomicBool>` 플래그(CAS)로 바꿨다.
+- `IoRing::completion_event()` 노출: 펌프 없는 `manual` 링을 직접 기다리는 쪽을 위해.
+
+**RIO**
+
+- `RequestQueue`의 `Mutex<RIO_RQ>` 삭제, `PhantomData<Cell<()>>`로 `!Sync`. `RioTcpStream`/`RioUdpSocket`의
+  `unsafe impl Sync` 삭제(`Send`는 유지). CQ는 원래 락이 없었고 펌프 모드(one-shot TP_WAIT = 단일 소비자)는 그대로다.
+  펌프가 소켓이 `!Sync`여도 되는 이유: 펌프가 만지는 건 커널 CQ와 요청별 `Box<Request>`(oneshot)뿐이고 `Waker`는
+  `Send + Sync`다.
+- 읽기/쓰기 태스크로 쪼개려면 사용자가 `Mutex`를 감싸되 **post 동안만** 잡는다. 모든 op 퓨처가 `use<>`(self를 안
+  빌림)인 것이 그 조건이고, 이건 지켜야 할 불변식으로 문서에 적었다.
+
+**측정 (같은 세션, 수정 전/후 바이너리를 번갈아 2회, 둘째 쌍)**
+
+| 행 | qd=32 전 | qd=32 후 | qd=1 전 | qd=1 후 |
+| --- | --- | --- | --- | --- |
+| ioring (op당 제출) | 211k | 178k | 86k | **180k** |
+| ioring batch | 227k | **247k** | 85k | **172k**¹ |
+| ioring batch+reg | 219k | 237k | 82k | 164k¹ |
+| ioring manual (천장) | 259k | 256k | 214k | 222k |
+| tp (비교) | 226k | 226k | 111k | 111k |
+
+¹ 처음엔 85k였다. `Batch`가 "pop → op poll(제출)" 순서라 `SubmitIoRing` 안에서 동기로 끝난 캐시 읽기를 못 보고 펌프
+웨이크를 한 바퀴 기다렸던 것. 첫 poll에서 제출 pass를 먼저 돌리고 pop하도록 바꾸니 2배.
+
+- **qd=1이 2배**(86k → 180k, compio 190k와 같은 자리): 완료를 "펌프 스레드가 pop → 다른 풀 스레드에서 poll" 대신
+  "제출한 스레드가 poll하며 pop"하니 핸드오프가 사라졌다. 앞 절에서 "깊이 1의 지연이 중요하면 제출한 스레드에서
+  처리하는 모드가 남은 과제"라고 적은 그것이다.
+- qd=32 배치 +9 %: 펌프 스레드와의 락 경합·핸드오프가 없어진 몫. 천장(manual)은 그대로 커널이다.
+- "ioring" 행(op당 제출)은 워크로드가 바뀌었다(전: tp 태스크 qd개, 후: 한 스레드의 로컬 join qd개)라 qd=32의
+  전후 비교는 의미가 없다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

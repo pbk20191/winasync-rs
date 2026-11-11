@@ -5,7 +5,7 @@ use super::*;
 
 /// What a ring operation knows how to do: build its entry, and turn the
 /// completion back into a result.
-pub trait RingOperation: Send + Sized {
+pub trait RingOperation: Sized {
     /// What the future resolves to.
     type Output;
 
@@ -129,13 +129,15 @@ impl<H: RingHandle> RingOperation for FlushOp<H> {
     }
 }
 
-/// One operation on an [`IoRing`], as a future.
+/// One operation on an [`IoRing`], as a future. `!Send`, like its ring.
 ///
 /// Built when created (so operations created together are submitted
-/// together), submitted when first polled. Dropping it before it completes
-/// cancels the operation; see [`IoRing`] for what happens to the buffer.
+/// together), submitted when first polled. Each poll also pops the ring's
+/// completion queue, so a task awaiting an operation is the ring's driver
+/// for as long as it waits. Dropping it before it completes cancels the
+/// operation; see [`IoRing`] for what happens to the buffer.
 pub struct RingOp<O: RingOperation> {
-    pub(super) inner: Arc<Inner>,
+    pub(super) inner: Rc<Inner>,
     pub(super) stage: Stage<O>,
     /// Set for the `*_unchecked` operations: a drop waits for the kernel.
     pub(super) wait_on_drop: bool,
@@ -156,13 +158,11 @@ pub(super) enum Stage<O> {
     Finished,
 }
 
-// The handle reference is a plain handle value; the payload is `Send`.
-unsafe impl<O: RingOperation> Send for RingOp<O> {}
 impl<O: RingOperation> Unpin for RingOp<O> {}
 
 impl<O: RingOperation> RingOp<O> {
     /// An operation that resolves to `error` without being built.
-    pub(super) fn failed(inner: &Arc<Inner>, op: O, error: Error) -> Self {
+    pub(super) fn failed(inner: &Rc<Inner>, op: O, error: Error) -> Self {
         RingOp {
             inner: inner.clone(),
             stage: Stage::Failed(op, error),
@@ -170,14 +170,88 @@ impl<O: RingOperation> RingOp<O> {
         }
     }
 
-    pub(super) fn new(inner: &Arc<Inner>, op: O, wait_on_drop: bool) -> Self {
+    pub(super) fn new(inner: &Rc<Inner>, op: O, wait_on_drop: bool) -> Self {
         let mut this = RingOp {
             inner: inner.clone(),
             stage: Stage::Unbuilt(op),
             wait_on_drop,
         };
-        this.try_build(&mut inner.ring.lock().unwrap());
+        this.try_build(&mut inner.ring.borrow_mut());
         this
+    }
+
+    /// [`Future::poll`], with the pop of the completion queue optional: a
+    /// [`Batch`] pops once and then polls its operations without.
+    pub(super) fn poll_inner(&mut self, cx: &mut Context<'_>, pop: bool) -> Poll<O::Output> {
+        let inner = self.inner.clone();
+        // Whoever polls last is the one the pump wakes.
+        inner.driver.register(cx.waker());
+        let mut ring = inner.ring.borrow_mut();
+        if let Stage::Unbuilt(_) = self.stage {
+            self.try_build(&mut ring);
+            if let Stage::Unbuilt(_) = self.stage {
+                ring.room_waiters.push(cx.waker().clone());
+                return Poll::Pending;
+            }
+        }
+        match std::mem::replace(&mut self.stage, Stage::Finished) {
+            Stage::Failed(op, e) => Poll::Ready(op.fail(e)),
+            Stage::Built {
+                index,
+                generation,
+                file,
+            } => {
+                if let Err(e) = submit_locked(&mut ring) {
+                    // Nothing went; the entry stays queued for the next
+                    // submission, so keep waiting rather than lose it.
+                    let _ = e;
+                }
+                let (mut wake, dead) = if pop {
+                    let (_, wake, dead) = drain_locked(&mut ring);
+                    (wake, dead)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let slot = &mut ring.slots[index as usize];
+                let result = match &mut slot.state {
+                    SlotState::Done { .. } => {
+                        let SlotState::Done {
+                            result,
+                            information,
+                            kept,
+                        } = std::mem::replace(&mut slot.state, SlotState::Free)
+                        else {
+                            unreachable!()
+                        };
+                        ring.release(index);
+                        // This task may stop polling now: hand the wake on.
+                        wake.append(&mut ring.other_waiters(Some(cx.waker())));
+                        drop(ring);
+                        // SAFETY: the slot was filled from an `O`.
+                        let op = unsafe { kept.take::<O>() };
+                        Poll::Ready(op.finish(result, information))
+                    }
+                    SlotState::Waiting { waker, .. } => {
+                        *waker = Some(cx.waker().clone());
+                        self.stage = Stage::Built {
+                            index,
+                            generation,
+                            file,
+                        };
+                        drop(ring);
+                        Poll::Pending
+                    }
+                    SlotState::Free => unreachable!("a built operation's slot was freed"),
+                };
+                // The drain's wakers are not ours to skip: a task woken here
+                // re-polls and finds its result. Both run with the borrow
+                // released, since either may poll into this ring.
+                wake.into_iter().filter(|w| !w.will_wake(cx.waker())).for_each(Waker::wake);
+                drop(dead);
+                result
+            }
+            Stage::Unbuilt(_) | Stage::Finished => panic!("RingOp polled after completion"),
+        }
     }
 
     /// Builds the entry if there is room for its completion; leaves the
@@ -232,59 +306,7 @@ impl<O: RingOperation> Future for RingOp<O> {
     type Output = O::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<O::Output> {
-        let this = &mut *self;
-        let inner = this.inner.clone();
-        let mut ring = inner.ring.lock().unwrap();
-        if let Stage::Unbuilt(_) = this.stage {
-            this.try_build(&mut ring);
-            if let Stage::Unbuilt(_) = this.stage {
-                ring.room_waiters.push(cx.waker().clone());
-                return Poll::Pending;
-            }
-        }
-        match std::mem::replace(&mut this.stage, Stage::Finished) {
-            Stage::Failed(op, e) => Poll::Ready(op.fail(e)),
-            Stage::Built {
-                index,
-                generation,
-                file,
-            } => {
-                if let Err(e) = submit_locked(&mut ring) {
-                    // Nothing went; the entry stays queued for the next
-                    // submission, so keep waiting rather than lose it.
-                    let _ = e;
-                }
-                let slot = &mut ring.slots[index as usize];
-                match &mut slot.state {
-                    SlotState::Done { .. } => {
-                        let SlotState::Done {
-                            result,
-                            information,
-                            kept,
-                        } = std::mem::replace(&mut slot.state, SlotState::Free)
-                        else {
-                            unreachable!()
-                        };
-                        ring.release(index);
-                        drop(ring);
-                        // SAFETY: the slot was filled from an `O`.
-                        let op = unsafe { kept.take::<O>() };
-                        Poll::Ready(op.finish(result, information))
-                    }
-                    SlotState::Waiting { waker, .. } => {
-                        *waker = Some(cx.waker().clone());
-                        this.stage = Stage::Built {
-                            index,
-                            generation,
-                            file,
-                        };
-                        Poll::Pending
-                    }
-                    SlotState::Free => unreachable!("a built operation's slot was freed"),
-                }
-            }
-            Stage::Unbuilt(_) | Stage::Finished => panic!("RingOp polled after completion"),
-        }
+        self.poll_inner(cx, true)
     }
 }
 
@@ -298,22 +320,29 @@ impl<O: RingOperation> Drop for RingOp<O> {
         else {
             return;
         };
-        let mut ring = self.inner.ring.lock().unwrap();
+        let mut ring = self.inner.ring.borrow_mut();
+        // The task that owned this future may stop polling the ring now, and
+        // it may have been the one the pump would wake: pass the baton.
+        let mut wake = ring.other_waiters(None);
         if let SlotState::Done { .. } = ring.slots[index as usize].state {
             let state = std::mem::replace(&mut ring.slots[index as usize].state, SlotState::Free);
             ring.release(index);
             drop(ring);
+            wake.into_iter().for_each(Waker::wake);
             drop(state);
             return;
         }
         if !self.wait_on_drop {
             // The buffer stays in the slot until the kernel is done; the
             // drain drops it then.
-            if let SlotState::Waiting { abandoned, .. } = &mut ring.slots[index as usize].state {
+            if let SlotState::Waiting { abandoned, waker, .. } = &mut ring.slots[index as usize].state {
                 *abandoned = true;
+                *waker = None;
             }
             let _ = submit_locked(&mut ring);
             ring.cancel(file, pack(index, generation));
+            drop(ring);
+            wake.into_iter().for_each(Waker::wake);
             return;
         }
         // A borrowed buffer: the kernel must be done before this returns.
@@ -321,7 +350,8 @@ impl<O: RingOperation> Drop for RingOp<O> {
         let _ = submit_locked(&mut ring);
         ring.cancel(file, pack(index, generation));
         loop {
-            let (_, wake, dead) = drain_locked(&mut ring);
+            let (_, mut woken, dead) = drain_locked(&mut ring);
+            wake.append(&mut woken);
             let done = matches!(ring.slots[index as usize].state, SlotState::Done { .. });
             if done {
                 let state = std::mem::replace(&mut ring.slots[index as usize].state, SlotState::Free);
@@ -333,10 +363,10 @@ impl<O: RingOperation> Drop for RingOp<O> {
                 return;
             }
             drop(ring);
-            wake.into_iter().for_each(Waker::wake);
+            std::mem::take(&mut wake).into_iter().for_each(Waker::wake);
             drop(dead);
             std::thread::yield_now();
-            ring = self.inner.ring.lock().unwrap();
+            ring = self.inner.ring.borrow_mut();
         }
     }
 }

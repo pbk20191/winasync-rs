@@ -11,6 +11,28 @@
 //! read, write and flush, which is what the kernel offers (read since
 //! version 1, write and flush since version 3; this machine reports 400).
 //!
+//! # One thread owns a ring
+//!
+//! A ring is a single-owner object in the kernel's design: its submission
+//! queue is written in user mode without a lock, there is one completion
+//! event, and registrations are per ring. This module says so in the
+//! types rather than papering over it with a mutex. [`IoRing`] and every
+//! future it hands out are `!Send` and `!Sync`: the ring, its operations
+//! and its registered tables live on the thread that made them, like an
+//! `io_uring` in tokio-uring or monoio. Nothing inside takes a lock; a
+//! caller who wants a ring reachable from several threads puts it behind
+//! their own.
+//!
+//! The consequence for executors: a task holding a ring operation across an
+//! `.await` is `!Send`, so it runs under [`crate::common::block_on::block_on`], a
+//! `dq` `spawn_local`, or any other single-threaded driver, and not on
+//! `tp::Runtime::spawn`, which moves tasks between pool threads.
+//!
+//! ```compile_fail
+//! let ring = winasync::ioring::IoRing::new(4).unwrap();
+//! std::thread::spawn(move || drop(ring)); // IoRing is !Send
+//! ```
+//!
 //! # How it is driven
 //!
 //! An operation is built when its future is created and submitted when any
@@ -22,12 +44,21 @@
 //! at one system call per batch, which is where a ring beats a handle
 //! bound to a completion port.
 //!
-//! Completions are popped by a pump: `SetIoRingCompletionEvent` signals an
-//! event, a `TP_WAIT` on the process default pool waits for it, and the
-//! callback drains the queue and wakes the futures -- the same arrangement
-//! as `rio`'s queue. With `tp`, [`IoRing::with_runtime`] puts the pump on
-//! that runtime's pool instead. [`IoRing::manual`] has no pump at all; the
-//! caller calls [`IoRing::drive`].
+//! Completions are popped **by the owner**: every poll of an operation pops
+//! whatever the completion queue holds (`PopIoRingCompletion` is a user-mode
+//! read) and settles it, and [`IoRing::drive`] does the same on demand.
+//! What a pump adds is only the *wake*: `SetIoRingCompletionEvent` signals
+//! an event when the completion queue goes from empty to non-empty, a
+//! `TP_WAIT` on the process default pool (or, with `tp`,
+//! [`IoRing::with_runtime`]'s pool) watches it, and the callback wakes the
+//! task that last polled an operation on this ring. That task pops, and
+//! wakes any other task whose operation it settled. [`IoRing::manual`] has
+//! no pump: the caller polls, or waits on [`IoRing::completion_event`]
+//! itself.
+//!
+//! Because the event is an edge -- measured: it fires on the queue's
+//! empty-to-non-empty transition, not per completion -- every pop here runs
+//! to empty before returning, so the next completion is sure to signal.
 //!
 //! # Buffers
 //!
@@ -74,9 +105,11 @@
 use crate::common::pool::PoolRef;
 use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 use crate::common::tpctx::CtxHeader;
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, GENERIC_WRITE, HANDLE,
@@ -93,8 +126,7 @@ use windows::Win32::Storage::FileSystem::{
     SetIoRingCompletionEvent, SubmitIoRing,
 };
 use windows::Win32::System::Threading::{
-    CallbackMayRunLong, CreateEventW, CreateThreadpoolWait, SetThreadpoolWait,
-    PTP_CALLBACK_INSTANCE, PTP_WAIT,
+    CreateEventW, CreateThreadpoolWait, SetThreadpoolWait, PTP_CALLBACK_INSTANCE, PTP_WAIT,
 };
 use windows_core::{Error, HRESULT, HSTRING, Result};
 
@@ -111,24 +143,24 @@ const TEARDOWN_ROUNDS: u32 = 5000;
 // ---------------------------------------------------------------------------
 
 /// An I/O ring. Cheap to clone; every clone and every operation keeps it
-/// open.
+/// open. `!Send` and `!Sync`: see the module documentation.
 #[derive(Clone)]
 pub struct IoRing {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
 }
 
 struct Inner {
-    ring: Mutex<Ring>,
-    /// Signalled by the kernel when a completion is posted. Auto-reset: the
-    /// pump's wait consumes it.
+    ring: RefCell<Ring>,
+    /// Signalled by the kernel when the completion queue goes from empty to
+    /// non-empty. Auto-reset: the pump's wait consumes it.
     event: HANDLE,
     /// The pump, if this ring has one. Taken by `Drop`.
-    pump: Mutex<Option<Pump>>,
+    pump: RefCell<Option<Pump>>,
+    /// The task to wake when the event fires: whoever polled an operation
+    /// on this ring last. Shared with the pump's callback, which is the one
+    /// thing about a ring another thread touches.
+    driver: Arc<crate::common::atomic_waker::AtomicWaker>,
 }
-
-// The ring and event are kernel handles; everything else is behind the lock.
-unsafe impl Send for Inner {}
-unsafe impl Sync for Inner {}
 
 struct Ring {
     handle: HIORING,
@@ -268,11 +300,8 @@ struct Kept {
     drop: unsafe fn(*mut ()),
 }
 
-// Constructed only from `Send` payloads.
-unsafe impl Send for Kept {}
-
 impl Kept {
-    fn new<P: Send>(payload: P) -> Self {
+    fn new<P>(payload: P) -> Self {
         unsafe fn drop_box<P>(ptr: *mut ()) {
             drop(unsafe { Box::from_raw(ptr.cast::<P>()) });
         }
@@ -318,10 +347,21 @@ impl IoRing {
         Self::build(entries, Some(rt.inner.pool_ref()))
     }
 
-    /// A ring with no pump: completions are delivered only when the caller
-    /// calls [`drive`](Self::drive).
+    /// A ring with no pump: completions are delivered when an operation is
+    /// polled or the caller calls [`drive`](Self::drive), and nothing wakes
+    /// a waiting task -- the caller polls, or waits on
+    /// [`completion_event`](Self::completion_event).
     pub fn manual(entries: u32) -> Result<IoRing> {
         Self::build(entries, None)
+    }
+
+    /// The auto-reset event the kernel signals when the completion queue
+    /// goes from empty to non-empty. Owned by the ring; wait on it, do not
+    /// close it. A waiter must pop to empty ([`drive`](Self::drive)) before
+    /// waiting again, or the next completion lands in a non-empty queue and
+    /// signals nothing.
+    pub fn completion_event(&self) -> HANDLE {
+        self.inner.event
     }
 
     /// `pump` is the pool to pump from; `None` for a manual ring.
@@ -349,8 +389,8 @@ impl IoRing {
         };
         unsafe { SetIoRingCompletionEvent(handle, event) }.map_err(close_both)?;
 
-        let inner = Arc::new(Inner {
-            ring: Mutex::new(Ring {
+        let inner = Rc::new(Inner {
+            ring: RefCell::new(Ring {
                 handle,
                 slots: Vec::new(),
                 free: Vec::new(),
@@ -364,25 +404,27 @@ impl IoRing {
                 buffers: Registration::default(),
             }),
             event,
-            pump: Mutex::new(None),
+            pump: RefCell::new(None),
+            driver: Arc::default(),
         });
         if let Some(pool) = pump {
             let pump = Pump::start(&inner, pool)?;
-            *inner.pump.lock().unwrap() = Some(pump);
+            *inner.pump.borrow_mut() = Some(pump);
         }
         Ok(IoRing { inner })
     }
 
     /// Submits every operation built so far; returns how many went.
     pub fn submit(&self) -> Result<u32> {
-        submit_locked(&mut self.inner.ring.lock().unwrap())
+        submit_locked(&mut self.inner.ring.borrow_mut())
     }
 
     /// Pops and delivers every completion waiting in the queue; returns how
-    /// many. The only way results arrive on a [`manual`](Self::manual) ring,
-    /// and harmless on a pumped one.
+    /// many. Polling an operation does this too; call it to settle
+    /// operations nobody is polling, or from a loop of your own on a
+    /// [`manual`](Self::manual) ring.
     pub fn drive(&self) -> usize {
-        let (n, wake, dead) = drain_locked(&mut self.inner.ring.lock().unwrap());
+        let (n, wake, dead) = drain_locked(&mut self.inner.ring.borrow_mut());
         wake.into_iter().for_each(Waker::wake);
         drop(dead);
         n
@@ -453,6 +495,16 @@ impl IoRing {
     }
 }
 
+impl Inner {
+    /// Pops to empty and wakes every task whose operation that settled,
+    /// except the caller's own, which is about to look for itself.
+    fn pop_for(&self, except: &Waker) {
+        let (_, wake, dead) = drain_locked(&mut self.ring.borrow_mut());
+        wake.into_iter().filter(|w| !w.will_wake(except)).for_each(Waker::wake);
+        drop(dead);
+    }
+}
+
 /// `SubmitIoRing` without waiting. A ring with nothing built is a no-op.
 fn submit_locked(ring: &mut Ring) -> Result<u32> {
     if ring.unsubmitted == 0 {
@@ -464,9 +516,10 @@ fn submit_locked(ring: &mut Ring) -> Result<u32> {
     Ok(submitted)
 }
 
-/// Pops every completion and settles its slot. Returns the count, the
-/// wakers to wake and the abandoned payloads to drop -- both *after* the
-/// lock is released, since either may run arbitrary code.
+/// Pops every completion -- to empty, so the next one signals the event --
+/// and settles its slot. Returns the count, the wakers to wake and the
+/// abandoned payloads to drop -- both *after* the borrow is released, since
+/// either may run arbitrary code.
 fn drain_locked(ring: &mut Ring) -> (usize, Vec<Waker>, Vec<Kept>) {
     let mut wake = Vec::new();
     let mut dead = Vec::new();
@@ -551,6 +604,28 @@ impl Ring {
         self.free.push(index);
     }
 
+    /// Takes the wakers of every operation still waiting, other than those
+    /// `except` would wake.
+    ///
+    /// The pump wakes only the task that polled last. When that task's
+    /// operation finishes, or its future is dropped, the ring must not be
+    /// left with waiters and nobody to hear the event: so the finishing
+    /// operation hands the baton to every other waiter, each of which
+    /// re-polls and re-registers. A batch's operations share one waker and
+    /// pass through `except`, so this costs a batch nothing but the scan.
+    fn other_waiters(&mut self, except: Option<&Waker>) -> Vec<Waker> {
+        let mut wake = Vec::new();
+        for slot in &mut self.slots {
+            if let SlotState::Waiting { waker, .. } = &mut slot.state
+                && waker.as_ref().is_some_and(|w| !except.is_some_and(|e| e.will_wake(w)))
+            {
+                wake.extend(waker.take());
+            }
+        }
+        wake.extend(self.room_waiters.drain(..).filter(|w| !except.is_some_and(|e| e.will_wake(w))));
+        wake
+    }
+
     /// Asks the kernel to cancel the operation `user_data` names on `file`.
     /// Skipped when the completion queue has no room for the cancel's own
     /// completion: the operation then simply runs to its end.
@@ -600,7 +675,7 @@ impl From<Error> for BuildStop {
     }
 }
 
-/// What an operation builds its entry with: the ring, under its lock, and
+/// What an operation builds its entry with: the ring, borrowed mutably, and
 /// the `UserData` its completion will carry.
 #[doc(hidden)]
 pub struct BuildCtx<'a> {
