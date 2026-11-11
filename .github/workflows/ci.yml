@@ -68,9 +68,11 @@ jobs:
         uses: ./.github/actions/windows-app-runtime
       - shell: bash
         run: |
-          threads=""
-          case "${{ matrix.features }}" in *dq*) threads="-- --test-threads=1";; esac
-          cargo test --no-default-features --features "${{ matrix.features }}" $threads
+          # One thread, like the all-features job: `dq` needs it, and the
+          # leak tests of every engine assert on `LIVE_OPS`, a process-wide
+          # count that a test running beside them can hold at 1 (seen on
+          # the comio job: three such tests, each off by exactly one).
+          cargo test --no-default-features --features "${{ matrix.features }}" -- --test-threads=1
 
   # The component driven from each script runtime it targets, through that
   # runtime's own projection of the published `.winmd`. These are the
