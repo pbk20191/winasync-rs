@@ -59,6 +59,12 @@
 //! Because the event is an edge -- measured: it fires on the queue's
 //! empty-to-non-empty transition, not per completion -- every pop here runs
 //! to empty before returning, so the next completion is sure to signal.
+//! Sure, that is, unless the kernel judged "empty" from a head index the
+//! owner was advancing at that moment; nothing documents the ordering, so
+//! a pumped ring with operations in flight also wakes its driver every
+//! 100 ms without a signal (`pump::RECHECK`), and a lost one costs
+//! latency, not a hang. A [`manual`](IoRing::manual) ring's caller should wait on the
+//! event with a timeout for the same reason.
 //!
 //! # Buffers
 //!
@@ -191,6 +197,10 @@ struct Ring {
     /// Built and not yet popped -- cancel requests included, since their
     /// completions take room in the completion queue too.
     in_flight: u32,
+    /// `in_flight`, as the pump's callback reads it: whether anything can
+    /// still complete decides whether its wait gets a timeout (see
+    /// [`pump`]). Written after every change to `in_flight`.
+    pending: Arc<std::sync::atomic::AtomicU32>,
     /// The completion queue's size: `in_flight` never exceeds it.
     capacity: u32,
     /// Operations waiting to be built: for `in_flight` to drop below
@@ -379,7 +389,9 @@ impl IoRing {
     /// goes from empty to non-empty. Owned by the ring; wait on it, do not
     /// close it. A waiter must pop to empty ([`drive`](Self::drive)) before
     /// waiting again, or the next completion lands in a non-empty queue and
-    /// signals nothing.
+    /// signals nothing -- and should wait with a timeout while operations
+    /// are in flight, since a completion that overlaps the pop may not
+    /// signal either (see the module documentation).
     pub fn completion_event(&self) -> HANDLE {
         self.inner.event
     }
@@ -449,6 +461,7 @@ impl IoRing {
                 free: Vec::new(),
                 unsubmitted: 0,
                 in_flight: 0,
+                pending: Arc::default(),
                 capacity,
                 room_waiters: Vec::new(),
                 id: NEXT_RING_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -623,6 +636,7 @@ fn drain_locked(ring: &mut Ring) -> (usize, Vec<Waker>, Vec<Kept>) {
             other => slot.state = other,
         }
     }
+    ring.publish_in_flight();
     if ring.in_flight < ring.capacity {
         wake.append(&mut ring.room_waiters);
     }
@@ -630,6 +644,11 @@ fn drain_locked(ring: &mut Ring) -> (usize, Vec<Waker>, Vec<Kept>) {
 }
 
 impl Ring {
+    /// Lets the pump's callback see `in_flight`.
+    fn publish_in_flight(&self) {
+        self.pending.store(self.in_flight, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn alloc(&mut self, kept: Kept) -> (u32, u32) {
         let index = match self.free.pop() {
             Some(index) => index,
@@ -691,6 +710,7 @@ impl Ring {
         });
         if built.is_ok() {
             self.in_flight += 1;
+            self.publish_in_flight();
             self.unsubmitted += 1;
             let _ = submit_locked(self);
         }

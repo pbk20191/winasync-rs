@@ -276,6 +276,7 @@ impl<O: RingOperation> RingOp<O> {
         match built {
             Ok(()) => {
                 ring.in_flight += 1;
+                ring.publish_in_flight();
                 ring.unsubmitted += 1;
                 self.stage = Stage::Built {
                     index,

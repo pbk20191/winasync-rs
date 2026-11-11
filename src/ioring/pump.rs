@@ -6,10 +6,40 @@
 //! fires it wakes whoever registered there -- the task that last polled an
 //! operation -- and re-arms. That task pops. This is what lets the ring be
 //! a single-owner object with no lock in it: the only state the pool thread
-//! shares with the owner is the waker slot, which is lock-free.
+//! shares with the owner is the waker slot, which is lock-free -- and the
+//! in-flight count, for the timeout below.
+//!
+//! # The timeout
+//!
+//! The kernel signals the event when a completion makes the queue
+//! non-empty, judging "empty" from the head index it reads at that moment
+//! (`IopCompleteIoRingEntry`, per Shafir's reversing). The owner advances
+//! the head from user mode as it pops; if the kernel's read of it is stale
+//! -- the pop and the completion overlapping -- a completion can land with
+//! no signal, and nothing would wake the owner. No ordering between the
+//! two is documented, and no loss was observed in 20000 runs (MikeGrier's
+//! measurement), but it is not a thing to depend on. So while anything is
+//! in flight the wait is armed with a timeout as well: a lost signal costs
+//! [`RECHECK`] of latency instead of a hang. An idle ring arms no timeout
+//! and costs nothing.
 
 use super::*;
 use crate::common::atomic_waker::AtomicWaker;
+use windows::Win32::Foundation::FILETIME;
+
+/// How long a wait with operations in flight goes without a signal before
+/// the driver is woken to look anyway.
+pub(super) const RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `RECHECK` as the relative (negative) `FILETIME` `SetThreadpoolWait`
+/// takes.
+fn recheck_timeout() -> FILETIME {
+    let ticks = -((RECHECK.as_nanos() / 100) as i64);
+    FILETIME {
+        dwLowDateTime: ticks as u64 as u32,
+        dwHighDateTime: (ticks as u64 >> 32) as u32,
+    }
+}
 
 /// The thread-pool wait that wakes the driver when the ring's event fires.
 pub(super) struct Pump {
@@ -28,6 +58,9 @@ pub(super) struct PumpCtx {
     pub(super) header: CtxHeader,
     /// Whom to wake: shared with the ring, which registers the driver.
     pub(super) driver: Arc<AtomicWaker>,
+    /// The ring's in-flight count, published by the owner: nonzero arms
+    /// the wait with a timeout.
+    pub(super) pending: Arc<std::sync::atomic::AtomicU32>,
     pub(super) event: HANDLE,
     /// Set by [`Pump::stop`] before it drains: a callback that runs during
     /// the drain must not re-arm the wait the close is about to find.
@@ -52,6 +85,7 @@ impl Pump {
         let ctx = Arc::into_raw(Arc::new(PumpCtx {
             header: unsafe { CtxHeader::new(release_ctx) },
             driver: inner.driver.clone(),
+            pending: inner.ring.borrow().pending.clone(),
             event: inner.event,
             closing: std::sync::atomic::AtomicBool::new(false),
             _pool: pool,
@@ -102,8 +136,13 @@ unsafe extern "system" fn pump_callback(
     // signalled when the completion queue goes from empty to non-empty
     // (measured, not documented); the driver pops to empty, so a completion
     // landing after its last pop signals again and the wait fires at once.
+    // With operations in flight the wait also times out, for the signal
+    // that may not come (see the module documentation); on a timeout this
+    // runs with `WAIT_TIMEOUT` and wakes the driver, which pops and finds
+    // either the lost completion or nothing.
     if !ctx.closing.load(std::sync::atomic::Ordering::Acquire) {
-        unsafe { SetThreadpoolWait(wait, Some(ctx.event), None) };
+        let timeout = (ctx.pending.load(std::sync::atomic::Ordering::Relaxed) > 0).then(recheck_timeout);
+        unsafe { SetThreadpoolWait(wait, Some(ctx.event), timeout.as_ref().map(|t| t as *const FILETIME)) };
     }
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.driver.wake()));
 }
