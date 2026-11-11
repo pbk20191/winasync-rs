@@ -1152,7 +1152,12 @@ Pillar 3 기준으로 거른 유일한 gap — WinRT에는 HTTP 서버가 없다
   첫 프로브가 한 스레드에서 보내고 받다가 멈춘 게 그 증거. overlapped로는 "소비될 때까지 pending"일 뿐.
 
 그래서 `tcp.rs`에 있던 두 메서드를 `net/transmit.rs`의 공용 함수로 올리고, `UnixStream`·`HvStream`에
-`transmit_file`/`transmit_packets`, `UdpSocket`에 `transmit_packets`를 붙였다. 빌더 `TransmitPackets`는 그대로.
+`transmit_file`/`transmit_packets`, `UdpSocket`에 `transmit_packets`를 붙였다.
+
+**`Elem::Mem(Box<dyn IoBuf>)` 제거** — 빌더가 `TransmitPackets<B: IoBuf = MemBuf>`로 원소 타입에 제네릭이다.
+사용자의 `IoBuf` 구현체는 `TransmitPackets::<MyBuf>::default()`로 그대로 들어오고(열린 끝), 이 크레이트의
+버퍼들을 한 시퀀스에 섞을 때는 기본 타입 `common::buffer::MemBuf`(Vec/Box/Arc<[u8]>/Arc<Vec>/&'static/RawBuf/
+SlabBuf/Bytes의 enum + 범위, `Slice<B>`도 변환됨)를 쓴다. enum 안 디스패치는 매크로 `match`라 `dyn`이 없다.
 
 ### `*_unchecked`의 이벤트는 호출자의 것 (2026-11-11)
 

@@ -11,6 +11,7 @@
 //! which overlapped merely makes "pending until consumed".
 
 use super::*;
+use crate::common::buffer::MemBuf;
 
 /// `TransmitFile` on a registered socket: (part of) an open overlapped
 /// `file` sent over the socket
@@ -21,7 +22,7 @@ use super::*;
 /// `offset` to end of file. Resolves to the number of bytes transmitted.
 /// The op completes on this socket's TP_IO like any other overlapped send.
 pub(crate) fn transmit_file(
-res: &Arc<IoRes>,
+    res: &Arc<IoRes>,
     file: &File,
     offset: u64,
     count: u32,
@@ -50,17 +51,17 @@ res: &Arc<IoRes>,
 /// `TransmitPackets` call — a single-syscall scatter of mixed memory and
 /// file sources, transmitted in insertion order. Resolves to the total
 /// number of bytes sent. See [`TransmitPackets`] for building the sequence.
-pub(crate) fn transmit_packets(
-res: &Arc<IoRes>,
-    packets: TransmitPackets,
+pub(crate) fn transmit_packets<B: IoBuf + 'static>(
+    res: &Arc<IoRes>,
+    packets: TransmitPackets<B>,
     flags: TransmitFlags,
-) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+) -> impl Future<Output = windows_core::Result<usize>> + Send + use<B> {
     let sock = res.socket();
     let tf = flags.to_bits();
     // Fetch the extension pointer and issue the op *synchronously*, so the
     // returned async block captures only the (Send) OpFuture — never the
     // non-Send HANDLEs, which are consumed here into the op block.
-    let started: windows_core::Result<OpFuture<TransmitPacketsPayload>> = (|| {
+    let started: windows_core::Result<OpFuture<TransmitPacketsPayload<B>>> = (|| {
         let transmit = get_transmitpackets(sock)?;
         let TransmitPackets { elems } = packets;
         let count = elems.len();
@@ -125,9 +126,9 @@ res: &Arc<IoRes>,
 
 /// One element of a [`TransmitPackets`] sequence: an owned memory buffer, or a
 /// range of an open file (kept alive via its `IoRes`).
-enum Elem {
+enum Elem<B> {
     /// Any owned buffer: the kernel only reads it.
-    Mem(Box<dyn IoBuf>),
+    Mem(B),
     File {
         /// Keeps the file handle valid for the op's lifetime.
         _keep: Arc<IoRes>,
@@ -137,23 +138,34 @@ enum Elem {
     },
 }
 
-/// A builder for `transmit_packets`: an ordered mix of in-memory
+/// A builder for `transmit_packets`, over one buffer type `B` -- the
+/// caller's own, or [`MemBuf`] to mix this crate's kinds: an ordered mix of in-memory
 /// buffers and open-file ranges, sent in one `TransmitPackets` syscall.
-#[derive(Default)]
-pub struct TransmitPackets {
-    elems: Vec<Elem>,
+pub struct TransmitPackets<B: IoBuf = MemBuf> {
+    elems: Vec<Elem<B>>,
+}
+
+impl<B: IoBuf> Default for TransmitPackets<B> {
+    fn default() -> Self {
+        Self { elems: Vec::new() }
+    }
 }
 
 impl TransmitPackets {
-    /// A new, empty sequence.
+    /// A new, empty sequence of [`MemBuf`]s, which any of this crate's
+    /// buffers converts into. For a buffer type of your own, start from
+    /// `TransmitPackets::<B>::default()`.
     pub fn new() -> Self {
         Self { elems: Vec::new() }
     }
+}
+
+impl<B: IoBuf> TransmitPackets<B> {
 
     /// Appends an in-memory buffer (sent inline): any owned buffer, so a
     /// shared `Arc<[u8]>` header can go out on many connections uncopied.
-    pub fn bytes(mut self, buf: impl IoBuf + 'static) -> Self {
-        self.elems.push(Elem::Mem(Box::new(buf)));
+    pub fn bytes(mut self, buf: impl Into<B>) -> Self {
+        self.elems.push(Elem::Mem(buf.into()));
         self
     }
 
@@ -172,11 +184,11 @@ impl TransmitPackets {
 
 /// Op-block payload for `TransmitPackets`: owns every memory buffer and file
 /// keepalive, plus the element array the kernel reads.
-struct TransmitPacketsPayload {
-    elems: Vec<Elem>,
+struct TransmitPacketsPayload<B> {
+    elems: Vec<Elem<B>>,
     array: Vec<TRANSMIT_PACKETS_ELEMENT>,
 }
 
 // All raw handles/pointers held here are plain kernel values / stable heap
 // pointers into this same payload; moving the payload is sound.
-unsafe impl Send for TransmitPacketsPayload {}
+unsafe impl<B: Send> Send for TransmitPacketsPayload<B> {}

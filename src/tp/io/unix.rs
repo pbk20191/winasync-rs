@@ -93,11 +93,11 @@ impl UnixStream {
     /// file sources, transmitted in insertion order. Resolves to the total
     /// number of bytes sent. See [`TransmitPackets`](crate::tp::TransmitPackets)
     /// for building the sequence.
-    pub fn transmit_packets(
+    pub fn transmit_packets<B: IoBuf + 'static>(
         &self,
-        packets: crate::tp::TransmitPackets,
+        packets: crate::tp::TransmitPackets<B>,
         flags: crate::tp::TransmitFlags,
-    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<B> {
         crate::tp::io::net::transmit::transmit_packets(&self.res, packets, flags)
     }
 

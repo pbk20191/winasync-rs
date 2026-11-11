@@ -560,11 +560,11 @@ impl TcpStream {
     /// `TransmitPackets` call -- a single-syscall scatter of mixed memory and
     /// file sources, transmitted in insertion order. Resolves to the total
     /// number of bytes sent. See [`TransmitPackets`] for building the sequence.
-    pub fn transmit_packets(
+    pub fn transmit_packets<B: IoBuf + 'static>(
         &self,
-        packets: TransmitPackets,
+        packets: TransmitPackets<B>,
         flags: TransmitFlags,
-    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<B> {
         transmit::transmit_packets(&self.res, packets, flags)
     }
 

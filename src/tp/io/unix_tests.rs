@@ -30,7 +30,22 @@ fn unix_stream_echo() {
     result.expect("unix echo timed out");
 }
 
-/// `TransmitPackets` and `TransmitFile` on AF_UNIX; measured to work.
+/// A buffer type of the caller's own, sent through `TransmitPackets<Own>`.
+struct Own(Vec<u8>);
+
+// SAFETY: a `Vec`'s heap stays put when the `Vec` moves.
+unsafe impl crate::common::buffer::IoBuf for Own {
+    fn stable_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// `TransmitPackets` and `TransmitFile` on AF_UNIX (measured to work):
+/// mixed crate buffers through `MemBuf`, then a file, then a caller's own
+/// buffer type.
 #[test]
 fn unix_transmit_packets_and_file() {
     use crate::tp::{TransmitFlags, TransmitPackets};
@@ -43,7 +58,7 @@ fn unix_transmit_packets_and_file() {
         let server = rt.spawn(async move {
             let s = listener.accept().await.unwrap();
             let mut got = Vec::new();
-            while got.len() < 10 {
+            while got.len() < 13 {
                 let (n, b) = s.read(vec![0u8; 16]).await;
                 let n = n.unwrap();
                 if n == 0 {
@@ -54,15 +69,17 @@ fn unix_transmit_packets_and_file() {
             got
         });
         let client = UnixStream::connect(&rt, &path).await.unwrap();
-        let n = client
-            .transmit_packets(TransmitPackets::new().bytes(b"pkts!".to_vec()), TransmitFlags::default())
-            .await
-            .unwrap();
+        let shared: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"ts!"[..]);
+        let mixed = TransmitPackets::new().bytes(b"pk".to_vec()).bytes(shared);
+        let n = client.transmit_packets(mixed, TransmitFlags::default()).await.unwrap();
         assert_eq!(n, 5);
         let file = crate::tp::File::open(&rt, &file_path.to_string_lossy()).unwrap();
         let n = client.transmit_file(&file, 0, 0, TransmitFlags::default()).await.unwrap();
         assert_eq!(n, 5);
-        assert_eq!(server.await.unwrap(), b"pkts!file!");
+        let own = TransmitPackets::<Own>::default().bytes(Own(b"own".to_vec()));
+        let n = client.transmit_packets(own, TransmitFlags::default()).await.unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(server.await.unwrap(), b"pkts!file!own");
     }));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&file_path);
