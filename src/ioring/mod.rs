@@ -93,8 +93,8 @@ use windows::Win32::Storage::FileSystem::{
     SetIoRingCompletionEvent, SubmitIoRing,
 };
 use windows::Win32::System::Threading::{
-    CallbackMayRunLong, CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait,
-    SetThreadpoolWait, WaitForThreadpoolWaitCallbacks, PTP_CALLBACK_INSTANCE, PTP_WAIT,
+    CallbackMayRunLong, CreateEventW, CreateThreadpoolWait, SetThreadpoolWait,
+    PTP_CALLBACK_INSTANCE, PTP_WAIT,
 };
 use windows_core::{Error, HRESULT, HSTRING, Result};
 

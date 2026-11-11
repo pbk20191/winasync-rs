@@ -43,8 +43,8 @@ use windows::Win32::Networking::WinSock::{
     RIO_NOTIFICATION_COMPLETION_0_0, RIO_NOTIFICATION_COMPLETION_0_1,
 };
 use windows::Win32::System::Threading::{
-    CallbackMayRunLong, CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait,
-    SetThreadpoolWait, WaitForThreadpoolWaitCallbacks, PTP_CALLBACK_INSTANCE, PTP_WAIT,
+    CallbackMayRunLong, CreateEventW, CreateThreadpoolWait, SetThreadpoolWait,
+    PTP_CALLBACK_INSTANCE, PTP_WAIT,
 };
 
 use crate::common::pool::PoolRef;
@@ -769,13 +769,9 @@ unsafe impl Send for Teardown {}
 
 impl Teardown {
     fn run(self) {
-        unsafe {
-            SetThreadpoolWait(self.pump.wait, None, None);
-            WaitForThreadpoolWaitCallbacks(self.pump.wait, true);
-            SetThreadpoolWait(self.pump.wait, None, None);
-            WaitForThreadpoolWaitCallbacks(self.pump.wait, true);
-            CloseThreadpoolWait(self.pump.wait);
-        }
+        // `closing` was set by `Drop` before handing over, so the callback
+        // this drains will not re-arm.
+        unsafe { crate::common::pool::close_wait_draining(self.pump.wait) };
         if let Some(ctx) = self.pump.ctx_to_release {
             unsafe { drop(Arc::from_raw(ctx)) };
         }
@@ -813,17 +809,10 @@ impl Drop for RioCq {
             return;
         }
 
-        unsafe {
-            // Cancel the pending wait, then let any running callback finish.
-            SetThreadpoolWait(pump.wait, None, None);
-            WaitForThreadpoolWaitCallbacks(pump.wait, true);
-            // A callback that started before `closing` was set may have
-            // re-armed on its way out; cancel that too before closing the
-            // wait object, which must not be pending.
-            SetThreadpoolWait(pump.wait, None, None);
-            WaitForThreadpoolWaitCallbacks(pump.wait, true);
-            CloseThreadpoolWait(pump.wait);
-        }
+        // Disarm, let a queued callback run (`closing` stops it re-arming),
+        // disarm again for one that re-armed before it saw the flag, and
+        // close. Drained rather than cancelled: see `close_wait_draining`.
+        unsafe { crate::common::pool::close_wait_draining(pump.wait) };
 
         // On an environment with a finalization callback the close above
         // already released the context — measured, not assumed: see

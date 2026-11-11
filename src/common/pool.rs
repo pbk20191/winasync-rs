@@ -7,7 +7,47 @@
 //! together, as one [`PoolRef`]: there is no way to hand over an environment
 //! and forget its owner.
 
-use windows::Win32::System::Threading::TP_CALLBACK_ENVIRON_V3;
+use windows::Win32::System::Threading::{
+    CloseThreadpoolWait, SetThreadpoolWait, WaitForThreadpoolWaitCallbacks, PTP_WAIT,
+    TP_CALLBACK_ENVIRON_V3,
+};
+
+/// Closes a `TP_WAIT`, letting a callback it has already queued run rather
+/// than cancelling it.
+///
+/// Measured (MikeGrier/windows-threadpool-sys, 2026-09-28..30, and our own
+/// `ioring::tests::cold_pool_teardown_sweep`): a `CloseThreadpoolWait` close
+/// behind `SetThreadpoolWait(NULL)`, with the wait's callback queued, on a
+/// pool that has not made a thread yet, can sever the port's request to the
+/// worker factory -- after which that pool dispatches *nothing*, not a wait,
+/// a timer or an overlapped completion, until some work item is submitted to
+/// it. About 2.5 per 1000 cold starts with `WaitForThreadpoolWaitCallbacks(TRUE)`
+/// in between, which cancels through the same kernel routine the close uses
+/// (`IopCancelWaitCompletionPacket`); 0 in 20000 with `FALSE`, which runs
+/// the queued callback so the close finds nothing to remove. The process
+/// default pool is the exposed one: every `IoRing::new` and
+/// `RioCq::with_default_pool` teardown reaches here before that pool's first
+/// dispatch.
+///
+/// Disarm and drain twice: a callback running during the first drain may
+/// have re-armed on its way out before it saw the caller's closing flag, and
+/// the close must not find the wait pending.
+///
+/// # Safety
+/// `wait` is a live wait object, closed by this call. The caller must not be
+/// inside its callback (the drain would wait for itself), and the callback
+/// must stop re-arming once the caller has decided to close -- a flag set
+/// before this is called -- or a callback run by the second drain could arm
+/// the wait the close then finds pending.
+pub(crate) unsafe fn close_wait_draining(wait: PTP_WAIT) {
+    unsafe {
+        SetThreadpoolWait(wait, None, None);
+        WaitForThreadpoolWaitCallbacks(wait, false);
+        SetThreadpoolWait(wait, None, None);
+        WaitForThreadpoolWaitCallbacks(wait, false);
+        CloseThreadpoolWait(wait);
+    }
+}
 
 /// A callback environment, and the owner that keeps it valid.
 pub enum PoolRef {

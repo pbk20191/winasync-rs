@@ -9,8 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
-    CloseThreadpoolWait, CreateThreadpoolWait, SetThreadpoolWait, WaitForThreadpoolWaitCallbacks,
-    PTP_CALLBACK_INSTANCE, PTP_WAIT,
+    CreateThreadpoolWait, SetThreadpoolWait, PTP_CALLBACK_INSTANCE, PTP_WAIT,
 };
 
 struct WaitState {
@@ -73,15 +72,12 @@ impl Future for HandleWait {
 
 impl Drop for HandleWait {
     fn drop(&mut self) {
-        unsafe {
-            // Deactivate, cancel a queued callback, wait out a running one,
-            // then close. Context released via finalization. A TP_WAIT
-            // deactivates itself after firing, so this is also the normal
-            // post-completion teardown.
-            SetThreadpoolWait(self.wait, None, None);
-            WaitForThreadpoolWaitCallbacks(self.wait, true);
-            CloseThreadpoolWait(self.wait);
-        }
+        // Deactivate, let a queued callback run (it only records a result
+        // nobody will read), then close; see `close_wait_draining` for why
+        // it is not cancelled. Context released via finalization. A TP_WAIT
+        // deactivates itself after firing, so this is also the normal
+        // post-completion teardown.
+        unsafe { crate::common::pool::close_wait_draining(self.wait) };
     }
 }
 

@@ -1339,6 +1339,33 @@ qd=32에서 2.7배, qd=128에서 3.4배 — tp·compio와 같은 선에 올라�
 - 결론: 이 크레이트의 tp 파일 경로(219k)는 이미 커널 천장(241k)의 90 %다. ioring은 Windows에서 "같은 일을 더
   적은 syscall로"이지 "더 빠른 커널 경로"가 아니며, 그 사실은 하네스가 보여 준 대로다.
 
+### TP_WAIT 정리는 취소가 아니라 drain으로 (2026-11-11)
+
+[MikeGrier/windows-threadpool-sys](https://github.com/MikeGrier/windows-threadpool-sys)(35개 크레이트 워크스페이스,
+동기 `&mut` API, async 없음)를 조사하다 가져온 두 가지 측정 사실. 둘 다 Win32 문서에는 없다.
+
+1. **콜드 풀 스톨.** 아직 스레드를 하나도 만들지 않은 풀(대개 프로세스 기본 풀)에서, 콜백이 큐잉된 TP_WAIT를
+   `SetThreadpoolWait(NULL)` 직후 `CloseThreadpoolWait`로 닫으면 포트→워커 팩토리 요청이 끊겨 **그 풀의 모든
+   dispatch가 멈춘다**(wait·timer·TP_IO 전부, 카운터는 정상). 그들 측정으로 콜드 시작 1000회당 ~2.5회, 웜 풀 0회,
+   `TP_WORK` 하나 제출하면 즉시 회복. 사이에 `WaitForThreadpoolWaitCallbacks(TRUE)`를 넣어도 같다 — 취소는 close와
+   같은 커널 루틴(`IopCancelWaitCompletionPacket`)을 타기 때문. `FALSE`(큐잉된 콜백을 실제로 돌림)를 넣으면 20000회
+   중 0회이고, 디스어셈블리로 `FALSE` 경로의 도달 가능 함수 7개에 그 루틴이 없음을 확인했다.
+2. **IoRing 완료 이벤트는 엣지다.** CQ가 비어 있다가 비지 않게 될 때만 신호. 비어 있지 않은 CQ에 완료가 더 들어오면
+   신호 없음, 비어 있지 않은 CQ에 이벤트를 붙이면 영원히 신호 없음. 대기자는 매번 **빈 큐까지 pop**해야 한다.
+
+반영:
+
+- `common::pool::close_wait_draining`: disarm → `WaitFor…(FALSE)` → disarm → `WaitFor…(FALSE)` → close. 두 번인 이유는
+  첫 drain 중 돌아간 콜백이 closing 플래그를 보기 전에 재무장했을 수 있어서. 세 TP_WAIT 정리 지점(`tp::wait`,
+  `rio::cq`의 Drop과 `Teardown`, `ioring::pump`)이 전부 이걸 쓴다. `ioring` 펌프 컨텍스트에 `closing` 플래그를 추가해
+  drain 중 콜백이 재무장하지 않게 했다(`rio`에는 이미 있었다).
+- `ioring::tests::cold_pool_teardown_sweep`(ignored): 자식 프로세스 N개로 콜드 풀 트리거(완료 신호 → 이 스레드가 pop →
+  즉시 drop)와 희생자(펌프로만 완료되는 읽기, 5 s 기한)를 돌리는 측정. **이 머신(26320.9877)에서는 수정 전 2000회 /
+  수정 후 2000회 모두 0회.** 그들의 측정은 26100.x였고 재현 조건이 µs 단위라 재현 실패가 "없음"의 증거는 아니다.
+  drain 경로가 위험한 커널 루틴에 구조적으로 닿지 않는다는 그들의 디스어셈블리 감사가 수정의 근거이고, 비용은 없다.
+- 우리 펌프는 이미 S_FALSE까지 pop한 뒤 재무장하므로 2는 현재 코드에 맞다. 링을 소유 태스크가 drive하는 모드로
+  바꿀 때(다음 작업) "깨어나면 빈 큐까지 pop"이 정확성 조건이 된다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

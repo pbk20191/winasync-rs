@@ -6,6 +6,8 @@ use super::*;
 /// The thread-pool wait that drains the ring when its event fires.
 pub(super) struct Pump {
     pub(super) wait: PTP_WAIT,
+    /// The wait's context; valid until the wait is closed.
+    pub(super) ctx: *const PumpCtx,
     /// `Some` exactly when the environment has no `FinalizationCallback` to
     /// release the context ([`PoolRef::finalizes`]).
     pub(super) ctx_to_release: Option<*const PumpCtx>,
@@ -22,6 +24,9 @@ pub(super) struct PumpCtx {
     /// Weak: the ring's owners decide when it goes, not its pump.
     pub(super) inner: Weak<Inner>,
     pub(super) event: HANDLE,
+    /// Set by [`Pump::stop`] before it drains: a callback that runs during
+    /// the drain must not re-arm the wait the close is about to find.
+    pub(super) closing: std::sync::atomic::AtomicBool,
     /// The pool the wait lives in; released with the context, after the wait
     /// is closed.
     pub(super) _pool: PoolRef,
@@ -49,6 +54,7 @@ impl Pump {
             header: unsafe { CtxHeader::new(release_ctx) },
             inner: Arc::downgrade(inner),
             event: inner.event,
+            closing: std::sync::atomic::AtomicBool::new(false),
             _pool: pool,
         }));
         let wait = match unsafe {
@@ -63,17 +69,23 @@ impl Pump {
         unsafe { SetThreadpoolWait(wait, Some(inner.event), None) };
         Ok(Pump {
             wait,
+            ctx,
             ctx_to_release: release_ourselves.then_some(ctx),
         })
     }
 
     /// Stops the wait and frees the context. Must not run inside the pump's
     /// own callback.
+    ///
+    /// Drained, not cancelled: a callback already queued runs (and finds the
+    /// ring gone, or drains it one last time) before the wait is closed. See
+    /// `close_wait_draining` for the pool stall this avoids.
     pub(super) fn stop(self) {
         unsafe {
-            SetThreadpoolWait(self.wait, None, None);
-            WaitForThreadpoolWaitCallbacks(self.wait, true);
-            CloseThreadpoolWait(self.wait);
+            (*self.ctx)
+                .closing
+                .store(true, std::sync::atomic::Ordering::Release);
+            crate::common::pool::close_wait_draining(self.wait);
         }
         if let Some(ctx) = self.ctx_to_release {
             unsafe { drop(Arc::from_raw(ctx)) };
@@ -106,10 +118,14 @@ unsafe extern "system" fn pump_callback(
     let (wake, dead) = {
         let mut ring = inner.ring.lock().unwrap();
         let (_, wake, dead) = drain_locked(&mut ring);
-        // Re-armed while the ring is certainly alive. A completion posted
-        // after the last pop has signalled the (auto-reset) event, so the
-        // wait fires again at once rather than missing it.
-        unsafe { SetThreadpoolWait(wait, Some(ctx.event), None) };
+        // Re-armed while the ring is certainly alive, unless its teardown
+        // has begun. The event is signalled when the completion queue goes
+        // from empty to non-empty (measured, not documented), so having
+        // popped to empty, a completion posted after the last pop signals
+        // it and the wait fires again at once rather than missing it.
+        if !ctx.closing.load(std::sync::atomic::Ordering::Acquire) {
+            unsafe { SetThreadpoolWait(wait, Some(ctx.event), None) };
+        }
         (wake, dead)
     };
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

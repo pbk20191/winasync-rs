@@ -402,6 +402,93 @@ fn a_refused_registration_leaves_none() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// One cold-pool trial: a pumped ring whose event has fired is torn down
+/// before the default pool has ever dispatched, then a second pumped ring
+/// must still deliver. Runs only as a child of [`cold_pool_teardown_sweep`]
+/// (the hazard needs a pool with no threads yet, which only a fresh process
+/// has); exits 3 if the victim never hears its completion.
+#[test]
+fn cold_pool_teardown_child() {
+    if std::env::var_os("WINASYNC_STALL_CHILD").is_none() {
+        return;
+    }
+    let (path, file) = temp_file("stall", b"x");
+    if std::env::var_os("WINASYNC_STALL_NO_TRIGGER").is_none() {
+        // The trigger: the read completes and signals the pump's event,
+        // which queues its callback on the cold pool; this thread pops the
+        // completion itself, spinning rather than sleeping so the pool has
+        // had no time to make a thread, and then the drop closes the wait
+        // microseconds behind its disarm with that callback still queued.
+        let ring = IoRing::new(4).unwrap();
+        let op = ring.read(&file, vec![0u8; 1], 0);
+        let _ = ring.submit();
+        while in_flight(&ring) > 0 {
+            ring.drive();
+        }
+        drop(op);
+        drop(ring);
+    }
+    // Opened without sharing, so the victim opens its own.
+    drop(file);
+    // The victim: delivered only by the pump.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path2 = path.clone();
+    std::thread::spawn(move || {
+        let file = File::open(&path2).unwrap();
+        let ring = IoRing::new(4).unwrap();
+        let (n, _) = block_on(ring.read(&file, vec![0u8; 1], 0));
+        let _ = tx.send(n.unwrap());
+    });
+    let heard = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    let _ = std::fs::remove_file(&path);
+    if !heard {
+        std::process::exit(3);
+    }
+}
+
+/// Runs [`cold_pool_teardown_child`] in `WINASYNC_STALL_RUNS` (default 1000)
+/// fresh processes and counts the ones whose pool stalled. Ignored: it takes
+/// minutes, and it is a measurement of the teardown rather than a unit test.
+///
+/// Background: closing a `TP_WAIT` shortly after disarming it, with its
+/// callback queued, on a default pool that has not made a thread yet, can
+/// leave that pool unable to dispatch anything (MikeGrier/windows-threadpool-sys,
+/// measurements of 2026-09-28..30: about 2.5 per 1000 cold runs with a
+/// cancelling teardown, 0 in 20000 with `WaitForThreadpoolWaitCallbacks(FALSE)`
+/// between the disarm and the close).
+#[test]
+#[ignore = "minutes-long cold-pool sweep; run by hand"]
+fn cold_pool_teardown_sweep() {
+    let runs: usize = std::env::var("WINASYNC_STALL_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let exe = std::env::current_exe().unwrap();
+    let started = Instant::now();
+    let mut stalled = 0;
+    let mut other = 0;
+    for i in 0..runs {
+        let status = std::process::Command::new(&exe)
+            .args(["--exact", "ioring::tests::cold_pool_teardown_child", "--test-threads=1", "-q"])
+            .env("WINASYNC_STALL_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        match status.code() {
+            Some(0) => {}
+            Some(3) => stalled += 1,
+            _ => other += 1,
+        }
+        if (i + 1) % 100 == 0 {
+            eprintln!("{}/{runs}: stalled={stalled} other={other} ({:?})", i + 1, started.elapsed());
+        }
+    }
+    eprintln!("cold-pool sweep: runs={runs} stalled={stalled} other={other} in {:?}", started.elapsed());
+    assert_eq!(other, 0, "children failed for another reason");
+    assert_eq!(stalled, 0, "the pool stalled in {stalled} of {runs} cold runs");
+}
+
 #[test]
 fn another_rings_registration_is_refused() {
     let one = IoRing::new(4).unwrap();
