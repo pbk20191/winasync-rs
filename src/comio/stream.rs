@@ -124,6 +124,42 @@ pub(crate) fn from_reg_with_mode(
     peer: Peer,
     message_mode: bool,
 ) -> bindings::Pbk20191::WinAsync::Comio::ITransportStream {
+    from_reg_with(reg, peer, message_mode, true)
+}
+
+/// The stream over `reg`, with the choice of finishing synchronous
+/// completions on the issuing thread.
+///
+/// Every stream takes that choice (`inline`): an operation the kernel
+/// finishes synchronously -- a write into a pipe with a reader waiting, a
+/// read that finds data, the common case on a busy connection -- is then
+/// completed on the thread that issued it, with no completion packet, no
+/// pool thread, and no hop back. Measured on a loopback named pipe
+/// (`comio::bench`): 9.4 us per operation through the port, 0.85 us
+/// without it, so the port's hand-off was nearly the whole cost of an
+/// operation on this surface.
+///
+/// What a caller sees: the operation may be `Completed` by the time
+/// `ReadAsync`/`WriteAsync` returns, and `SetCompleted` then invokes the
+/// handler at once, on the caller's thread -- which WinRT allows of any
+/// async operation and every projection's `await` handles. A caller that
+/// starts the next operation from inside a `Completed` handler should know
+/// that, on a connection where everything completes synchronously, those
+/// handlers nest on one stack. Listeners' accept operations are not
+/// affected: their handles are registered elsewhere and stay on the port,
+/// which keeps the accept chain free of re-entry.
+///
+/// Off only for `comio::bench`'s baseline. The mode is set best-effort:
+/// a handle that refuses it is served through the port as before.
+pub(crate) fn from_reg_with(
+    reg: Arc<IoReg>,
+    peer: Peer,
+    message_mode: bool,
+    inline: bool,
+) -> bindings::Pbk20191::WinAsync::Comio::ITransportStream {
+    if inline {
+        let _ = reg.set_skip_completion_on_success();
+    }
     let object = ComObject::new(TransportStream {
         reg,
         closed: std::sync::atomic::AtomicBool::new(false),

@@ -1437,8 +1437,24 @@ poll/cancel 경주. 나머지는 객체당 설정(`ListenerState` 6개 등)이�
 대신 op당 가장 큰 것이었던 `AgileReference::new`(`RoGetAgileReference` + 프록시 객체)를 `asyncop::Keep`으로 바꿨다: 버퍼가
 `IAgileObject`에 답하면(`Windows.Storage.Streams.Buffer`와 모든 `#[implement]` 객체) 그대로 캡처, 아니면 종전대로 참조.
 측정(`comio::bench`, 64바이트 named-pipe 왕복, 왕복당 op 4개): op당 9.7~10.5 µs → 9.05~9.17 µs(약 6 %). 남은 ~9 µs의
-본체는 파이프 커널 op(~2~3 µs)와 "완료 → 핸들러 → waker → block_on 깨움"의 스레드 핸드오프(~5 µs)라, comio를 더
-빠르게 하려면 뮤텍스나 COM이 아니라 그 핸드오프를 봐야 한다(tp 깊이 1과 같은 이야기).
+본체는 파이프 커널 op와 "완료 패킷 → 풀 스레드 → 핸들러 → waker → block_on 깨움"의 핸드오프라, comio를 더
+빠르게 하려면 뮤텍스나 COM이 아니라 그 핸드오프를 봐야 한다.
+
+**그 핸드오프를 없앰: 스트림은 동기 완료를 제출 스레드에서 끝낸다 (2026-11-12).** 코어에 이미 있던
+`set_skip_completion_on_success`(`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`, tp의 소켓·파일이 쓰던 것)를 comio 스트림에도
+켰다(`stream::from_reg_with`, 모든 `from_reg`가 지나감). 커널이 동기로 끝낸 op(읽을 데이터가 있는 읽기, 독자가 기다리는
+파이프 쓰기 — 바쁜 연결의 일반 경우)는 패킷도, 풀 스레드도, 돌아오는 홉도 없이 제출한 스레드에서 완료된다.
+
+| `comio::bench` | op당 |
+| --- | --- |
+| 포트 경유 (전) | 9.4~12.6 µs |
+| 제출 스레드에서 완료 (후) | 0.83~0.96 µs |
+
+핸드오프가 op 비용의 90 %였다. 호출자가 보는 차이: `ReadAsync`/`WriteAsync`가 돌아올 때 이미 `Completed`일 수 있고
+`SetCompleted`는 그 자리에서 핸들러를 호출한다 — WinRT가 모든 async op에 허용하는 모양이고 각 프로젝션의 `await`는
+상태를 먼저 보므로 재귀하지 않는다. 단 `Completed` 핸들러 안에서 다음 op를 시작하는 손수 짠 체인은 전부 동기로
+끝나는 연결에서 한 스택에 중첩된다(문서에 적음). 리스너의 accept 핸들은 따로 등록되어 그대로 포트를 타므로 accept
+체인의 비재진입 보장은 그대로다. 모드 설정은 best-effort라 거부하는 핸들은 종전 경로.
 
 **후속 (Shafir, "One Year to I/O Ring", 커널 리버싱)**
 
