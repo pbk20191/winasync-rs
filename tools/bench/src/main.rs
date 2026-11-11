@@ -117,14 +117,14 @@ fn row(name: &str, s: &Stats) {
     let per_s = s.ops as f64 / s.elapsed.as_secs_f64();
     if s.lat.is_empty() {
         println!(
-            "{name:<18}{per_s:>12.0}{:>10.1}{:>10.1}{:>12.2}",
+            "{name:<22}{per_s:>12.0}{:>10.1}{:>10.1}{:>12.2}",
             s.elapsed.as_secs_f64() * 1000.0,
             0.0,
             s.allocs as f64 / s.ops as f64
         );
     } else {
         println!(
-            "{name:<18}{per_s:>12.0}{:>10.1}{:>10.1}{:>12.2}",
+            "{name:<22}{per_s:>12.0}{:>10.1}{:>10.1}{:>12.2}",
             pct(&s.lat, 0.50),
             pct(&s.lat, 0.99),
             s.allocs as f64 / s.ops as f64
@@ -403,6 +403,31 @@ fn ioring_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
     })
 }
 
+// ---------------------------------------------------------------- file: winasync ioring, batched
+/// One task, `qd` reads per `Batch`: one `SubmitIoRing` per `qd` reads.
+fn ioring_batch_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
+    use winasync::ioring::{File, IoRing};
+    use winasync::tp::Runtime;
+    let rt = Runtime::new();
+    let Config { qd, reads, file_mb, .. } = cfg;
+    let ring = IoRing::with_runtime(&rt, qd as u32).unwrap();
+    let file = File::open(path).unwrap();
+    let rounds = reads / qd;
+    let file_len = file_mb << 20;
+    rt.block_on(async move {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut bufs: Vec<Vec<u8>> = (0..qd).map(|_| vec![0u8; READ]).collect();
+        for _ in 0..rounds {
+            let batch = ring.read_batch(&file, bufs.drain(..).map(|b| (b, offset(&mut rng, file_len))));
+            for (n, b) in batch.await {
+                assert_eq!(n.unwrap(), READ);
+                bufs.push(b);
+            }
+        }
+        (rounds * qd, Vec::new())
+    })
+}
+
 // ---------------------------------------------------------------- file: tokio
 fn tokio_file(cfg: Config, path: &str) -> (usize, Vec<u64>) {
     // `tokio::fs` is `spawn_blocking` over std; positional reads go the same
@@ -499,7 +524,7 @@ fn main() {
             "\nTCP echo: conns={} iters={} msg={}B  (round trips)",
             cfg.conns, cfg.iters, cfg.msg
         );
-        println!("{:<18}{:>12}{:>10}{:>10}{:>12}", "runtime", "rt/s", "p50 us", "p99 us", "allocs/rt");
+        println!("{:<22}{:>12}{:>10}{:>10}{:>12}", "runtime", "rt/s", "p50 us", "p99 us", "allocs/rt");
         for (name, f) in [
             ("winasync tp", tp_echo as fn(Config) -> (usize, Vec<u64>)),
             ("winasync tp+skip", |c| tp_echo(Config { skip: true, ..c })),
@@ -517,11 +542,12 @@ fn main() {
             "\nrandom 4 KiB reads: file={}MiB qd={} reads={}  (cached)",
             cfg.file_mb, cfg.qd, cfg.reads
         );
-        println!("{:<18}{:>12}{:>10}{:>10}{:>12}", "runtime", "reads/s", "ms", "", "allocs/read");
+        println!("{:<22}{:>12}{:>10}{:>10}{:>12}", "runtime", "reads/s", "ms", "", "allocs/read");
         for (name, f) in [
             ("winasync tp", tp_file as fn(Config, &str) -> (usize, Vec<u64>)),
             ("winasync tp+skip", |c, p| tp_file(Config { skip: true, ..c }, p)),
             ("winasync ioring", ioring_file),
+            ("winasync ioring batch", ioring_batch_file),
             ("tokio", tokio_file),
             ("compio", compio_file),
         ] {

@@ -16,7 +16,11 @@
 //! An operation is built when its future is created and submitted when any
 //! of them is first polled, so creating several before awaiting them (with
 //! `join!`, say) submits them together. [`IoRing::submit`] does the same on
-//! demand.
+//! demand. A [`Batch`] is that pattern as one future: the operations
+//! collected into it, submitted by its first poll in one `SubmitIoRing`,
+//! resolving to all their results in order -- queue depth from one task
+//! at one system call per batch, which is where a ring beats a handle
+//! bound to a completion port.
 //!
 //! Completions are popped by a pump: `SetIoRingCompletionEvent` signals an
 //! event, a `TP_WAIT` on the process default pool waits for it, and the
@@ -658,10 +662,12 @@ impl BuildCtx<'_> {
 #[cfg(test)]
 mod tests;
 
+mod batch;
 mod file;
 mod ops;
 mod pump;
 mod registered;
+pub use batch::*;
 pub use file::*;
 pub use ops::*;
 use pump::*;

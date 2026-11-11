@@ -72,6 +72,52 @@ fn operations_created_together_are_submitted_together() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A `Batch`: the reads collected go in one submission, and the results
+/// come back in the order the reads were added.
+#[test]
+fn a_batch_submits_once_and_resolves_in_order() {
+    let ring = IoRing::new(32).unwrap();
+    let data: Vec<u8> = (0..16u8).flat_map(|i| [i; 512]).collect();
+    let (path, file) = temp_file("batch_in_order", &data);
+    // Added in reverse, so order of results is order of adding, not of offset.
+    let batch = ring.read_batch(&file, (0..16u64).rev().map(|i| (vec![0u8; 512], i * 512)));
+    assert_eq!(batch.len(), 16);
+    assert_eq!(ring.inner.ring.lock().unwrap().unsubmitted, 16, "built, not yet submitted");
+    let results = block_on(batch);
+    assert_eq!(ring.inner.ring.lock().unwrap().unsubmitted, 0);
+    assert_eq!(results.len(), 16);
+    for (slot, (n, got)) in results.into_iter().enumerate() {
+        let i = 15 - slot as u8;
+        assert_eq!(n.unwrap(), 512);
+        assert!(got.iter().all(|&b| b == i), "result {slot} is not read {i}");
+    }
+    // Collected from any operations, the empty batch included.
+    let empty: Batch<ReadOp<File, Vec<u8>>> = std::iter::empty().collect();
+    assert!(block_on(empty).is_empty());
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A batch larger than the ring: the overflow waits for room, and the
+/// batch still resolves with every result. Dropped half-way, it cancels
+/// and the ring settles.
+#[test]
+fn a_batch_past_the_queue_completes_and_a_dropped_one_settles() {
+    let ring = IoRing::new(2).unwrap();
+    let (path, file) = temp_file("batch_room", &[9u8; 4096]);
+    let batch = ring.read_batch(&file, (0..40u64).map(|i| (vec![0u8; 64], i * 64)));
+    let results = block_on(batch);
+    assert_eq!(results.len(), 40);
+    assert!(results.iter().all(|(n, b)| *n.as_ref().unwrap() == 64 && b.iter().all(|&x| x == 9)));
+
+    let batch = ring.read_batch(&file, (0..40u64).map(|i| (vec![0u8; 64], i * 64)));
+    assert_eq!(batch.pending(), 40);
+    drop(batch);
+    settle(&ring);
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// More operations than the completion queue holds: the rest wait for
 /// room instead of overflowing it, and all of them finish.
 #[test]

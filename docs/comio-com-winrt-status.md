@@ -1290,6 +1290,33 @@ SYN이 버려졌다. `common::winsock::LISTEN_BACKLOG = 0x7fff_ffff`로 통일�
 `listen_backlog_takes_a_burst_of_connects`(std 클라이언트 32개 동시 connect, 가장 느린 것이 300 ms 미만)는
 백로그 5로 되돌리면 2.03 s에 실패한다.
 
+### ioring 배치 제출: `Batch` (2026-11-11)
+
+위 벤치에서 ioring이 느렸던 이유는 하네스가 태스크마다 op 하나씩 제출해 `SubmitIoRing`이 작업당 1회였기 때문이다.
+링은 원래 "만들 때 빌드, 처음 poll할 때 제출"이라 op 여러 개를 만들어 두고 `join!`하면 한 번에 갔지만, 그걸
+타입으로 드러내는 것이 없었다. `ioring::Batch<O>`:
+
+- `RingOp<O>`들의 `FromIterator` — `offsets.map(|o| ring.read(&f, buf, o)).collect::<Batch<_>>()` — 와
+  `IoRing::read_batch(file, (buf, offset) 반복자)` / `write_batch`.
+- 하나의 Future: 첫 poll이 전부를 `SubmitIoRing` 한 번에 제출하고, `Vec<O::Output>`을 **추가한 순서로** 돌려준다.
+  링 용량을 넘는 op는 자리가 나는 대로 들어간다(`RingOp`의 기존 `Unbuilt` 대기).
+- 중간에 드롭하면 각 op가 하던 대로 취소한다. 완료 하나가 배치를 깨우면 남은 op를 전부 다시 poll하므로
+  (각각 락 1회·waker 클론 1회) 수십~수백 개 규모용이지 수십만 개용은 아니다 — 문서에 적어 둠.
+- `dyn` 없음: 한 종류의 op(`Batch<ReadOp<H,B>>`)를 담는 동종 배치다. 읽기와 쓰기를 섞으려면 배치 둘을 `join`.
+
+하네스에 `winasync ioring batch` 행(태스크 하나, 라운드마다 `qd`개 읽기를 배치 하나로) 추가. 측정:
+
+| 4K 랜덤 읽기, 읽기/s | qd=1 | qd=32 | qd=128 |
+|---|---|---|---|
+| winasync ioring (op당 제출) | 78k | 84k | 64k |
+| **winasync ioring batch** | 94k | **227k** | **217k** |
+| winasync tp | 98k | 218k | 217k |
+| compio | 185k | 215k | 212k |
+
+qd=32에서 2.7배, qd=128에서 3.4배 — tp·compio와 같은 선에 올라선다. 그 선 자체는 완료 → 펌프 → 태스크 깨움의
+핸드오프 비용이 정하고, 그건 세 런타임이 같다(compio가 qd=1에서 앞서는 이유는 앞 절). 테스트 둘:
+순서 보존 + 미제출 카운트 16 → 0, 용량 2짜리 링에 40개 배치 완료 + 드롭 후 settle.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |
