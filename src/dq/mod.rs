@@ -212,14 +212,14 @@ pub struct DispatcherRuntime;
 /// normally or panicked; `DispatcherRuntime::run` resumes the panic (if any)
 /// after `RunEventLoop` has actually returned, on its own stack, well clear
 /// of the WinRT FFI boundary that ultimately invoked this `poll`.
-struct RunRootTask<T> {
-    root: Pin<Box<dyn Future<Output = T>>>,
+struct RunRootTask<F: Future> {
+    root: Pin<Box<F>>,
     done: bool,
-    output: Rc<RefCell<Option<std::thread::Result<T>>>>,
+    output: Rc<RefCell<Option<std::thread::Result<F::Output>>>>,
     queue: DispatcherQueue,
 }
 
-impl<T> Future for RunRootTask<T> {
+impl<F: Future> Future for RunRootTask<F> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -252,13 +252,13 @@ impl<T> Future for RunRootTask<T> {
 /// an explicit `EnqueueEventLoopExit` — a dedicated-thread queue already
 /// pumps its own event loop for its whole lifetime (see `run_dedicated`), so
 /// there is no caller-owned `RunEventLoop` to release.
-struct DedicatedRootTask<T> {
-    root: Pin<Box<dyn Future<Output = T>>>,
+struct DedicatedRootTask<F: Future> {
+    root: Pin<Box<F>>,
     done: bool,
-    tx: Option<std::sync::mpsc::Sender<std::thread::Result<T>>>,
+    tx: Option<std::sync::mpsc::Sender<std::thread::Result<F::Output>>>,
 }
 
-impl<T> Future for DedicatedRootTask<T> {
+impl<F: Future> Future for DedicatedRootTask<F> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {

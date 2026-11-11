@@ -1137,6 +1137,16 @@ Pillar 3 기준으로 거른 유일한 gap — WinRT에는 HTTP 서버가 없다
 - 테스트: Rust에서 WinRT 인터페이스로 왕복(POST + 본문 + 응답), 취소/닫기. 소비자(Python/Node/C#) 스크립트는
   그대로이고 CI의 프로젝션 생성이 새 타입을 받는지 본다.
 
+### 남은 `dyn` Future 둘 (2026-11-11)
+
+- `tp::io::async_rw`의 `DynIoFut`(`Pin<Box<dyn Future>>`): `TcpStream::start_read/start_write`가 이름 있는
+  `OpFuture<…>`를 돌려주게 하고(`File::start_read`와 같은 모양) 어댑터가 그것을 필드에 둔다. `OpFuture`는 `Unpin`이라
+  `Pin::new`로 폴링. 어댑터의 read/write마다 있던 Box 하나가 사라졌다.
+- dq의 루트 태스크 `Pin<Box<dyn Future<Output = T>>>` → `RunRootTask<F>`/`DedicatedRootTask<F>`. `run()` 시점에
+  Future 타입이 알려져 있으니 제네릭이면 된다.
+- 두지 않은 것: dq `Rc<dyn TaskObj>`, tp `Arc<dyn ErasedTask<T>>`. 실행기의 태스크 테이블은 서로 다른 Future를
+  담는 것이 목적이라 지우기(erasure)가 본질이다. vtable을 손으로 쓰면 같은 것을 `unsafe`로 다시 쓰는 셈.
+
 ### TransmitFile / TransmitPackets를 모든 소켓 종류로 (2026-11-11)
 
 프로브로 측정(이 호스트, 각 종류의 연결된 소켓 쌍):

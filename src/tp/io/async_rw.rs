@@ -81,7 +81,10 @@ pub trait AsyncWrite {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<windows_core::Result<()>>;
 }
 
-type DynIoFut = Pin<Box<dyn Future<Output = (windows_core::Result<usize>, Vec<u8>)> + Send>>;
+/// The receive in flight: the stream's own future, which is `Unpin` and
+/// nameable, so nothing is boxed to keep it in a field.
+type ReadFut = crate::common::opfuture::OpFuture<super::net::RecvPayload<Vec<u8>>>;
+type WriteFut = crate::common::opfuture::OpFuture<Vec<u8>>;
 
 const DEFAULT_READ_CAP: usize = 16 * 1024;
 
@@ -90,7 +93,7 @@ pub struct ReadHalf {
     stream: TcpStream,
     read_cap: usize,
     /// In-flight WSARecv (owns the staging buffer the kernel writes into).
-    read_fut: Option<DynIoFut>,
+    read_fut: Option<ReadFut>,
     /// A recycled read staging buffer (len == `read_cap`) awaiting reuse.
     read_spare: Option<Vec<u8>>,
     /// Bytes read but not yet handed to a caller: `(buffer, start, end)`.
@@ -144,14 +147,15 @@ impl AsyncRead for ReadHalf {
             if staging.len() != this.read_cap {
                 staging.resize(this.read_cap, 0);
             }
-            this.read_fut = Some(Box::pin(this.stream.read(staging)));
+            this.read_fut = Some(this.stream.start_read(staging));
         }
 
         // 3. Poll it; on completion copy into the caller's slice.
-        match this.read_fut.as_mut().unwrap().as_mut().poll(cx) {
+        match Pin::new(this.read_fut.as_mut().unwrap()).poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready((res, staging)) => {
+            Poll::Ready((res, payload)) => {
                 this.read_fut = None;
+                let staging = crate::common::buffer::mark_read(res.as_ref().ok().copied(), payload.buf);
                 match res {
                     Ok(n) => {
                         let m = buf.len().min(n);
@@ -177,7 +181,7 @@ impl AsyncRead for ReadHalf {
 pub struct WriteHalf {
     stream: TcpStream,
     /// In-flight WSASend (owns the copied bytes the kernel reads from).
-    write_fut: Option<DynIoFut>,
+    write_fut: Option<WriteFut>,
     /// A recycled write staging buffer awaiting reuse.
     write_spare: Option<Vec<u8>>,
 }
@@ -212,10 +216,10 @@ impl AsyncWrite for WriteHalf {
             let mut staging = this.write_spare.take().unwrap_or_default();
             staging.clear();
             staging.extend_from_slice(buf);
-            this.write_fut = Some(Box::pin(this.stream.write(staging)));
+            this.write_fut = Some(this.stream.start_write(staging));
         }
 
-        match this.write_fut.as_mut().unwrap().as_mut().poll(cx) {
+        match Pin::new(this.write_fut.as_mut().unwrap()).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready((res, staging)) => {
                 this.write_fut = None;
@@ -230,7 +234,7 @@ impl AsyncWrite for WriteHalf {
         let Some(fut) = this.write_fut.as_mut() else {
             return Poll::Ready(Ok(()));
         };
-        match fut.as_mut().poll(cx) {
+        match Pin::new(fut).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready((res, staging)) => {
                 this.write_fut = None;

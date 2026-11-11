@@ -295,8 +295,20 @@ impl TcpStream {
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        let fut = self.start_read(buf);
+        async move {
+            let (result, payload) = fut.await;
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, payload.buf))
+        }
+    }
+
+    /// The overlapped receive under [`read`](Self::read), as the nameable
+    /// future it is: the payload comes back as received, length not yet
+    /// marked. For code that must store the future in a field.
+    pub(in crate::tp::io) fn start_read<B: IoBufMut>(&self, buf: B) -> OpFuture<RecvPayload<B>> {
         let sock = self.res.socket();
-        let fut = unsafe {
+        unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
                 let wsabuf = WSABUF {
                     len: IoBuf::bytes_total(&p.buf) as u32,
@@ -305,13 +317,6 @@ impl TcpStream {
                 let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })
-        };
-        async move {
-            let (result, payload) = fut.await;
-            {
-                let n = result.as_ref().ok().copied();
-                (result, crate::common::buffer::mark_read(n, payload.buf))
-            }
         }
     }
 
@@ -360,8 +365,13 @@ impl TcpStream {
         &self,
         buf: B,
     ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        self.start_write(buf)
+    }
+
+    /// The overlapped send under [`write`](Self::write), nameable.
+    pub(in crate::tp::io) fn start_write<B: IoBuf>(&self, buf: B) -> OpFuture<B> {
         let sock = self.res.socket();
-        let fut = unsafe {
+        unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let wsabuf = WSABUF {
                     len: IoBuf::len(buf) as u32,
@@ -370,10 +380,6 @@ impl TcpStream {
                 let r = WSASend(sock, &[wsabuf], None, 0, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })
-        };
-        async move {
-            let (result, buf) = fut.await;
-            (result, buf)
         }
     }
 
