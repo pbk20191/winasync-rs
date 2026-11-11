@@ -16,8 +16,10 @@
 //! crosses the completion FFI boundary; `LIVE_OPS` tracks live blocks in test builds and under `counters`.
 
 use core::ffi::c_void;
+use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::mem;
+use std::ptr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -162,12 +164,48 @@ pub struct IoReg {
     io: Option<PTP_IO>,
     /// Taken in `drop` to close it at the right moment.
     owned: Option<IoHandle>,
+    /// Op blocks whose op is over, kept for this handle's next ops: a read
+    /// and a write alternating on a connection then allocate nothing after
+    /// the first round. Two slots, because those two ops have two layouts.
+    /// Each slot's block is raw memory -- its contents were dropped when
+    /// the op was released -- and is freed with the registration.
+    spare: Mutex<[Option<Spare>; 2]>,
     /// Dropped last: the pool or port the `TP_IO` and handle belonged to.
     _binding: Binding,
 }
 
 unsafe impl Send for IoReg {}
 unsafe impl Sync for IoReg {}
+
+/// A released op block's memory, kept by its handle for reuse.
+struct Spare {
+    ptr: *mut u8,
+    layout: Layout,
+}
+
+unsafe impl Send for Spare {}
+
+impl IoReg {
+    /// A kept block of exactly `layout`, if there is one.
+    fn take_spare(&self, layout: Layout) -> Option<*mut u8> {
+        let mut slots = self.spare.lock().unwrap();
+        let slot = slots.iter_mut().find(|s| s.as_ref().is_some_and(|s| s.layout == layout))?;
+        slot.take().map(|s| s.ptr)
+    }
+
+    /// Keeps `ptr` (a block of `layout` whose contents are already dropped)
+    /// for a later op, or frees it when both slots are taken.
+    ///
+    /// # Safety
+    /// `ptr` was allocated with `layout` and nothing refers to it any more.
+    unsafe fn keep_spare(&self, ptr: *mut u8, layout: Layout) {
+        let mut slots = self.spare.lock().unwrap();
+        match slots.iter_mut().find(|s| s.is_none()) {
+            Some(slot) => *slot = Some(Spare { ptr, layout }),
+            None => unsafe { std::alloc::dealloc(ptr, layout) },
+        }
+    }
+}
 
 impl IoReg {
     /// Registers `io` with `binding`. Takes `io` either way: on failure it
@@ -189,6 +227,7 @@ impl IoReg {
             skip_on_success: AtomicBool::new(false),
             io: tp_io,
             owned: Some(owned),
+            spare: Mutex::new([None, None]),
             _binding: binding,
         }))
     }
@@ -255,6 +294,9 @@ impl Drop for IoReg {
             unsafe { CloseThreadpoolIo(io) };
         }
         drop(self.owned.take());
+        for spare in self.spare.get_mut().unwrap().iter_mut().filter_map(Option::take) {
+            unsafe { std::alloc::dealloc(spare.ptr, spare.layout) };
+        }
     }
 }
 
@@ -370,7 +412,16 @@ unsafe fn release_op<P, F>(op: *mut c_void) {
     LIVE_OPS.fetch_sub(1, Ordering::Release);
     #[cfg(test)]
     LIVE_SITES.lock().unwrap().retain(|(ptr, _, _)| *ptr != op as usize);
-    unsafe { drop(Box::from_raw(op as *mut Op<P, F>)) }
+    let op = op as *mut Op<P, F>;
+    // Drop what the block owns -- the registration last, since the block's
+    // memory goes back to it -- and keep the memory for the handle's next op.
+    unsafe {
+        let reg = ptr::read(&raw const (*op).header.reg);
+        ptr::drop_in_place(&raw mut (*op).header.shared);
+        ptr::drop_in_place(&raw mut (*op).payload);
+        ptr::drop_in_place(&raw mut (*op).on_complete);
+        reg.keep_spare(op as *mut u8, Layout::new::<Op<P, F>>());
+    }
 }
 
 unsafe fn release_ref(op: *mut c_void) {
@@ -549,22 +600,33 @@ pub unsafe fn submit<P, F: FnOnce(Completion) + Send + 'static>(
     on_complete: F,
     issue: impl FnOnce(*mut OVERLAPPED, &mut P) -> Issue,
 ) -> OpHandle<P> {
-    let op = Box::into_raw(Box::new(Op {
-        overlapped: unsafe { mem::zeroed() },
-        header: OpHeader {
-            refs: AtomicUsize::new(2),
-            shared: Mutex::new(Shared {
-                fired: false,
-                result: None,
-                waker: None,
-            }),
-            complete: complete_op::<P, F>,
-            release: release_op::<P, F>,
-            reg: reg.clone(),
-        },
-        payload: UnsafeCell::new(Some(payload)),
-        on_complete: UnsafeCell::new(Some(on_complete)),
-    }));
+    // The handle's kept block of this layout if it has one, else a fresh one.
+    let layout = Layout::new::<Op<P, F>>();
+    let op = reg.take_spare(layout).unwrap_or_else(|| {
+        let p = unsafe { std::alloc::alloc(layout) };
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        p
+    }) as *mut Op<P, F>;
+    unsafe {
+        ptr::write(op, Op {
+            overlapped: mem::zeroed(),
+            header: OpHeader {
+                refs: AtomicUsize::new(2),
+                shared: Mutex::new(Shared {
+                    fired: false,
+                    result: None,
+                    waker: None,
+                }),
+                complete: complete_op::<P, F>,
+                release: release_op::<P, F>,
+                reg: reg.clone(),
+            },
+            payload: UnsafeCell::new(Some(payload)),
+            on_complete: UnsafeCell::new(Some(on_complete)),
+        })
+    };
     #[cfg(any(test, feature = "counters"))]
     LIVE_OPS.fetch_add(1, Ordering::Relaxed);
     #[cfg(test)]
