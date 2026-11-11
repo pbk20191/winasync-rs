@@ -26,7 +26,7 @@ path = "src/lib.rs"
 # Deliberately not `tp`, `dq` or `rio`. The server is the WinRT component,
 # and the component is `comio`; the other pillars would be dead weight in the
 # DLL and, in `rio`'s case, would pin Winsock against teardown.
-library = { package = "winasync", path = "..", default-features = false, features = ["dylib"] }
+library = { package = "winasync", path = "..", default-features = false, features = ["dylib", "http"] }
 # Must resolve to the same `windows-core` as the library: the entry points
 # forward `GUID`, `HRESULT` and `HSTRING` straight into its functions, so a
 # second copy would be a second, incompatible set of types.

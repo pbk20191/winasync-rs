@@ -70,6 +70,9 @@ pub mod asyncop;
 pub mod bindings;
 pub mod buffer;
 pub mod connector;
+pub mod future_op;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod hvsock;
 pub mod listener;
 pub mod pipe;

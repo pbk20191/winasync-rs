@@ -194,6 +194,13 @@ pub static CLASSES: &[ComClass] = &[
         description: "Hyper-V socket stream connector",
         create: || super::HyperVConnector::new().into_interface(),
     },
+    #[cfg(feature = "http")]
+    ComClass {
+        clsid: CLSID_HTTP_SERVER,
+        name: class_name::<rc::HttpServer>(),
+        description: "HTTP server on http.sys",
+        create: || super::http::HttpServer::new().into_interface(),
+    },
 ];
 
 // The six CLSIDs. Frozen — do not change or reuse, for the same reason the
@@ -207,6 +214,7 @@ pub const CLSID_HYPER_V_CONNECTION_LISTENER: GUID =
 pub const CLSID_NAMED_PIPE_CONNECTOR: GUID = GUID::from_u128(0x2ad42747_717e_4994_9457_5e2b1ba48247);
 pub const CLSID_UNIX_CONNECTOR: GUID = GUID::from_u128(0xdb436265_333f_4f3e_a7fd_a3f842a639d4);
 pub const CLSID_HYPER_V_CONNECTOR: GUID = GUID::from_u128(0xbe6a6ff1_e2b8_4014_b608_168668baf43d);
+pub const CLSID_HTTP_SERVER: GUID = GUID::from_u128(0x7c3e9a41_2d5b_4f0e_9b7a_1e6c8d2f4a93);
 
 /// The runtime class name `C` answers `GetRuntimeClassName` with.
 ///
@@ -517,6 +525,8 @@ mod tests {
             (CLSID_HYPER_V_CONNECTOR, |u| {
                 u.cast::<super::super::IHyperVConnector>().is_ok()
             }),
+            #[cfg(feature = "http")]
+            (CLSID_HTTP_SERVER, |u| u.cast::<rc::IHttpServer>().is_ok()),
         ];
         assert_eq!(expected.len(), CLASSES.len(), "a class has no coverage here");
 

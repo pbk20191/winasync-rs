@@ -1117,6 +1117,26 @@ tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
   `curl -k`로 받은 뒤 `ssl_protocol`을 확인한다 — GitHub 런너는 관리자라 CI에서 돈다.
 - 아직 없는 것: 로깅 속성, 채널 바인딩/확장 인증, 요청 위임(`HttpDelegateRequestEx`), 클라이언트 인증서.
 
+### WinRT 표면: `HttpServer` / `HttpRequest` (2026-11-11)
+
+Pillar 3 기준으로 거른 유일한 gap — WinRT에는 HTTP 서버가 없다. `metadata/*.rdl`에 `IHttpServer`/`IHttpRequest`와
+클래스 둘을 추가하고 `cargo run -p winmdgen`으로 `.winmd`·`bindings.rs`를 다시 만들었다(새 IID는 이름에서 유도).
+`src/comio/http.rs`가 `crate::http` 위에 얇게 얹힌다. DLL은 이제 `http` 피처를 포함한다(`dll/Cargo.toml`).
+
+- `HttpServer`(activatable): `BindAsync(url)`(첫 호출이 큐 생성, 이후는 prefix 추가), `AcceptAsync()`,
+  `SetAuthentication(bits, realm)`, `Shutdown()`, `Information`, `IClosable`.
+- `HttpRequest`: `Method/RawUrl/Url/Path/Query/Headers/RemoteAddress/LocalAddress/HasBody/AuthStatus/AuthPackage`,
+  `Header(name)`, `ReadBodyAsync(IBuffer) -> IAsyncOperation<u32>`, `RespondAsync(status, headers, IBuffer) ->
+  IAsyncAction`(요청을 소비한다 — 이후 getter는 `RO_E_CLOSED`), `IClosable`(응답 없이 닫으면 취소).
+  헤더는 스크립트가 다루기 쉽게 `Name: value` 줄 문자열로 주고받는다.
+- **Future 드라이버** `comio::future_op`: comio의 다른 연산은 콜백 체인이지만 http는 Future라서, 실행기 없이
+  "wake마다 풀에 poll 하나 제출"하는 `FutureOp<T, F>`/`FutureAction<F>`를 만들었다. Future는 연산 객체 안에 살고
+  `Cancel`이 Future를 drop해 진행 중인 커널 I/O를 취소한다. `dyn` 없음(`F`가 타입 파라미터).
+- 배운 것: `#[implement]`는 `macro_rules!` 안에서 쓸 수 없다(`self`/`iid` 위생 깨짐). 클래스 외의 인터페이스는
+  `#[implement(Class, …, IClosable)]`에 **명시**해야 QI가 된다 — 기본 인터페이스만 클래스 타입이 준다.
+- 테스트: Rust에서 WinRT 인터페이스로 왕복(POST + 본문 + 응답), 취소/닫기. 소비자(Python/Node/C#) 스크립트는
+  그대로이고 CI의 프로젝션 생성이 새 타입을 받는지 본다.
+
 ### 메모리/수명 리뷰 반영 (2026-11-11)
 
 - **완료 슬롯을 op 블록 안으로**: `OpHeader.shared = Mutex<{fired, result, waker}>`. 핵심이 완료를 항상 기록하고

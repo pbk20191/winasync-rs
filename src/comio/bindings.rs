@@ -80,6 +80,327 @@ pub mod Pbk20191 {
             }
             #[repr(transparent)]
             #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct HttpRequest(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
+                HttpRequest,
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                IHttpRequest
+            );
+            windows_core::imp::required_hierarchy!(HttpRequest, windows::Foundation::IClosable);
+            impl HttpRequest {
+                pub fn Close(&self) -> windows_core::Result<()> {
+                    let this =
+                        &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Close)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Method(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Method)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn RawUrl(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RawUrl)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Url(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Url)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Path(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Path)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Query(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Query)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Headers(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Headers)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn RemoteAddress(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteAddress)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn LocalAddress(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).LocalAddress)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn HasBody(&self) -> windows_core::Result<bool> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).HasBody)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn AuthStatus(&self) -> windows_core::Result<u32> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).AuthStatus)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn AuthPackage(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).AuthPackage)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Header(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Header)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(name),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn ReadBodyAsync<P0>(
+                    &self,
+                    buffer: P0,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<u32>>
+                where
+                    P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ReadBodyAsync)(
+                            windows_core::Interface::as_raw(this),
+                            buffer.param().abi(),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn RespondAsync<P2>(
+                    &self,
+                    status: u32,
+                    headers: &windows_core::HSTRING,
+                    body: P2,
+                ) -> windows_core::Result<windows_future::IAsyncAction>
+                where
+                    P2: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RespondAsync)(
+                            windows_core::Interface::as_raw(this),
+                            status,
+                            core::mem::transmute_copy(headers),
+                            body.param().abi(),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+            }
+            impl windows_core::RuntimeType for HttpRequest {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, IHttpRequest>();
+            }
+            unsafe impl windows_core::Interface for HttpRequest {
+                type Vtable = <IHttpRequest as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID = <IHttpRequest as windows_core::Interface>::IID;
+            }
+            impl windows_core::RuntimeName for HttpRequest {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.HttpRequest";
+            }
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
+            pub struct HttpServer(windows_core::IUnknown);
+            windows_core::imp::interface_hierarchy!(
+                HttpServer,
+                windows_core::IUnknown,
+                windows_core::IInspectable,
+                IHttpServer
+            );
+            windows_core::imp::required_hierarchy!(HttpServer, windows::Foundation::IClosable);
+            impl HttpServer {
+                pub fn new() -> windows_core::Result<Self> {
+                    Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+                }
+                fn IActivationFactory<
+                    R,
+                    F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+                >(
+                    callback: F,
+                ) -> windows_core::Result<R> {
+                    static SHARED: windows_core::imp::FactoryCache<
+                        HttpServer,
+                        windows_core::imp::IGenericFactory,
+                    > = windows_core::imp::FactoryCache::new();
+                    SHARED.call(callback)
+                }
+                pub fn Close(&self) -> windows_core::Result<()> {
+                    let this =
+                        &windows_core::Interface::cast::<windows::Foundation::IClosable>(self)?;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Close)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn BindAsync(
+                    &self,
+                    url: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(url),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn AcceptAsync(
+                    &self,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<HttpRequest>>
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).AcceptAsync)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn SetAuthentication(
+                    &self,
+                    schemes: u32,
+                    realm: &windows_core::HSTRING,
+                ) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetAuthentication)(
+                            windows_core::Interface::as_raw(this),
+                            schemes,
+                            core::mem::transmute_copy(realm),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Shutdown(&self) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Shutdown)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Information)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+            }
+            impl windows_core::RuntimeType for HttpServer {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_class::<Self, IHttpServer>();
+            }
+            unsafe impl windows_core::Interface for HttpServer {
+                type Vtable = <IHttpServer as windows_core::Interface>::Vtable;
+                const IID: windows_core::GUID = <IHttpServer as windows_core::Interface>::IID;
+            }
+            impl windows_core::RuntimeName for HttpServer {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.HttpServer";
+            }
+            #[repr(transparent)]
+            #[derive(Clone, Debug, Eq, PartialEq)]
             pub struct HyperVConnectionListener(windows_core::IUnknown);
             windows_core::imp::interface_hierarchy!(
                 HyperVConnectionListener,
@@ -631,6 +952,853 @@ pub mod Pbk20191 {
                 )
                     -> windows_core::HRESULT,
                 pub RemoteUserSid: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                IHttpRequest,
+                IHttpRequest_Vtbl,
+                0xae4a2233_61d5_5f9d_9501_870a402d78ef
+            );
+            impl windows_core::RuntimeType for IHttpRequest {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IHttpRequest,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IHttpRequest {
+                pub fn Method(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Method)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn RawUrl(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RawUrl)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Url(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Url)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Path(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Path)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Query(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Query)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Headers(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Headers)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn RemoteAddress(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RemoteAddress)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn LocalAddress(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).LocalAddress)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn HasBody(&self) -> windows_core::Result<bool> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).HasBody)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn AuthStatus(&self) -> windows_core::Result<u32> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).AuthStatus)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| result__)
+                    }
+                }
+                pub fn AuthPackage(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).AuthPackage)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn Header(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Header)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(name),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+                pub fn ReadBodyAsync<P0>(
+                    &self,
+                    buffer: P0,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<u32>>
+                where
+                    P0: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).ReadBodyAsync)(
+                            windows_core::Interface::as_raw(this),
+                            buffer.param().abi(),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn RespondAsync<P2>(
+                    &self,
+                    status: u32,
+                    headers: &windows_core::HSTRING,
+                    body: P2,
+                ) -> windows_core::Result<windows_future::IAsyncAction>
+                where
+                    P2: windows_core::Param<windows::Storage::Streams::IBuffer>,
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).RespondAsync)(
+                            windows_core::Interface::as_raw(this),
+                            status,
+                            core::mem::transmute_copy(headers),
+                            body.param().abi(),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+            }
+            impl windows_core::RuntimeName for IHttpRequest {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IHttpRequest";
+            }
+            pub trait IHttpRequest_Impl: windows_core::IUnknownImpl {
+                fn Method(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn RawUrl(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn Url(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn Path(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn Query(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn Headers(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn RemoteAddress(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn LocalAddress(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn HasBody(&self) -> windows_core::Result<bool>;
+                fn AuthStatus(&self) -> windows_core::Result<u32>;
+                fn AuthPackage(&self) -> windows_core::Result<windows_core::HSTRING>;
+                fn Header(
+                    &self,
+                    name: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_core::HSTRING>;
+                fn ReadBodyAsync(
+                    &self,
+                    buffer: windows_core::Ref<'_, windows::Storage::Streams::IBuffer>,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<u32>>;
+                fn RespondAsync(
+                    &self,
+                    status: u32,
+                    headers: &windows_core::HSTRING,
+                    body: windows_core::Ref<'_, windows::Storage::Streams::IBuffer>,
+                ) -> windows_core::Result<windows_future::IAsyncAction>;
+            }
+            impl IHttpRequest_Vtbl {
+                pub const fn new<Identity: IHttpRequest_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn Method<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::Method(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn RawUrl<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::RawUrl(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn Url<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::Url(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn Path<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::Path(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn Query<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::Query(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn Headers<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::Headers(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn RemoteAddress<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::RemoteAddress(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn LocalAddress<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::LocalAddress(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn HasBody<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut bool,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::HasBody(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn AuthStatus<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut u32,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::AuthStatus(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn AuthPackage<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::AuthPackage(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn Header<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        name: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::Header(this, core::mem::transmute(&name)) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn ReadBodyAsync<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        buffer: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::ReadBodyAsync(
+                                this,
+                                core::mem::transmute_copy(&buffer),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn RespondAsync<
+                        Identity: IHttpRequest_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        status: u32,
+                        headers: *mut core::ffi::c_void,
+                        body: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpRequest_Impl::RespondAsync(
+                                this,
+                                status,
+                                core::mem::transmute(&headers),
+                                core::mem::transmute_copy(&body),
+                            ) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<
+                            Identity,
+                            IHttpRequest,
+                            OFFSET,
+                        >(),
+                        Method: Method::<Identity, OFFSET>,
+                        RawUrl: RawUrl::<Identity, OFFSET>,
+                        Url: Url::<Identity, OFFSET>,
+                        Path: Path::<Identity, OFFSET>,
+                        Query: Query::<Identity, OFFSET>,
+                        Headers: Headers::<Identity, OFFSET>,
+                        RemoteAddress: RemoteAddress::<Identity, OFFSET>,
+                        LocalAddress: LocalAddress::<Identity, OFFSET>,
+                        HasBody: HasBody::<Identity, OFFSET>,
+                        AuthStatus: AuthStatus::<Identity, OFFSET>,
+                        AuthPackage: AuthPackage::<Identity, OFFSET>,
+                        Header: Header::<Identity, OFFSET>,
+                        ReadBodyAsync: ReadBodyAsync::<Identity, OFFSET>,
+                        RespondAsync: RespondAsync::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IHttpRequest as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IHttpRequest_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub Method: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub RawUrl: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub Url: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub Path: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub Query: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub Headers: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub RemoteAddress: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub LocalAddress: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub HasBody: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut bool,
+                ) -> windows_core::HRESULT,
+                pub AuthStatus: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut u32,
+                ) -> windows_core::HRESULT,
+                pub AuthPackage: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub Header: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub ReadBodyAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub RespondAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    u32,
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+            }
+            windows_core::imp::define_interface!(
+                IHttpServer,
+                IHttpServer_Vtbl,
+                0xc35abd67_ba6d_5442_800a_bcceb4bdb864
+            );
+            impl windows_core::RuntimeType for IHttpServer {
+                const SIGNATURE: windows_core::imp::ConstBuffer =
+                    windows_core::imp::ConstBuffer::for_interface::<Self>();
+            }
+            windows_core::imp::interface_hierarchy!(
+                IHttpServer,
+                windows_core::IUnknown,
+                windows_core::IInspectable
+            );
+            impl IHttpServer {
+                pub fn BindAsync(
+                    &self,
+                    url: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).BindAsync)(
+                            windows_core::Interface::as_raw(this),
+                            core::mem::transmute_copy(url),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn AcceptAsync(
+                    &self,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<HttpRequest>>
+                {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).AcceptAsync)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .and_then(|| windows_core::Type::from_abi(result__))
+                    }
+                }
+                pub fn SetAuthentication(
+                    &self,
+                    schemes: u32,
+                    realm: &windows_core::HSTRING,
+                ) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).SetAuthentication)(
+                            windows_core::Interface::as_raw(this),
+                            schemes,
+                            core::mem::transmute_copy(realm),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Shutdown(&self) -> windows_core::Result<()> {
+                    let this = self;
+                    unsafe {
+                        (windows_core::Interface::vtable(this).Shutdown)(
+                            windows_core::Interface::as_raw(this),
+                        )
+                        .ok()
+                    }
+                }
+                pub fn Information(&self) -> windows_core::Result<windows_core::HSTRING> {
+                    let this = self;
+                    unsafe {
+                        let mut result__ = core::mem::zeroed();
+                        (windows_core::Interface::vtable(this).Information)(
+                            windows_core::Interface::as_raw(this),
+                            &mut result__,
+                        )
+                        .map(|| core::mem::transmute(result__))
+                    }
+                }
+            }
+            impl windows_core::RuntimeName for IHttpServer {
+                const NAME: &'static str = "Pbk20191.WinAsync.Comio.IHttpServer";
+            }
+            pub trait IHttpServer_Impl: windows_core::IUnknownImpl {
+                fn BindAsync(
+                    &self,
+                    url: &windows_core::HSTRING,
+                ) -> windows_core::Result<windows_future::IAsyncAction>;
+                fn AcceptAsync(
+                    &self,
+                ) -> windows_core::Result<windows_future::IAsyncOperation<HttpRequest>>;
+                fn SetAuthentication(
+                    &self,
+                    schemes: u32,
+                    realm: &windows_core::HSTRING,
+                ) -> windows_core::Result<()>;
+                fn Shutdown(&self) -> windows_core::Result<()>;
+                fn Information(&self) -> windows_core::Result<windows_core::HSTRING>;
+            }
+            impl IHttpServer_Vtbl {
+                pub const fn new<Identity: IHttpServer_Impl, const OFFSET: isize>() -> Self {
+                    unsafe extern "system" fn BindAsync<
+                        Identity: IHttpServer_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        url: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpServer_Impl::BindAsync(this, core::mem::transmute(&url)) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn AcceptAsync<
+                        Identity: IHttpServer_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpServer_Impl::AcceptAsync(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    unsafe extern "system" fn SetAuthentication<
+                        Identity: IHttpServer_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        schemes: u32,
+                        realm: *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            IHttpServer_Impl::SetAuthentication(
+                                this,
+                                schemes,
+                                core::mem::transmute(&realm),
+                            )
+                            .into()
+                        }
+                    }
+                    unsafe extern "system" fn Shutdown<
+                        Identity: IHttpServer_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            IHttpServer_Impl::Shutdown(this).into()
+                        }
+                    }
+                    unsafe extern "system" fn Information<
+                        Identity: IHttpServer_Impl,
+                        const OFFSET: isize,
+                    >(
+                        this: *mut core::ffi::c_void,
+                        result__: *mut *mut core::ffi::c_void,
+                    ) -> windows_core::HRESULT {
+                        unsafe {
+                            let this: &Identity =
+                                &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                            match IHttpServer_Impl::Information(this) {
+                                Ok(ok__) => {
+                                    result__.write(core::mem::transmute_copy(&ok__));
+                                    core::mem::forget(ok__);
+                                    windows_core::HRESULT(0)
+                                }
+                                Err(err) => err.into(),
+                            }
+                        }
+                    }
+                    Self {
+                        base__: windows_core::IInspectable_Vtbl::new::<Identity, IHttpServer, OFFSET>(
+                        ),
+                        BindAsync: BindAsync::<Identity, OFFSET>,
+                        AcceptAsync: AcceptAsync::<Identity, OFFSET>,
+                        SetAuthentication: SetAuthentication::<Identity, OFFSET>,
+                        Shutdown: Shutdown::<Identity, OFFSET>,
+                        Information: Information::<Identity, OFFSET>,
+                    }
+                }
+                pub fn matches(iid: &windows_core::GUID) -> bool {
+                    iid == &<IHttpServer as windows_core::Interface>::IID
+                }
+            }
+            #[repr(C)]
+            #[doc(hidden)]
+            pub struct IHttpServer_Vtbl {
+                pub base__: windows_core::IInspectable_Vtbl,
+                pub BindAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                ) -> windows_core::HRESULT,
+                pub AcceptAsync: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    *mut *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub SetAuthentication: unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    u32,
+                    *mut core::ffi::c_void,
+                )
+                    -> windows_core::HRESULT,
+                pub Shutdown:
+                    unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+                pub Information: unsafe extern "system" fn(
                     *mut core::ffi::c_void,
                     *mut *mut core::ffi::c_void,
                 )

@@ -763,6 +763,11 @@ impl HttpRequest {
         }
     }
 
+    /// Whether a body follows the headers.
+    pub fn has_body(&self) -> bool {
+        self.has_body
+    }
+
     fn base(&self) -> &HTTP_REQUEST_V1 {
         unsafe { &(*(self.buf.as_ptr() as *const HTTP_REQUEST_V2)).Base }
     }
@@ -1179,6 +1184,10 @@ pub struct Timeouts {
 pub struct AuthSchemes(u32);
 
 impl AuthSchemes {
+    /// From the `HTTP_AUTH_ENABLE_*` bits.
+    pub const fn from_bits(bits: u32) -> AuthSchemes {
+        AuthSchemes(bits)
+    }
     pub const NONE: AuthSchemes = AuthSchemes(0);
     pub const BASIC: AuthSchemes = AuthSchemes(HTTP_AUTH_ENABLE_BASIC);
     pub const DIGEST: AuthSchemes = AuthSchemes(HTTP_AUTH_ENABLE_DIGEST);

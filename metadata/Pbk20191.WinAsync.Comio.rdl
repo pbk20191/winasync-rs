@@ -408,6 +408,83 @@ mod Pbk20191 {
                 ITransport,
                 IHyperVConnector,
             }
+
+            // ---------------------------------------------------------------------
+            // HTTP, on http.sys
+            //
+            // The one gap WinRT leaves on the server side: it has `HttpClient`
+            // and no server. What this buys over a user-mode server is what
+            // http.sys does in the kernel -- sharing a port between processes
+            // by URL prefix, Windows authentication with the caller's token,
+            // the response cache, and queues named so that another process
+            // can take requests from them. Registering `http://localhost:P/`
+            // needs no elevation; `+` and `*` do.
+            // ---------------------------------------------------------------------
+
+            // One request, with the response sent through it. Getters read
+            // the record http.sys delivered; `Headers` is every header as
+            // `Name: value` lines, `Header` one by name (empty if absent).
+            // `AuthStatus` is 0 with authentication off, else 1 success,
+            // 2 not authenticated, 3 failure; `AuthPackage` names the
+            // security package that authenticated (`NTLM`, ...).
+            //
+            // `ReadBodyAsync` fills the buffer from the body and sets its
+            // length; 0 at the end. `RespondAsync` sends the whole response
+            // -- `headers` as `Name: value` lines, a `Content-Length` added
+            // if none -- and ends the request: nothing may be read from it
+            // after. A request closed, or released, without a response is
+            // cancelled, and its client sees the connection end.
+            #[Version(1)]
+            #[guid(auto)]
+            interface IHttpRequest {
+                #[get] Method: String;
+                #[get] RawUrl: String;
+                #[get] Url: String;
+                #[get] Path: String;
+                #[get] Query: String;
+                #[get] Headers: String;
+                #[get] RemoteAddress: String;
+                #[get] LocalAddress: String;
+                #[get] HasBody: bool;
+                #[get] AuthStatus: u32;
+                #[get] AuthPackage: String;
+                fn Header(&self, #[in] name: String) -> String;
+                fn ReadBodyAsync(&self, #[in] buffer: Windows::Storage::Streams::IBuffer) -> Windows::Foundation::IAsyncOperation<u32>;
+                fn RespondAsync(&self, #[in] status: u32, #[in] headers: String, #[in] body: Windows::Storage::Streams::IBuffer) -> Windows::Foundation::IAsyncAction;
+            }
+
+            #[Version(1)]
+            class HttpRequest {
+                IHttpRequest,
+                Windows::Foundation::IClosable,
+            }
+
+            // `BindAsync` registers a URL prefix (`http://localhost:8080/app/`)
+            // the first time, creating the request queue, and adds a prefix
+            // on later calls. `AcceptAsync` waits for the next request.
+            // `SetAuthentication` turns on http.sys's schemes -- a bit set:
+            // 1 Basic, 2 Digest, 4 NTLM, 8 Negotiate, 16 Kerberos -- after
+            // which a request arrives with `AuthStatus` 2 until the server
+            // answers 401 with `WWW-Authenticate` headers naming them (for
+            // Digest, `Digest realm="..."` is enough; http.sys completes it).
+            // `Shutdown` fails every waiting and later accept; `Close` also
+            // releases the queue and its prefixes.
+            #[Version(1)]
+            #[guid(auto)]
+            interface IHttpServer {
+                fn BindAsync(&self, #[in] url: String) -> Windows::Foundation::IAsyncAction;
+                fn AcceptAsync(&self) -> Windows::Foundation::IAsyncOperation<HttpRequest>;
+                fn SetAuthentication(&self, #[in] schemes: u32, #[in] realm: String);
+                fn Shutdown(&self);
+                #[get] Information: String;
+            }
+
+            #[Version(1)]
+            #[Activatable(1)]
+            class HttpServer {
+                IHttpServer,
+                Windows::Foundation::IClosable,
+            }
         }
     }
 }
