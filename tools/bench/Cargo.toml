@@ -11,7 +11,7 @@ description = "winasync against tokio and compio on the same workloads: TCP echo
 [workspace]
 
 [dependencies]
-winasync = { path = "../..", default-features = false, features = ["tp", "ioring"] }
+winasync = { path = "../..", default-features = false, features = ["tp", "ioring", "rio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util"] }
 compio = { version = "0.19", features = ["runtime", "io", "net", "fs", "macros"] }
 

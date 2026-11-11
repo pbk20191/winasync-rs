@@ -221,6 +221,98 @@ fn tp_echo(cfg: Config) -> (usize, Vec<u64>) {
     })
 }
 
+// ---------------------------------------------------------------- echo: rio
+
+/// The same echo over RIO request queues: `tp` does the handshakes
+/// (`RioTcpAcceptor`, `RioTcpStream::connect`), RIO every byte after. One
+/// receive and one send outstanding per socket, which is all a
+/// request/response round trip ever has in flight, so the depth RIO is
+/// built for is absent by construction -- this is its documented worst
+/// case, measured rather than assumed.
+fn rio_echo(cfg: Config) -> (usize, Vec<u64>) {
+    use winasync::rio::{RioBufferPool, RioCq, RioTcpAcceptor, RioTcpStream, RqConfig};
+    use winasync::tp::Runtime;
+    let rt = Runtime::new();
+    let Config { conns, iters, msg, .. } = cfg;
+    let rq = RqConfig {
+        max_outstanding_recv: 1,
+        max_outstanding_send: 1,
+    };
+    // Every socket may have one receive and one send outstanding, and the
+    // completion queue must hold them all.
+    let cq = RioCq::new(&rt, (4 * conns as u32).max(16)).unwrap();
+    // A receive and a send slice per socket.
+    let pool = RioBufferPool::new(msg, 4 * conns as u32 + 8).unwrap();
+    let acceptor = RioTcpAcceptor::bind(&rt, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = acceptor.local_addr().unwrap();
+    let rt2 = rt.clone();
+    rt.block_on(async move {
+        let rt3 = rt2.clone();
+        let cq_s = cq.clone();
+        let pool_s = pool.clone();
+        let server = rt2.spawn(async move {
+            let mut tasks = Vec::with_capacity(conns);
+            for _ in 0..conns {
+                let s = acceptor.accept(&cq_s, rq).await.unwrap();
+                let pool = pool_s.clone();
+                tasks.push(rt3.spawn(async move {
+                    let mut buf = pool.acquire().unwrap();
+                    loop {
+                        let (n, b) = s.recv(buf).unwrap().await;
+                        let n = n.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        let mut b = b;
+                        b.set_len(n);
+                        let (w, mut b) = s.send(b).unwrap().await;
+                        assert_eq!(w.unwrap(), n);
+                        b.reset_len();
+                        buf = b;
+                    }
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        });
+        let mut clients = Vec::with_capacity(conns);
+        for _ in 0..conns {
+            let rt4 = rt2.clone();
+            let cq = cq.clone();
+            let pool = pool.clone();
+            clients.push(rt2.spawn(async move {
+                let s = RioTcpStream::connect(&rt4, &cq, addr, rq).await.unwrap();
+                let mut out = pool.acquire().unwrap();
+                out.fill(0xAB);
+                let mut inb = pool.acquire().unwrap();
+                let mut lat = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    let (w, o) = s.send(out).unwrap().await;
+                    assert_eq!(w.unwrap(), msg);
+                    out = o;
+                    let mut got = 0;
+                    while got < msg {
+                        let (n, b) = s.recv(inb).unwrap().await;
+                        got += n.unwrap();
+                        inb = b;
+                    }
+                    lat.push(t.elapsed().as_nanos() as u64);
+                }
+                drop(s);
+                lat
+            }));
+        }
+        let mut lat = Vec::with_capacity(conns * iters);
+        for c in clients {
+            lat.extend(c.await.unwrap());
+        }
+        server.await.unwrap();
+        (conns * iters, lat)
+    })
+}
+
 // ---------------------------------------------------------------- echo: tokio
 fn tokio_echo(cfg: Config) -> (usize, Vec<u64>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -612,6 +704,7 @@ fn main() {
         for (name, f) in [
             ("winasync tp", tp_echo as fn(Config) -> (usize, Vec<u64>)),
             ("winasync tp+skip", |c| tp_echo(Config { skip: true, ..c })),
+            ("winasync rio", rio_echo),
             ("tokio", tokio_echo),
             ("compio", compio_echo),
         ] {
