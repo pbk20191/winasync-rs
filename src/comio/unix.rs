@@ -32,7 +32,7 @@ use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
     SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
-    SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
+    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
 };
 use windows_core::{Error, Result, HRESULT};
 
@@ -120,7 +120,7 @@ impl UnixStreamListener {
             if let Some(security) = security {
                 security.apply_dacl_to_file(path)?;
             }
-            sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
+            sock_check(unsafe { listen(sock, crate::common::winsock::LISTEN_BACKLOG) })?;
             IoReg::register(owned)
         };
         Ok(UnixStreamListener { reg: register()? })

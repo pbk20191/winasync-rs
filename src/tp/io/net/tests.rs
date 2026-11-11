@@ -1169,6 +1169,37 @@ use crate::tp::{FileRange, TransmitSequence};
     /// buffer the caller has taken back.
     /// Sockets the standard library made, taken over: a listener, its accepted
     /// stream, a client, and a UDP pair.
+    /// More clients connect at once than any sane backlog is short of:
+    /// with the `winsock.h` `SOMAXCONN` of 5 the sixth SYN is dropped and
+    /// retransmitted 500 ms later. Every connect must finish well inside
+    /// that.
+    #[test]
+    fn listen_backlog_takes_a_burst_of_connects() {
+        let rt = Runtime::new();
+        let listener = TcpListener::bind(&rt, "127.0.0.1:0".parse().unwrap(), &SocketOptions::default()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let clients: Vec<_> = (0..32)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let t = std::time::Instant::now();
+                    let s = std::net::TcpStream::connect(addr).unwrap();
+                    (t.elapsed(), s)
+                })
+            })
+            .collect();
+        let mut slowest = std::time::Duration::ZERO;
+        let mut keep = Vec::new();
+        for c in clients {
+            let (took, s) = c.join().unwrap();
+            slowest = slowest.max(took);
+            keep.push(s);
+        }
+        assert!(slowest < std::time::Duration::from_millis(300), "slowest connect {slowest:?}");
+        for _ in 0..32 {
+            block_on(listener.accept()).unwrap();
+        }
+    }
+
     #[test]
     fn std_sockets_are_taken_over() {
         use std::io::Write;

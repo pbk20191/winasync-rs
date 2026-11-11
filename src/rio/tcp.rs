@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
     closesocket, connect, listen, IPPROTO_TCP, RIO_MSG_DEFER, RIO_MSG_DONT_NOTIFY, SOCKADDR, SOCKADDR_STORAGE,
-    SOCKET, SOCK_STREAM, SOMAXCONN,
+    SOCKET, SOCK_STREAM,
 };
 
 use super::buffer::RioSlice;
@@ -44,7 +44,7 @@ impl RioTcpListener {
         let sock = new_rio_socket(&addr, SOCK_STREAM.0, IPPROTO_TCP.0)?;
         let setup = || -> windows_core::Result<()> {
             bind_socket(sock, &addr)?;
-            sock_check(unsafe { listen(sock, SOMAXCONN as i32) })
+            sock_check(unsafe { listen(sock, crate::common::winsock::LISTEN_BACKLOG) })
         };
         match setup() {
             Ok(()) => Ok(Self { sock }),

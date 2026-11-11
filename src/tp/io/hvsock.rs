@@ -28,7 +28,7 @@ use std::mem;
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
     bind, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_HYPERV, INVALID_SOCKET,
-    IPPROTO, SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN, SO_UPDATE_ACCEPT_CONTEXT,
+    IPPROTO, SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
     SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
 };
 
@@ -347,7 +347,7 @@ impl HvListener {
         let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
         let (sa, len) = addr.to_raw();
         sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
-        sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
+        sock_check(unsafe { listen(sock, crate::common::winsock::LISTEN_BACKLOG) })?;
         let res = crate::tp::io::register_on(&rt.inner, owned)?;
         Ok(HvListener {
             res,

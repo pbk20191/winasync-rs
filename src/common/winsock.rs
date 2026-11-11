@@ -197,6 +197,16 @@ pub fn wsa_last_err() -> windows_core::Error {
 }
 
 /// Maps a Winsock "0 or SOCKET_ERROR" return to a `Result`.
+/// The `backlog` every listener in this crate passes to `listen`.
+///
+/// Not the `windows` crate's `SOMAXCONN`: that binding comes from the old
+/// `winsock.h` and is **5**. `winsock2.h` redefines it as `0x7fffffff`,
+/// which the provider reads as "the maximum reasonable value" (200 on
+/// desktop Windows); the benchmark harness found the difference as 500 ms
+/// SYN retransmits on the sixth concurrent connect. This is the
+/// `winsock2.h` value.
+pub const LISTEN_BACKLOG: i32 = 0x7fff_ffff;
+
 pub fn sock_check(r: i32) -> windows_core::Result<()> {
     if r == 0 {
         Ok(())

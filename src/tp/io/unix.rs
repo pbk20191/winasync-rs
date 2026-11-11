@@ -20,7 +20,7 @@ use std::mem;
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
     bind, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
-    IPPROTO, SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
+    IPPROTO, SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
 };
 use windows_core::Error;
@@ -420,7 +420,7 @@ impl UnixListener {
         if let Some(security) = security {
             security.apply_dacl_to_file(path)?;
         }
-        sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
+        sock_check(unsafe { listen(sock, crate::common::winsock::LISTEN_BACKLOG) })?;
         let res = crate::tp::io::register_on(&rt.inner, owned)?;
         Ok(UnixListener {
             res,

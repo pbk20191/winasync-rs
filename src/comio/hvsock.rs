@@ -37,7 +37,7 @@ use std::mem;
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
     bind, closesocket, listen, setsockopt, AcceptEx, AF_HYPERV, INVALID_SOCKET,
-    SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
+    SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
 };
 use windows_core::{Error, HSTRING, Result, HRESULT};
@@ -82,7 +82,7 @@ impl HvStreamListener {
         let register = move || -> Result<Arc<IoReg>> {
             let (sa, addrlen) = addr.to_raw();
             sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, addrlen) })?;
-            sock_check(unsafe { listen(sock, SOMAXCONN as i32) })?;
+            sock_check(unsafe { listen(sock, crate::common::winsock::LISTEN_BACKLOG) })?;
             IoReg::register(owned)
         };
         Ok(HvStreamListener { reg: register()? })
