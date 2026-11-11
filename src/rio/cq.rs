@@ -48,8 +48,10 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::common::pool::PoolRef;
+use std::cell::UnsafeCell;
+use std::net::SocketAddr;
 use super::buffer::RioSlice;
-use super::rq::{Finish, RIO_INVALID_CQ};
+use super::rq::RIO_INVALID_CQ;
 use super::table::rio_table;
 use crate::common::winsock::wsa_last_err;
 use crate::common::tpctx::CtxHeader;
@@ -61,31 +63,128 @@ use crate::tp::Runtime;
 const DRAIN_BATCH: usize = 128;
 
 /// One in-flight operation's state, reached from the completion's
-/// `RequestContext`.
+/// `RequestContext` on one side and polled by its future on the other.
+///
+/// One allocation per operation, shared by both sides through an `Arc`:
+/// the `RequestContext` is one reference and the future the other. The
+/// hand-off between them is lock-free -- the completer fills the cells,
+/// publishes `done`, and wakes; the poller registers, then checks `done`
+/// -- the same shape as a oneshot channel, inlined so an operation costs
+/// no second allocation and no mutex.
 ///
 /// It owns the [`RioSlice`] for the operation's whole life. That is not a
 /// convenience: RIO cannot cancel, and completions still arrive after
 /// `closesocket`, so the buffer has to stay registered until the result
-/// actually appears in the queue.
+/// actually appears in the queue. A future dropped early just drops its
+/// reference; the completion still lands, still fills the cells, and the
+/// last reference frees the buffer back to its pool.
 pub(crate) struct Request {
-    pub(crate) finish: Finish,
-    pub(crate) slice: Option<RioSlice>,
+    /// Published by the completer, with `Release`, after the cells are
+    /// written; read by the poller with `Acquire` before it touches them.
+    done: AtomicBool,
+    waker: crate::common::atomic_waker::AtomicWaker,
+    /// Owned by the completer until `done`, by the poller after.
+    cells: UnsafeCell<Cells>,
 }
 
+struct Cells {
+    /// The data buffer, handed back with the outcome.
+    slice: Option<RioSlice>,
+    /// The peer address slot of an addressed operation (`RIOSendEx` /
+    /// `RIOReceiveEx`); read at completion, released then.
+    addr: Option<RioSlice>,
+    outcome: Option<Outcome>,
+}
+
+/// What a completed operation hands its future: the count and, for an
+/// addressed operation, the peer; and the buffer back.
+pub(crate) type Outcome = (windows_core::Result<(usize, Option<SocketAddr>)>, RioSlice);
+
+// SAFETY: the cells are reached by exactly one side at a time, which `done`
+// decides; the slices inside are `Send`.
+unsafe impl Send for Request {}
+unsafe impl Sync for Request {}
+
 impl Request {
-    /// Leaks the request into a `RequestContext` for RIO to carry.
-    pub(crate) fn into_context(self) -> *const core::ffi::c_void {
-        Box::into_raw(Box::new(self)) as *const core::ffi::c_void
+    /// A request owning `slice`, and `addr` for an addressed operation.
+    pub(crate) fn new(slice: RioSlice, addr: Option<RioSlice>) -> Arc<Request> {
+        Arc::new(Request {
+            done: AtomicBool::new(false),
+            waker: Default::default(),
+            cells: UnsafeCell::new(Cells {
+                slice: Some(slice),
+                addr,
+                outcome: None,
+            }),
+        })
     }
 
-    /// Reclaims a request the queue handed back. Every posted operation
-    /// completes exactly once — including with `WSAECONNABORTED` when the
-    /// socket is closed under it — so this runs once per `into_context`.
-    unsafe fn from_context(ctx: u64) -> Option<Box<Request>> {
-        if ctx == 0 {
+    /// The `RequestContext` for RIO to carry: a reference of its own.
+    pub(crate) fn into_context(this: &Arc<Request>) -> *const core::ffi::c_void {
+        Arc::into_raw(this.clone()) as *const core::ffi::c_void
+    }
+
+    /// Takes back the reference a `RequestContext` carries: once per
+    /// `into_context`, when the completion arrives or the post was refused.
+    ///
+    /// # Safety
+    /// `ctx` came from [`into_context`](Self::into_context) and has not
+    /// been reclaimed before.
+    pub(crate) unsafe fn from_context(ctx: *const core::ffi::c_void) -> Option<Arc<Request>> {
+        if ctx.is_null() {
             return None;
         }
-        Some(unsafe { Box::from_raw(ctx as *mut Request) })
+        Some(unsafe { Arc::from_raw(ctx as *const Request) })
+    }
+
+    /// The completion: records the outcome, releases the address slot, and
+    /// wakes the future. Runs once, on whichever thread drains the queue.
+    fn complete(&self, status: i32, bytes: u32) {
+        // SAFETY: before `done`, the cells are the completer's alone.
+        let cells = unsafe { &mut *self.cells.get() };
+        let slice = cells.slice.take().expect("a request completes once");
+        let addr = cells.addr.take();
+        let result = if status != 0 {
+            Err(windows_core::Error::from_hresult(
+                windows::Win32::Foundation::WIN32_ERROR(status as u32).to_hresult(),
+            ))
+        } else {
+            match &addr {
+                // The kernel is done with the address slice by now, so
+                // reading the peer here is sound.
+                Some(addr) => {
+                    use windows::Win32::Networking::WinSock::{SOCKADDR_INET, SOCKADDR_STORAGE};
+                    let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            addr.as_ptr(),
+                            &mut storage as *mut _ as *mut u8,
+                            size_of::<SOCKADDR_INET>(),
+                        );
+                    }
+                    crate::common::sockaddr::read_sockaddr(&storage).map(|a| (bytes as usize, Some(a)))
+                }
+                None => Ok((bytes as usize, None)),
+            }
+        };
+        // The slot returns to its pool on the way out.
+        drop(addr);
+        cells.outcome = Some((result, slice));
+        self.done.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+
+    /// The outcome, once it has landed; `Pending` registers `cx`'s waker.
+    pub(crate) fn poll(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Outcome> {
+        // Register first, then look: a completion between the two wakes
+        // the waker just registered rather than nobody.
+        self.waker.register(cx.waker());
+        if !self.done.load(Ordering::Acquire) {
+            return std::task::Poll::Pending;
+        }
+        // SAFETY: after `done`, the cells are the poller's alone.
+        let cells = unsafe { &mut *self.cells.get() };
+        std::task::Poll::Ready(cells.outcome.take().expect("a request's outcome is taken once"))
     }
 }
 
@@ -674,12 +773,12 @@ fn drain(state: &CqState) -> Option<usize> {
             return Some(total);
         }
         for r in &results[..n as usize] {
-            if let Some(req) = unsafe { Request::from_context(r.RequestContext) } {
-                let Request { finish, slice } = *req;
+            if let Some(req) = unsafe { Request::from_context(r.RequestContext as *const _) } {
                 // Hand the buffer on with the result: now, and only now, is
-                // the kernel provably finished with it.
+                // the kernel provably finished with it. The wake inside may
+                // run arbitrary code; the queue's reference drops after.
                 let (status, bytes) = (r.Status, r.BytesTransferred);
-                let _ = catch_unwind(AssertUnwindSafe(move || finish.run(status, bytes, slice)));
+                let _ = catch_unwind(AssertUnwindSafe(|| req.complete(status, bytes)));
             }
         }
         total += n as usize;

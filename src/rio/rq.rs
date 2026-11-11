@@ -13,14 +13,13 @@
 
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_RQ, SOCKADDR, SOCKADDR_STORAGE, SOCKET, WSASocketW,
+    RIO_BUFFERID, RIO_CQ, RIO_RQ, SOCKADDR, SOCKADDR_STORAGE, SOCKET, WSASocketW,
     WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
 };
 
 use super::buffer::RioSlice;
 use super::cq::{Request, RioCq};
 use super::table::rio_table;
-use crate::common::oneshot;
 use crate::common::winsock::{wsa_init, wsa_last_err};
 use std::net::SocketAddr;
 
@@ -156,17 +155,13 @@ impl RequestQueue {
     ) -> windows_core::Result<impl Future<Output = (windows_core::Result<usize>, RioSlice)> + use<>>
     {
         let table = rio_table()?;
-        let (tx, rx) = oneshot::channel::<(windows_core::Result<usize>, Option<RioSlice>)>();
         let buf = slice.rio_buf();
 
-        let ctx = Request {
-            finish: Finish::Plain(tx),
-            // The request owns the buffer until the completion carries it
-            // back — the only way to satisfy RIO's "buffer outlives the op"
-            // rule when operations cannot be cancelled.
-            slice: Some(slice),
-        }
-        .into_context();
+        // The request owns the buffer until the completion carries it
+        // back — the only way to satisfy RIO's "buffer outlives the op"
+        // rule when operations cannot be cancelled.
+        let req = Request::new(slice, None);
+        let ctx = Request::into_context(&req);
 
         let ok = unsafe {
             if is_send {
@@ -178,7 +173,9 @@ impl RequestQueue {
         if !ok.as_bool() {
             return Err(reclaim(ctx));
         }
-        Ok(async move { resolve(rx).await })
+        Ok(std::future::poll_fn(move |cx| {
+            req.poll(cx).map(|(result, slice)| (result.map(|(n, _)| n), slice))
+        }))
     }
 
     /// Resizes the queue's outstanding-operation budget.
@@ -218,22 +215,23 @@ impl RequestQueue {
 
     /// Posts an addressed send or receive (`RIOSendEx` / `RIOReceiveEx`).
     ///
-    /// `addr_buf` must describe a registered buffer that stays alive until the
-    /// completion; the caller keeps it by capturing it in `complete`.
+    /// `addr` is the registered slice holding the destination (a send) or
+    /// receiving the source (a receive); the request keeps it until the
+    /// completion, reads the peer from it then, and releases it.
     pub(crate) fn post_ex(
         &self,
-        data_buf: &RIO_BUF,
-        addr_buf: &RIO_BUF,
         is_send: bool,
         slice: RioSlice,
-        finish: Finish,
-    ) -> windows_core::Result<()> {
+        addr: RioSlice,
+    ) -> windows_core::Result<
+        impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, RioSlice)> + use<>,
+    > {
         let table = rio_table()?;
-        let ctx = Request {
-            finish,
-            slice: Some(slice),
-        }
-        .into_context();
+        let data_buf = slice.rio_buf();
+        let addr_buf = addr.rio_buf();
+        let req = Request::new(slice, Some(addr));
+        let ctx = Request::into_context(&req);
+        let (data_buf, addr_buf) = (&data_buf, &addr_buf);
 
         let ok = {
             let rq = self.rq;
@@ -271,7 +269,11 @@ impl RequestQueue {
         if !ok {
             return Err(reclaim(ctx));
         }
-        Ok(())
+        Ok(std::future::poll_fn(move |cx| {
+            req.poll(cx).map(|(result, slice)| {
+                (result.map(|(n, peer)| (n, peer.expect("an addressed completion names its peer"))), slice)
+            })
+        }))
     }
 
     /// Keeps the completion queue alive for as long as this socket lives.
@@ -280,84 +282,11 @@ impl RequestQueue {
     }
 }
 
-/// Turns a completion status into a result.
-/// What a finished operation hands back, and to whom: the raw status (0 =
-/// success, else a winsock error), the transferred byte count, and the
-/// buffer the operation held.
-///
-/// The slice travels through the completion rather than being released by the
-/// pump, so the caller gets its buffer back at exactly the moment the kernel
-/// is provably done with it.
-pub(crate) enum Finish {
-    /// A plain send or receive: the count and the buffer.
-    Plain(Sender<Finished<usize>>),
-    /// A send-to or receive-from: the peer travels in `addr`, a registered
-    /// slice of its own, released once it has been read.
-    Addressed {
-        tx: Sender<Finished<(usize, std::net::SocketAddr)>>,
-        addr: RioSlice,
-    },
-}
-
-/// What a completion sends on: the result, and the buffer coming back.
-pub(crate) type Finished<T> = (windows_core::Result<T>, Option<RioSlice>);
-use crate::common::oneshot::Sender;
-
-impl Finish {
-    pub(crate) fn run(self, status: i32, bytes: u32, slice: Option<RioSlice>) {
-        match self {
-            Finish::Plain(tx) => {
-                let _ = tx.send((status_to_result(status, bytes), slice));
-            }
-            Finish::Addressed { tx, addr } => {
-                use windows::Win32::Networking::WinSock::{SOCKADDR_INET, SOCKADDR_STORAGE};
-                // The kernel is done with the address slice by now, so
-                // reading the peer here is sound, and the slot returns to
-                // the pool on the way out.
-                let result = if status == 0 {
-                    let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            addr.as_ptr(),
-                            &mut storage as *mut _ as *mut u8,
-                            size_of::<SOCKADDR_INET>(),
-                        );
-                    }
-                    crate::common::sockaddr::read_sockaddr(&storage).map(|a| (bytes as usize, a))
-                } else {
-                    Err(status_to_result(status, bytes).unwrap_err())
-                };
-                drop(addr);
-                let _ = tx.send((result, slice));
-            }
-        }
-    }
-}
-
-pub(crate) fn status_to_result(status: i32, bytes: u32) -> windows_core::Result<usize> {
-    if status == 0 {
-        Ok(bytes as usize)
-    } else {
-        Err(windows_core::Error::from_hresult(
-            windows::Win32::Foundation::WIN32_ERROR(status as u32).to_hresult(),
-        ))
-    }
-}
-
-/// Reclaims a request RIO refused to queue. No completion is coming for it,
-/// so its buffer would otherwise be held forever.
+/// Reclaims a request RIO refused to queue: no completion is coming for it,
+/// so the queue's reference is dropped here, and with the caller's -- the
+/// future never built -- the buffer goes back to its pool.
 fn reclaim(ctx: *const core::ffi::c_void) -> windows_core::Error {
     let err = wsa_last_err();
-    let _ = unsafe { Box::from_raw(ctx as *mut Request) };
+    drop(unsafe { Request::from_context(ctx) });
     err
-}
-
-/// Awaits a posted operation's result.
-pub(crate) async fn resolve<T>(
-    rx: oneshot::Receiver<(windows_core::Result<T>, Option<RioSlice>)>,
-) -> (windows_core::Result<T>, RioSlice) {
-    match rx.await {
-        Ok((result, slice)) => (result, slice.expect("the pump returns the buffer")),
-        Err(_) => unreachable!("every posted request completes exactly once"),
-    }
 }

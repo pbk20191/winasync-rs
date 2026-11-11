@@ -3,8 +3,9 @@
 #![allow(dead_code)]
 
 pub mod oneshot;
-// A lock-free waker slot: what a pump that only notifies hands its wake to.
-#[cfg(feature = "ioring")]
+// A lock-free waker slot: what a pump that only notifies hands its wake to,
+// and what a RIO request's completion wakes.
+#[cfg(any(feature = "ioring", feature = "rio"))]
 pub mod atomic_waker;
 
 // Overlapped IO + its calling-thread driver are only needed by the overlapped

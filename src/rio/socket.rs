@@ -34,11 +34,8 @@ use windows::Win32::Networking::WinSock::{
 
 use super::buffer::RioSlice;
 use super::cq::RioCq;
-use super::rq::{
-    bind_socket, new_rio_socket, resolve, Finish, RequestQueue, RqConfig, WSAENOBUFS_HRESULT,
-};
+use super::rq::{bind_socket, new_rio_socket, RequestQueue, RqConfig, WSAENOBUFS_HRESULT};
 use crate::common::winsock::sock_check;
-use crate::common::oneshot;
 
 use std::net::SocketAddr;
 
@@ -249,11 +246,6 @@ impl RioUdpSocket {
     ) -> windows_core::Result<
         impl Future<Output = (windows_core::Result<(usize, SocketAddr)>, RioSlice)> + use<>,
     > {
-        let (tx, rx) = oneshot::channel::<(
-            windows_core::Result<(usize, SocketAddr)>,
-            Option<RioSlice>,
-        )>();
-
         // The address travels in its own registered slice, because RIO names
         // it with a RIO_BUF like any other buffer.
         let mut addr_slice = self
@@ -274,14 +266,7 @@ impl RioUdpSocket {
         } else {
             addr_slice.fill(0);
         }
-        let addr_buf = addr_slice.rio_buf();
-        let data_buf = slice.rio_buf();
-
-        let finish = Finish::Addressed { tx, addr: addr_slice };
-        self.rq
-            .post_ex(&data_buf, &addr_buf, dest.is_some(), slice, finish)?;
-
-        Ok(async move { resolve(rx).await })
+        self.rq.post_ex(dest.is_some(), slice, addr_slice)
     }
 
 }

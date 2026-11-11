@@ -1422,6 +1422,14 @@ tokio-uring/monoio/compio도 같은 모양(링과 op가 전부 한 스레드).
 - "ioring" 행(op당 제출)은 워크로드가 바뀌었다(전: tp 태스크 qd개, 후: 한 스레드의 로컬 join qd개)라 qd=32의
   전후 비교는 의미가 없다.
 
+**RIO 요청 블록: 할당 하나, 락 없음.** `Request`가 `Box<Request>` + `oneshot::channel`(`Arc<Mutex<Inner>>`)에서
+`Arc<Request>` 하나가 됐다. `RequestContext`가 참조 하나, 퓨처가 참조 하나. 핸드오프는 `done: AtomicBool` +
+`AtomicWaker` + `UnsafeCell` 셀(슬라이스·주소 슬롯·결과)로, 완료자가 셀을 쓰고 `done`을 Release로 올린 뒤 깨우고 poll
+쪽은 waker 등록 후 `done`을 Acquire로 본다. op당 할당 2 → 1(주소 지정 op 3 → 2), 뮤텍스 0. 처리량은 `rio::bench`
+기준 노이즈 안(깊이 128: 204~217k vs 전 203~219k) — 예상대로 측정 가능한 차이는 없고, 구조가 깔끔해진 것이 전부.
+overlapped의 op 블록 안 `Mutex<Shared>`는 그대로 둔다: 인라인 futex 워드 하나라 왕복의 ~2 %이고, tp/comio/http 공통
+경로인 데다 LIVE_OPS 플레이크 조사 대상이라 지금 손대지 않는다.
+
 **후속 (Shafir, "One Year to I/O Ring", 커널 리버싱)**
 
 - 완료 이벤트는 `IopCompleteIoRingEntry`가 `(newTail - Head) % size == 1`일 때만 `KeSetEvent`한다 — 엣지 트리거의
