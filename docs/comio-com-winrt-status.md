@@ -1234,6 +1234,62 @@ enum이 `IoBuf`가 이미 추상화한 집합을 한 번 더 열거하는 꼴이
 - 검토 후 둔 것: `HttpRequest<'a>`(spawn이 `'static`을 요구해 결국 Arc로 돌아옴), `RawBuf<K>`, 작업당 `Arc<IoReg>` 클론
   (핸들을 열어 두는 유일한 장치).
 
+### 벤치 하네스: winasync vs tokio vs compio (2026-11-11)
+
+`tools/bench/`(자체 워크스페이스 — 루트 `[workspace]`가 `exclude`해 clippy/CI가 tokio·compio를 컴파일하지 않는다).
+같은 기계·같은 워크로드·같은 프로세스에서 네 런타임을 차례로 돌리고, 전역 할당자를 감싸 **힙 할당 수**를 센다.
+
+```text
+cd tools/bench && cargo run --release -- all [conns=64 iters=2000 msg=64 qd=32 reads=200000 skip=0]
+```
+
+- **echo**: 루프백 TCP `conns`개 연결, 각각 64B 메시지 `iters`회 왕복. 서버도 같은 런타임 안에서 돈다.
+- **file**: 256 MiB 파일(OS 캐시에 올라와 있음)에서 4 KiB 랜덤 읽기 `reads`회, 큐 깊이 `qd`. 디스크가 아니라
+  런타임의 제출·완료 경로를 재는 것.
+- `tp+skip`은 모든 핸들에 `set_skip_completion_on_success`를 켠 것. tokio는 readiness 모델(mio/afd),
+  compio는 단일 스레드 완료 모델이라 24코어 기계에서 멀티스레드 런타임과 1:1 비교는 아니다.
+
+측정 (Windows 11 26320, 24 CPU, release):
+
+| echo, 왕복/s (p50 µs / p99 µs / 할당·왕복) | conns=1 | conns=64 | conns=256 |
+|---|---|---|---|
+| winasync tp | 48.6k (19 / 45 / 4.0) | 145k (432 / 685 / 4.0) | 144k (1354 / 2252 / 4.0) |
+| winasync tp+skip | 53.3k (17 / 43 / 4.0) | **263k** (227 / 475 / 4.0) | — |
+| tokio | 47.4k (21 / 35 / 0.0) | 73k (853 / 1540 / 0.0) | 61k (2995 / 6609 / 0.0) |
+| compio | 57.2k (17 / 29 / 6.0) | 52k (1135 / 2313 / 4.0) | 57k (3084 / 5535 / 4.0) |
+
+| file 4K 랜덤 읽기, 읽기/s (할당·읽기) | qd=1 | qd=32 | qd=128 |
+|---|---|---|---|
+| winasync tp | 97–106k (1.0) | 186–220k (1.0) | 216k (1.0) |
+| winasync tp+skip | 111k (1.0) | 211k (1.0) | — |
+| winasync ioring | 99k (2.0) | 84k (1.2) | 62k (1.1) |
+| tokio (`spawn_blocking` + `seek_read`) | 84k (1.0) | 62k (1.0) | 62k (1.0) |
+| compio | 188k (2.0) | 216k (1.0) | 212k (1.0) |
+
+읽는 법:
+
+- **동시성이 있으면 tp가 앞선다.** 64연결 echo에서 tokio의 2배, skip을 켜면 3.6배. 완료가 풀 스레드에서
+  바로 처리되고 readiness 재시도가 없다. 연결 1개(순수 왕복 지연)에서는 셋이 같은 급 — 그 지점은 루프백
+  커널 경로가 지배한다.
+- **할당 4/왕복**은 작업당 op 블록 1개(클라이언트 read+write, 서버 read+write)다. compio도 같은 4이고,
+  tokio의 0은 readiness 모델의 성질이다. 더 줄이려면 op 블록을 핸들에 붙박이로 두는 재사용이 필요하다(미착수).
+- **파일 읽기에서 `skip`은 효과가 없다** — `File` 문서가 말한 대로, NTFS는 캐시된 읽기도 `ERROR_IO_PENDING`으로
+  돌려준다. 소켓에서는 크게 효과가 있다(위).
+- **qd=1 파일에서 compio가 tp보다 빠르다(188k vs 106k).** compio는 완료를 폴링하는 그 스레드에서 처리해 핸드오프가
+  없고, tp는 완료 → 태스크 깨움 → 다른 풀 스레드에서 재폴링을 거친다. 깊이가 생기면(qd≥32) 차이가 사라진다.
+- **ioring은 이 하네스에서 느리다(84k@qd32).** 32개 태스크가 각자 op 하나씩 제출하므로 `SubmitIoRing` 호출이
+  작업당 1회고, 펌프 스레드의 이벤트 대기 왕복이 더해진다. 링은 한 번에 여러 op를 제출할 때 값을 하는 구조이고
+  현재 API는 그 배치를 노출하지 않는다 — 다음 과제.
+- tokio 파일 I/O는 `spawn_blocking`이라 큐 깊이와 무관하게 62k에서 막힌다.
+
+**하네스가 바로 잡아낸 버그 — listen 백로그 5.** 첫 실행에서 tp echo가 16연결에 6k 왕복/s가 나왔다.
+연결 7개의 `connect`가 정확히 512 ms 걸렸는데, SYN 재전송 타이머다. 원인: `windows` 크레이트의 `SOMAXCONN`은
+옛 `winsock.h` 값 **5**이고(`winsock2.h`는 `0x7fffffff` = "provider가 정하는 최대", 데스크톱에서 200), 크레이트의
+여섯 listener(tp tcp/unix/hvsock, comio unix/hvsock, rio tcp)가 전부 그 값을 넘기고 있었다. 여섯 번째 동시 연결부터
+SYN이 버려졌다. `common::winsock::LISTEN_BACKLOG = 0x7fff_ffff`로 통일했고, 회귀 테스트
+`listen_backlog_takes_a_burst_of_connects`(std 클라이언트 32개 동시 connect, 가장 느린 것이 300 ms 미만)는
+백로그 5로 되돌리면 2.03 s에 실패한다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

@@ -16,6 +16,9 @@ repository = "https://github.com/pbk20191/winasync-rs"
 # stops an ordinary build from paying for it.
 [workspace]
 members = ["dll", "tools/winmdgen"]
+# `tools/bench` is its own workspace: it pulls in tokio and compio, which
+# the library's clippy/doc/test jobs should not have to compile.
+exclude = ["tools/bench"]
 
 # No `[lib] crate-type` here: this package is an rlib and nothing else.
 #

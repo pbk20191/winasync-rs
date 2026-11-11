@@ -1,0 +1,19 @@
+[package]
+name = "winasync-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "winasync against tokio and compio on the same workloads: TCP echo round trips and 4 KiB random file reads."
+
+# Its own workspace: the root `[workspace]` excludes this package so that
+# `cargo clippy --workspace` and the CI jobs never compile tokio and compio.
+# Run it from here: `cargo run --release -- all`.
+[workspace]
+
+[dependencies]
+winasync = { path = "../..", default-features = false, features = ["tp", "ioring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util"] }
+compio = { version = "0.19", features = ["runtime", "io", "net", "fs", "macros"] }
+
+[profile.release]
+debug = 1
