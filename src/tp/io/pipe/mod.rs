@@ -499,5 +499,4 @@ impl NamedPipeConnector {
 }
 
 #[cfg(test)]
-#[path = "pipe_tests.rs"]
 mod tests;
