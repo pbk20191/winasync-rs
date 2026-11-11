@@ -51,6 +51,7 @@ pub(crate) type OpHandle = ov::OpHandle<()>;
 /// # Safety
 /// Same contract as [`ov::submit`]: `issue` issues exactly one overlapped op and
 /// classifies its outcome truthfully.
+#[cfg_attr(test, track_caller)]
 pub(crate) unsafe fn submit<F: FnOnce(u32, usize) + Send + 'static>(
     reg: &Arc<IoReg>,
     on_complete: F,

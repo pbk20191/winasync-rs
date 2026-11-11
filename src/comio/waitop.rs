@@ -80,6 +80,7 @@ fn sync_fail_win32(hr: HRESULT) -> u32 {
 /// call — semantically a successful connect, not an error, even though no
 /// completion packet is ever queued for it. Every other nonzero code is
 /// `Err(Error::from_hresult(HRESULT::from_win32(ioresult)))`.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn await_io(
     reg: &Arc<IoReg>,
     issue: impl FnOnce(*mut OVERLAPPED) -> Issue,
@@ -117,6 +118,7 @@ pub(crate) fn await_io(
 /// `Box`'s heap allocation doesn't move even though the `Box` value (and
 /// thus `payload`) does. Raw pointers aren't `Send`, so callers typically
 /// smuggle them through as a `usize` and cast back inside `issue`.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn await_io_owning<P: Send + 'static>(
     reg: &Arc<IoReg>,
     payload: P,

@@ -348,8 +348,17 @@ pub fn live_ops_report() -> String {
     }
     sites
         .iter()
-        .map(|(_, payload, site)| format!("
-  live op: {payload} submitted at {site}"))
+        .map(|(ptr, payload, site)| {
+            // `fired` says whether the kernel's completion was delivered;
+            // with it, a live block is a reference someone still holds (an
+            // `OpHandle` in a future or a COM object that never released);
+            // without it, a completion that never came.
+            let header = unsafe { &(*(*ptr as *mut Op<(), ()>)).header };
+            let fired = header.shared.lock().unwrap().fired;
+            let refs = header.refs.load(Ordering::Relaxed);
+            format!("
+  live op: {payload} submitted at {site} (fired={fired}, refs={refs})")
+        })
         .collect()
 }
 
