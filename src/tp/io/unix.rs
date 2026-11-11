@@ -90,14 +90,14 @@ impl UnixStream {
 
     /// Sends a sequence of in-memory buffers and/or file ranges as one
     /// `TransmitPackets` call -- a single-syscall scatter of mixed memory and
-    /// file sources, transmitted in insertion order. Resolves to the total
-    /// number of bytes sent. See [`TransmitPackets`](crate::tp::TransmitPackets)
-    /// for building the sequence.
-    pub fn transmit_packets<B: IoBuf + 'static>(
+    /// file sources, in order. Resolves to the total number of bytes sent.
+    /// See [`TransmitSequence`](crate::tp::TransmitSequence) for what a
+    /// sequence is made of.
+    pub fn transmit_packets<S: crate::tp::TransmitSequence>(
         &self,
-        packets: crate::tp::TransmitPackets<B>,
+        packets: S,
         flags: crate::tp::TransmitFlags,
-    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<B> {
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<S> {
         crate::tp::io::net::transmit::transmit_packets(&self.res, packets, flags)
     }
 

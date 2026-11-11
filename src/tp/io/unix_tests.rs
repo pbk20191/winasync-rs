@@ -44,11 +44,12 @@ unsafe impl crate::common::buffer::IoBuf for Own {
 }
 
 /// `TransmitPackets` and `TransmitFile` on AF_UNIX (measured to work):
-/// mixed crate buffers through `MemBuf`, then a file, then a caller's own
-/// buffer type.
+/// kinds mixed with `then`, a file, a caller's own buffer type, and a
+/// run-time list of mixed kinds through `RawBuf::of`.
 #[test]
 fn unix_transmit_packets_and_file() {
-    use crate::tp::{TransmitFlags, TransmitPackets};
+    use crate::tp::{List, TransmitFlags, TransmitSequence};
+    use crate::common::buffer::RawBuf;
     let rt = Runtime::new();
     let path = temp_path("tx");
     let file_path = std::env::temp_dir().join(format!("tp_unix_tx_{}.txt", std::process::id()));
@@ -58,7 +59,7 @@ fn unix_transmit_packets_and_file() {
         let server = rt.spawn(async move {
             let s = listener.accept().await.unwrap();
             let mut got = Vec::new();
-            while got.len() < 13 {
+            while got.len() < 14 {
                 let (n, b) = s.read(vec![0u8; 16]).await;
                 let n = n.unwrap();
                 if n == 0 {
@@ -69,17 +70,22 @@ fn unix_transmit_packets_and_file() {
             got
         });
         let client = UnixStream::connect(&rt, &path).await.unwrap();
+        // Kinds mixed by `then`: a Vec, then a shared slice.
         let shared: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"ts!"[..]);
-        let mixed = TransmitPackets::new().bytes(b"pk".to_vec()).bytes(shared);
+        let mixed = b"pk".to_vec().then(shared);
         let n = client.transmit_packets(mixed, TransmitFlags::default()).await.unwrap();
         assert_eq!(n, 5);
         let file = crate::tp::File::open(&rt, &file_path.to_string_lossy()).unwrap();
         let n = client.transmit_file(&file, 0, 0, TransmitFlags::default()).await.unwrap();
         assert_eq!(n, 5);
-        let own = TransmitPackets::<Own>::default().bytes(Own(b"own".to_vec()));
-        let n = client.transmit_packets(own, TransmitFlags::default()).await.unwrap();
-        assert_eq!(n, 3);
-        assert_eq!(server.await.unwrap(), b"pkts!file!own");
+        // A caller's own buffer type is a sequence by itself ...
+        let n = client.transmit_packets(Own(b"ow".to_vec()), TransmitFlags::default()).await.unwrap();
+        assert_eq!(n, 2);
+        // ... and kinds mixed at run time go through `RawBuf::of`.
+        let dynamic = List(vec![RawBuf::of(b"n".to_vec()), RawBuf::of(Own(b"!".to_vec()))]);
+        let n = client.transmit_packets(dynamic, TransmitFlags::default()).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(server.await.unwrap(), b"pkts!file!own!");
     }));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&file_path);

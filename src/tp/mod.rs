@@ -56,7 +56,7 @@ pub use io::file::{File, PageBuffers};
 #[allow(unused_imports)]
 pub use io::net::{
     parse_ip_pktinfo, resolve, ReceivedMsg, ReusableSocket, SocketOptions, TcpListener, TcpStream,
-    TransmitFlags, TransmitPackets, UdpSocket,
+    FileRange, List, Then, TransmitFlags, TransmitSequence, UdpSocket,
 };
 #[allow(unused_imports)]
 pub use io::pipe::{NamedPipeConnector, NamedPipeListener, NamedPipeOptions, NamedPipeStream};

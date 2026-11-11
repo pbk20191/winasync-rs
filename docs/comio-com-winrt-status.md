@@ -1175,10 +1175,17 @@ Pillar 3 기준으로 거른 유일한 gap — WinRT에는 HTTP 서버가 없다
 그래서 `tcp.rs`에 있던 두 메서드를 `net/transmit.rs`의 공용 함수로 올리고, `UnixStream`·`HvStream`에
 `transmit_file`/`transmit_packets`, `UdpSocket`에 `transmit_packets`를 붙였다.
 
-**`Elem::Mem(Box<dyn IoBuf>)` 제거** — 빌더가 `TransmitPackets<B: IoBuf = MemBuf>`로 원소 타입에 제네릭이다.
-사용자의 `IoBuf` 구현체는 `TransmitPackets::<MyBuf>::default()`로 그대로 들어오고(열린 끝), 이 크레이트의
-버퍼들을 한 시퀀스에 섞을 때는 기본 타입 `common::buffer::MemBuf`(Vec/Box/Arc<[u8]>/Arc<Vec>/&'static/RawBuf/
-SlabBuf/Bytes의 enum + 범위, `Slice<B>`도 변환됨)를 쓴다. enum 안 디스패치는 매크로 `match`라 `dyn`이 없다.
+**`Elem::Mem(Box<dyn IoBuf>)` 제거 — 시퀀스는 트레이트, 섞기는 타입으로.** 처음엔 `TransmitPackets<B: IoBuf = MemBuf>`
+(원소 타입 제네릭 + 섞기용 enum `MemBuf`)로 갔는데, 기본 타입 파라미터가 추론에 안 쓰여 생성자가 비대칭이고
+enum이 `IoBuf`가 이미 추상화한 집합을 한 번 더 열거하는 꼴이라 걷어냈다. 지금:
+
+- `TransmitSequence` 트레이트: 모든 `IoBuf`(blanket), `FileRange`, `Then<A, B>`(`a.then(b)`), `List<T>`(동적 길이).
+  `stream.transmit_packets(hdr.then(body).then(FileRange::new(&file, 0, 0)), flags)`.
+- 종류가 섞인 **동적** 리스트는 `List<RawBuf>` — `RawBuf::of(any IoBuf)`는 안전한 변환이다(`IoBuf`의 계약이
+  `from_raw_parts`가 요구하는 것과 같고, keeper가 버퍼 자신).
+- 튜플·`Vec<T>`에 직접 impl하지 못한 이유: 외부 타입이라 "나중에 `IoBuf`를 구현할 수도 있다"고 보는 일관성 규칙
+  (E0119)에 blanket impl과 겹친다. 그래서 결합은 우리 타입 `Then`/`List`로 한다.
+- 빌더 `TransmitPackets`와 `MemBuf`/`MemKind`는 삭제. 원소는 모두 op 블록 안에 인라인, `dyn` 없음.
 
 ### `*_unchecked`의 이벤트는 호출자의 것 (2026-11-11)
 

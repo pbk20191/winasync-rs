@@ -1,5 +1,6 @@
     use super::super::super::{block_on, timeout, Runtime};
     use super::*;
+use crate::tp::{FileRange, TransmitSequence};
     use std::time::Duration;
 
     #[test]
@@ -276,7 +277,7 @@
             let hdr = header.clone();
             let server = rt.spawn(async move {
                 let stream = listener.accept().await.unwrap();
-                let pk = TransmitPackets::new().bytes(hdr).file(&file, 0, 0);
+                let pk = hdr.then(FileRange::new(&file, 0, 0));
                 let n = stream.transmit_packets(pk, TransmitFlags::default()).await.unwrap();
                 stream.shutdown_send().unwrap();
                 n

@@ -9,14 +9,28 @@
 //! each call is one datagram. A synchronous `TransmitFile` on AF_UNIX did
 //! not return until the peer had read -- TCP buffers, AF_UNIX hands over --
 //! which overlapped merely makes "pending until consumed".
+//!
+//! # What a `TransmitPackets` sends
+//!
+//! A [`TransmitSequence`]: any owned buffer, a [`FileRange`], or those
+//! joined with [`then`](TransmitSequence::then). The whole sequence moves
+//! into the operation and comes back out of it, so a header shared as an
+//! `Arc<[u8]>` goes out on many connections uncopied, and no element is
+//! boxed or erased: the sequence's type says what it holds.
+//!
+//! ```ignore
+//! stream.transmit_packets(header.then(body).then(FileRange::new(&file, 0, 0)), flags)
+//! ```
+//!
+//! A sequence of one type but any length is a [`List`]; one of mixed kinds
+//! and any length is a `List<RawBuf>`, with [`RawBuf::of`] over each.
 
 use super::*;
-use crate::common::buffer::MemBuf;
 
 /// `TransmitFile` on a registered socket: (part of) an open overlapped
-/// `file` sent over the socket
-/// using the kernel's `TransmitFile` — a zero-copy path straight from the
-/// file-system cache, without staging the bytes through user space.
+/// `file` sent over the socket using the kernel's `TransmitFile` -- a
+/// zero-copy path straight from the file-system cache, without staging the
+/// bytes through user space.
 ///
 /// `offset` is the starting position in the file; `count == 0` sends from
 /// `offset` to end of file. Resolves to the number of bytes transmitted.
@@ -47,71 +61,32 @@ pub(crate) fn transmit_file(
     }
 }
 
-/// Sends a sequence of in-memory buffers and/or file ranges as one
-/// `TransmitPackets` call — a single-syscall scatter of mixed memory and
-/// file sources, transmitted in insertion order. Resolves to the total
-/// number of bytes sent. See [`TransmitPackets`] for building the sequence.
-pub(crate) fn transmit_packets<B: IoBuf + 'static>(
+/// Sends `packets` as one `TransmitPackets` call -- a single-syscall scatter
+/// of memory and file sources, in order. Resolves to the total number of
+/// bytes sent.
+pub(crate) fn transmit_packets<S: TransmitSequence>(
     res: &Arc<IoRes>,
-    packets: TransmitPackets<B>,
+    packets: S,
     flags: TransmitFlags,
-) -> impl Future<Output = windows_core::Result<usize>> + Send + use<B> {
+) -> impl Future<Output = windows_core::Result<usize>> + Send + use<S> {
     let sock = res.socket();
     let tf = flags.to_bits();
     // Fetch the extension pointer and issue the op *synchronously*, so the
-    // returned async block captures only the (Send) OpFuture — never the
-    // non-Send HANDLEs, which are consumed here into the op block.
-    let started: windows_core::Result<OpFuture<TransmitPacketsPayload<B>>> = (|| {
+    // returned async block captures only the (Send) OpFuture.
+    let started: windows_core::Result<OpFuture<Payload<S>>> = (|| {
         let transmit = get_transmitpackets(sock)?;
-        let TransmitPackets { elems } = packets;
-        let count = elems.len();
-        let payload = TransmitPacketsPayload {
-            elems,
+        let count = packets.count();
+        let payload = Payload {
+            seq: packets,
             array: Vec::with_capacity(count),
         };
         Ok(unsafe {
             submit(res, payload, move |ovl, p| {
-                // Build the element array in place (it and the memory
-                // buffers it points at all live in the op block for the
-                // op's duration). Pre-reserved, so no realloc moves it.
+                // The element array is built in place: it and everything it
+                // points at live in the op block for the op's duration.
                 p.array.clear();
-                for e in p.elems.iter_mut() {
-                    let el = match e {
-                        Elem::Mem(buf) => TRANSMIT_PACKETS_ELEMENT {
-                            dwElFlags: TP_ELEMENT_MEMORY,
-                            cLength: buf.len() as u32,
-                            Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
-                                // One pointer type for both directions;
-                                // a transmit never writes through it.
-                                pBuffer: buf.stable_ptr() as *mut c_void,
-                            },
-                        },
-                        Elem::File {
-                            handle,
-                            offset,
-                            length,
-                            ..
-                        } => TRANSMIT_PACKETS_ELEMENT {
-                            dwElFlags: TP_ELEMENT_FILE,
-                            cLength: *length,
-                            Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
-                                Anonymous: TRANSMIT_PACKETS_ELEMENT_0_0 {
-                                    nFileOffset: *offset,
-                                    hFile: *handle,
-                                },
-                            },
-                        },
-                    };
-                    p.array.push(el);
-                }
-                let ok = transmit(
-                    sock,
-                    p.array.as_mut_ptr(),
-                    p.array.len() as u32,
-                    0,
-                    ovl,
-                    tf,
-                );
+                p.seq.fill(&mut p.array);
+                let ok = transmit(sock, p.array.as_mut_ptr(), p.array.len() as u32, 0, ovl, tf);
                 classify_wsa_overlapped(ok.as_bool())
             })
         })
@@ -124,71 +99,124 @@ pub(crate) fn transmit_packets<B: IoBuf + 'static>(
     }
 }
 
-/// One element of a [`TransmitPackets`] sequence: an owned memory buffer, or a
-/// range of an open file (kept alive via its `IoRes`).
-enum Elem<B> {
-    /// Any owned buffer: the kernel only reads it.
-    Mem(B),
-    File {
-        /// Keeps the file handle valid for the op's lifetime.
-        _keep: Arc<IoRes>,
-        handle: HANDLE,
-        offset: i64,
-        length: u32,
-    },
+/// Op-block payload: the sequence, and the element array the kernel reads.
+struct Payload<S> {
+    seq: S,
+    array: Vec<TRANSMIT_PACKETS_ELEMENT>,
 }
 
-/// A builder for `transmit_packets`, over one buffer type `B` -- the
-/// caller's own, or [`MemBuf`] to mix this crate's kinds: an ordered mix of in-memory
-/// buffers and open-file ranges, sent in one `TransmitPackets` syscall.
-pub struct TransmitPackets<B: IoBuf = MemBuf> {
-    elems: Vec<Elem<B>>,
-}
+// The array's pointers point into `seq`, which is `Send`; the array is not
+// shared.
+unsafe impl<S: Send> Send for Payload<S> {}
 
-impl<B: IoBuf> Default for TransmitPackets<B> {
-    fn default() -> Self {
-        Self { elems: Vec::new() }
+/// What `transmit_packets` sends: one or more memory buffers and file
+/// ranges, in order, owned by the operation while it runs.
+///
+/// Every [`IoBuf`] is one element; a [`FileRange`] is one; `a.then(b)` is
+/// `a`'s elements followed by `b`'s; a [`List`] is each of its items in
+/// turn. The elements must point at memory that stays where it is while the
+/// value exists -- which is [`IoBuf`]'s own contract.
+pub trait TransmitSequence: Send + 'static {
+    /// How many elements [`fill`](Self::fill) appends.
+    fn count(&self) -> usize;
+
+    /// Appends this sequence's elements, pointing into `self`.
+    fn fill(&self, out: &mut Vec<TRANSMIT_PACKETS_ELEMENT>);
+
+    /// This sequence, then `next`.
+    fn then<B: TransmitSequence>(self, next: B) -> Then<Self, B>
+    where
+        Self: Sized,
+    {
+        Then(self, next)
     }
 }
 
-impl TransmitPackets {
-    /// A new, empty sequence of [`MemBuf`]s, which any of this crate's
-    /// buffers converts into. For a buffer type of your own, start from
-    /// `TransmitPackets::<B>::default()`.
-    pub fn new() -> Self {
-        Self { elems: Vec::new() }
+impl<B: IoBuf + 'static> TransmitSequence for B {
+    fn count(&self) -> usize {
+        1
+    }
+    fn fill(&self, out: &mut Vec<TRANSMIT_PACKETS_ELEMENT>) {
+        out.push(TRANSMIT_PACKETS_ELEMENT {
+            dwElFlags: TP_ELEMENT_MEMORY,
+            cLength: IoBuf::len(self) as u32,
+            Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
+                // One pointer type for both directions; a transmit never
+                // writes through it.
+                pBuffer: self.stable_ptr() as *mut c_void,
+            },
+        });
     }
 }
 
-impl<B: IoBuf> TransmitPackets<B> {
+/// A byte range of an open overlapped file, kept open until the send
+/// completes.
+pub struct FileRange {
+    /// Keeps the file handle valid for the op's lifetime.
+    _keep: Arc<IoRes>,
+    handle: HANDLE,
+    offset: i64,
+    length: u32,
+}
 
-    /// Appends an in-memory buffer (sent inline): any owned buffer, so a
-    /// shared `Arc<[u8]>` header can go out on many connections uncopied.
-    pub fn bytes(mut self, buf: impl Into<B>) -> Self {
-        self.elems.push(Elem::Mem(buf.into()));
-        self
-    }
+// A handle value and the registration that keeps it open.
+unsafe impl Send for FileRange {}
 
-    /// Appends a byte range of an open overlapped `file` (`length == 0` sends to
-    /// end of file). The file is kept alive until the transmit completes.
-    pub fn file(mut self, file: &File, offset: i64, length: u32) -> Self {
-        self.elems.push(Elem::File {
+impl FileRange {
+    /// `length` bytes of `file` from `offset`; `length == 0` sends to the
+    /// end of the file.
+    pub fn new(file: &File, offset: i64, length: u32) -> FileRange {
+        FileRange {
             _keep: file.res_arc(),
             handle: file.handle(),
             offset,
             length,
-        });
-        self
+        }
     }
 }
 
-/// Op-block payload for `TransmitPackets`: owns every memory buffer and file
-/// keepalive, plus the element array the kernel reads.
-struct TransmitPacketsPayload<B> {
-    elems: Vec<Elem<B>>,
-    array: Vec<TRANSMIT_PACKETS_ELEMENT>,
+impl TransmitSequence for FileRange {
+    fn count(&self) -> usize {
+        1
+    }
+    fn fill(&self, out: &mut Vec<TRANSMIT_PACKETS_ELEMENT>) {
+        out.push(TRANSMIT_PACKETS_ELEMENT {
+            dwElFlags: TP_ELEMENT_FILE,
+            cLength: self.length,
+            Anonymous: TRANSMIT_PACKETS_ELEMENT_0 {
+                Anonymous: TRANSMIT_PACKETS_ELEMENT_0_0 {
+                    nFileOffset: self.offset,
+                    hFile: self.handle,
+                },
+            },
+        });
+    }
 }
 
-// All raw handles/pointers held here are plain kernel values / stable heap
-// pointers into this same payload; moving the payload is sound.
-unsafe impl<B: Send> Send for TransmitPacketsPayload<B> {}
+/// Two sequences, one after the other: what [`TransmitSequence::then`]
+/// builds.
+pub struct Then<A, B>(pub A, pub B);
+
+impl<A: TransmitSequence, B: TransmitSequence> TransmitSequence for Then<A, B> {
+    fn count(&self) -> usize {
+        self.0.count() + self.1.count()
+    }
+    fn fill(&self, out: &mut Vec<TRANSMIT_PACKETS_ELEMENT>) {
+        self.0.fill(out);
+        self.1.fill(out);
+    }
+}
+
+/// Any number of sequences of one type, in order.
+pub struct List<T>(pub Vec<T>);
+
+impl<T: TransmitSequence> TransmitSequence for List<T> {
+    fn count(&self) -> usize {
+        self.0.iter().map(TransmitSequence::count).sum()
+    }
+    fn fill(&self, out: &mut Vec<TRANSMIT_PACKETS_ELEMENT>) {
+        for item in &self.0 {
+            item.fill(out);
+        }
+    }
+}

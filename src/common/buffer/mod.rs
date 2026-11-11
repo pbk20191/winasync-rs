@@ -25,8 +25,7 @@
 //! `Arc<[u8]>` / `Arc<Vec<u8>>` to send one allocation on many sockets;
 //! `&'static` memory; [`SlabBuf`]; `bytes::Bytes` / `BytesMut` with the
 //! `bytes` feature; and, for memory this crate cannot see the owner of,
-//! [`RawBuf`]. [`IoBuf::slice`] narrows any of them to a range, and
-//! [`MemBuf`] holds any one of them where kinds must mix.
+//! [`RawBuf`]. [`IoBuf::slice`] narrows any of them to a range.
 //!
 //! A read may fill [`IoBuf::bytes_total`] -- for a `Vec`, its capacity -- so
 //! `Vec::with_capacity(n)` is a read buffer that was never zeroed, and its
@@ -350,6 +349,18 @@ pub struct RawBuf {
 unsafe impl Send for RawBuf {}
 
 impl RawBuf {
+    /// Any owned buffer as a `RawBuf`, which keeps it: the one type that
+    /// can stand for buffers of different kinds in one collection. Safe,
+    /// because [`IoBuf`]'s contract is exactly what
+    /// [`from_raw_parts`](Self::from_raw_parts) asks for, and the keeper is
+    /// the buffer itself.
+    pub fn of<B: IoBuf + 'static>(buf: B) -> RawBuf {
+        let (ptr, len, total) = (buf.stable_ptr() as *mut u8, buf.len(), buf.bytes_total());
+        // SAFETY: `IoBuf` promises the address stays valid and fixed for as
+        // long as `buf` exists, and `buf` lives exactly as long as this.
+        unsafe { RawBuf::from_raw_parts(ptr, len, total, buf) }
+    }
+
     /// Wraps `total` bytes at `ptr`, of which the first `len` hold data.
     /// `keeper` is dropped with the `RawBuf` -- the mapping, the handle, the
     /// allocation that owns the memory.
@@ -546,118 +557,3 @@ mod tests {
 
 mod slab;
 pub use slab::*;
-
-/// Any of this crate's owned buffers, as one type: what a sequence that
-/// mixes buffers of different kinds (`TransmitPackets`) holds when its
-/// element type is not one buffer type of the caller's own. The kinds are
-/// the `IoBuf` implementors here; memory of any other kind comes in as a
-/// [`RawBuf`]. A range narrows it, as [`Slice`] does for a single kind.
-pub struct MemBuf {
-    kind: MemKind,
-    begin: usize,
-    end: usize,
-}
-
-enum MemKind {
-    Vec(Vec<u8>),
-    Boxed(Box<[u8]>),
-    Shared(Arc<[u8]>),
-    SharedVec(Arc<Vec<u8>>),
-    Static(&'static [u8]),
-    Raw(RawBuf),
-    Slab(SlabBuf),
-    #[cfg(feature = "bytes")]
-    Bytes(bytes::Bytes),
-}
-
-/// Applies `$f` to whichever buffer is inside.
-macro_rules! with_kind {
-    ($kind:expr, |$b:ident| $body:expr) => {
-        match $kind {
-            MemKind::Vec($b) => $body,
-            MemKind::Boxed($b) => $body,
-            MemKind::Shared($b) => $body,
-            MemKind::SharedVec($b) => $body,
-            MemKind::Static($b) => $body,
-            MemKind::Raw($b) => $body,
-            MemKind::Slab($b) => $body,
-            #[cfg(feature = "bytes")]
-            MemKind::Bytes($b) => $body,
-        }
-    };
-}
-
-impl MemBuf {
-    fn of(kind: MemKind) -> MemBuf {
-        let end = with_kind!(&kind, |b| IoBuf::len(b));
-        MemBuf { kind, begin: 0, end }
-    }
-
-    /// Narrows to `range` of the data.
-    pub fn narrow(mut self, range: impl core::ops::RangeBounds<usize>) -> MemBuf {
-        use core::ops::Bound;
-        let len = self.end - self.begin;
-        let b = match range.start_bound() {
-            Bound::Included(&b) => b,
-            Bound::Excluded(&b) => b + 1,
-            Bound::Unbounded => 0,
-        };
-        let e = match range.end_bound() {
-            Bound::Included(&e) => e + 1,
-            Bound::Excluded(&e) => e,
-            Bound::Unbounded => len,
-        };
-        assert!(b <= e && e <= len, "range {b}..{e} outside {len} bytes");
-        self.end = self.begin + e;
-        self.begin += b;
-        self
-    }
-}
-
-macro_rules! mem_from {
-    ($($t:ty => $k:ident),* $(,)?) => {$(
-        impl From<$t> for MemBuf {
-            fn from(b: $t) -> MemBuf {
-                MemBuf::of(MemKind::$k(b))
-            }
-        }
-    )*};
-}
-mem_from!(
-    Vec<u8> => Vec,
-    Box<[u8]> => Boxed,
-    Arc<[u8]> => Shared,
-    Arc<Vec<u8>> => SharedVec,
-    &'static [u8] => Static,
-    RawBuf => Raw,
-    SlabBuf => Slab,
-);
-#[cfg(feature = "bytes")]
-mem_from!(bytes::Bytes => Bytes);
-
-impl<const N: usize> From<&'static [u8; N]> for MemBuf {
-    fn from(b: &'static [u8; N]) -> MemBuf {
-        MemBuf::of(MemKind::Static(b))
-    }
-}
-
-impl<B: Into<MemBuf>> From<Slice<B>> for MemBuf {
-    fn from(s: Slice<B>) -> MemBuf {
-        let (begin, end) = (s.begin(), s.end());
-        let whole: MemBuf = s.into_inner().into();
-        // `Slice` may reach past the data into capacity; a send cannot.
-        let end = end.min(whole.end);
-        MemBuf { begin: begin.min(end), end, ..whole }
-    }
-}
-
-// SAFETY: forwards to one of the implementors above, offset into it; the
-// range never leaves the data.
-unsafe impl IoBuf for MemBuf {
-    fn stable_ptr(&self) -> *const u8 {
-        unsafe { with_kind!(&self.kind, |b| b.stable_ptr()).add(self.begin) }
-    }
-    fn len(&self) -> usize {
-        self.end - self.begin
-    }
-}
