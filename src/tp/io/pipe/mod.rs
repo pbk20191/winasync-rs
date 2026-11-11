@@ -423,9 +423,6 @@ pub(crate) fn bytes_left_in_message(handle: HANDLE) -> windows_core::Result<usiz
 pub struct NamedPipeListener {
     rt: Runtime,
     server: PipeServer,
-    /// Set by [`set_skip_completion_on_success`](Self::set_skip_completion_on_success);
-    /// applied to each instance before its `ConnectNamedPipe`.
-    skip_on_success: std::sync::atomic::AtomicBool,
 }
 
 impl NamedPipeListener {
@@ -446,24 +443,7 @@ impl NamedPipeListener {
         Ok(NamedPipeListener {
             rt: rt.clone(),
             server: PipeServer::new(name, options.clone()),
-            skip_on_success: std::sync::atomic::AtomicBool::new(false),
         })
-    }
-
-    /// Puts every instance this listener accepts on into skip-completion
-    /// mode before its `ConnectNamedPipe`; see
-    /// [`NamedPipeStream::set_skip_completion_on_success`]. A listener has
-    /// no handle of its own -- each accept is a fresh instance -- so unlike
-    /// the socket listeners this is a setting, applied per instance.
-    ///
-    /// The accept itself gains nothing: `ConnectNamedPipe` never completes
-    /// synchronously with success (a client already waiting is
-    /// `ERROR_PIPE_CONNECTED`, which this engine already finishes inline).
-    /// What it buys is that the accepted stream starts in the mode, so the
-    /// per-stream call can be skipped.
-    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
-        self.skip_on_success.store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
     }
 
     /// Waits for a client on a listening instance.
@@ -488,9 +468,6 @@ impl NamedPipeListener {
         };
         let res = crate::tp::io::register_on(&self.rt.inner, instance)?;
         let _replenish = ReplenishOnExit(&self.server);
-        if self.skip_on_success.load(std::sync::atomic::Ordering::Relaxed) {
-            res.set_skip_completion_on_success()?;
-        }
         let h = res.handle;
         let fut = unsafe {
             submit(&res, (), move |ovl, _| {
