@@ -687,7 +687,14 @@ fn is_elevated() -> bool {
 /// binding call says.
 #[test]
 fn https_serves_with_a_bound_certificate() {
-    let (port, _) = prefix("tls");
+    let (mut port, _) = prefix("tls");
+    // A port with no SSL binding already on it. Measured on a GitHub
+    // runner: ERROR_ALREADY_EXISTS from `bind_certificate` -- the image
+    // carries IIS Express's bindings on 44300-44399, which the pid-derived
+    // port landed in.
+    while ssl::query_certificate(format!("0.0.0.0:{port}").parse().unwrap()).unwrap().is_some() {
+        port += 1;
+    }
     let url = format!("https://localhost:{port}/tls/");
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let app_id = windows_core::GUID::from_u128(0x6f2d2f3a_7b1e_4c3c_9d1a_5e8b1c0a2f11);

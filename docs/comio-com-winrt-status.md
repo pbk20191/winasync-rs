@@ -1115,6 +1115,8 @@ tp 풀(TP_IO)에 등록해 모든 호출을 overlapped로 했다.
   `HTTP_INITIALIZE_CONFIG`). **측정(비승격)**: bind는 `ERROR_ACCESS_DENIED`, query는 되고(`None`),
   `https://localhost:P/` URL 등록은 승격 없이도 된다. 승격 시에만 도는 테스트가 자체 서명 인증서를 만들어 바인딩하고
   `curl -k`로 받은 뒤 `ssl_protocol`을 확인한다 — GitHub 런너는 관리자라 CI에서 돈다.
+  **측정(런너)**: `bind_certificate`가 `ERROR_ALREADY_EXISTS`를 낸 적이 있다 — 런너 이미지에 IIS Express의 sslcert
+  바인딩이 44300–44399에 있고, pid로 고른 포트가 거기 떨어졌다. 테스트는 `query_certificate`로 빈 포트를 찾는다.
 - 아직 없는 것: 로깅 속성, 채널 바인딩/확장 인증, 요청 위임(`HttpDelegateRequestEx`), 클라이언트 인증서.
 
 ### WinRT 표면: `HttpServer` / `HttpRequest` (2026-11-11)
