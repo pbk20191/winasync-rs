@@ -1,21 +1,23 @@
-//! Three engines, one connection, one buffer.
+//! Three engines, three transports, one buffer.
 //!
-//! A tiny "file chunk" server: a client asks for `offset len` and gets
-//! those bytes of a file back. Each engine does the one thing it is for:
+//! A tiny "file chunk" server with a control plane and a data plane:
+//! the client asks over a local socket for `offset len`, and the bytes
+//! arrive as a UDP datagram. Each engine does the one thing it is for:
 //!
-//! * **tp** -- the TCP handshake (`AcceptEx` / `ConnectEx`, which RIO
-//!   lacks), the pumps for the other two engines, and the client side.
-//! * **rio** -- the connection's data path. Buffers come from one slab
-//!   registered with RIO once, so each send and receive names a
-//!   descriptor the kernel already pinned.
-//! * **ioring** -- the file reads, submitted in a batch and popped by the
-//!   serving task itself, **straight into the RIO-registered slice**: the
-//!   bytes the ring reads are the bytes RIO sends, with no copy between.
+//! * **tp** -- the control plane, an `AF_UNIX` stream (accept, read and
+//!   write through `AcceptEx`/`WSARecv`/`WSASend` on the pool), the pumps
+//!   for the other two engines, and the whole client.
+//! * **rio** -- the data plane, UDP from one slab registered with RIO
+//!   once, so each `RIOSendEx` names a descriptor the kernel already
+//!   pinned.
+//! * **ioring** -- the file reads, popped by the serving task itself,
+//!   **straight into the RIO-registered slice**: the bytes the ring reads
+//!   are the bytes RIO sends, with no copy between.
 //!
 //! The ring and its operations are `!Send`, so the serving task runs on
 //! the main thread under `common::block_on`; the client is an ordinary
-//! `Send` task on the pool. Both pumps live on the same `tp` pool and only
-//! *wake*: the serving task pops the ring, the RIO pump drains the
+//! `Send` task on the pool. Both pumps live on the same `tp` pool and
+//! only *wake*: the serving task pops the ring, the RIO pump drains the
 //! completion queue.
 //!
 //! ```text
@@ -25,7 +27,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use winasync::common::block_on;
 use winasync::ioring::{self, IoRing};
-use winasync::rio::{RioBufferPool, RioCq, RioTcpAcceptor, RqConfig};
+use winasync::rio::{RioBufferPool, RioCq, RioUdpSocket, RqConfig};
 use winasync::tp;
 
 const CHUNK: usize = 4096;
@@ -33,73 +35,73 @@ const FILE_LEN: usize = 1 << 20;
 
 fn main() -> windows_core::Result<()> {
     let rt = tp::Runtime::new();
+    let localhost = |port| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
 
     // The file: a megabyte whose every byte is its own offset, so a chunk
     // is checkable by the client.
-    let path = std::env::temp_dir().join(format!("three_engines_{}.bin", std::process::id()));
+    let tag = std::process::id();
+    let path = std::env::temp_dir().join(format!("three_engines_{tag}.bin"));
     let path = path.to_string_lossy().into_owned();
     std::fs::write(&path, (0..FILE_LEN).map(|i| i as u8).collect::<Vec<u8>>()).unwrap();
 
-    // tp: the listener whose accepted sockets can take RIO queues.
-    let acceptor = RioTcpAcceptor::bind(&rt, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))?;
-    let addr = acceptor.local_addr()?;
+    // tp: the control plane, an AF_UNIX listener on the pool.
+    let sock_path = std::env::temp_dir().join(format!("three_engines_{tag}.sock"));
+    let sock_path = sock_path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&sock_path);
+    let control = tp::UnixListener::bind(&rt, &sock_path, None)?;
 
-    // rio: one completion queue pumped from tp's pool, one registered slab.
+    // rio: the data plane. One completion queue pumped from tp's pool,
+    // one registered slab, one UDP socket.
     let cq = RioCq::new(&rt, 256)?;
     let pool = RioBufferPool::new(CHUNK, 16)?;
+    let udp = RioUdpSocket::bind(&cq, localhost(0), RqConfig::default())?;
 
     // ioring: one ring, pumped from tp's pool, owned by this thread.
     let ring = IoRing::with_runtime(&rt, 32)?;
     let file = ioring::File::open(&path)?;
 
-    // The client, on the pool: plain tp TCP. Asks for eight chunks, checks
-    // each byte, and reports how many bytes came back.
+    // The client, on the pool: asks over the unix socket, receives over
+    // plain tp UDP, checks every byte.
     let client = rt.spawn({
         let rt = rt.clone();
+        let sock_path = sock_path.clone();
         async move {
-            let stream = tp::TcpStream::connect(&rt, addr, &tp::SocketOptions::new()).await?;
+            let control = tp::UnixStream::connect(&rt, &sock_path).await?;
+            let data = tp::UdpSocket::bind(&rt, localhost(0), &tp::SocketOptions::new())?;
+            let port = data.local_addr()?.port();
             let mut total = 0usize;
             for i in 0..8u64 {
-                let (offset, len) = (i * 100_003 % FILE_LEN as u64, CHUNK);
-                stream.write(format!("{offset} {len}\n").into_bytes()).await.0?;
-                let mut got = Vec::with_capacity(len);
-                while got.len() < len {
-                    let (n, buf) = stream.read(vec![0u8; len - got.len()]).await;
-                    let n = n?;
-                    if n == 0 {
-                        break;
-                    }
-                    got.extend_from_slice(&buf[..n]);
-                }
+                let offset = i * 100_003 % FILE_LEN as u64;
+                control.write(format!("{offset} {CHUNK} {port}\n").into_bytes()).await.0?;
+                let (got, buf) = data.recv_from(vec![0u8; CHUNK]).await;
+                let (n, _from) = got?;
                 assert!(
-                    got.iter().enumerate().all(|(k, &b)| b == (offset as usize + k) as u8),
+                    buf[..n].iter().enumerate().all(|(k, &b)| b == (offset as usize + k) as u8),
                     "chunk {i} came back wrong"
                 );
-                total += got.len();
+                total += n;
             }
-            // Closing the socket ends the server's loop.
-            drop(stream);
+            // Closing the control socket ends the server's loop.
+            drop(control);
             Ok::<_, windows_core::Error>(total)
         }
     });
 
-    // The server, on this thread: accept with tp's AcceptEx, then serve
-    // over RIO, reading with the ring into RIO's own slices.
+    // The server, on this thread: requests arrive on the unix stream (tp),
+    // the chunk is read by the ring into a RIO slice, and RIO sends that
+    // slice as a datagram.
     let served = block_on(async {
-        let stream = acceptor.accept(&cq, RqConfig::default()).await?;
+        let control = control.accept().await?;
         let mut served = 0usize;
         loop {
-            // A request line arrives in a registered slice.
-            let (n, req) = stream.recv(pool.acquire().expect("a free slice"))?.await;
+            let (n, line) = control.read(vec![0u8; 64]).await;
             let n = n?;
             if n == 0 {
                 break; // the client closed
             }
-            let text = String::from_utf8_lossy(&req[..n]);
-            let mut words = text.split_whitespace();
-            let offset: u64 = words.next().and_then(|w| w.parse().ok()).expect("offset");
-            let len: usize = words.next().and_then(|w| w.parse().ok()).expect("len");
-            drop(req);
+            let text = String::from_utf8_lossy(&line[..n]);
+            let mut words = text.split_whitespace().map(|w| w.parse::<u64>().expect("a number"));
+            let (offset, len, port) = (words.next().unwrap(), words.next().unwrap() as usize, words.next().unwrap() as u16);
 
             // The ring reads the chunk straight into a RIO slice (a
             // `RioSlice` is an `IoBufMut` like any other), and RIO sends
@@ -107,20 +109,23 @@ fn main() -> windows_core::Result<()> {
             let mut slice = pool.acquire().expect("a free slice");
             slice.reset_len();
             let (read, mut slice) = ring.read(&file, slice, offset).await;
-            let read = read?.min(len);
-            slice.set_len(read);
-            let (sent, _slice) = stream.send(slice)?.await;
-            served += sent?;
+            slice.set_len(read?.min(len));
+            let (sent, _slice) = udp.send_to(slice, localhost(port))?.await;
+            served += sent?.0;
         }
         Ok::<_, windows_core::Error>(served)
     })?;
 
     let received = block_on(client).expect("client task").expect("client");
-    println!("[three_engines] served {served} bytes over RIO from {CHUNK}-byte ring reads; client verified {received}");
+    println!(
+        "[three_engines] {served} bytes: requests over AF_UNIX (tp), reads by the ring into RIO slices, \
+         datagrams by RIO; client verified {received}"
+    );
     assert_eq!(served, received);
 
-    drop((file, ring, cq, pool));
+    drop((file, ring, udp, cq, pool, control));
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&sock_path);
     drop(rt);
     Ok(())
 }
