@@ -1183,17 +1183,17 @@
         let mut buf = [0u8; 16];
         // SAFETY: dropped by the timeout, never forgotten.
         let timed_out =
-            block_on(timeout(&rt, Duration::from_millis(100), unsafe { server.read_unchecked(&mut buf[..]) }))
+            block_on(timeout(&rt, Duration::from_millis(100), unsafe { server.read_unchecked(&mut buf[..], crate::tp::io_event().unwrap()) }))
                 .is_err();
         assert!(timed_out);
         buf.fill(0xAA);
         let hello = *b"hello";
         // SAFETY: awaited to completion.
-        block_on(unsafe { client.write_unchecked(&hello[..]) }).0.unwrap();
+        block_on(unsafe { client.write_unchecked(&hello[..], crate::tp::io_event().unwrap()) }).0.unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(buf.iter().all(|&b| b == 0xAA), "the kernel wrote after the drop");
         // SAFETY: awaited to completion.
-        let (n, _) = block_on(unsafe { server.read_unchecked(&mut buf[..]) });
+        let (n, _) = block_on(unsafe { server.read_unchecked(&mut buf[..], crate::tp::io_event().unwrap()) });
         assert_eq!(&buf[..n.unwrap()], b"hello");
 
         let a = UdpSocket::bind(
@@ -1210,7 +1210,7 @@
         b.connect(a.local_addr().unwrap()).unwrap();
         let mut got = [0u8; 8];
         // SAFETY: both awaited to completion.
-        block_on(unsafe { a.send_unchecked(&b"dgram"[..]) }).0.unwrap();
-        let (n, _) = block_on(unsafe { b.recv_unchecked(&mut got[..]) });
+        block_on(unsafe { a.send_unchecked(&b"dgram"[..], crate::tp::io_event().unwrap()) }).0.unwrap();
+        let (n, _) = block_on(unsafe { b.recv_unchecked(&mut got[..], crate::tp::io_event().unwrap()) });
         assert_eq!(&got[..n.unwrap()], b"dgram");
     }

@@ -2,6 +2,7 @@
 //! and read/written positionally with owned buffers (the buffer must live in
 //! the op block so cancellation can hand it to the completion callback).
 
+use std::os::windows::io::AsHandle;
 use super::{submit, IoRes, Issue, OpFuture};
 use crate::common::buffer::{page_size, IoBuf, IoBufMut, Region};
 use crate::tp::Runtime;
@@ -178,13 +179,18 @@ impl File {
     /// an executor that frees tasks without dropping them. A future that
     /// disappears without its `Drop` running leaves the kernel writing into
     /// memory the borrow has already given back.
-    pub unsafe fn read_at_unchecked<B: IoBufMut>(
+    /// `event` is a manual-reset event, unsignaled and used by nothing
+    /// else until the future is done or dropped; it is left signaled. Owned
+    /// (an `OwnedHandle`) it moves into the future; borrowed, the future
+    /// cannot outlive it. See [`io_event`](crate::tp::io_event).
+    pub unsafe fn read_at_unchecked<B: IoBufMut, E: AsHandle + Send>(
         &self,
         buf: B,
         pos: u64,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        event: E,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
         let handle = self.res.handle.0 as usize;
-        let fut = super::evented(&self.res, buf, move |mem, buf| unsafe {
+        let fut = super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             mem.ovl.Anonymous.Anonymous.Offset = pos as u32;
             mem.ovl.Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
             let slice =
@@ -244,13 +250,18 @@ impl File {
     /// an executor that frees tasks without dropping them. A future that
     /// disappears without its `Drop` running leaves the kernel reading from
     /// memory the borrow has already given back.
-    pub unsafe fn write_at_unchecked<B: IoBuf>(
+    /// `event` is a manual-reset event, unsignaled and used by nothing
+    /// else until the future is done or dropped; it is left signaled. Owned
+    /// (an `OwnedHandle`) it moves into the future; borrowed, the future
+    /// cannot outlive it. See [`io_event`](crate::tp::io_event).
+    pub unsafe fn write_at_unchecked<B: IoBuf, E: AsHandle + Send>(
         &self,
         buf: B,
         pos: u64,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        event: E,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
         let handle = self.res.handle.0 as usize;
-        super::evented(&self.res, buf, move |mem, buf| unsafe {
+        super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             mem.ovl.Anonymous.Anonymous.Offset = pos as u32;
             mem.ovl.Anonymous.Anonymous.OffsetHigh = (pos >> 32) as u32;
             let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));

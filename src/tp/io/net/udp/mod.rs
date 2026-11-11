@@ -1,6 +1,7 @@
 //! UDP over TP_IO: `UdpSocket` (WSARecvFrom / WSASendTo, plus connected-mode
 //! WSARecv / WSASend) and control messages (WSARecvMsg / WSASendMsg, IP_PKTINFO).
 
+use std::os::windows::io::AsHandle;
 use crate::common::winsock::ExtFnCache;
 use super::*;
 
@@ -333,12 +334,17 @@ impl UdpSocket {
     /// an executor that frees tasks without dropping them. A future that
     /// disappears without its `Drop` running leaves the kernel reading from
     /// memory the borrow has already given back.
-    pub unsafe fn send_unchecked<B: IoBuf>(
+    /// `event` is a manual-reset event, unsignaled and used by nothing
+    /// else until the future is done or dropped; it is left signaled. Owned
+    /// (an `OwnedHandle`) it moves into the future; borrowed, the future
+    /// cannot outlive it. See [`io_event`](crate::tp::io_event).
+    pub unsafe fn send_unchecked<B: IoBuf, E: AsHandle + Send>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        event: E,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
         let sock = self.res.socket().0;
-        super::super::evented(&self.res, buf, move |mem, buf| unsafe {
+        super::super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let wsabuf = WSABUF {
                 len: IoBuf::len(buf) as u32,
                 buf: windows_core::PSTR(buf.stable_ptr() as *mut u8),
@@ -390,12 +396,17 @@ impl UdpSocket {
     /// an executor that frees tasks without dropping them. A future that
     /// disappears without its `Drop` running leaves the kernel writing into
     /// memory the borrow has already given back.
-    pub unsafe fn recv_unchecked<B: IoBufMut>(
+    /// `event` is a manual-reset event, unsignaled and used by nothing
+    /// else until the future is done or dropped; it is left signaled. Owned
+    /// (an `OwnedHandle`) it moves into the future; borrowed, the future
+    /// cannot outlive it. See [`io_event`](crate::tp::io_event).
+    pub unsafe fn recv_unchecked<B: IoBufMut, E: AsHandle + Send>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        event: E,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
         let sock = self.res.socket().0;
-        let fut = super::super::evented(&self.res, buf, move |mem, buf| unsafe {
+        let fut = super::super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let wsabuf = WSABUF {
                 len: IoBuf::bytes_total(buf) as u32,
                 buf: windows_core::PSTR(buf.stable_mut_ptr()),

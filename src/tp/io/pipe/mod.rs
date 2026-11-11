@@ -8,6 +8,7 @@
 //! at identification level, so a server can tell who we are and cannot act
 //! as us, and matches its read mode to the pipe's.
 
+use std::os::windows::io::AsHandle;
 use super::{submit, IoRes, Issue};
 use crate::common::buffer::{mark_read, IoBuf, IoBufMut};
 pub use crate::common::pipe::NamedPipeOptions;
@@ -98,12 +99,17 @@ impl NamedPipeStream {
     /// an executor that frees tasks without dropping them. A future that
     /// disappears without its `Drop` running leaves the kernel writing into
     /// memory the borrow has already given back.
-    pub unsafe fn read_unchecked<B: IoBufMut>(
+    /// `event` is a manual-reset event, unsignaled and used by nothing
+    /// else until the future is done or dropped; it is left signaled. Owned
+    /// (an `OwnedHandle`) it moves into the future; borrowed, the future
+    /// cannot outlive it. See [`io_event`](crate::tp::io_event).
+    pub unsafe fn read_unchecked<B: IoBufMut, E: AsHandle + Send>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        event: E,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
         let handle = self.res.handle.0 as usize;
-        let fut = super::evented(&self.res, buf, move |mem, buf| unsafe {
+        let fut = super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let slice =
                 core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::bytes_total(buf));
             super::classify_file(ReadFile(
@@ -365,12 +371,17 @@ impl NamedPipeStream {
     /// an executor that frees tasks without dropping them. A future that
     /// disappears without its `Drop` running leaves the kernel reading from
     /// memory the borrow has already given back.
-    pub unsafe fn write_unchecked<B: IoBuf>(
+    /// `event` is a manual-reset event, unsignaled and used by nothing
+    /// else until the future is done or dropped; it is left signaled. Owned
+    /// (an `OwnedHandle`) it moves into the future; borrowed, the future
+    /// cannot outlive it. See [`io_event`](crate::tp::io_event).
+    pub unsafe fn write_unchecked<B: IoBuf, E: AsHandle + Send>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B> {
+        event: E,
+    ) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E> {
         let handle = self.res.handle.0 as usize;
-        super::evented(&self.res, buf, move |mem, buf| unsafe {
+        super::evented(&self.res, buf, event, move |mem, buf| unsafe {
             let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
             super::classify_file(WriteFile(
                 windows::Win32::Foundation::HANDLE(handle as *mut core::ffi::c_void),

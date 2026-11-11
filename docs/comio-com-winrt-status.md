@@ -1137,6 +1137,20 @@ Pillar 3 기준으로 거른 유일한 gap — WinRT에는 HTTP 서버가 없다
 - 테스트: Rust에서 WinRT 인터페이스로 왕복(POST + 본문 + 응답), 취소/닫기. 소비자(Python/Node/C#) 스크립트는
   그대로이고 CI의 프로젝션 생성이 새 타입을 받는지 본다.
 
+### `*_unchecked`의 이벤트는 호출자의 것 (2026-11-11)
+
+`evented()`는 작업마다 `CreateEventW`/`CloseHandle`(시스템콜 2회 + 커널 객체)을 하고 있었다. 이벤트 자체는 없앨 수
+없다 — 포트에 묶인 핸들에서 완료를 포트 밖으로 빼는 수단이 `hEvent|1`이고, drop이 그 이벤트를 기다려야 빌린
+버퍼가 건전하다. 작업마다 하나인 것도 필요하다(동시 작업끼리 공유 불가, 시작 시 비신호여야 함). 그래서 비용을
+라이브러리가 아니라 **호출자**에게 둔다: 이 경로는 메모리·수명을 호출자가 관리하라고 있는 `unsafe` 표면이다.
+
+- 열 개의 `*_unchecked`가 `event: impl AsHandle + Send`를 받는다. `OwnedHandle`을 주면 Future로 이동하고,
+  `BorrowedHandle`을 주면 Future가 이벤트보다 오래 못 산다 — 수명이 타입으로 묶인다.
+- 계약(이미 `unsafe`인 메서드의 계약에 추가): 수동 리셋 이벤트, 비신호 상태, Future가 끝나거나 drop될 때까지 다른
+  데 쓰지 않을 것. 끝나면 신호 상태로 남으니 재사용 전 `ResetEvent`. `tp::io_event()`가 하나 만들어 준다.
+- `BorrowedHandle<'e>`만 받는 첫 시도는 edition 2024에서 블록 꼬리 임시값이 블록 끝에 drop돼 호출이 번거로웠다.
+  `impl AsHandle`이 두 소유 형태를 다 받는다.
+
 ### 메모리/수명 리뷰 반영 (2026-11-11)
 
 - **완료 슬롯을 op 블록 안으로**: `OpHeader.shared = Mutex<{fired, result, waker}>`. 핵심이 완료를 항상 기록하고

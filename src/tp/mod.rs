@@ -67,6 +67,7 @@ pub use io::watch::{
     ExtendedChange, NotifyFilter,
 };
 pub use io::unix::{UnixListener, UnixStream};
+pub use io::io_event;
 // Who may connect to a listener, for the `bind`s of the local
 // transports.
 pub use crate::common::security::SecurityDescriptor;

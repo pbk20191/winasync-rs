@@ -747,9 +747,9 @@ fn unchecked_ops_take_borrowed_buffers() {
     let request = *b"borrowed";
     let mut reply = [0u8; 16];
     // SAFETY: each future is awaited to completion right here.
-    let (n, _) = block_on(unsafe { client.write_unchecked(&request[..]) });
+    let (n, _) = block_on(unsafe { client.write_unchecked(&request[..], crate::tp::io_event().unwrap()) });
     assert_eq!(n.unwrap(), 8);
-    let (n, _) = block_on(unsafe { server.read_unchecked(&mut reply[..]) });
+    let (n, _) = block_on(unsafe { server.read_unchecked(&mut reply[..], crate::tp::io_event().unwrap()) });
     assert_eq!(&reply[..n.unwrap()], b"borrowed");
 }
 
@@ -766,7 +766,7 @@ fn a_dropped_unchecked_read_lets_go_of_the_buffer() {
     let timed_out = block_on(timeout(
         &rt,
         std::time::Duration::from_millis(100),
-        unsafe { server.read_unchecked(&mut buf[..]) },
+        unsafe { server.read_unchecked(&mut buf[..], crate::tp::io_event().unwrap()) },
     ))
     .is_err();
     assert!(timed_out);
@@ -791,7 +791,7 @@ fn a_dropped_unchecked_read_does_not_need_a_pool_thread() {
         let mut buf = [0u8; 16];
         // SAFETY: dropped by the timeout, inside this task.
         let r = timeout(&rt2, std::time::Duration::from_millis(50), unsafe {
-            server.read_unchecked(&mut buf[..])
+            server.read_unchecked(&mut buf[..], crate::tp::io_event().unwrap())
         })
         .await;
         r.is_err()
@@ -833,7 +833,7 @@ fn unchecked_drops_race_completions_cleanly() {
         let mut buf = [0u8; 4];
         let wait = std::time::Duration::from_micros(u64::from(i % 5) * 200);
         // SAFETY: dropped by the timeout or completed, never forgotten.
-        if let Ok((n, _)) = block_on(timeout(&rt, wait, unsafe { server.read_unchecked(&mut buf[..]) })) {
+        if let Ok((n, _)) = block_on(timeout(&rt, wait, unsafe { server.read_unchecked(&mut buf[..], crate::tp::io_event().unwrap()) })) {
             seen.extend_from_slice(&buf[..n.unwrap()]);
         }
         if seen.len() >= 300 {

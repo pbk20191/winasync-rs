@@ -163,12 +163,12 @@ fn unchecked_file_ops_take_borrowed_buffers() {
     let path = path.to_string_lossy().into_owned();
     let file = File::create(&rt, &path).unwrap();
     // SAFETY: each future is awaited to completion.
-    let (n, _) = block_on(unsafe { file.write_at_unchecked(&b"0123456789"[..], 0) });
+    let (n, _) = block_on(unsafe { file.write_at_unchecked(&b"0123456789"[..], 0, crate::tp::io_event().unwrap()) });
     assert_eq!(n.unwrap(), 10);
     let mut part = [0u8; 4];
-    let (n, _) = block_on(unsafe { file.read_at_unchecked(&mut part[..], 3) });
+    let (n, _) = block_on(unsafe { file.read_at_unchecked(&mut part[..], 3, crate::tp::io_event().unwrap()) });
     assert_eq!(&part[..n.unwrap()], b"3456");
-    let (n, _) = block_on(unsafe { file.read_at_unchecked(&mut part[..], 100) });
+    let (n, _) = block_on(unsafe { file.read_at_unchecked(&mut part[..], 100, crate::tp::io_event().unwrap()) });
     assert_eq!(n.unwrap(), 0, "end of file is a zero-length read");
     drop(file);
     let _ = std::fs::remove_file(&path);

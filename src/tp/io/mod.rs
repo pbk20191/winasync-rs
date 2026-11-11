@@ -17,6 +17,7 @@ pub mod serial;
 pub mod unix;
 pub mod watch;
 
+use std::os::windows::io::AsHandle;
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::common::overlapped::{Binding, IoHandle, IoReg};
 use crate::tp::RuntimeInner;
@@ -135,9 +136,22 @@ pub(crate) struct EventedMem {
 /// borrowed buffer: by the time this is gone, so is the kernel's use of it.
 struct Evented {
     mem: Box<EventedMem>,
+    /// The caller's; not closed here.
     event: HANDLE,
     handle: HANDLE,
     in_flight: bool,
+}
+
+/// A manual-reset event, unsignaled, for the `*_unchecked` operations.
+///
+/// One is needed per operation in flight; after the operation it is left
+/// signaled, and a `ResetEvent` makes it good for the next. Any
+/// manual-reset event does -- this is only the one-line way to get one
+/// without the `windows` crate.
+pub fn io_event() -> windows_core::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    let event = unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, None)? };
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(event.0) })
 }
 
 // The handles are plain kernel handles; the memory is owned.
@@ -146,12 +160,11 @@ unsafe impl Send for Evented {}
 impl Drop for Evented {
     fn drop(&mut self) {
         use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-        unsafe {
-            if self.in_flight {
+        if self.in_flight {
+            unsafe {
                 let _ = windows::Win32::System::IO::CancelIoEx(self.handle, Some(&self.mem.ovl));
                 WaitForSingleObject(self.event, INFINITE);
             }
-            let _ = windows::Win32::Foundation::CloseHandle(self.event);
         }
     }
 }
@@ -175,12 +188,20 @@ impl Drop for Evented {
 /// The future waits for the event on the runtime's pool (`TP_WAIT`); a drop
 /// waits for it directly. `issue` makes exactly one overlapped call with
 /// the given `OVERLAPPED` and reports what it did.
-pub(crate) fn evented<B: Send, F: FnOnce(&mut EventedMem, &mut B) -> Issue + Send>(
+///
+/// The event is the caller's ([`io_event`]): owned, it moves into the
+/// future; borrowed, the future cannot outlive it. The caller promises it
+/// is a manual-reset event, unsignaled, and used by nothing else until the
+/// future is done or dropped; it is left signaled. Making one here per
+/// operation would cost two system calls and an object per call, on the
+/// path that exists to let the caller own exactly that.
+pub(crate) fn evented<B: Send, E: AsHandle + Send, F: FnOnce(&mut EventedMem, &mut B) -> Issue + Send>(
     res: &Arc<IoRes>,
     buf: B,
+    event: E,
     issue: F,
-) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, F> {
-    use windows::Win32::System::Threading::CreateEventW;
+) -> impl Future<Output = (windows_core::Result<usize>, B)> + Send + use<B, E, F> {
+    use std::os::windows::io::AsRawHandle;
     let rt = crate::tp::Runtime {
         inner: res.runtime_inner().clone(),
     };
@@ -191,18 +212,16 @@ pub(crate) fn evented<B: Send, F: FnOnce(&mut EventedMem, &mut B) -> Issue + Sen
     let res = res.clone();
     async move {
         let _res = res;
-        // Declared before `op`, so it is dropped after `op` has waited.
+        // Declared before `op`, so they are dropped after `op` has waited.
+        let event = event;
         let mut buf = buf;
-        let event = match unsafe { CreateEventW(None, true, false, None) } {
-            Ok(event) => event,
-            Err(e) => return (Err(e), buf),
-        };
+        let raw_event = event.as_handle().as_raw_handle() as usize;
         let mut op = Evented {
             mem: Box::new(EventedMem {
                 ovl: unsafe { std::mem::zeroed() },
                 flags: 0,
             }),
-            event,
+            event: HANDLE(raw_event as *mut core::ffi::c_void),
             handle: HANDLE(handle as *mut core::ffi::c_void),
             in_flight: false,
         };
