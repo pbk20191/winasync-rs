@@ -30,14 +30,13 @@
 //!   type there rather than an interface. [`activation::CLASSES`] keys its
 //!   WinRT activation off those same constants, so an object has one name
 //!   whichever world asks.
-//! * `GetIids` reports an empty set. `IInspectable_Vtbl::new` installs a free
-//!   function that writes `count = 0`, `values = null` and returns `S_OK`.
-//!   Unlike the name it takes no type parameter at all, so there is no point
-//!   at which an object's real interface chains could reach it — short of
-//!   hand-writing the identity vtable that `#[implement]` generates. A
-//!   consumer doing type discovery is told "no interfaces" rather than "I
-//!   cannot say", which is a confident wrong answer; no projection asks, so
-//!   it is not on the critical path.
+//! * `GetIids` reports the interfaces named in `#[implement]`, each once.
+//!   Upstream's `IInspectable_Vtbl::new` installs a free function that
+//!   writes `count = 0`, `values = null` and returns `S_OK`, and unlike the
+//!   name it takes no type parameter, so no object's interface list could
+//!   reach it from outside the macro. Every `#[implement]` here is therefore
+//!   `winasync_implement::implement` (`tools/implement`): `windows-implement`
+//!   0.60.2 copied, with the one slot replaced.
 //! * `GetTrustLevel` does reach our code, through `IUnknownImpl`, but the
 //!   macro hardcodes what it returns to `0`, `BaseTrust`. The attribute does
 //!   accept `TrustLevel = Partial | Full`; `BaseTrust` is what these objects

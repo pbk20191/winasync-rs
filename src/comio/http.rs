@@ -15,7 +15,8 @@ use windows::Foundation::IClosable_Impl;
 use windows_future::{IAsyncAction, IAsyncOperation};
 use windows::Storage::Streams::IBuffer;
 use super::asyncop::Keep;
-use windows_core::{implement, ComObject, Error, Ref, Result, HRESULT, HSTRING};
+use windows_core::{ComObject, Error, Ref, Result, HRESULT, HSTRING};
+use winasync_implement::implement;
 
 const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
 const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);

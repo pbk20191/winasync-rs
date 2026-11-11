@@ -12,7 +12,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
-use windows_core::{implement, ComObject, ComObjectInner, Error, IUnknownImpl, Ref, Result, RuntimeType, HRESULT};
+use windows_core::{ComObject, ComObjectInner, Error, IUnknownImpl, Ref, Result, RuntimeType, HRESULT};
+use winasync_implement::implement;
 use windows_future::{
     AsyncActionCompletedHandler, AsyncOperationCompletedHandler, AsyncStatus, IAsyncAction,
     IAsyncAction_Impl, IAsyncInfo_Impl, IAsyncOperation, IAsyncOperation_Impl,

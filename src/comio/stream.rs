@@ -24,7 +24,8 @@ use windows::Storage::Streams::{
 use windows::Win32::Foundation::{ERROR_IO_PENDING, ERROR_MORE_DATA};
 use windows::Win32::Networking::WinSock::{WSARecv, WSASend, WSAGetLastError, WSA_IO_PENDING, SOCKET, WSABUF};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_core::{implement, ComObject, Ref, Result};
+use windows_core::{ComObject, Ref, Result};
+use winasync_implement::implement;
 use windows_future::{IAsyncOperation, IAsyncOperationWithProgress};
 
 /// Classifies a WinSock overlapped call's return: `r == 0` is a synchronous

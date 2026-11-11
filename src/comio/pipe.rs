@@ -236,7 +236,7 @@ pub(crate) fn arm_accept(
 }
 
 /// Client side of a named pipe.
-#[windows_core::implement(
+#[winasync_implement::implement(
     bindings::Pbk20191::WinAsync::Comio::NamedPipeConnector,
     bindings::Pbk20191::WinAsync::Comio::INamedPipeConnector
 )]

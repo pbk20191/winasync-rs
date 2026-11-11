@@ -29,7 +29,8 @@
 
 use crate::comio::unload::ModuleRef;
 use std::sync::Mutex;
-use windows_core::{HRESULT, IUnknownImpl, Result, RuntimeType, implement};
+use windows_core::{HRESULT, IUnknownImpl, Result, RuntimeType};
+use winasync_implement::implement;
 use windows_future::{
     AsyncActionCompletedHandler, AsyncOperationCompletedHandler, AsyncStatus, IAsyncAction,
     IAsyncAction_Impl, IAsyncInfo, IAsyncInfo_Impl, IAsyncOperation, IAsyncOperation_Impl,

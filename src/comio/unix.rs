@@ -274,7 +274,7 @@ impl UnixStreamListener {
 }
 
 /// Client side of an AF_UNIX connection.
-#[windows_core::implement(
+#[winasync_implement::implement(
     bindings::Pbk20191::WinAsync::Comio::UnixConnector,
     bindings::Pbk20191::WinAsync::Comio::IUnixConnector
 )]

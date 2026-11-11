@@ -208,7 +208,7 @@ impl HvStreamListener {
 }
 
 /// Client side of a Hyper-V socket connection.
-#[windows_core::implement(
+#[winasync_implement::implement(
     bindings::Pbk20191::WinAsync::Comio::HyperVConnector,
     bindings::Pbk20191::WinAsync::Comio::IHyperVConnector
 )]

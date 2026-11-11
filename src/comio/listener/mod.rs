@@ -10,7 +10,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Foundation::{IClosable_Impl, TypedEventHandler};
-use windows_core::{ComObject, Error, HRESULT, HSTRING, Result, implement};
+use windows_core::{ComObject, Error, HRESULT, HSTRING, Result};
+use winasync_implement::implement;
 use windows_future::IAsyncAction;
 
 use super::bindings;

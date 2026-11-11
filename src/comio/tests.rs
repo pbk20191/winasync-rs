@@ -124,10 +124,12 @@ fn cancel_storm() {
 /// or changes it some other way — that is a failure to read rather than
 /// a silent shift under a design decision which cited it.
 ///
-/// Half of it is no longer hollow: the generated class types in
+/// None of it is hollow any more: the generated class types in
 /// [`bindings`] carry a `RuntimeName`, so `GetRuntimeClassName` is
 /// checked against the string the metadata defines rather than against
-/// `""`. `GetIids` is what is left, and it has no seam at all.
+/// `""`; and `GetIids`, which upstream's macro hard-codes empty with no
+/// seam, is answered by the forked macro in `tools/implement`. The name
+/// stays, for the history it points at.
 ///
 /// A real WinRT class goes through the same calls as a control. Without
 /// it, "empty" could just as well mean the test is calling the vtable
@@ -137,8 +139,8 @@ fn iinspectable_is_shaped_but_hollow() {
     use windows_core::{IInspectable, IInspectable_Vtbl};
 
     /// `GetIids` has no safe wrapper in `windows-core`, so go through the
-    /// vtable. Returns the count, and whether the array came back null.
-    fn get_iids(what: &str, object: &IInspectable) -> (u32, bool) {
+    /// vtable. Returns the count, and the IIDs (sorted).
+    fn get_iids(what: &str, object: &IInspectable) -> (u32, Vec<windows_core::GUID>) {
         // Seeded with values the callee must overwrite, so a vtable entry
         // that ignored its out-params could not pass for "empty".
         let mut count = 0xDEADu32;
@@ -149,8 +151,9 @@ fn iinspectable_is_shaped_but_hollow() {
             ((*vtbl).GetIids)(raw, &mut count, &mut values)
         };
         assert!(hr.is_ok(), "{what}: GetIids failed with {hr:?}");
-        let null = values.is_null();
-        if !null {
+        let mut iids = Vec::new();
+        if !values.is_null() {
+            iids.extend_from_slice(unsafe { std::slice::from_raw_parts(values, count as usize) });
             // The array is the caller's to release.
             unsafe {
                 windows::Win32::System::Com::CoTaskMemFree(Some(
@@ -158,16 +161,32 @@ fn iinspectable_is_shaped_but_hollow() {
                 ))
             };
         }
-        (count, null)
+        iids.sort_by_key(|g| g.to_u128());
+        (count, iids)
     }
 
     let ours: IInspectable = crate::comio::NamedPipeConnectionListener::new()
         .cast()
         .expect("listener QI IInspectable");
 
-    let (count, values_null) = get_iids("listener", &ours);
-    assert_eq!(count, 0, "GetIids reported interfaces");
-    assert!(values_null, "GetIids returned a non-null array");
+    // Since the forked macro (`tools/implement`): every interface named in
+    // the listener's `#[implement]`, each once.
+    let (count, iids) = get_iids("listener", &ours);
+    use crate::comio::bindings::Pbk20191::WinAsync::Comio as c;
+    use windows_core::Interface;
+    for (what, iid) in [
+        ("ITransport", c::ITransport::IID),
+        ("INamedPipeBind", c::INamedPipeBind::IID),
+        ("IListenerSecurity", c::IListenerSecurity::IID),
+        ("INamedPipeListenerSettings", c::INamedPipeListenerSettings::IID),
+        ("IClosable", windows::Foundation::IClosable::IID),
+    ] {
+        assert!(iids.contains(&iid), "GetIids left out {what}: {iids:?}");
+    }
+    assert_eq!(count as usize, iids.len());
+    let mut unique = iids.clone();
+    unique.dedup();
+    assert_eq!(unique.len(), iids.len(), "GetIids repeated an IID: {iids:?}");
     // Not merely non-empty: the exact name, and the same constant the
     // `activation::CLASSES` keys activation off, so a rename cannot land
     // in one world and not the other.
@@ -190,9 +209,9 @@ fn iinspectable_is_shaped_but_hollow() {
         .cast()
         .expect("Buffer QI IInspectable");
 
-    let (count, values_null) = get_iids("control", &theirs);
+    let (count, iids) = get_iids("control", &theirs);
     assert_ne!(count, 0, "control: a real WinRT class reported no IIDs");
-    assert!(!values_null, "control: a real WinRT class returned no array");
+    assert!(!iids.is_empty(), "control: a real WinRT class returned no array");
     assert!(
         !theirs
             .GetRuntimeClassName()

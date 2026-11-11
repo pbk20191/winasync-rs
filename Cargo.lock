@@ -110,6 +110,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures-io",
+ "winasync-implement",
  "windows",
  "windows-core",
  "windows-future",
@@ -123,6 +124,15 @@ version = "0.1.0"
 dependencies = [
  "winasync",
  "windows-core",
+]
+
+[[package]]
+name = "winasync-implement"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

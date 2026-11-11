@@ -15,7 +15,7 @@ repository = "https://github.com/pbk20191/winasync-rs"
 # are checked in, and keeping `windows-rdl` out of the library's graph is what
 # stops an ordinary build from paying for it.
 [workspace]
-members = ["dll", "tools/winmdgen"]
+members = ["dll", "tools/winmdgen", "tools/implement"]
 # `tools/bench` is its own workspace: it pulls in tokio and compio, which
 # the library's clippy/doc/test jobs should not have to compile.
 exclude = ["tools/bench"]
@@ -100,6 +100,14 @@ version = "0.3.2"
 version = "0.3.2"
 optional = true
 
+# `windows_core::implement`, forked (`tools/implement`) so that
+# `IInspectable::GetIids` answers: the upstream macro installs a `GetIids`
+# that returns an empty list and offers no hook. Only `comio` makes COM
+# objects.
+[dependencies.winasync-implement]
+path = "tools/implement"
+optional = true
+
 # `UI_Dispatching` is the only part of WinUI that `dq` touches: the queue, its
 # controller and its timer. `UI_Xaml` and `UI_Composition` would each drag in
 # dozens of `windows` namespaces for nothing.
@@ -140,6 +148,7 @@ tp = [
 # WinRT-shaped COM streams over overlapped IO.
 comio = [
     "dep:windows-future",
+    "dep:winasync-implement",
     # No `windows-threading`: its `submit` queues with a null callback
     # environment and no count, and `comio::pool::submit` replaced it so that
     # every work item is both counted and pinned in the server DLL.
