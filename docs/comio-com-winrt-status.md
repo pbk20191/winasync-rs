@@ -1186,6 +1186,9 @@ enum이 `IoBuf`가 이미 추상화한 집합을 한 번 더 열거하는 꼴이
 - 튜플·`Vec<T>`에 직접 impl하지 못한 이유: 외부 타입이라 "나중에 `IoBuf`를 구현할 수도 있다"고 보는 일관성 규칙
   (E0119)에 blanket impl과 겹친다. 그래서 결합은 우리 타입 `Then`/`List`로 한다.
 - 빌더 `TransmitPackets`와 `MemBuf`/`MemKind`는 삭제. 원소는 모두 op 블록 안에 인라인, `dyn` 없음.
+- **수명도 열었다**: 트레이트는 `'static`이 아니다(`&[u8]`도 원소). 안전한 `transmit_packets`만 `S: 'static`을
+  요구하고(잊힌 Future는 아무것도 취소하지 않으므로, 다른 안전한 연산과 같은 이유), 빌리는 시퀀스는
+  `transmit_packets_unchecked(seq, flags, event)` — 다른 `*_unchecked`와 같은 이벤트 경로·drop 대기·계약.
 
 ### `*_unchecked`의 이벤트는 호출자의 것 (2026-11-11)
 

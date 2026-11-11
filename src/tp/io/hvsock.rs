@@ -12,6 +12,7 @@
 //! Streams mirror [`super::unix`]: `AcceptEx` / `ConnectEx` for the handshake,
 //! `WSARecv` / `WSASend` for data.
 
+use std::os::windows::io::AsHandle;
 use crate::common::winsock::ExtFnCache;
 use super::net::{
     classify_wsa_overlapped, new_socket, sock_check, AcceptPayload, RecvPayload,
@@ -86,12 +87,30 @@ impl HvStream {
     /// file sources, in order. Resolves to the total number of bytes sent.
     /// See [`TransmitSequence`](crate::tp::TransmitSequence) for what a
     /// sequence is made of.
-    pub fn transmit_packets<S: crate::tp::TransmitSequence>(
+    pub fn transmit_packets<S: crate::tp::TransmitSequence + 'static>(
         &self,
         packets: S,
         flags: crate::tp::TransmitFlags,
     ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<S> {
         crate::tp::io::net::transmit::transmit_packets(&self.res, packets, flags)
+    }
+
+    /// [`transmit_packets`](Self::transmit_packets) for a sequence that
+    /// borrows (`&[u8]` elements, say). Runs on `event` rather than the
+    /// completion port, and dropping the future waits for the kernel.
+    ///
+    /// # Safety
+    /// As for the other `*_unchecked` operations: the future must be
+    /// dropped or awaited, never forgotten; `event` is a manual-reset
+    /// event, unsignaled and used by nothing else until then, left
+    /// signaled after. See [`io_event`](crate::tp::io_event).
+    pub unsafe fn transmit_packets_unchecked<S: crate::tp::TransmitSequence, E: AsHandle + Send>(
+        &self,
+        packets: S,
+        flags: crate::tp::TransmitFlags,
+        event: E,
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<S, E> {
+        unsafe { crate::tp::io::net::transmit::transmit_packets_unchecked(&self.res, packets, flags, event) }
     }
 
     /// Sends a Winsock control code (`WSAIoctl`, overlapped) with `input`,

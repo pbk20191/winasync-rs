@@ -59,7 +59,7 @@ fn unix_transmit_packets_and_file() {
         let server = rt.spawn(async move {
             let s = listener.accept().await.unwrap();
             let mut got = Vec::new();
-            while got.len() < 14 {
+            while got.len() < 17 {
                 let (n, b) = s.read(vec![0u8; 16]).await;
                 let n = n.unwrap();
                 if n == 0 {
@@ -85,7 +85,14 @@ fn unix_transmit_packets_and_file() {
         let dynamic = List(vec![RawBuf::of(b"n".to_vec()), RawBuf::of(Own(b"!".to_vec()))]);
         let n = client.transmit_packets(dynamic, TransmitFlags::default()).await.unwrap();
         assert_eq!(n, 2);
-        assert_eq!(server.await.unwrap(), b"pkts!file!own!");
+        // Borrowed elements, on the caller's event: the unchecked path.
+        let tail = String::from("end");
+        let borrowed = (&tail.as_bytes()[..1]).then(&tail.as_bytes()[1..]);
+        let n = unsafe { client.transmit_packets_unchecked(borrowed, TransmitFlags::default(), crate::tp::io_event().unwrap()) }
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(server.await.unwrap(), b"pkts!file!own!end");
     }));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&file_path);

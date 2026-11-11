@@ -26,6 +26,8 @@
 //! and any length is a `List<RawBuf>`, with [`RawBuf::of`] over each.
 
 use super::*;
+use std::os::windows::io::AsHandle;
+use super::super::Issue;
 
 /// `TransmitFile` on a registered socket: (part of) an open overlapped
 /// `file` sent over the socket using the kernel's `TransmitFile` -- a
@@ -64,7 +66,7 @@ pub(crate) fn transmit_file(
 /// Sends `packets` as one `TransmitPackets` call -- a single-syscall scatter
 /// of memory and file sources, in order. Resolves to the total number of
 /// bytes sent.
-pub(crate) fn transmit_packets<S: TransmitSequence>(
+pub(crate) fn transmit_packets<S: TransmitSequence + 'static>(
     res: &Arc<IoRes>,
     packets: S,
     flags: TransmitFlags,
@@ -99,6 +101,41 @@ pub(crate) fn transmit_packets<S: TransmitSequence>(
     }
 }
 
+/// [`transmit_packets`] for a sequence that borrows: the operation runs on
+/// the caller's `event` instead of the completion port, and dropping the
+/// future waits for the kernel to be done with the borrowed memory -- the
+/// engine under every `*_unchecked` (see `tp::io::evented`).
+///
+/// # Safety
+/// As for the other `*_unchecked` operations: the future must be dropped
+/// or awaited, never forgotten, and `event` is a manual-reset event,
+/// unsignaled and used by nothing else until then.
+pub(crate) unsafe fn transmit_packets_unchecked<S: TransmitSequence, E: AsHandle + Send>(
+    res: &Arc<IoRes>,
+    packets: S,
+    flags: TransmitFlags,
+    event: E,
+) -> impl Future<Output = windows_core::Result<usize>> + Send + use<S, E> {
+    let sock = res.socket();
+    let tf = flags.to_bits();
+    let transmit = get_transmitpackets(sock);
+    let count = packets.count();
+    let payload = Payload {
+        seq: packets,
+        array: Vec::with_capacity(count),
+    };
+    let fut = super::super::evented(res, payload, event, move |mem, p| match transmit {
+        Err(e) => Issue::Failed(e.code()),
+        Ok(transmit) => {
+            p.array.clear();
+            p.seq.fill(&mut p.array);
+            let ok = unsafe { transmit(sock, p.array.as_mut_ptr(), p.array.len() as u32, 0, &mut mem.ovl, tf) };
+            classify_wsa_overlapped(ok.as_bool())
+        }
+    });
+    async move { fut.await.0 }
+}
+
 /// Op-block payload: the sequence, and the element array the kernel reads.
 struct Payload<S> {
     seq: S,
@@ -116,7 +153,12 @@ unsafe impl<S: Send> Send for Payload<S> {}
 /// `a`'s elements followed by `b`'s; a [`List`] is each of its items in
 /// turn. The elements must point at memory that stays where it is while the
 /// value exists -- which is [`IoBuf`]'s own contract.
-pub trait TransmitSequence: Send + 'static {
+///
+/// Not `'static`: a sequence may borrow (`&[u8]` is an [`IoBuf`]). The safe
+/// `transmit_packets` asks for `'static` all the same, for the reason every
+/// safe operation does -- a forgotten future cancels nothing -- and a
+/// borrowing sequence goes to `transmit_packets_unchecked`.
+pub trait TransmitSequence: Send {
     /// How many elements [`fill`](Self::fill) appends.
     fn count(&self) -> usize;
 
@@ -132,7 +174,7 @@ pub trait TransmitSequence: Send + 'static {
     }
 }
 
-impl<B: IoBuf + 'static> TransmitSequence for B {
+impl<B: IoBuf> TransmitSequence for B {
     fn count(&self) -> usize {
         1
     }
