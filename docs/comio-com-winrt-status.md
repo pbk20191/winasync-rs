@@ -1422,6 +1422,20 @@ tokio-uring/monoio/compio도 같은 모양(링과 op가 전부 한 스레드).
 - "ioring" 행(op당 제출)은 워크로드가 바뀌었다(전: tp 태스크 qd개, 후: 한 스레드의 로컬 join qd개)라 qd=32의
   전후 비교는 의미가 없다.
 
+**후속 (Shafir, "One Year to I/O Ring", 커널 리버싱)**
+
+- 완료 이벤트는 `IopCompleteIoRingEntry`가 `(newTail - Head) % size == 1`일 때만 `KeSetEvent`한다 — 엣지 트리거의
+  커널 쪽 근거. `DRAIN_PRECEDING_OPS`는 `NtSubmitIoRing` 안에서 **제출 스레드를 timeout 없이 블로킹**하므로 비동기
+  경로에 노출하면 안 된다(현재 미사용). 제출은 호출자 컨텍스트에서 op마다 IRP를 만들며 동기 처리되고, 그래서
+  캐시 읽기가 `SubmitIoRing` 안에서 끝난다(위 `Batch` 순서 수정의 이유).
+- `IoRing::capabilities()` 추가(`QueryIoRingCapabilities`): 버전, SQ/CQ 최대 크기, `UM_EMULATION`,
+  `SET_COMPLETION_EVENT`. 생성자는 버전 < 3이거나 완료 이벤트 미지원이면 `ERROR_NOT_SUPPORTED`로 거절하고, 에뮬레이션은
+  거절하지 않고 보고만 한다.
+- 남은 위험(기록만): 커널이 신호 조건의 `Head`를 읽는 순간과 pop 스레드가 `Head`를 올리는 순간이 겹치면 "완료는
+  들어왔는데 신호는 없음"이 이론상 가능하다. ntdll/커널의 배리어는 미확인. 우리 모델은 제출과 pop이 같은 스레드라
+  겹침이 없고, MikeGrier의 2만 회 측정에서도 유실은 없었다. 제출/pop을 다른 스레드에서 하는 것은 문서상 보장이
+  없으므로 기대지 않는다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

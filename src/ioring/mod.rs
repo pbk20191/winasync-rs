@@ -123,7 +123,8 @@ use windows::Win32::Storage::FileSystem::{
     IORING_CQE, IORING_CREATE_FLAGS, IORING_HANDLE_REF, IORING_HANDLE_REF_0, IORING_REF_RAW,
     IORING_REF_REGISTERED, IORING_REGISTERED_BUFFER,
     IORING_VERSION_3, IOSQE_FLAGS_NONE, CREATE_ALWAYS, OPEN_EXISTING, PopIoRingCompletion,
-    SetIoRingCompletionEvent, SubmitIoRing,
+    QueryIoRingCapabilities, SetIoRingCompletionEvent, SubmitIoRing, IORING_FEATURE_SET_COMPLETION_EVENT,
+    IORING_FEATURE_UM_EMULATION,
 };
 use windows::Win32::System::Threading::{
     CreateEventW, CreateThreadpoolWait, SetThreadpoolWait, PTP_CALLBACK_INSTANCE, PTP_WAIT,
@@ -141,6 +142,25 @@ const TEARDOWN_ROUNDS: u32 = 5000;
 // ---------------------------------------------------------------------------
 // Files
 // ---------------------------------------------------------------------------
+
+/// What [`IoRing::capabilities`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capabilities {
+    /// The highest ring version the system supports: 1, 2, or 300 for
+    /// version 3 (`IORING_VERSION_3` is 300; Windows 11 22H2 reports 300,
+    /// and this crate's constructors need it).
+    pub version: i32,
+    /// The most entries a submission queue may have.
+    pub max_submission_entries: u32,
+    /// The most entries a completion queue may have.
+    pub max_completion_entries: u32,
+    /// The ring is emulated in user mode: operations still work, but each
+    /// is an ordinary call and a submission batches nothing.
+    pub emulated: bool,
+    /// `SetIoRingCompletionEvent` is available; the pumped constructors
+    /// need it.
+    pub completion_event: bool,
+}
 
 /// An I/O ring. Cheap to clone; every clone and every operation keeps it
 /// open. `!Send` and `!Sync`: see the module documentation.
@@ -364,8 +384,41 @@ impl IoRing {
         self.inner.event
     }
 
+    /// What this system's rings can do, without creating one.
+    ///
+    /// Three facts are decided at run time, not by the headers: the ring
+    /// version (write and flush need 3), whether the ring is the kernel's
+    /// or a user-mode emulation with no batching benefit, and whether a
+    /// completion event can be attached at all. The constructors check the
+    /// first and the last and refuse with `ERROR_NOT_SUPPORTED` rather than
+    /// let `CreateIoRing` or `SetIoRingCompletionEvent` fail less clearly;
+    /// the emulation is reported here for a caller to decide about.
+    pub fn capabilities() -> Result<Capabilities> {
+        let caps = unsafe { QueryIoRingCapabilities()? };
+        Ok(Capabilities {
+            version: caps.MaxVersion.0,
+            max_submission_entries: caps.MaxSubmissionQueueSize,
+            max_completion_entries: caps.MaxCompletionQueueSize,
+            emulated: caps.FeatureFlags.0 & IORING_FEATURE_UM_EMULATION.0 != 0,
+            completion_event: caps.FeatureFlags.0 & IORING_FEATURE_SET_COMPLETION_EVENT.0 != 0,
+        })
+    }
+
     /// `pump` is the pool to pump from; `None` for a manual ring.
     fn build(entries: u32, pump: Option<PoolRef>) -> Result<IoRing> {
+        let caps = Self::capabilities()?;
+        let unsupported = |what: &str| {
+            Error::new(
+                windows::Win32::Foundation::ERROR_NOT_SUPPORTED.to_hresult(),
+                format!("I/O rings: {what} ({caps:?})"),
+            )
+        };
+        if caps.version < IORING_VERSION_3.0 {
+            return Err(unsupported("this system's rings are below version 3, which write and flush need"));
+        }
+        if !caps.completion_event {
+            return Err(unsupported("this system's rings cannot signal a completion event"));
+        }
         let entries = entries.max(1);
         let capacity = entries.saturating_mul(2);
         let handle = unsafe {

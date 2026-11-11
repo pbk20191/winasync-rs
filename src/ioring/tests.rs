@@ -27,6 +27,19 @@ fn settle(ring: &IoRing) {
     assert_eq!(in_flight(ring), 0, "operations were left in flight");
 }
 
+/// What the constructors check before creating a ring: this machine has
+/// a version-3 kernel ring that can signal an event, or the rest of these
+/// tests could not pass.
+#[test]
+fn capabilities_are_queried_without_a_ring() {
+    let caps = IoRing::capabilities().unwrap();
+    assert!(caps.version >= 300, "{caps:?}");
+    assert!(caps.completion_event, "{caps:?}");
+    assert!(caps.max_submission_entries >= 8 && caps.max_completion_entries >= 16, "{caps:?}");
+    // Reported, not refused: an emulated ring still works.
+    let _ = caps.emulated;
+}
+
 #[test]
 fn write_then_read() {
     let ring = IoRing::new(8).unwrap();
