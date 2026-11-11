@@ -146,11 +146,7 @@ fn dropped_read_future_does_not_leak() {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(
-            super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "op blocks leaked"
-        );
+        assert_eq!(super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed), 0, "{}: {}", "op blocks leaked", crate::common::overlapped::live_ops_report());
     }
     let _ = std::fs::remove_file(&path);
 }

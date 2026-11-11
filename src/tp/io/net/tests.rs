@@ -524,11 +524,7 @@ use crate::tp::{FileRange, TransmitSequence};
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "op blocks leaked on the skip-completion path"
-        );
+        assert_eq!(super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed), 0, "{}: {}", "op blocks leaked on the skip-completion path", crate::common::overlapped::live_ops_report());
     }
 
     #[test]
@@ -1077,11 +1073,7 @@ use crate::tp::{FileRange, TransmitSequence};
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(
-                super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
-                0,
-                "op blocks leaked"
-            );
+            assert_eq!(super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed), 0, "{}: {}", "op blocks leaked", crate::common::overlapped::live_ops_report());
         }
     }
 
@@ -1157,11 +1149,7 @@ use crate::tp::{FileRange, TransmitSequence};
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "the cancelled ioctl leaked its op"
-        );
+        assert_eq!(super::super::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed), 0, "{}: {}", "the cancelled ioctl leaked its op", crate::common::overlapped::live_ops_report());
     }
 
     /// Borrowed buffers over TCP and connected UDP, and a dropped TCP read

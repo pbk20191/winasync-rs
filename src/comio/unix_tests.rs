@@ -41,11 +41,7 @@ fn assert_no_live_ops(msg: &str) {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(
-        crate::comio::tpio::LIVE_OPS.load(Ordering::Relaxed),
-        0,
-        "{msg}"
-    );
+    assert_eq!(crate::comio::tpio::LIVE_OPS.load(Ordering::Relaxed), 0, "{msg}: {}", crate::common::overlapped::live_ops_report());
 }
 
 #[test]

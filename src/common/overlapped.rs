@@ -329,12 +329,38 @@ pub struct Op<P, F = ()> {
     on_complete: UnsafeCell<Option<F>>,
 }
 
+/// Test builds only: what every live op block is -- its payload type and
+/// where it was submitted -- so a leak check that fails can say *which*
+/// op was left behind, not just that one was. `LIVE_OPS` alone could not,
+/// and a leak seen once on a CI runner (2026-11-11: one block, never
+/// completed, failing every later check) could not be traced.
+#[cfg(test)]
+pub static LIVE_SITES: Mutex<Vec<(usize, &'static str, &'static core::panic::Location<'static>)>> =
+    Mutex::new(Vec::new());
+
+/// Test builds only: the live op blocks, one per line, for a leak
+/// assertion's message.
+#[cfg(test)]
+pub fn live_ops_report() -> String {
+    let sites = LIVE_SITES.lock().unwrap();
+    if sites.is_empty() {
+        return String::from("no live op blocks");
+    }
+    sites
+        .iter()
+        .map(|(_, payload, site)| format!("
+  live op: {payload} submitted at {site}"))
+        .collect()
+}
+
 unsafe fn release_op<P, F>(op: *mut c_void) {
     // Release, not Relaxed, for the same reason `Arc` uses it on the way
     // down: a thread that observes this counter at zero and acts on it (see
     // `comio::unload`) must see everything this op did.
     #[cfg(any(test, feature = "counters"))]
     LIVE_OPS.fetch_sub(1, Ordering::Release);
+    #[cfg(test)]
+    LIVE_SITES.lock().unwrap().retain(|(ptr, _, _)| *ptr != op as usize);
     unsafe { drop(Box::from_raw(op as *mut Op<P, F>)) }
 }
 
@@ -507,6 +533,7 @@ impl<P> Drop for OpHandle<P> {
 /// provided OVERLAPPED pointer and classify truthfully: `Failed` when a
 /// completion is still coming is a use-after-free; `Pending` when none is coming
 /// leaks the block and unbalances the TP_IO.
+#[cfg_attr(test, track_caller)]
 pub unsafe fn submit<P, F: FnOnce(Completion) + Send + 'static>(
     reg: &Arc<IoReg>,
     payload: P,
@@ -531,6 +558,12 @@ pub unsafe fn submit<P, F: FnOnce(Completion) + Send + 'static>(
     }));
     #[cfg(any(test, feature = "counters"))]
     LIVE_OPS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    LIVE_SITES.lock().unwrap().push((
+        op as usize,
+        core::any::type_name::<P>(),
+        core::panic::Location::caller(),
+    ));
 
     if let Some(io) = reg.io {
         unsafe { StartThreadpoolIo(io) };

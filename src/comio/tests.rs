@@ -112,11 +112,7 @@ fn cancel_storm() {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            crate::comio::tpio::LIVE_OPS.load(Ordering::Relaxed),
-            0,
-            "op blocks leaked after read cancel storm"
-        );
+        assert_eq!(crate::comio::tpio::LIVE_OPS.load(Ordering::Relaxed), 0, "{}: {}", "op blocks leaked after read cancel storm", crate::common::overlapped::live_ops_report());
     }
 }
 

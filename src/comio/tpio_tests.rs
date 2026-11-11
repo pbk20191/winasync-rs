@@ -100,6 +100,6 @@ fn cancel_in_flight_read_does_not_leak() {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed), 0, "op blocks leaked after cancel");
+        assert_eq!(LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed), 0, "{}: {}", "op blocks leaked after cancel", crate::common::overlapped::live_ops_report());
     }
 }

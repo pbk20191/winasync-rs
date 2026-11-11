@@ -356,11 +356,7 @@ fn close_cancels_inflight_accept_no_leak() {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(
-            crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "listener accept leaked an op"
-        );
+        assert_eq!(crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed), 0, "{}: {}", "listener accept leaked an op", crate::common::overlapped::live_ops_report());
     }
 }
 
@@ -389,7 +385,7 @@ fn drop_without_close_no_leak() {
             std::thread::sleep(std::time::Duration::from_millis(10));
             live = crate::comio::tpio::LIVE_OPS.load(std::sync::atomic::Ordering::Relaxed);
         }
-        assert_eq!(live, 0, "dropping listener without Close leaked an op");
+        assert_eq!(live, 0, "{}: {}", "dropping listener without Close leaked an op", crate::common::overlapped::live_ops_report());
     }
 }
 
