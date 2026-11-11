@@ -435,7 +435,10 @@ impl HttpServer {
     /// this server's prefixes, which is the name's only role -- to be sent
     /// as a response body by [`HttpRequest::respond_fragment`] and
     /// [`HttpRequest::send_fragment`] without passing through this process
-    /// again. `ttl` is `None` to keep it until flushed.
+    /// again. `ttl` is `None` to keep it until flushed -- but a cache keeps
+    /// nothing for certain: measured on one machine, a fragment was gone
+    /// after the first response that used it, and the next send failed
+    /// with `ERROR_PATH_NOT_FOUND`. A caller adds it again on that.
     pub fn add_fragment(&self, name: &str, data: &[u8], ttl: Option<Duration>) -> Result<()> {
         let chunk = memory_chunk(data.as_ptr(), data.len());
         let policy = cache_policy(match ttl {

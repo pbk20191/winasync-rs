@@ -593,7 +593,14 @@ fn a_fragment_is_sent_from_the_cache() {
     let req = block_on(server.accept()).unwrap();
     block_on(req.start_response(Response::new(200).header("Content-Length", "20"))).unwrap();
     block_on(req.send_body(b"head: ".to_vec(), false)).0.unwrap();
-    block_on(req.send_fragment(&name, true)).unwrap();
+    // Measured on a GitHub runner: the fragment was gone after the one
+    // response that used it (ERROR_PATH_NOT_FOUND); locally it stayed. A
+    // cache may drop an entry whenever it likes, so the caller re-adds.
+    if let Err(e) = block_on(req.send_fragment(&name, true)) {
+        eprintln!("fragment gone after one use ({e:?}); adding it again");
+        server.add_fragment(&name, b"from the cache", None).unwrap();
+        block_on(req.send_fragment(&name, true)).unwrap();
+    }
     assert_eq!(split(&c.join().unwrap()).1, b"head: from the cache");
 
     server.flush_cache(&name, false).unwrap();
