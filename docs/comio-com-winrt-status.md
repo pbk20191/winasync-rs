@@ -1147,6 +1147,15 @@ Pillar 3 기준으로 거른 유일한 gap — WinRT에는 HTTP 서버가 없다
 - 두지 않은 것: dq `Rc<dyn TaskObj>`, tp `Arc<dyn ErasedTask<T>>`. 실행기의 태스크 테이블은 서로 다른 Future를
   담는 것이 목적이라 지우기(erasure)가 본질이다. vtable을 손으로 쓰면 같은 것을 `unsafe`로 다시 쓰는 셈.
 
+**`dyn Send (+ Sync)` 점검**
+- ioring `Registration`: `active: Option<Arc<dyn Send + Sync>>`였는데 파일 등록과 버퍼 등록은 필드가 따로라
+  `Registration<FileTable>` / `Registration<BufferTable>`로 타입을 붙였다 — dyn 둘 제거.
+- ioring 테이블 keeper: 파일/버퍼 **하나마다** `Box<dyn>`을 만들던 것(`Vec<Box<dyn Send>>`)을 호출자의 `Vec<H>`/`Vec<B>`
+  전체를 **테이블당 Box 하나**로 바꿨다(N 할당 → 1). 이 하나는 남는다: 링이 서로 다른 `H`/`B`의 테이블을 번갈아
+  들어야 하므로 `IoRing<H, B>`로 만들지 않는 한 지울 수 없고, 그러면 "아무 핸들이나 등록"이라는 열린 끝이 닫힌다.
+- `RawBuf._keeper: Box<dyn Send>`: 이 타입의 역할 자체가 "소유자를 지운 메모리"다. ZST keeper는 할당하지 않는다.
+- panic payload(`Box<dyn Any>`): `catch_unwind`가 주는 그대로.
+
 ### TransmitFile / TransmitPackets를 모든 소켓 종류로 (2026-11-11)
 
 프로브로 측정(이 호스트, 각 종류의 연결된 소켓 쌍):

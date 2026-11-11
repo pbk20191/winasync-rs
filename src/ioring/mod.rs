@@ -146,8 +146,8 @@ struct Ring {
     /// Every registration gets the next number; an index is valid only with
     /// the number of the registration that is active.
     next_generation: u64,
-    files: Registration,
-    buffers: Registration,
+    files: Registration<FileTable>,
+    buffers: Registration<BufferTable>,
 }
 
 /// One kind of registration (files, or buffers) on a ring.
@@ -164,23 +164,32 @@ struct Ring {
 /// "out of range" at build -- the ring's own record of the table had
 /// already been replaced. So a failure leaves no registration at all, and
 /// every index, old or new, is refused until the next one succeeds.
-#[derive(Default)]
-struct Registration {
+struct Registration<T> {
     /// The active registration's number; 0 for none.
     generation: u64,
     /// Keeps the active table -- its handles, its memory -- alive while the
     /// kernel may use it.
-    active: Option<Arc<dyn Send + Sync>>,
-    pending: Option<PendingRegistration>,
+    active: Option<Arc<T>>,
+    pending: Option<PendingRegistration<T>>,
 }
 
-struct PendingRegistration {
+impl<T> Default for Registration<T> {
+    fn default() -> Self {
+        Registration {
+            generation: 0,
+            active: None,
+            pending: None,
+        }
+    }
+}
+
+struct PendingRegistration<T> {
     user_data: usize,
     generation: u64,
-    table: Arc<dyn Send + Sync>,
+    table: Arc<T>,
 }
 
-impl Registration {
+impl<T> Registration<T> {
     /// Whether an entry registered as `generation` on ring `owner` may be
     /// built on ring `ring` now.
     fn check(&self, ring: usize, owner: usize, generation: u64) -> core::result::Result<(), BuildStop> {

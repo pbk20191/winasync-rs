@@ -18,8 +18,9 @@ pub(super) struct FileTable {
     pub(super) ring: usize,
     pub(super) generation: u64,
     pub(super) handles: Vec<HANDLE>,
-    /// Whatever keeps each handle open.
-    pub(super) _keep: Vec<Box<dyn Send + Sync>>,
+    /// Whatever keeps the handles open -- the caller's `Vec<H>`, whose type
+    /// the ring cannot carry, boxed once for the table.
+    pub(super) _keep: Box<dyn Send + Sync>,
 }
 
 // Handle values and the owners that keep them open; never mutated.
@@ -121,8 +122,9 @@ pub(super) struct BufferTable {
     pub(super) ring: usize,
     pub(super) generation: u64,
     pub(super) infos: Vec<IORING_BUFFER_INFO>,
-    /// The owners of the memory; only ever dropped.
-    pub(super) _keep: Vec<Box<dyn Send>>,
+    /// The owners of the memory -- the caller's `Vec<B>`, or a slab's
+    /// region -- boxed once for the table; only ever dropped.
+    pub(super) _keep: Box<dyn Send>,
     pub(super) free: Mutex<Vec<u32>>,
 }
 
@@ -301,10 +303,7 @@ impl IoRing {
             ring: ring.id,
             generation,
             handles: files.iter().map(RingHandle::raw_handle).collect(),
-            _keep: files
-                .iter()
-                .map(|f| Box::new(f.clone()) as Box<dyn Send + Sync>)
-                .collect(),
+            _keep: Box::new(files.to_vec()),
         });
         drop(ring);
         RingOp::new(&self.inner, RegisterFilesOp { table }, false)
@@ -318,11 +317,10 @@ impl IoRing {
     /// is replaced and every `RingBuffer` and operation using it is gone.
     /// Fails with `E_INVALIDARG` for a buffer over 4 GiB, which a
     /// registration cannot describe.
-    pub fn register_buffers<B: IoBufMut + 'static>(&self, buffers: Vec<B>) -> RingOp<RegisterBuffersOp> {
+    pub fn register_buffers<B: IoBufMut + 'static>(&self, mut buffers: Vec<B>) -> RingOp<RegisterBuffersOp> {
         let mut infos = Vec::with_capacity(buffers.len());
-        let mut keep: Vec<Box<dyn Send>> = Vec::with_capacity(buffers.len());
         let mut too_big = false;
-        for mut b in buffers {
+        for b in buffers.iter_mut() {
             let Ok(len) = u32::try_from(b.bytes_total()) else {
                 too_big = true;
                 break;
@@ -331,9 +329,8 @@ impl IoRing {
                 Address: b.stable_mut_ptr().cast(),
                 Length: len,
             });
-            keep.push(Box::new(b));
         }
-        self.register_infos(infos, keep, too_big)
+        self.register_infos(infos, Box::new(buffers), too_big)
     }
 
     /// Registers one region of `count` buffers of `size` bytes each -- a slab
@@ -349,13 +346,13 @@ impl IoRing {
                 Length: size,
             })
             .collect();
-        Ok(self.register_infos(infos, vec![Box::new(region)], false))
+        Ok(self.register_infos(infos, Box::new(region), false))
     }
 
     pub(super) fn register_infos(
         &self,
         infos: Vec<IORING_BUFFER_INFO>,
-        keep: Vec<Box<dyn Send>>,
+        keep: Box<dyn Send>,
         too_big: bool,
     ) -> RingOp<RegisterBuffersOp> {
         let mut ring = self.inner.ring.lock().unwrap();
