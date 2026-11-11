@@ -46,6 +46,17 @@ impl std::os::windows::io::AsHandle for NamedPipeStream {
 }
 
 impl NamedPipeStream {
+    /// Finishes an operation the kernel completes synchronously on the
+    /// issuing thread, skipping the completion port and its pool thread;
+    /// see [`TcpStream::set_skip_completion_on_success`](crate::tp::TcpStream::set_skip_completion_on_success).
+    /// On a pipe that is most operations on a busy connection -- a read
+    /// that finds data, a write the reader is waiting for -- and the hop it
+    /// saves is most of an operation's cost (`comio::bench`: 9.4 us through
+    /// the port, 0.9 us without). Enable it before issuing ops.
+    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
+        self.res.set_skip_completion_on_success()
+    }
+
     /// The process id at the other end: the client, on a stream from
     /// `accept`; the server, on one from `connect`.
     pub fn peer_process_id(&self) -> windows_core::Result<u32> {

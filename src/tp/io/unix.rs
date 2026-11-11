@@ -80,6 +80,15 @@ impl std::os::windows::io::AsSocket for UnixStream {
 }
 
 impl UnixStream {
+    /// Finishes an operation the kernel completes synchronously on the
+    /// issuing thread, skipping the completion port and its pool thread;
+    /// see [`TcpStream::set_skip_completion_on_success`](crate::tp::TcpStream::set_skip_completion_on_success).
+    /// AF_UNIX is a kernel provider (`afunix.sys`), so the mode applies to
+    /// it as to any socket. Enable it before issuing ops.
+    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
+        self.res.set_skip_completion_on_success()
+    }
+
     /// Sends (part of) an open overlapped `file`'s contents over the socket
     /// using the kernel's `TransmitFile` -- a zero-copy path straight from
     /// the file-system cache, without staging the bytes through user space.

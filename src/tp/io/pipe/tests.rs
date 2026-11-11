@@ -2,6 +2,38 @@ use crate::common::security::SecurityDescriptor;
 use super::super::super::{block_on, timeout, Runtime};
 use super::*;
 
+/// With the completion port skipped on both ends, an echo still round
+/// trips, and the counter shows the completions were finished inline.
+#[test]
+fn named_pipe_echo_skipping_the_port() {
+    let rt = Runtime::new();
+    let name = format!(r"\\.\pipe\tp_pipe_skip_{}", std::process::id());
+    let before = crate::common::overlapped::INLINE_COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed);
+    let rt2 = rt.clone();
+    let sname = name.clone();
+    let server = std::thread::spawn(move || {
+        let listener = NamedPipeListener::bind(&rt2, &sname, &NamedPipeOptions::new()).unwrap();
+        let s = block_on(listener.accept()).unwrap();
+        s.set_skip_completion_on_success().unwrap();
+        for _ in 0..100 {
+            let (n, b) = block_on(s.read(vec![0u8; 16]));
+            let n = n.unwrap();
+            block_on(s.write(b[..n].to_vec())).0.unwrap();
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let client = NamedPipeConnector::connect(&rt, &name).unwrap();
+    client.set_skip_completion_on_success().unwrap();
+    for i in 0..100u8 {
+        block_on(client.write(vec![i; 8])).0.unwrap();
+        let (n, b) = block_on(client.read(vec![0u8; 16]));
+        assert_eq!(&b[..n.unwrap()], &[i; 8]);
+    }
+    server.join().unwrap();
+    let inline = crate::common::overlapped::INLINE_COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert!(inline > 0, "no completion was finished inline");
+}
+
 #[test]
 fn named_pipe_echo() {
     let rt = Runtime::new();

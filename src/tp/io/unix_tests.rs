@@ -2,6 +2,40 @@ use super::super::super::{block_on, timeout, Runtime};
 use super::*;
 use std::time::Duration;
 
+/// With the completion port skipped on both ends, an echo still round
+/// trips: the mode applies to AF_UNIX as to any kernel-provider socket.
+#[test]
+fn unix_stream_echo_skipping_the_port() {
+    let rt = Runtime::new();
+    let path = std::env::temp_dir()
+        .join(format!("tp_unix_skip_{}.sock", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+    let _ = std::fs::remove_file(&path);
+    let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+        let listener = UnixListener::bind(&rt, &path, None).unwrap();
+        let server = rt.spawn(async move {
+            let s = listener.accept().await.unwrap();
+            s.set_skip_completion_on_success().unwrap();
+            for _ in 0..100 {
+                let (n, b) = s.read(vec![0u8; 16]).await;
+                let n = n.unwrap();
+                s.write(b[..n].to_vec()).await.0.unwrap();
+            }
+        });
+        let client = UnixStream::connect(&rt, &path).await.unwrap();
+        client.set_skip_completion_on_success().unwrap();
+        for i in 0..100u8 {
+            client.write(vec![i; 8]).await.0.unwrap();
+            let (n, b) = client.read(vec![0u8; 16]).await;
+            assert_eq!(&b[..n.unwrap()], &[i; 8]);
+        }
+        server.await.unwrap();
+    }));
+    let _ = std::fs::remove_file(&path);
+    result.expect("unix echo timed out");
+}
+
 #[test]
 fn unix_stream_echo() {
     let rt = Runtime::new();
