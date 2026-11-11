@@ -14,7 +14,8 @@ use std::sync::Mutex;
 use windows::Foundation::IClosable_Impl;
 use windows_future::{IAsyncAction, IAsyncOperation};
 use windows::Storage::Streams::IBuffer;
-use windows_core::{implement, AgileReference, ComObject, Error, Ref, Result, HRESULT, HSTRING};
+use super::asyncop::Keep;
+use windows_core::{implement, ComObject, Error, Ref, Result, HRESULT, HSTRING};
 
 const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
 const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
@@ -120,11 +121,11 @@ impl HttpRequest_Impl {
 }
 
 /// A WinRT buffer as an owned buffer for the core: the bytes stay where
-/// `IBufferByteAccess` says while the agile reference keeps the buffer.
+/// `IBufferByteAccess` says while the kept buffer lives.
 fn raw_buf(buffer: &IBuffer, len: usize) -> Result<RawBuf> {
     let ptr = super::buffer::buffer_ptr(buffer)?;
     let total = buffer.Capacity()? as usize;
-    let keep = AgileReference::new(buffer)?;
+    let keep = Keep::new(buffer)?;
     // SAFETY: the buffer's bytes live, at that address, while `keep` does.
     Ok(unsafe { RawBuf::from_raw_parts(ptr, len.min(total), total, keep) })
 }
@@ -185,7 +186,7 @@ impl IHttpRequest_Impl for HttpRequest_Impl {
     fn ReadBodyAsync(&self, buffer: Ref<'_, IBuffer>) -> Result<IAsyncOperation<u32>> {
         let buffer = buffer.ok()?.clone();
         let buf = raw_buf(&buffer, 0)?;
-        let done = AgileReference::new(&buffer)?;
+        let done = Keep::new(&buffer)?;
         let fut = self.with(|r| r.read_body(buf))?;
         Ok(spawn_op(async move {
             let (n, _buf) = fut.await;

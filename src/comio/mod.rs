@@ -124,3 +124,5 @@ pub(crate) use crate::common::check::check;
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "tp"))]
+mod bench;

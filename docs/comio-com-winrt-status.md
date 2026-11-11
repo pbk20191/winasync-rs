@@ -1430,6 +1430,16 @@ tokio-uring/monoio/compio도 같은 모양(링과 op가 전부 한 스레드).
 overlapped의 op 블록 안 `Mutex<Shared>`는 그대로 둔다: 인라인 futex 워드 하나라 왕복의 ~2 %이고, tp/comio/http 공통
 경로인 데다 LIVE_OPS 플레이크 조사 대상이라 지금 손대지 않는다.
 
+**comio의 Mutex 검토와 `AgileReference` 생략.** comio의 Mutex 15곳은 두 부류다. 연산마다 잡히는 것은
+`IoAsyncOp(Mutex<OpState>)`(WinRT 계약상 아무 스레드에서나 들어오는 `Status`/`SetCompleted`/`Cancel`과 완료의 경주 —
+windows-future와 C++/WinRT의 `slim_mutex`와 같은 설계), overlapped op 블록, 파이프 accept의 싱크 경주, http `FutureOp`의
+poll/cancel 경주. 나머지는 객체당 설정(`ListenerState` 6개 등)이라 성능과 무관. 락을 전부 빼도 op당 ~100 ns라 두기로 했다.
+대신 op당 가장 큰 것이었던 `AgileReference::new`(`RoGetAgileReference` + 프록시 객체)를 `asyncop::Keep`으로 바꿨다: 버퍼가
+`IAgileObject`에 답하면(`Windows.Storage.Streams.Buffer`와 모든 `#[implement]` 객체) 그대로 캡처, 아니면 종전대로 참조.
+측정(`comio::bench`, 64바이트 named-pipe 왕복, 왕복당 op 4개): op당 9.7~10.5 µs → 9.05~9.17 µs(약 6 %). 남은 ~9 µs의
+본체는 파이프 커널 op(~2~3 µs)와 "완료 → 핸들러 → waker → block_on 깨움"의 스레드 핸드오프(~5 µs)라, comio를 더
+빠르게 하려면 뮤텍스나 COM이 아니라 그 핸드오프를 봐야 한다(tp 깊이 1과 같은 이야기).
+
 **후속 (Shafir, "One Year to I/O Ring", 커널 리버싱)**
 
 - 완료 이벤트는 `IopCompleteIoRingEntry`가 `(newTail - Head) % size == 1`일 때만 `KeSetEvent`한다 — 엣지 트리거의

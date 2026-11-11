@@ -62,6 +62,42 @@ pub(crate) fn settle<T>(res: Result<T>, cancel_requested: bool) -> (Result<T>, b
     }
 }
 
+/// A WinRT object kept alive for an operation and reached again from the
+/// pool thread that completes it.
+///
+/// An agile object -- one answering `IAgileObject`, which
+/// `Windows.Storage.Streams.Buffer` and every `#[implement]` object do --
+/// may be used from any thread as it is, so it is kept directly. Only a
+/// non-agile one needs an `AgileReference`, which costs a
+/// `RoGetAgileReference` call and a proxy object per operation; measured on
+/// the pipe round trip (`comio::bench`), taking one for every buffer cost
+/// about 0.6 us of each operation's 9.7. The check is one `QueryInterface`.
+pub(crate) enum Keep<T: windows_core::Interface> {
+    Agile(T),
+    Reference(AgileReference<T>),
+}
+
+// SAFETY: an agile object may be used from any thread by contract, and an
+// `AgileReference` is `Send` by construction.
+unsafe impl<T: windows_core::Interface> Send for Keep<T> {}
+
+impl<T: windows_core::Interface> Keep<T> {
+    pub(crate) fn new(object: &T) -> Result<Self> {
+        if object.cast::<windows_core::imp::IAgileObject>().is_ok() {
+            Ok(Keep::Agile(object.clone()))
+        } else {
+            AgileReference::new(object).map(Keep::Reference)
+        }
+    }
+
+    pub(crate) fn resolve(&self) -> Result<T> {
+        match self {
+            Keep::Agile(object) => Ok(object.clone()),
+            Keep::Reference(reference) => reference.resolve(),
+        }
+    }
+}
+
 struct OpState<T: RuntimeType + 'static> {
     result: Option<Result<T>>,
     /// `Cancel` was called while the operation was still running.
@@ -242,10 +278,9 @@ impl IoAsyncOp<IBuffer> {
     ) -> IAsyncOperationWithProgress<IBuffer, u32> {
         let object = new_object::<IBuffer>();
         let iface: IAsyncOperationWithProgress<IBuffer, u32> = object.to_interface();
-        // The completion callback runs on a thread-pool thread, so it may not
-        // capture the non-agile `IBuffer` directly; hold an agile reference and
-        // resolve it there.
-        let out_agile = check(AgileReference::new(&out));
+        // The completion callback runs on a thread-pool thread; the buffer
+        // goes there as itself if it is agile, through a reference if not.
+        let out_agile = check(Keep::new(&out));
         let cb_object = object.clone();
         let handle = unsafe {
             submit(
@@ -494,11 +529,10 @@ impl IoAsyncOp<u32> {
     ) -> IAsyncOperationWithProgress<u32, u32> {
         let object = new_object::<u32>();
         let iface: IAsyncOperationWithProgress<u32, u32> = object.to_interface();
-        // The completion callback runs on a thread-pool thread, so it may not
-        // capture the non-agile `IBuffer` directly; hold an agile reference
-        // purely to keep the buffer's backing memory alive until the
-        // overlapped write completes.
-        let out_agile = check(AgileReference::new(&out));
+        // Kept purely so the buffer's backing memory lives until the
+        // overlapped write completes; see `Keep` for why not always an
+        // agile reference.
+        let out_agile = check(Keep::new(&out));
         let cb_object = object.clone();
         let handle = unsafe {
             submit(
