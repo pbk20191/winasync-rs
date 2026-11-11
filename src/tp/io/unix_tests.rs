@@ -30,6 +30,45 @@ fn unix_stream_echo() {
     result.expect("unix echo timed out");
 }
 
+/// `TransmitPackets` and `TransmitFile` on AF_UNIX; measured to work.
+#[test]
+fn unix_transmit_packets_and_file() {
+    use crate::tp::{TransmitFlags, TransmitPackets};
+    let rt = Runtime::new();
+    let path = temp_path("tx");
+    let file_path = std::env::temp_dir().join(format!("tp_unix_tx_{}.txt", std::process::id()));
+    std::fs::write(&file_path, b"file!").unwrap();
+    let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+        let listener = UnixListener::bind(&rt, &path, None).unwrap();
+        let server = rt.spawn(async move {
+            let s = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            while got.len() < 10 {
+                let (n, b) = s.read(vec![0u8; 16]).await;
+                let n = n.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&b[..n]);
+            }
+            got
+        });
+        let client = UnixStream::connect(&rt, &path).await.unwrap();
+        let n = client
+            .transmit_packets(TransmitPackets::new().bytes(b"pkts!".to_vec()), TransmitFlags::default())
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        let file = crate::tp::File::open(&rt, &file_path.to_string_lossy()).unwrap();
+        let n = client.transmit_file(&file, 0, 0, TransmitFlags::default()).await.unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(server.await.unwrap(), b"pkts!file!");
+    }));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&file_path);
+    result.expect("timed out");
+}
+
 fn temp_path(tag: &str) -> String {
     let path = std::env::temp_dir()
         .join(format!("tp_unix_{tag}_{}.sock", std::process::id()))

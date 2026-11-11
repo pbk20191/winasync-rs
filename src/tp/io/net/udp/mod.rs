@@ -52,6 +52,19 @@ pub struct UdpSocket {
 }
 
 impl UdpSocket {
+    /// Sends a sequence of in-memory buffers and/or file ranges as one
+    /// `TransmitPackets` call -- a single-syscall scatter of mixed memory and
+    /// file sources, transmitted in insertion order. Resolves to the total
+    /// number of bytes sent -- one datagram. See [`TransmitPackets`](crate::tp::TransmitPackets)
+    /// for building the sequence.
+    pub fn transmit_packets(
+        &self,
+        packets: crate::tp::TransmitPackets,
+        flags: crate::tp::TransmitFlags,
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+        crate::tp::io::net::transmit::transmit_packets(&self.res, packets, flags)
+    }
+
     /// Sends a Winsock control code (`WSAIoctl`, overlapped) with `input`,
     /// filling `output`; resolves to the bytes written into `output`, with
     /// both buffers handed back.

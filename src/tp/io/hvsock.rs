@@ -65,6 +65,35 @@ pub struct HvStream {
 }
 
 impl HvStream {
+    /// Sends (part of) an open overlapped `file`'s contents over the socket
+    /// using the kernel's `TransmitFile` -- a zero-copy path straight from
+    /// the file-system cache, without staging the bytes through user space.
+    ///
+    /// `offset` is the starting position in the file; `count == 0` sends from
+    /// `offset` to end of file. Resolves to the number of bytes transmitted.
+    pub fn transmit_file(
+        &self,
+        file: &crate::tp::File,
+        offset: u64,
+        count: u32,
+        flags: crate::tp::TransmitFlags,
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+        crate::tp::io::net::transmit::transmit_file(&self.res, file, offset, count, flags)
+    }
+
+    /// Sends a sequence of in-memory buffers and/or file ranges as one
+    /// `TransmitPackets` call -- a single-syscall scatter of mixed memory and
+    /// file sources, transmitted in insertion order. Resolves to the total
+    /// number of bytes sent. See [`TransmitPackets`](crate::tp::TransmitPackets)
+    /// for building the sequence.
+    pub fn transmit_packets(
+        &self,
+        packets: crate::tp::TransmitPackets,
+        flags: crate::tp::TransmitFlags,
+    ) -> impl Future<Output = windows_core::Result<usize>> + Send + use<> {
+        crate::tp::io::net::transmit::transmit_packets(&self.res, packets, flags)
+    }
+
     /// Sends a Winsock control code (`WSAIoctl`, overlapped) with `input`,
     /// filling `output`; resolves to the bytes written into `output`, with
     /// both buffers handed back.

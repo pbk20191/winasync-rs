@@ -1137,6 +1137,23 @@ Pillar 3 기준으로 거른 유일한 gap — WinRT에는 HTTP 서버가 없다
 - 테스트: Rust에서 WinRT 인터페이스로 왕복(POST + 본문 + 응답), 취소/닫기. 소비자(Python/Node/C#) 스크립트는
   그대로이고 CI의 프로젝션 생성이 새 타입을 받는지 본다.
 
+### TransmitFile / TransmitPackets를 모든 소켓 종류로 (2026-11-11)
+
+프로브로 측정(이 호스트, 각 종류의 연결된 소켓 쌍):
+
+| | TCP | UDP(connected) | AF_UNIX | AF_HYPERV |
+|---|---|---|---|---|
+| `WSAID_TRANSMITFILE` | ✓ | 포인터는 주지만 호출이 **WSAENOTCONN** | ✓ | ✓ |
+| `WSAID_TRANSMITPACKETS` | ✓ | ✓ (원소 하나 = 데이터그램 하나) | ✓ | ✓ |
+
+- 네 종류 모두 같은 `mswsock` 함수 포인터를 돌려준다(제공자 위의 공통 층).
+- `TransmitFile`은 연결 지향 소켓만: UDP는 `connect` 해도 거부.
+- AF_UNIX에서 **동기** `TransmitFile`은 상대가 읽을 때까지 돌아오지 않았다(TCP는 버퍼링, AF_UNIX는 건네주기).
+  첫 프로브가 한 스레드에서 보내고 받다가 멈춘 게 그 증거. overlapped로는 "소비될 때까지 pending"일 뿐.
+
+그래서 `tcp.rs`에 있던 두 메서드를 `net/transmit.rs`의 공용 함수로 올리고, `UnixStream`·`HvStream`에
+`transmit_file`/`transmit_packets`, `UdpSocket`에 `transmit_packets`를 붙였다. 빌더 `TransmitPackets`는 그대로.
+
 ### `*_unchecked`의 이벤트는 호출자의 것 (2026-11-11)
 
 `evented()`는 작업마다 `CreateEventW`/`CloseHandle`(시스템콜 2회 + 커널 객체)을 하고 있었다. 이벤트 자체는 없앨 수
