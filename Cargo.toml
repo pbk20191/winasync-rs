@@ -47,6 +47,10 @@ required-features = ["dq"]
 name = "dq_named_pipe"
 required-features = ["tp", "comio", "dq"]
 
+[[example]]
+name = "three_engines"
+required-features = ["tp", "rio", "ioring"]
+
 [dependencies]
 windows-core = "0.62.2"
 
