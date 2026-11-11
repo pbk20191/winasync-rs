@@ -4,6 +4,8 @@ use super::*;
 
 /// With the completion port skipped on both ends, an echo still round
 /// trips, and the counter shows the completions were finished inline.
+/// The server side gets the mode from the listener: the accepted stream
+/// inherits it, so the stream is never told.
 #[test]
 fn named_pipe_echo_skipping_the_port() {
     let rt = Runtime::new();
@@ -13,8 +15,8 @@ fn named_pipe_echo_skipping_the_port() {
     let sname = name.clone();
     let server = std::thread::spawn(move || {
         let listener = NamedPipeListener::bind(&rt2, &sname, &NamedPipeOptions::new()).unwrap();
+        listener.set_skip_completion_on_success().unwrap();
         let s = block_on(listener.accept()).unwrap();
-        s.set_skip_completion_on_success().unwrap();
         for _ in 0..100 {
             let (n, b) = block_on(s.read(vec![0u8; 16]));
             let n = n.unwrap();
@@ -31,7 +33,9 @@ fn named_pipe_echo_skipping_the_port() {
     }
     server.join().unwrap();
     let inline = crate::common::overlapped::INLINE_COMPLETIONS.load(std::sync::atomic::Ordering::Relaxed) - before;
-    assert!(inline > 0, "no completion was finished inline");
+    // Both ends inline most of 200 ops each; the client alone could not
+    // reach this, so the server's inherited mode was in effect.
+    assert!(inline > 200, "only {inline} completions were finished inline");
 }
 
 #[test]

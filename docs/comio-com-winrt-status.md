@@ -1456,6 +1456,15 @@ poll/cancel 경주. 나머지는 객체당 설정(`ListenerState` 6개 등)이�
 끝나는 연결에서 한 스택에 중첩된다(문서에 적음). 리스너의 accept 핸들은 따로 등록되어 그대로 포트를 타므로 accept
 체인의 비재진입 보장은 그대로다. 모드 설정은 best-effort라 거부하는 핸들은 종전 경로.
 
+tp 쪽은 스트림(`TcpStream`/`UdpSocket`/`File`에 이어 `UnixStream`/`NamedPipeStream`)에 더해 리스너 넷에도
+`set_skip_completion_on_success`를 뒀다. 소켓 리스너(`TcpListener`/`UnixListener`/`HvListener`)는 자기 핸들의 모드라
+백로그에 연결이 이미 있는 accept(`AcceptEx` 동기 성공)가 풀 홉 없이 끝난다 — accept당 홉 하나라 이득은 작다.
+`NamedPipeListener`는 핸들이 없고 accept마다 새 인스턴스를 만들므로 설정값으로 들고 있다가 `ConnectNamedPipe` 전에
+인스턴스에 적용한다. accept 자체는 얻는 게 없다(`ConnectNamedPipe`는 동기 성공이 없고 `ERROR_PIPE_CONNECTED`는
+이미 인라인). 받은 스트림이 모드를 물려받아 스트림마다 켤 필요가 없어지는 것이 전부다. RIO 소켓에는 의미가 없다:
+RIO op는 IRP/IOCP를 타지 않아 `SetFileCompletionNotificationModes`가 건드리는 경로에 없다. comio 리스너는 accept
+체인의 비재진입을 위해 일부러 포트에 남긴다.
+
 **후속 (Shafir, "One Year to I/O Ring", 커널 리버싱)**
 
 - 완료 이벤트는 `IopCompleteIoRingEntry`가 `(newTail - Head) % size == 1`일 때만 `KeSetEvent`한다 — 엣지 트리거의

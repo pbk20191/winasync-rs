@@ -49,12 +49,18 @@ fn main() -> windows_core::Result<()> {
     let sock_path = sock_path.to_string_lossy().into_owned();
     let _ = std::fs::remove_file(&sock_path);
     let control = tp::UnixListener::bind(&rt, &sock_path, None)?;
+    // The tp handles all finish a synchronous success on the issuing
+    // thread; the listener too, for an accept the backlog can satisfy.
+    control.set_skip_completion_on_success()?;
 
     // rio: the data plane. One completion queue pumped from tp's pool,
     // one registered slab, one UDP socket.
     let cq = RioCq::new(&rt, 256)?;
     let pool = RioBufferPool::new(CHUNK, 16)?;
     let udp = RioUdpSocket::bind(&cq, localhost(0), RqConfig::default())?;
+    // No skip-completion mode here: RIO operations never take the IRP /
+    // completion-port path that the mode shortens, so it has nothing to
+    // apply to. The socket is already as direct as it gets.
 
     // ioring: one ring, pumped from tp's pool, owned by this thread.
     let ring = IoRing::with_runtime(&rt, 32)?;
@@ -67,7 +73,9 @@ fn main() -> windows_core::Result<()> {
         let sock_path = sock_path.clone();
         async move {
             let control = tp::UnixStream::connect(&rt, &sock_path).await?;
+            control.set_skip_completion_on_success()?;
             let data = tp::UdpSocket::bind(&rt, localhost(0), &tp::SocketOptions::new())?;
+            data.set_skip_completion_on_success()?;
             let port = data.local_addr()?.port();
             let mut total = 0usize;
             for i in 0..8u64 {
@@ -92,6 +100,7 @@ fn main() -> windows_core::Result<()> {
     // slice as a datagram.
     let served = block_on(async {
         let control = control.accept().await?;
+        control.set_skip_completion_on_success()?;
         let mut served = 0usize;
         loop {
             let (n, line) = control.read(vec![0u8; 64]).await;

@@ -89,6 +89,17 @@ impl TcpListener {
         addr_of_socket(self.res.socket())
     }
 
+    /// Finishes an accept the kernel completes synchronously on the issuing
+    /// thread, skipping the completion port and its pool thread; see
+    /// [`TcpStream::set_skip_completion_on_success`]. That is an accept
+    /// issued while the backlog already holds a connection -- a busy
+    /// listener's common case -- and what it saves is one pool hop per
+    /// accept, small next to the socket the accept creates. The mode is the
+    /// listening socket's; accepted streams set their own.
+    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
+        self.res.set_skip_completion_on_success()
+    }
+
     /// Accepts one connection.
     pub async fn accept(&self) -> windows_core::Result<TcpStream> {
         let accept_sock =

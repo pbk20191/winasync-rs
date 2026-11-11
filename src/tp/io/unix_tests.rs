@@ -2,8 +2,9 @@ use super::super::super::{block_on, timeout, Runtime};
 use super::*;
 use std::time::Duration;
 
-/// With the completion port skipped on both ends, an echo still round
-/// trips: the mode applies to AF_UNIX as to any kernel-provider socket.
+/// With the completion port skipped on both ends, and on the listener, an
+/// echo still round trips: the mode applies to AF_UNIX as to any
+/// kernel-provider socket.
 #[test]
 fn unix_stream_echo_skipping_the_port() {
     let rt = Runtime::new();
@@ -14,6 +15,7 @@ fn unix_stream_echo_skipping_the_port() {
     let _ = std::fs::remove_file(&path);
     let result = block_on(timeout(&rt, Duration::from_secs(10), async {
         let listener = UnixListener::bind(&rt, &path, None).unwrap();
+        listener.set_skip_completion_on_success().unwrap();
         let server = rt.spawn(async move {
             let s = listener.accept().await.unwrap();
             s.set_skip_completion_on_success().unwrap();

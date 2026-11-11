@@ -437,6 +437,14 @@ impl UnixListener {
         })
     }
 
+    /// Finishes an accept the kernel completes synchronously on the issuing
+    /// thread, skipping the completion port and its pool thread; see
+    /// [`TcpListener::set_skip_completion_on_success`](crate::tp::TcpListener::set_skip_completion_on_success).
+    /// The mode is the listening socket's; accepted streams set their own.
+    pub fn set_skip_completion_on_success(&self) -> windows_core::Result<()> {
+        self.res.set_skip_completion_on_success()
+    }
+
     /// Accepts one connection.
     pub async fn accept(&self) -> windows_core::Result<UnixStream> {
         let accept_sock = unix_socket()?;

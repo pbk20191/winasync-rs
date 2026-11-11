@@ -462,6 +462,11 @@ use crate::tp::{FileRange, TransmitSequence};
             )
             .unwrap();
             let addr = listener.local_addr().unwrap();
+            // The listener too: with the client connected before the accept
+            // is issued, AcceptEx completes synchronously and is finished
+            // inline as well.
+            listener.set_skip_completion_on_success().unwrap();
+            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             let server = rt.spawn(async move {
                 let stream = listener.accept().await.unwrap();
                 stream.set_skip_completion_on_success().unwrap();
@@ -481,7 +486,6 @@ use crate::tp::{FileRange, TransmitSequence};
                 echoed
             });
 
-            let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
             client.set_skip_completion_on_success().unwrap();
             for i in 0..16u8 {
                 let msg = vec![i; 8];
