@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{RIO_BUF, RIO_BUFFERID};
 
+use super::cq::Request;
 use super::rq::RIO_INVALID_BUFFERID;
 use super::table::rio_table;
 use crate::common::buffer::{IoBuf, IoBufMut, SlabBuf, SlabPool};
@@ -41,6 +42,11 @@ use crate::common::buffer::{IoBuf, IoBufMut, SlabBuf, SlabPool};
 pub struct RioBufferPool {
     slab: Arc<SlabPool>,
     id: RIO_BUFFERID,
+    /// One operation's state per slice, made with the pool. A slice is in
+    /// at most one operation at a time, so slot `i` is the state of
+    /// whatever operation slice `i` is in — and an operation allocates
+    /// nothing.
+    slots: Box<[Request]>,
 }
 
 impl RioBufferPool {
@@ -56,7 +62,14 @@ impl RioBufferPool {
         if id == RIO_INVALID_BUFFERID {
             return Err(crate::common::winsock::wsa_last_err());
         }
-        Ok(Arc::new(Self { slab, id }))
+        let slots = (0..slice_count).map(|_| Request::empty()).collect();
+        Ok(Arc::new(Self { slab, id, slots }))
+    }
+
+    /// The operation slot of `slice` — `slice` must be of this pool.
+    pub(crate) fn slot(&self, slice: &RioSlice) -> &Request {
+        debug_assert!(core::ptr::eq(&*slice.pool, self));
+        &self.slots[slice.buf.index() as usize]
     }
 
     /// Takes a slice, or `None` when every slice is out.
@@ -115,6 +128,11 @@ impl RioSlice {
     /// Restores the slice to its full size, for reuse as a receive buffer.
     pub fn reset_len(&mut self) {
         self.buf.reset_len();
+    }
+
+    /// The pool this slice is of.
+    pub(crate) fn pool(&self) -> &Arc<RioBufferPool> {
+        &self.pool
     }
 }
 

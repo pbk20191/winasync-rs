@@ -192,6 +192,70 @@ fn default_pool_pump_drives_a_roundtrip() {
     drop(cq);
 }
 
+/// Waits for every slice of `pool` to be back, which only a dispatched
+/// completion can bring about.
+fn wait_all_back(pool: &RioBufferPool, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while pool.available() != count {
+        assert!(std::time::Instant::now() < deadline, "{} of {count} slices back", pool.available());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A future dropped before its completion, and one dropped after it but
+/// never polled: both leave the slot to be emptied by whichever side comes
+/// last, and the slice — the only one in the pool — is good for another
+/// round trip after each.
+#[test]
+fn dropped_futures_return_their_slices_and_free_their_slots() {
+    use super::super::cq::RioCq;
+    let cq = RioCq::with_default_pool(64).expect("default-pool cq");
+    let pool = RioBufferPool::new(512, 1).expect("pool");
+    let tx_pool = RioBufferPool::new(512, 1).expect("send pool");
+    let rq = RqConfig {
+        max_outstanding_recv: 8,
+        max_outstanding_send: 8,
+    };
+    let client = RioUdpSocket::bind(&cq, v4(), rq).expect("client");
+
+    // Dropped before any datagram: the completion comes from closesocket.
+    let server = RioUdpSocket::bind(&cq, v4(), rq).expect("server");
+    let rx = server.recv(pool.acquire().unwrap()).expect("post recv");
+    drop(rx);
+    assert_eq!(pool.available(), 0, "the slot keeps the slice for the kernel");
+    drop(server);
+    wait_all_back(&pool, 1);
+
+    // Dropped after the completion landed, without ever being polled.
+    let server = RioUdpSocket::bind(&cq, v4(), rq).expect("server");
+    client.connect(server.local_addr().unwrap()).unwrap();
+    let rx = server.recv(pool.acquire().unwrap()).expect("post recv");
+    let mut out = tx_pool.acquire().unwrap();
+    out.set_len(3);
+    let (sent, _) = block_on(client.send(out).expect("post send"));
+    assert_eq!(sent.unwrap(), 3);
+    // The receive completes with the send's datagram, moments later.
+    // Nothing observable from outside says when it is in; the drop below
+    // is correct whether it is or not, and the sleep just makes "after"
+    // the likely case.
+    std::thread::sleep(Duration::from_millis(50));
+    drop(rx);
+    wait_all_back(&pool, 1);
+
+    // The same slot, used again, resolves normally.
+    let rx = server.recv(pool.acquire().unwrap()).expect("post recv");
+    let mut out = tx_pool.acquire().unwrap();
+    out[..2].copy_from_slice(b"ok");
+    out.set_len(2);
+    let (sent, _) = block_on(client.send(out).expect("post send"));
+    assert_eq!(sent.unwrap(), 2);
+    let (n, slice) = block_on(rx);
+    assert_eq!(&slice[..n.unwrap()], b"ok");
+    drop(slice);
+    assert_eq!(pool.available(), 1);
+    assert!(cq.pump_error().is_none(), "pump died: {:?}", cq.pump_error());
+}
+
 /// A polling queue with notification-free posts: no event, no TP_WAIT,
 /// no IOCP — the caller drains when it chooses. This is the shape of a
 /// hybrid loop's hot path.

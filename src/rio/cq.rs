@@ -31,7 +31,7 @@
 //! reads as four billion results.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 // Only `PUMP_RELEASES` needs it, and it is gated on its readers.
 #[cfg(any(test, feature = "counters"))]
 use std::sync::atomic::AtomicUsize;
@@ -65,27 +65,50 @@ const DRAIN_BATCH: usize = 128;
 /// One in-flight operation's state, reached from the completion's
 /// `RequestContext` on one side and polled by its future on the other.
 ///
-/// One allocation per operation, shared by both sides through an `Arc`:
-/// the `RequestContext` is one reference and the future the other. The
-/// hand-off between them is lock-free -- the completer fills the cells,
-/// publishes `done`, and wakes; the poller registers, then checks `done`
-/// -- the same shape as a oneshot channel, inlined so an operation costs
-/// no second allocation and no mutex.
+/// No allocation per operation. A slice is in at most one operation at a
+/// time, so its [`RioBufferPool`](super::buffer::RioBufferPool) keeps one
+/// of these per slice, made with the pool, and the operation on slice `i`
+/// is slot `i`: the `RequestContext` is the slot's address. The hand-off
+/// between the two sides is lock-free -- the completer fills the cells,
+/// publishes `DONE`, and wakes; the poller registers, then checks for
+/// `DONE` -- the same shape as a oneshot channel, inlined so an operation
+/// costs no mutex either.
 ///
-/// It owns the [`RioSlice`] for the operation's whole life. That is not a
-/// convenience: RIO cannot cancel, and completions still arrive after
-/// `closesocket`, so the buffer has to stay registered until the result
-/// actually appears in the queue. A future dropped early just drops its
-/// reference; the completion still lands, still fills the cells, and the
-/// last reference frees the buffer back to its pool.
+/// The slot owns the [`RioSlice`] for the operation's whole life. That is
+/// not a convenience: RIO cannot cancel, and completions still arrive
+/// after `closesocket`, so the buffer has to stay registered until the
+/// result actually appears in the queue. A future dropped early leaves
+/// `FUTURE_GONE`; the completion still lands, still fills the cells, and
+/// then empties the slot itself, which frees the buffer back to its pool.
+///
+/// # Reuse
+///
+/// The slot is reused the moment its slice is: the future hands the slice
+/// out with the outcome, and the caller may post it again at once, while
+/// the completer that published `DONE` is still inside its wake. So the
+/// completer's last touch of the slot is the one `swap` that publishes;
+/// after it the completer touches only the waker, which the next
+/// operation's `arm` does not reset and which is its own synchronization,
+/// and it does so holding an `Arc` of the pool so the slot is at least
+/// still memory. A completer with the pool's last reference does not keep
+/// the slot alive, and so could be the one to drop it, but drops it
+/// only after returning from the slot's methods.
 pub(crate) struct Request {
-    /// Published by the completer, with `Release`, after the cells are
-    /// written; read by the poller with `Acquire` before it touches them.
-    done: AtomicBool,
+    /// `IDLE` until [`arm`](Self::arm); then `ARMED` while both sides are
+    /// live, `DONE` once the completer has published, or `FUTURE_GONE`
+    /// once the future dropped unresolved. Whichever side moves it out of
+    /// `ARMED` second owns the cells.
+    state: AtomicU8,
     waker: crate::common::atomic_waker::AtomicWaker,
-    /// Owned by the completer until `done`, by the poller after.
+    /// Owned by the completer until `DONE`, by the poller after; by the
+    /// completer alone once `FUTURE_GONE`.
     cells: UnsafeCell<Cells>,
 }
+
+const IDLE: u8 = 0;
+const ARMED: u8 = 1;
+const DONE: u8 = 2;
+const FUTURE_GONE: u8 = 3;
 
 struct Cells {
     /// The data buffer, handed back with the outcome.
@@ -100,47 +123,140 @@ struct Cells {
 /// addressed operation, the peer; and the buffer back.
 pub(crate) type Outcome = (windows_core::Result<(usize, Option<SocketAddr>)>, RioSlice);
 
-// SAFETY: the cells are reached by exactly one side at a time, which `done`
-// decides; the slices inside are `Send`.
+// SAFETY: the cells are reached by exactly one side at a time, which
+// `state` decides; the slices inside are `Send`.
 unsafe impl Send for Request {}
 unsafe impl Sync for Request {}
 
 impl Request {
-    /// A request owning `slice`, and `addr` for an addressed operation.
-    pub(crate) fn new(slice: RioSlice, addr: Option<RioSlice>) -> Arc<Request> {
-        Arc::new(Request {
-            done: AtomicBool::new(false),
-            waker: Default::default(),
+    /// An idle slot, for the pool to make once per slice.
+    pub(crate) const fn empty() -> Request {
+        Request {
+            state: AtomicU8::new(IDLE),
+            waker: crate::common::atomic_waker::AtomicWaker::new(),
             cells: UnsafeCell::new(Cells {
-                slice: Some(slice),
-                addr,
+                slice: None,
+                addr: None,
                 outcome: None,
             }),
-        })
+        }
     }
 
-    /// The `RequestContext` for RIO to carry: a reference of its own.
-    pub(crate) fn into_context(this: &Arc<Request>) -> *const core::ffi::c_void {
-        Arc::into_raw(this.clone()) as *const core::ffi::c_void
+    /// Starts an operation on this slot: it takes `slice` — which must be
+    /// the slice this is the slot of — and `addr` for an addressed
+    /// operation.
+    ///
+    /// Sound without a lock because `slice` was acquired from the pool by
+    /// the caller, so no operation is on this slot and nobody else reaches
+    /// its cells. (A previous operation's completer may still be in its
+    /// wake, which touches only the waker.)
+    pub(crate) fn arm(&self, slice: RioSlice, addr: Option<RioSlice>) {
+        debug_assert_eq!(self.state.load(Ordering::Relaxed), IDLE, "a slot in use");
+        // SAFETY: as above — an idle slot's cells are reached by nobody.
+        let cells = unsafe { &mut *self.cells.get() };
+        cells.slice = Some(slice);
+        cells.addr = addr;
+        cells.outcome = None;
+        self.state.store(ARMED, Ordering::Release);
     }
 
-    /// Takes back the reference a `RequestContext` carries: once per
-    /// `into_context`, when the completion arrives or the post was refused.
+    /// The `RequestContext` for RIO to carry: this slot's address, which is
+    /// stable because the pool holds its slots in one fixed table.
+    pub(crate) fn context(&self) -> *const core::ffi::c_void {
+        self as *const Request as *const core::ffi::c_void
+    }
+
+    /// The slot a completion's `RequestContext` names, or `None` for a null
+    /// one.
     ///
     /// # Safety
-    /// `ctx` came from [`into_context`](Self::into_context) and has not
-    /// been reclaimed before.
-    pub(crate) unsafe fn from_context(ctx: *const core::ffi::c_void) -> Option<Arc<Request>> {
+    /// `ctx` came from [`context`](Self::context) and the operation has
+    /// not completed: the slot is then alive, since the slice it holds
+    /// keeps its pool.
+    pub(crate) unsafe fn from_context(ctx: *const core::ffi::c_void) -> Option<*const Request> {
         if ctx.is_null() {
             return None;
         }
-        Some(unsafe { Arc::from_raw(ctx as *const Request) })
+        Some(ctx as *const Request)
+    }
+
+    /// Undoes [`arm`](Self::arm) for a post RIO refused: no completion is
+    /// coming and no future was built, so the buffers go straight back to
+    /// the pool.
+    pub(crate) fn disarm(&self) {
+        debug_assert_eq!(self.state.load(Ordering::Relaxed), ARMED);
+        self.state.store(IDLE, Ordering::Relaxed);
+        // SAFETY: as for `arm` — nobody else reaches the cells.
+        let cells = unsafe { &mut *self.cells.get() };
+        drop((cells.slice.take(), cells.addr.take(), cells.outcome.take()));
+    }
+
+    /// The future's drop, unresolved: leaves the slot to the completer, or
+    /// empties it if the completion already landed.
+    ///
+    /// # Safety
+    /// Once, by the future, which has not taken the outcome. The slot may
+    /// be gone when this returns — the slice it dropped may have been the
+    /// pool's last holder — so the caller touches it no more.
+    pub(crate) unsafe fn abandon(this: *const Request) {
+        // SAFETY: the future's side is live, so the slice is in the slot
+        // or in its outcome, and the pool with it.
+        let state = unsafe { &(*this).state };
+        if state.swap(FUTURE_GONE, Ordering::AcqRel) != DONE {
+            // The completer will find FUTURE_GONE and empty the slot.
+            return;
+        }
+        // The completer published and is done with the cells; they are
+        // ours to empty. IDLE first: the drop may free the pool.
+        state.store(IDLE, Ordering::Relaxed);
+        // SAFETY: as above.
+        let taken = unsafe {
+            let cells = &mut *(*this).cells.get();
+            (cells.slice.take(), cells.addr.take(), cells.outcome.take())
+        };
+        drop(taken);
     }
 
     /// The completion: records the outcome, releases the address slot, and
-    /// wakes the future. Runs once, on whichever thread drains the queue.
-    fn complete(&self, status: i32, bytes: u32) {
-        // SAFETY: before `done`, the cells are the completer's alone.
+    /// wakes the future — or, if the future is gone, empties the slot.
+    /// Runs once, on whichever thread drains the queue.
+    ///
+    /// # Safety
+    /// Once per armed operation, with the completion the kernel reported
+    /// for it. The slot may be gone when this returns, as for
+    /// [`abandon`](Self::abandon).
+    unsafe fn complete(this: *const Request, status: i32, bytes: u32) {
+        // SAFETY: the operation has not completed, so the slot holds its
+        // slice and the pool is alive. This clone keeps it so through the
+        // wake below, which may outlast the future's interest in the slot.
+        let pool = unsafe {
+            let cells = &*(*this).cells.get();
+            cells.slice.as_ref().expect("a request completes once").pool().clone()
+        };
+        // SAFETY: before `DONE`, the cells are the completer's alone.
+        let slot = unsafe { &*this };
+        slot.fill(status, bytes);
+        if slot.state.swap(DONE, Ordering::AcqRel) == FUTURE_GONE {
+            // Nobody will take the outcome: the slot is ours to empty, and
+            // this may be the slice's — and the pool's — end.
+            slot.state.store(IDLE, Ordering::Relaxed);
+            // SAFETY: as above.
+            let taken = unsafe {
+                let cells = &mut *(*this).cells.get();
+                (cells.slice.take(), cells.addr.take(), cells.outcome.take())
+            };
+            drop(taken);
+        } else {
+            // From here the slot may be reused under us; the waker is the
+            // only thing touched, and `pool` keeps it memory.
+            slot.waker.wake();
+        }
+        drop(pool);
+    }
+
+    /// Writes the outcome into the cells and releases the address slot.
+    fn fill(&self, status: i32, bytes: u32) {
+        // SAFETY: before `DONE`, the cells are the completer's alone.
         let cells = unsafe { &mut *self.cells.get() };
         let slice = cells.slice.take().expect("a request completes once");
         let addr = cells.addr.take();
@@ -167,24 +283,26 @@ impl Request {
                 None => Ok((bytes as usize, None)),
             }
         };
-        // The slot returns to its pool on the way out.
+        // The address slice returns to its pool on the way out.
         drop(addr);
         cells.outcome = Some((result, slice));
-        self.done.store(true, Ordering::Release);
-        self.waker.wake();
     }
 
     /// The outcome, once it has landed; `Pending` registers `cx`'s waker.
+    /// `Ready` leaves the slot idle: with the outcome goes the slice, and
+    /// with the slice the right to arm the slot again.
     pub(crate) fn poll(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Outcome> {
         // Register first, then look: a completion between the two wakes
         // the waker just registered rather than nobody.
         self.waker.register(cx.waker());
-        if !self.done.load(Ordering::Acquire) {
+        if self.state.load(Ordering::Acquire) != DONE {
             return std::task::Poll::Pending;
         }
-        // SAFETY: after `done`, the cells are the poller's alone.
+        // SAFETY: after `DONE`, the cells are the poller's alone.
         let cells = unsafe { &mut *self.cells.get() };
-        std::task::Poll::Ready(cells.outcome.take().expect("a request's outcome is taken once"))
+        let outcome = cells.outcome.take().expect("a request's outcome is taken once");
+        self.state.store(IDLE, Ordering::Relaxed);
+        std::task::Poll::Ready(outcome)
     }
 }
 
@@ -579,9 +697,9 @@ impl RioCq {
     pub fn drain(&self) -> Option<usize> {
         if self.state.is_self_pumping() {
             // Not a debug_assert: in release this would put two threads in
-            // RIODequeueCompletion on an unsynchronized queue, hand the same
-            // RequestContext to Box::from_raw twice, and double-free a
-            // Request along with the RioSlice it holds. Refuse instead.
+            // RIODequeueCompletion on an unsynchronized queue, complete and
+            // release the same RequestContext twice, and free a slot's
+            // RioSlice under a live operation. Refuse instead.
             return Some(0);
         }
         drain(&self.state)
@@ -686,11 +804,11 @@ fn create_cq(
 /// Sockets hold an `Arc<RioCq>`, so they close first and this runs moments
 /// later — while the `WSAECONNABORTED` completions their `closesocket` just
 /// produced are still arriving. Throwing the queue away without dequeuing
-/// them leaks every outstanding `Request`: its `RioSlice`, and through that
-/// the `Arc<RioBufferPool>`, so `RIODeregisterBuffer` never runs and the
-/// slab stays page-locked for the life of the process. The waiting
-/// `oneshot::Sender`s would never drop either, leaving any still-held
-/// receiver pending forever instead of resolving.
+/// them leaves every outstanding `Request` slot armed: its `RioSlice`, and
+/// through that the `Arc<RioBufferPool>`, never drop, so
+/// `RIODeregisterBuffer` never runs and the slab stays page-locked for the
+/// life of the process. Their futures would never wake either, leaving any
+/// still-held one pending forever instead of resolving.
 ///
 /// Bounded: the kernel queues those completions promptly, and a teardown is
 /// not a place to wait indefinitely for a peer.
@@ -776,9 +894,10 @@ fn drain(state: &CqState) -> Option<usize> {
             if let Some(req) = unsafe { Request::from_context(r.RequestContext as *const _) } {
                 // Hand the buffer on with the result: now, and only now, is
                 // the kernel provably finished with it. The wake inside may
-                // run arbitrary code; the queue's reference drops after.
+                // run arbitrary code, hence the unwind guard.
                 let (status, bytes) = (r.Status, r.BytesTransferred);
-                let _ = catch_unwind(AssertUnwindSafe(|| req.complete(status, bytes)));
+                // SAFETY: once, for the operation the kernel just reported.
+                let _ = catch_unwind(AssertUnwindSafe(|| unsafe { Request::complete(req, status, bytes) }));
             }
         }
         total += n as usize;

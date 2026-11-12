@@ -3,9 +3,9 @@
 //!
 //! A request queue is where operations are posted; the completion queue is
 //! where their results land. Both sockets need exactly the same plumbing
-//! around a post — build a `Request` that owns the buffer, hand its pointer to
-//! RIO as the request context, and reclaim it if the call is rejected — so
-//! that lives here once rather than per socket type.
+//! around a post — arm the buffer's `Request` slot, hand its address to RIO
+//! as the request context, and disarm it if the call is rejected — so that
+//! lives here once rather than per socket type.
 //!
 //! The sentinels below are from `mswsockdef.h`. `windows` binds RIO's types
 //! and function pointers but not these macros, so they are declared here, in
@@ -18,7 +18,7 @@ use windows::Win32::Networking::WinSock::{
 };
 
 use super::buffer::RioSlice;
-use super::cq::{Request, RioCq};
+use super::cq::{Outcome, Request, RioCq};
 use super::table::rio_table;
 use crate::common::winsock::{wsa_init, wsa_last_err};
 use std::net::SocketAddr;
@@ -157,11 +157,11 @@ impl RequestQueue {
         let table = rio_table()?;
         let buf = slice.rio_buf();
 
-        // The request owns the buffer until the completion carries it
-        // back — the only way to satisfy RIO's "buffer outlives the op"
-        // rule when operations cannot be cancelled.
-        let req = Request::new(slice, None);
-        let ctx = Request::into_context(&req);
+        // The slot owns the buffer until the completion carries it back —
+        // the only way to satisfy RIO's "buffer outlives the op" rule when
+        // operations cannot be cancelled.
+        let slot = arm(slice, None);
+        let ctx = unsafe { (*slot).context() };
 
         let ok = unsafe {
             if is_send {
@@ -171,11 +171,13 @@ impl RequestQueue {
             }
         };
         if !ok.as_bool() {
-            return Err(reclaim(ctx));
+            return Err(reclaim(slot));
         }
-        Ok(std::future::poll_fn(move |cx| {
-            req.poll(cx).map(|(result, slice)| (result.map(|(n, _)| n), slice))
-        }))
+        let op = OpFuture { slot, resolved: false };
+        Ok(async move {
+            let (result, slice) = op.await;
+            (result.map(|(n, _)| n), slice)
+        })
     }
 
     /// Resizes the queue's outstanding-operation budget.
@@ -229,8 +231,8 @@ impl RequestQueue {
         let table = rio_table()?;
         let data_buf = slice.rio_buf();
         let addr_buf = addr.rio_buf();
-        let req = Request::new(slice, Some(addr));
-        let ctx = Request::into_context(&req);
+        let slot = arm(slice, Some(addr));
+        let ctx = unsafe { (*slot).context() };
         let (data_buf, addr_buf) = (&data_buf, &addr_buf);
 
         let ok = {
@@ -267,13 +269,13 @@ impl RequestQueue {
             }
         };
         if !ok {
-            return Err(reclaim(ctx));
+            return Err(reclaim(slot));
         }
-        Ok(std::future::poll_fn(move |cx| {
-            req.poll(cx).map(|(result, slice)| {
-                (result.map(|(n, peer)| (n, peer.expect("an addressed completion names its peer"))), slice)
-            })
-        }))
+        let op = OpFuture { slot, resolved: false };
+        Ok(async move {
+            let (result, slice) = op.await;
+            (result.map(|(n, peer)| (n, peer.expect("an addressed completion names its peer"))), slice)
+        })
     }
 
     /// Keeps the completion queue alive for as long as this socket lives.
@@ -282,11 +284,60 @@ impl RequestQueue {
     }
 }
 
-/// Reclaims a request RIO refused to queue: no completion is coming for it,
-/// so the queue's reference is dropped here, and with the caller's -- the
-/// future never built -- the buffer goes back to its pool.
-fn reclaim(ctx: *const core::ffi::c_void) -> windows_core::Error {
+/// Arms the slot of `slice` for an operation and names it. The slot is in
+/// `slice`'s pool, which the slice — now in the slot — keeps alive until
+/// the outcome is taken or the slot emptied, so the pointer is good for
+/// the operation's life.
+fn arm(slice: RioSlice, addr: Option<RioSlice>) -> *const Request {
+    let slot: *const Request = slice.pool().slot(&slice);
+    // SAFETY: the pool is alive — `slice` holds it — and the slot is idle,
+    // since the slice is this caller's.
+    unsafe { (*slot).arm(slice, addr) };
+    slot
+}
+
+/// Reclaims a request RIO refused to queue: no completion is coming for it
+/// and no future was built, so the slot is disarmed here and the buffers go
+/// back to their pool.
+fn reclaim(slot: *const Request) -> windows_core::Error {
     let err = wsa_last_err();
-    drop(unsafe { Request::from_context(ctx) });
+    // SAFETY: both references are this caller's; the slot is alive.
+    unsafe { (*slot).disarm() };
     err
+}
+
+/// The future's side of a slot.
+///
+/// Holds no `Arc` of its own: until the outcome is taken the slot holds
+/// the slice, and the slice the pool. Resolving hands the slice out and
+/// with it the slot, so a resolved future touches the slot no more; one
+/// dropped unresolved [`abandon`](Request::abandon)s it.
+struct OpFuture {
+    slot: *const Request,
+    resolved: bool,
+}
+
+// SAFETY: the slot is reached only through atomics on this side, and the
+// cells only after `DONE`, from one thread — the one polling.
+unsafe impl Send for OpFuture {}
+
+impl Future for OpFuture {
+    type Output = Outcome;
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Outcome> {
+        assert!(!self.resolved, "polled after completion");
+        // SAFETY: unresolved, so the slot holds the slice and is alive.
+        let outcome = std::task::ready!(unsafe { (*self.slot).poll(cx) });
+        self.resolved = true;
+        std::task::Poll::Ready(outcome)
+    }
+}
+
+impl Drop for OpFuture {
+    fn drop(&mut self) {
+        if !self.resolved {
+            // SAFETY: once, unresolved; the slot is alive for it.
+            unsafe { Request::abandon(self.slot) };
+        }
+    }
 }

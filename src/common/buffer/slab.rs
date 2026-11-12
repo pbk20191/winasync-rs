@@ -134,6 +134,13 @@ impl SlabBuf {
         self.index as usize * self.pool.slice_size
     }
 
+    /// Which slice of the pool this is, `0..slice_count` — stable for the
+    /// slice's life, so an engine can keep per-slice state in a table of
+    /// its own.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
     /// Narrows the slice to its first `len` bytes: how a send says how much
     /// is payload. Capped at the slice size.
     pub fn set_len(&mut self, len: usize) {
