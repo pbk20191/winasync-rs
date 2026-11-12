@@ -7,6 +7,16 @@
 //! `GetIids` that reports none, as a free function with no type parameter,
 //! so there was no way to supply the answer from outside the macro.
 //!
+//! A second change, `Export = prefix`, adds for each implemented interface
+//! an exported `extern "system" fn <prefix>_<Interface>_vtable() -> *const
+//! <Interface>_Vtbl` returning the class's vtable for it. A caller that
+//! links the crate statically and knows the class can call through that
+//! table instead of the one in the object; under full LTO the slot load
+//! folds before the inliner runs and the method inlines, which a call
+//! through the object's vtable never does (measured in `tools/lto-probe`).
+//! Under ThinLTO it is a direct call. The table is the same one the object
+//! carries, so `this` is the same interface pointer either way.
+//!
 //! Everything else is upstream's, and the generated code uses only
 //! `windows_core`'s public API, so it is a drop-in for
 //! `windows_core::implement` on the same `windows-core` version.
@@ -42,6 +52,23 @@ use r#gen::gen_all;
 /// let object: IValue = Value(123).into();
 /// // Call interface methods...
 /// ```
+///
+/// # `Export = prefix`
+/// ```rust,no_run
+/// # use windows_core::*;
+/// # #[interface("094d70d6-5202-44b8-abb8-43860da5aca2")]
+/// # unsafe trait IValue: IUnknown { fn GetValue(&self, value: *mut i32) -> HRESULT; }
+/// #[implement(IValue, Export = mylib_Value)]
+/// struct Value(i32);
+/// # impl IValue_Impl for Value_Impl {
+/// #     unsafe fn GetValue(&self, value: *mut i32) -> HRESULT { *value = self.0; HRESULT(0) }
+/// # }
+/// // Generated, with the symbol name `mylib_Value_IValue_vtable`:
+/// // pub extern "system" fn mylib_Value_IValue_vtable() -> *const IValue_Vtbl
+/// ```
+/// One function per interface in the list, named `<prefix>_<Interface>_vtable`
+/// (a generic interface's arguments join the name: `IIterable_HSTRING`).
+/// Not available on generic types, which have no single vtable to export.
 #[proc_macro_attribute]
 pub fn implement(
     attributes: proc_macro::TokenStream,
@@ -57,6 +84,16 @@ fn implement_core(
     let attributes = syn::parse2::<ImplementAttributes>(attributes).unwrap();
     let original_type = syn::parse2::<syn::ItemStruct>(item_tokens).unwrap();
 
+    if let Some(export) = &attributes.export {
+        if !original_type.generics.params.is_empty() {
+            return syn::Error::new(
+                export.span(),
+                "`Export` is not available on a generic type: it has no single vtable to export",
+            )
+            .to_compile_error();
+        }
+    }
+
     // Do a little thinking and assemble ImplementInputs.  We pass ImplementInputs to
     // all of our gen_* function.
     let inputs = ImplementInputs {
@@ -64,6 +101,7 @@ fn implement_core(
         interface_chains: convert_implements_to_interface_chains(attributes.implement),
         trust_level: attributes.trust_level,
         agile: attributes.agile,
+        export: attributes.export,
         impl_ident: quote::format_ident!("{}_Impl", &original_type.ident),
         constraints: {
             if let Some(where_clause) = &original_type.generics.where_clause {
@@ -108,6 +146,10 @@ struct ImplementInputs {
 
     /// Determines whether `IAgileObject` and `IMarshal` are implemented automatically.
     agile: bool,
+
+    /// winasync: the prefix of the exported per-interface vtable getters,
+    /// if `Export = prefix` was given.
+    export: Option<syn::Ident>,
 
     /// The identifier of the `Foo_Impl` type.
     impl_ident: syn::Ident,
@@ -156,6 +198,23 @@ impl ImplementType {
             <#ident as ::windows_core::Interface>::Vtable
         }
     }
+
+    /// winasync: the interface's part of an exported symbol name -- the
+    /// last path segment, with a generic's arguments joined on: `IFoo`,
+    /// `IIterable_HSTRING`.
+    fn export_name(&self) -> String {
+        let mut name = self
+            .type_name
+            .rsplit("::")
+            .next()
+            .unwrap_or(&self.type_name)
+            .to_owned();
+        for g in &self.generics {
+            name.push('_');
+            name.push_str(&g.export_name());
+        }
+        name
+    }
 }
 
 #[derive(Default)]
@@ -163,6 +222,7 @@ struct ImplementAttributes {
     pub implement: Vec<ImplementType>,
     pub trust_level: usize,
     pub agile: bool,
+    pub export: Option<syn::Ident>,
 }
 
 impl syn::parse::Parse for ImplementAttributes {
@@ -216,6 +276,7 @@ impl ImplementAttributes {
             }
             UseTree2::TrustLevel(input) => self.trust_level = *input,
             UseTree2::Agile(agile) => self.agile = *agile,
+            UseTree2::Export(prefix) => self.export = Some(prefix.clone()),
         }
 
         Ok(())
@@ -228,6 +289,8 @@ enum UseTree2 {
     Group(UseGroup2),
     TrustLevel(usize),
     Agile(bool),
+    /// winasync: `Export = prefix`.
+    Export(syn::Ident),
 }
 
 impl UseTree2 {
@@ -322,6 +385,10 @@ impl syn::parse::Parse for UseTree2 {
                             "`Agile` must be `true` or `false`",
                         )),
                     }
+                } else if ident == "Export" {
+                    input.parse::<syn::Token![=]>()?;
+                    let prefix = input.call(syn::Ident::parse_any)?;
+                    Ok(Self::Export(prefix))
                 } else {
                     Err(syn::parse::Error::new(
                         ident.span(),

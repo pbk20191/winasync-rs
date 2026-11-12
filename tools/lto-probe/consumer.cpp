@@ -96,15 +96,16 @@ __attribute__((noinline)) int run_vtable_symbol(IAdder* p, int n) {
     return acc;
 }
 
-// The vtable behind a getter: nothing exported but a function returning
-// the table's address, called on every iteration, as a projection would.
-extern "C" const IAdderVtbl* __stdcall probe_adder_vtable();
+// The vtable behind a getter, as `#[implement(..., Export = probe_Adder)]`
+// emits it: nothing exported but a function returning the table's address,
+// called on every iteration, as a projection would.
+extern "C" const IAdderVtbl* __stdcall probe_Adder_IAdder_vtable();
 
 __attribute__((noinline)) int run_vtable_getter(IAdder* p, int n) {
     int acc = 0;
     for (int i = 0; i < n; i++) {
         int out;
-        probe_adder_vtable()->Add(p, i, acc, &out);
+        probe_Adder_IAdder_vtable()->Add(p, i, acc, &out);
         acc = out;
     }
     return acc;

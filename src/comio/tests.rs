@@ -220,3 +220,39 @@ fn iinspectable_is_shaped_but_hollow() {
         "control: a real WinRT class reported no name"
     );
 }
+
+/// `#[implement(..., Export = prefix)]` (the forked macro's second change):
+/// the exported getter hands out the class's vtable, and a call through it
+/// with the object's own interface pointer reaches the object. This is the
+/// table a statically linked caller uses so that LTO can inline the method
+/// (`tools/lto-probe`); here only its identity is checked.
+#[winasync_implement::implement(windows::Foundation::IClosable, Export = winasync_test_Closable)]
+struct ExportedClosable;
+
+static EXPORTED_CLOSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl windows::Foundation::IClosable_Impl for ExportedClosable_Impl {
+    fn Close(&self) -> windows_core::Result<()> {
+        EXPORTED_CLOSED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn export_hands_out_the_vtable_the_object_carries() {
+    use windows::Foundation::IClosable;
+    let obj: IClosable = ExportedClosable.into();
+    let table = winasync_test_Closable_IClosable_vtable();
+    assert!(!table.is_null());
+    assert_eq!(table, winasync_test_Closable_IClosable_vtable(), "the getter is stable");
+
+    // Through the exported table, with the interface pointer the vtable
+    // call would take.
+    let hr = unsafe { ((*table).Close)(obj.as_raw()) };
+    assert!(hr.is_ok(), "{hr:?}");
+    assert_eq!(EXPORTED_CLOSED.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // And the ordinary way reaches the same implementation.
+    obj.Close().unwrap();
+    assert_eq!(EXPORTED_CLOSED.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

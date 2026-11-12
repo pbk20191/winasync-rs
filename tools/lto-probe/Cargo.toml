@@ -14,6 +14,10 @@ crate-type = ["staticlib"]
 
 [dependencies]
 windows-core = "0.62.2"
+# The forked macro, for its `Export = prefix`.
+winasync-implement = { path = "../implement" }
+# The macro's GetIids links CoTaskMemAlloc through it.
+windows-link = "0.2"
 
 [profile.release]
 panic = "abort"

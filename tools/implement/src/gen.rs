@@ -31,7 +31,54 @@ pub(crate) fn gen_all(inputs: &ImplementInputs) -> Vec<syn::Item> {
         items.push(gen_impl_as_impl(inputs, interface_chain, i));
     }
 
+    items.extend(gen_vtable_exports(inputs));
+
     items
+}
+
+/// winasync: with `Export = prefix`, one exported function per interface
+/// returning the class's vtable for it, `<prefix>_<Interface>_vtable`.
+///
+/// The returned pointer is to the same table the object carries, so a
+/// caller that reaches a method through it passes the interface pointer it
+/// would have passed to the vtable call. Reading the slot from a function's
+/// constant instead of from the object is what lets LTO fold the slot to
+/// the method and inline it.
+fn gen_vtable_exports(inputs: &ImplementInputs) -> Vec<syn::Item> {
+    let Some(prefix) = &inputs.export else {
+        return Vec::new();
+    };
+    assert!(!inputs.is_generic);
+    let impl_ident = &inputs.impl_ident;
+    let generics = &inputs.generics;
+
+    inputs
+        .interface_chains
+        .iter()
+        .map(|chain| {
+            let vtbl_ty = chain.implement.to_vtbl_ident();
+            let vtable_const_ident = &chain.vtable_const_ident;
+            let fn_ident = quote::format_ident!(
+                "{}_{}_vtable",
+                prefix,
+                chain.implement.export_name(),
+                span = prefix.span()
+            );
+            let doc = format!(
+                "The vtable of `{}` for `{}`, as the object carries it; for a caller that links statically and knows the class.",
+                inputs.original_ident,
+                chain.implement.type_name
+            );
+            parse_quote_spanned! { chain.implement.span =>
+                #[doc = #doc]
+                #[unsafe(no_mangle)]
+                #[allow(non_snake_case)]
+                pub extern "system" fn #fn_ident() -> *const #vtbl_ty {
+                    &#impl_ident::#generics::#vtable_const_ident
+                }
+            }
+        })
+        .collect()
 }
 
 /// Generates an `impl` block for the original `Foo` type.

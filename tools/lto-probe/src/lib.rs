@@ -15,14 +15,16 @@
 #![allow(non_snake_case)]
 
 use core::ffi::c_void;
-use windows_core::{HRESULT, IUnknown, IUnknown_Vtbl, Interface, implement, interface};
+use winasync_implement::implement;
+use windows_core::{HRESULT, IUnknown, IUnknown_Vtbl, Interface, interface};
 
 #[interface("5f4d0b6e-1c7a-4a3e-9d2c-7b1e3f8a9c01")]
 pub unsafe trait IAdder: IUnknown {
     fn Add(&self, a: i32, b: i32, out: *mut i32) -> HRESULT;
 }
 
-#[implement(IAdder)]
+// `Export`: the macro emits `probe_Adder_IAdder_vtable() -> *const IAdder_Vtbl`.
+#[implement(IAdder, Export = probe_Adder)]
 struct Adder {
     salt: i32,
 }
@@ -41,17 +43,6 @@ impl IAdder_Impl for Adder_Impl {
 /// through this and never touch the object's vtable pointer.
 #[unsafe(no_mangle)]
 pub static ADDER_IADDER_VTABLE: IAdder_Vtbl = IAdder_Vtbl::new::<Adder_Impl, { -1 }>();
-
-/// The same table, not exported: reached only through
-/// [`probe_adder_vtable`], a function that returns its address. The
-/// question is whether a getter in front of the constant costs the
-/// optimizer the fold.
-static ADDER_IADDER_VTABLE_PRIVATE: IAdder_Vtbl = IAdder_Vtbl::new::<Adder_Impl, { -1 }>();
-
-#[unsafe(no_mangle)]
-pub extern "system" fn probe_adder_vtable() -> *const IAdder_Vtbl {
-    &ADDER_IADDER_VTABLE_PRIVATE
-}
 
 /// A new `Adder` as an `IAdder` interface pointer, refcount 1.
 #[unsafe(no_mangle)]

@@ -1666,7 +1666,16 @@ LTO에서는 getter가 인라인되어 상수 주소가 드러나고, 같은 CGS
 인라인된다(remark: `IAdder_Vtbl::new::<Adder_Impl,-1>::Add inlined into run_vtable_getter`, 직접 심볼 루프와
 같은 코드로 합쳐짐). ThinLTO에서는 getter는 인라인되지만 썽크는 여전히 `declare`라 직접 호출까지다.
 즉 상수를 심볼로 노출할지 함수 뒤에 둘지는 ABI 취향의 문제이고 최적화 결과는 같다. 함수 쪽이 심볼
-하나로 끝나고 테이블의 레이아웃을 헤더에 드러내지 않아도 되므로 더 낫다. 참고로 `IAdder_Vtbl::new::<T, OFFSET>`의 OFFSET은
+하나로 끝나고 테이블의 레이아웃을 헤더에 드러내지 않아도 되므로 더 낫다.
+
+**매크로에 넣었다 (2026-11-12).** 포크한 `implement`에 `Export = prefix`를 추가했다. 인터페이스마다
+`pub extern "system" fn <prefix>_<Interface>_vtable() -> *const <Interface>_Vtbl`을 `#[unsafe(no_mangle)]`로
+내보내고, 본체는 `&Foo_Impl::VTABLE_INTERFACEn`이라 객체가 드는 테이블과 같은 썽크다. 제네릭 인터페이스는
+인자를 이름에 붙이고(`IIterable_HSTRING`), 제네릭 타입에는 컴파일 오류를 낸다. `tools/lto-probe`의 `Adder`가
+`#[implement(IAdder, Export = probe_Adder)]`로 바뀌어 손으로 쓴 getter를 대체했고, fat LTO에서 같은 결과를
+확인했다(`probe_Adder_IAdder_vtable` inlined → 썽크 inlined → 0.000 ns). comio의 실제 클래스에는 아직 붙이지
+않았다. 심볼 이름이 ABI가 되므로 정적 링크 소비자 설계와 함께 접두사를 정해야 한다. DLL 쪽은 `dll/exports.def`가
+내보낼 심볼을 고르므로 붙여도 DLL 표면은 변하지 않는다. 참고로 `IAdder_Vtbl::new::<T, OFFSET>`의 OFFSET은
 썽크가 `this.offset(OFFSET)`로 쓰므로 interface 1은 `-1`이다. `1`을 주면 엉뚱한 메모리에서 salt를 읽어
 acc가 달라진다(처음 그렇게 틀렸다).
 
