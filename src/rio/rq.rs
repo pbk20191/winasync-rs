@@ -59,9 +59,10 @@ impl Default for RqConfig {
 
 /// Creates a socket able to take a request queue.
 ///
-/// `WSA_FLAG_REGISTERED_IO` is accepted only by the TCP/IP families: AF_UNIX,
-/// AF_HYPERV and raw sockets fail here with `WSAEINVAL`, at creation rather
-/// than at queue setup.
+/// `WSA_FLAG_REGISTERED_IO` is accepted only by the TCP/IP families: AF_UNIX
+/// and AF_HYPERV fail here with `WSAEINVAL`, at creation rather than at
+/// queue setup, with or without `WSA_FLAG_OVERLAPPED` beside the flag
+/// (measured on 26320 by `probe_tests::rio_families`).
 pub(crate) fn new_rio_socket(
     addr: &SocketAddr,
     sock_type: i32,

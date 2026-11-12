@@ -131,3 +131,6 @@ pub use tcp::{RioTcpListener, RioTcpStream};
 #[cfg(feature = "tp")]
 #[allow(unused_imports)]
 pub use tcp::RioTcpAcceptor;
+
+#[cfg(test)]
+mod probe_tests;

@@ -1537,6 +1537,16 @@ RIO op는 IRP/IOCP를 타지 않아 `SetFileCompletionNotificationModes`가 건�
 인터페이스가 각 한 번씩 나오는지 단언한다. 비용: 600줄짜리 매크로 사본을 `windows-core` 0.62에 묶어 두는 것 —
 0.62 고정은 이미 결정이라 추가 제약은 아니다.
 
+### RIO는 AF_UNIX·AF_HYPERV를 받지 않는다 — 실측 (2026-11-12)
+
+`rq.rs`의 "TCP/IP 패밀리만"이라는 주석을 `rio::probe_tests::rio_families`(`#[ignore]`, `--ignored --nocapture`로
+실행)로 쟀다. 패밀리마다 세 단계 — `WSASocketW(WSA_FLAG_REGISTERED_IO)`, `RIOCreateRequestQueue`, 연결 쌍에서
+`RIOReceive` 하나와 상대의 `send`로 완료 하나 — 인데 둘 다 **1단계에서 `WSAEINVAL`(10022)** 로 끝난다.
+`WSA_FLAG_OVERLAPPED`를 빼고 `REGISTERED_IO`만 줘도 같다. 즉 AF_UNIX(`afunix.sys`)와 AF_HYPERV(`hvsocket.sys`)
+프로바이더는 RIO 소켓 생성 자체를 거부하며, 큐 부착이나 op 단계까지 가지 않는다. 26320에서 측정.
+AF_UNIX·Hyper-V 전송의 "RIO 급 경로"는 없고, 그 패밀리들의 성능 상한은 tp의 overlapped + skip-completion이다.
+프로브는 다른 빌드에서 다시 재 볼 수 있도록 남겨 둔다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |
