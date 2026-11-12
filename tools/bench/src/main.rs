@@ -230,17 +230,53 @@ fn tp_echo(cfg: Config) -> (usize, Vec<u64>) {
 /// built for is absent by construction -- this is its documented worst
 /// case, measured rather than assumed.
 fn rio_echo(cfg: Config) -> (usize, Vec<u64>) {
-    use winasync::rio::{RioBufferPool, RioCq, RioTcpAcceptor, RioTcpStream, RqConfig};
-    use winasync::tp::Runtime;
-    let rt = Runtime::new();
+    use winasync::rio::RioCq;
+    let rt = winasync::tp::Runtime::new();
+    // Every socket may have one receive and one send outstanding, and the
+    // completion queue must hold them all.
+    let cq = RioCq::new(&rt, (4 * cfg.conns as u32).max(16)).unwrap();
+    rio_echo_on(cfg, rt, cq)
+}
+
+/// The same, with the completion queue in polling mode: one thread of our
+/// own spins on `drain`, so no event, no TP_WAIT and no pool-thread
+/// wake-up stand between a completion and its waker. What this buys is the
+/// cost of the first hand-off, isolated; it burns a core to show it.
+fn rio_echo_poll(cfg: Config) -> (usize, Vec<u64>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use winasync::rio::RioCq;
+    let rt = winasync::tp::Runtime::new();
+    let cq = RioCq::polling((4 * cfg.conns as u32).max(16)).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spinner = {
+        let (cq, stop) = (cq.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match cq.drain() {
+                    Some(0) => std::hint::spin_loop(),
+                    Some(_) => {}
+                    None => panic!("RIO_CORRUPT_CQ"),
+                }
+            }
+        })
+    };
+    let out = rio_echo_on(cfg, rt, cq);
+    stop.store(true, Ordering::Relaxed);
+    spinner.join().unwrap();
+    out
+}
+
+fn rio_echo_on(
+    cfg: Config,
+    rt: winasync::tp::Runtime,
+    cq: Arc<winasync::rio::RioCq>,
+) -> (usize, Vec<u64>) {
+    use winasync::rio::{RioBufferPool, RioTcpAcceptor, RioTcpStream, RqConfig};
     let Config { conns, iters, msg, .. } = cfg;
     let rq = RqConfig {
         max_outstanding_recv: 1,
         max_outstanding_send: 1,
     };
-    // Every socket may have one receive and one send outstanding, and the
-    // completion queue must hold them all.
-    let cq = RioCq::new(&rt, (4 * conns as u32).max(16)).unwrap();
     // A receive and a send slice per socket.
     let pool = RioBufferPool::new(msg, 4 * conns as u32 + 8).unwrap();
     let acceptor = RioTcpAcceptor::bind(&rt, "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -705,6 +741,7 @@ fn main() {
             ("winasync tp", tp_echo as fn(Config) -> (usize, Vec<u64>)),
             ("winasync tp+skip", |c| tp_echo(Config { skip: true, ..c })),
             ("winasync rio", rio_echo),
+            ("winasync rio poll", rio_echo_poll),
             ("tokio", tokio_echo),
             ("compio", compio_echo),
         ] {
