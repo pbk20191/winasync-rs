@@ -276,7 +276,9 @@ impl UnixStreamListener {
 /// Client side of an AF_UNIX connection.
 #[winasync_implement::implement(
     bindings::Pbk20191::WinAsync::Comio::UnixConnector,
-    bindings::Pbk20191::WinAsync::Comio::IUnixConnector
+    bindings::Pbk20191::WinAsync::Comio::IUnixConnector,
+    Export = Pbk20191_WinAsync_Comio_UnixConnector,
+    ExportCfg = "feature = \"static-exports\""
 )]
 pub struct UnixConnector {
     _module: ModuleRef,

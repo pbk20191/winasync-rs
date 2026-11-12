@@ -1,0 +1,20 @@
+[package]
+name = "winasync-static"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "winasync's WinRT component as a static library: the same classes as the DLL, reached through plain C entry points instead of activation exports, with each class's vtables as symbols so that a caller's LTO can inline through them."
+
+[lib]
+# `winasync.lib` is the DLL's import library, so not that.
+name = "winasync_static"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# `static-exports` is what makes this crate different from the DLL's view of
+# the library: the per-class vtable getters exist only here. No `dylib`:
+# that is the server DLL's feature (unload counting, `DllCanUnloadNow`'s
+# `WSACleanup`), and a static library is never unloaded on its own.
+library = { package = "winasync", path = "..", default-features = false, features = ["comio", "http", "static-exports"] }
+windows-core = "0.62.2"

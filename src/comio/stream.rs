@@ -81,7 +81,9 @@ unsafe impl Send for AcceptSockGuard {}
     IOutputStream,
     windows::Foundation::IClosable,
     bindings::Pbk20191::WinAsync::Comio::ITransportPeer,
-    bindings::Pbk20191::WinAsync::Comio::IMessageStream
+    bindings::Pbk20191::WinAsync::Comio::IMessageStream,
+    Export = Pbk20191_WinAsync_Comio_TransportStream,
+    ExportCfg = "feature = \"static-exports\""
 )]
 pub struct TransportStream {
     reg: Arc<IoReg>,

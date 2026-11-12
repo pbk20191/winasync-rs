@@ -21,7 +21,12 @@ use winasync_implement::implement;
 const RO_E_CLOSED: HRESULT = HRESULT(0x80000013u32 as i32);
 const E_ILLEGAL_METHOD_CALL: HRESULT = HRESULT(0x8000000Eu32 as i32);
 
-#[implement(rc::HttpServer, windows::Foundation::IClosable)]
+#[implement(
+    rc::HttpServer,
+    windows::Foundation::IClosable,
+    Export = Pbk20191_WinAsync_Comio_HttpServer,
+    ExportCfg = "feature = \"static-exports\""
+)]
 pub struct HttpServer {
     inner: Mutex<Option<h::HttpServer>>,
     urls: Mutex<Vec<String>>,
@@ -94,7 +99,12 @@ impl IClosable_Impl for HttpServer_Impl {
     }
 }
 
-#[implement(rc::HttpRequest, windows::Foundation::IClosable)]
+#[implement(
+    rc::HttpRequest,
+    windows::Foundation::IClosable,
+    Export = Pbk20191_WinAsync_Comio_HttpRequest,
+    ExportCfg = "feature = \"static-exports\""
+)]
 pub struct HttpRequest {
     inner: Mutex<Option<h::HttpRequest>>,
     _module: ModuleRef,

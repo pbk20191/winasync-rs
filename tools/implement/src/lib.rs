@@ -54,7 +54,7 @@ use r#gen::gen_all;
 /// ```
 ///
 /// # `Export = prefix`
-/// ```rust,no_run
+/// ```rust,ignore
 /// # use windows_core::*;
 /// # #[interface("094d70d6-5202-44b8-abb8-43860da5aca2")]
 /// # unsafe trait IValue: IUnknown { fn GetValue(&self, value: *mut i32) -> HRESULT; }
@@ -69,6 +69,11 @@ use r#gen::gen_all;
 /// One function per interface in the list, named `<prefix>_<Interface>_vtable`
 /// (a generic interface's arguments join the name: `IIterable_HSTRING`).
 /// Not available on generic types, which have no single vtable to export.
+///
+/// `ExportCfg = "feature = \"static-exports\""` puts that cfg on the
+/// generated functions, for a crate that is also built as a cdylib: a
+/// cdylib exports every `no_mangle` symbol it links, so without the gate
+/// the getters would become part of the DLL's surface too.
 #[proc_macro_attribute]
 pub fn implement(
     attributes: proc_macro::TokenStream,
@@ -102,6 +107,7 @@ fn implement_core(
         trust_level: attributes.trust_level,
         agile: attributes.agile,
         export: attributes.export,
+        export_cfg: attributes.export_cfg,
         impl_ident: quote::format_ident!("{}_Impl", &original_type.ident),
         constraints: {
             if let Some(where_clause) = &original_type.generics.where_clause {
@@ -150,6 +156,12 @@ struct ImplementInputs {
     /// winasync: the prefix of the exported per-interface vtable getters,
     /// if `Export = prefix` was given.
     export: Option<syn::Ident>,
+
+    /// winasync: a cfg predicate the getters are compiled under, if
+    /// `ExportCfg = "..."` was given -- so a crate can keep them out of a
+    /// build (a cdylib exports every `no_mangle` symbol it links) and let
+    /// only its static-library build have them.
+    export_cfg: Option<proc_macro2::TokenStream>,
 
     /// The identifier of the `Foo_Impl` type.
     impl_ident: syn::Ident,
@@ -223,6 +235,7 @@ struct ImplementAttributes {
     pub trust_level: usize,
     pub agile: bool,
     pub export: Option<syn::Ident>,
+    pub export_cfg: Option<proc_macro2::TokenStream>,
 }
 
 impl syn::parse::Parse for ImplementAttributes {
@@ -277,6 +290,7 @@ impl ImplementAttributes {
             UseTree2::TrustLevel(input) => self.trust_level = *input,
             UseTree2::Agile(agile) => self.agile = *agile,
             UseTree2::Export(prefix) => self.export = Some(prefix.clone()),
+            UseTree2::ExportCfg(predicate) => self.export_cfg = Some(predicate.clone()),
         }
 
         Ok(())
@@ -291,6 +305,8 @@ enum UseTree2 {
     Agile(bool),
     /// winasync: `Export = prefix`.
     Export(syn::Ident),
+    /// winasync: `ExportCfg = "<cfg predicate>"`.
+    ExportCfg(proc_macro2::TokenStream),
 }
 
 impl UseTree2 {
@@ -389,6 +405,12 @@ impl syn::parse::Parse for UseTree2 {
                     input.parse::<syn::Token![=]>()?;
                     let prefix = input.call(syn::Ident::parse_any)?;
                     Ok(Self::Export(prefix))
+                } else if ident == "ExportCfg" {
+                    input.parse::<syn::Token![=]>()?;
+                    let lit = input.parse::<syn::LitStr>()?;
+                    let predicate = syn::parse_str::<proc_macro2::TokenStream>(&lit.value())
+                        .map_err(|e| syn::parse::Error::new(lit.span(), format!("`ExportCfg` is not a cfg predicate: {e}")))?;
+                    Ok(Self::ExportCfg(predicate))
                 } else {
                     Err(syn::parse::Error::new(
                         ident.span(),

@@ -88,7 +88,9 @@ macro_rules! listener_impls {
     bindings::Pbk20191::WinAsync::Comio::INamedPipeBind,
     bindings::Pbk20191::WinAsync::Comio::IListenerSecurity,
     bindings::Pbk20191::WinAsync::Comio::INamedPipeListenerSettings,
-    windows::Foundation::IClosable
+    windows::Foundation::IClosable,
+    Export = Pbk20191_WinAsync_Comio_NamedPipeConnectionListener,
+    ExportCfg = "feature = \"static-exports\""
 )]
 pub struct NamedPipeConnectionListener {
     pub(super) core: ListenerCore,
@@ -104,7 +106,9 @@ pub struct NamedPipeConnectionListener {
     bindings::Pbk20191::WinAsync::Comio::ITransport,
     bindings::Pbk20191::WinAsync::Comio::IUnixBind,
     bindings::Pbk20191::WinAsync::Comio::IListenerSecurity,
-    windows::Foundation::IClosable
+    windows::Foundation::IClosable,
+    Export = Pbk20191_WinAsync_Comio_UnixConnectionListener,
+    ExportCfg = "feature = \"static-exports\""
 )]
 pub struct UnixConnectionListener {
     pub(super) core: ListenerCore,
@@ -118,7 +122,9 @@ pub struct UnixConnectionListener {
     bindings::Pbk20191::WinAsync::Comio::HyperVConnectionListener,
     bindings::Pbk20191::WinAsync::Comio::ITransport,
     bindings::Pbk20191::WinAsync::Comio::IHyperVBind,
-    windows::Foundation::IClosable
+    windows::Foundation::IClosable,
+    Export = Pbk20191_WinAsync_Comio_HyperVConnectionListener,
+    ExportCfg = "feature = \"static-exports\""
 )]
 pub struct HyperVConnectionListener {
     pub(super) core: ListenerCore,

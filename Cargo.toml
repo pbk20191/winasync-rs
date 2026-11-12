@@ -15,7 +15,7 @@ repository = "https://github.com/pbk20191/winasync-rs"
 # are checked in, and keeping `windows-rdl` out of the library's graph is what
 # stops an ordinary build from paying for it.
 [workspace]
-members = ["dll", "tools/winmdgen", "tools/implement"]
+members = ["dll", "static", "tools/winmdgen", "tools/implement"]
 # `tools/bench` is its own workspace: it pulls in tokio and compio, which
 # the library's clippy/doc/test jobs should not have to compile.
 exclude = ["tools/bench", "tools/lto-probe"]
@@ -182,6 +182,15 @@ comio = [
 # `comio::unload::can_unload` reads it to decide whether an operation is still
 # in flight, and a counter that does not exist cannot answer that.
 counters = []
+
+# The per-class vtable getters the forked `implement` macro emits under
+# `Export`/`ExportCfg` (`Pbk20191_WinAsync_Comio_<Class>_<Interface>_vtable`):
+# for a caller that links the component statically and wants LTO to see
+# through a method call, which it cannot through the object's own vtable
+# (measured in `tools/lto-probe`). Enabled by `static/` only. A cdylib
+# exports every `no_mangle` symbol it links, so leaving this off keeps them
+# out of the DLL.
+static-exports = ["comio"]
 
 # Compiled for the in-process server DLL. **Do not enable this yourself** --
 # `dll/` (package `winasync-dll`) enables it through its dependency

@@ -210,7 +210,9 @@ impl HvStreamListener {
 /// Client side of a Hyper-V socket connection.
 #[winasync_implement::implement(
     bindings::Pbk20191::WinAsync::Comio::HyperVConnector,
-    bindings::Pbk20191::WinAsync::Comio::IHyperVConnector
+    bindings::Pbk20191::WinAsync::Comio::IHyperVConnector,
+    Export = Pbk20191_WinAsync_Comio_HyperVConnector,
+    ExportCfg = "feature = \"static-exports\""
 )]
 pub struct HyperVConnector {
     _module: ModuleRef,

@@ -51,6 +51,10 @@ fn gen_vtable_exports(inputs: &ImplementInputs) -> Vec<syn::Item> {
     assert!(!inputs.is_generic);
     let impl_ident = &inputs.impl_ident;
     let generics = &inputs.generics;
+    let cfg = inputs
+        .export_cfg
+        .as_ref()
+        .map(|predicate| quote! { #[cfg(#predicate)] });
 
     inputs
         .interface_chains
@@ -70,6 +74,7 @@ fn gen_vtable_exports(inputs: &ImplementInputs) -> Vec<syn::Item> {
                 chain.implement.type_name
             );
             parse_quote_spanned! { chain.implement.span =>
+                #cfg
                 #[doc = #doc]
                 #[unsafe(no_mangle)]
                 #[allow(non_snake_case)]

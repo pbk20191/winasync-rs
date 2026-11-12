@@ -1674,8 +1674,36 @@ LTO에서는 getter가 인라인되어 상수 주소가 드러나고, 같은 CGS
 인자를 이름에 붙이고(`IIterable_HSTRING`), 제네릭 타입에는 컴파일 오류를 낸다. `tools/lto-probe`의 `Adder`가
 `#[implement(IAdder, Export = probe_Adder)]`로 바뀌어 손으로 쓴 getter를 대체했고, fat LTO에서 같은 결과를
 확인했다(`probe_Adder_IAdder_vtable` inlined → 썽크 inlined → 0.000 ns). comio의 실제 클래스에는 아직 붙이지
-않았다. 심볼 이름이 ABI가 되므로 정적 링크 소비자 설계와 함께 접두사를 정해야 한다. DLL 쪽은 `dll/exports.def`가
-내보낼 심볼을 고르므로 붙여도 DLL 표면은 변하지 않는다. 참고로 `IAdder_Vtbl::new::<T, OFFSET>`의 OFFSET은
+않았다. 심볼 이름이 ABI가 되므로 정적 링크 소비자 설계와 함께 접두사를 정해야 한다.
+
+### 정적 라이브러리 crate `static/` — comio 클래스를 심볼로 (2026-11-12)
+
+위의 두 결정을 내리고 붙였다. 접두사는 `Pbk20191_WinAsync_Comio_<Class>`로, IID와 같은 이름 권위에서 나온다.
+DLL 누출은 피처로 막았다. `dll/exports.def`의 주석대로 cdylib는 의존 crate의 `#[no_mangle]`도 전부 내보내므로
+(def 파일은 PRIVATE만 표시한다), 매크로에 `ExportCfg = "<cfg 술어>"`를 추가해 getter에 `#[cfg(...)]`를 걸고,
+winasync에 `static-exports` 피처를 두어 `static/`만 켠다. 제네릭이 아닌 런타임 클래스 아홉 개에 붙였다.
+`TransportStream`, 커넥터 셋, 리스너 셋, `HttpServer`, `HttpRequest`. 합쳐서 getter 31개다.
+
+`static/`(패키지 `winasync-static`, `winasync_static.lib`; `winasync.lib`는 DLL의 import lib 이름이라 피함)은
+`comio, http, static-exports`로 라이브러리를 끌어오고 예약 이름 없는 진입점 둘을 내보낸다.
+`winasync_get_activation_factory(HSTRING, void**)`와 `winasync_get_class_object(clsid, iid, void**)`로, DLL의
+`Dll*`가 쓰는 `comio::activation`의 같은 테이블을 감싼다. `dylib` 피처는 켜지 않는다. 언로드 카운팅과
+`DllCanUnloadNow`의 `WSACleanup`은 DLL의 것이다. C 선언은 `static/include/winasync_static.h`에 있고, getter는
+`const void*`를 돌려주어 소비자가 자기 프로젝션의 vtable 타입으로 캐스팅한다. 헤더는 `Export =` 목록에서
+스크립트로 생성했다.
+
+**실측 (`static/probe/`).** C++ 소비자가 `winasync_get_activation_factory`로 `NamedPipeConnectionListener`를
+만들고 `IClosable::Close`를 두 길로 부른다. full LTO(라이브러리 `-Clto=fat -Clinker-plugin-lto`, clang `-flto`,
+`-march=x86-64-v2`, rust-lld 링크)에서:
+- 객체 vtable 경로: remark 없음, 간접 호출 그대로.
+- 클래스 테이블 경로: `IClosable_Vtbl::new::<…Listener_Impl, -5>::Close inlined into close_via_class_table (cost=40)`.
+  그 안의 `ListenerCore::close`는 비용(2045)으로 인라인되지 않고 직접 호출로 남는데, 그게 실제 본체라 맞다.
+- 두 길 모두 S_OK, 그리고 테이블의 `Close` 슬롯이 객체의 슬롯과 같은 함수임을 확인했다.
+
+remark에 찍힌 썽크가 `UnixConnectionListener_Impl, -5`인 것은 버그가 아니다. 리스너들의 `IClosable` 썽크는
+`this`에서 vtable 수만큼 빼고 `core` 필드로 가는데, Named 쪽은 vtable이 하나 더 있고 `core`도 그만큼 뒤에
+있어 최종 주소 계산이 같다. 동일한 코드를 LTO가 하나로 합치고 대표 이름 하나를 찍은 것이다. 프로브의
+"same slot yes"가 Named의 getter와 Named 객체를 비교한 결과다. 참고로 `IAdder_Vtbl::new::<T, OFFSET>`의 OFFSET은
 썽크가 `this.offset(OFFSET)`로 쓰므로 interface 1은 `-1`이다. `1`을 주면 엉뚱한 메모리에서 salt를 읽어
 acc가 달라진다(처음 그렇게 틀렸다).
 

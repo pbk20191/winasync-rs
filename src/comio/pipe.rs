@@ -238,7 +238,9 @@ pub(crate) fn arm_accept(
 /// Client side of a named pipe.
 #[winasync_implement::implement(
     bindings::Pbk20191::WinAsync::Comio::NamedPipeConnector,
-    bindings::Pbk20191::WinAsync::Comio::INamedPipeConnector
+    bindings::Pbk20191::WinAsync::Comio::INamedPipeConnector,
+    Export = Pbk20191_WinAsync_Comio_NamedPipeConnector,
+    ExportCfg = "feature = \"static-exports\""
 )]
 pub struct NamedPipeConnector {
     _module: ModuleRef,
