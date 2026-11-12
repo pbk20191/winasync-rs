@@ -1598,6 +1598,51 @@ completion I/O에서 "빌린 버퍼를 커널에 넘긴다"는 모델이 맞는�
 
 복사 비용은 그대로고 할당 0·박싱 0도 그대로다. `futures-io` impl은 `S`에 대해 제네릭이 됐다.
 
+### 정적 링크 + 교차 언어 LTO: vtable 호출은 그대로, 심볼 호출은 인라인 — 실측 (2026-11-12)
+
+질문은 "소비자는 COM/WinRT 인터페이스(vtable)로 쓰되, 정적 링크하면 LTO로 호출이 사라지게 할 수
+있는가"였다. `tools/lto-probe`로 쟀다. Rust staticlib에 `#[implement]` 클래스 하나(`IAdder::Add`,
+객체별 salt를 더하는 한 줄), C++ 소비자가 손으로 선언한 vtable로 2억 번 호출. 같은 메서드를
+`probe_adder_add`라는 이름 있는 심볼로도 내보내 비교했다. 빌드는 `build.sh`.
+
+**툴체인.** rustc 1.99는 LLVM 23, 설치된 clang-cl은 22. 새 lld는 옛 비트코드를 읽지만 반대는 안 되므로
+링크는 rustc가 배포하는 `rust-lld`(`lld-link.exe`로 복사해 flavor를 정함)가 맡고 clang-cl은 컴파일만
+한다. 비트코드 목적 파일을 `link.exe`가 받으면 LNK1107로 죽으므로 `RUSTFLAGS`는 `--target`을 명시해
+호스트 빌드 스크립트·proc-macro에 닿지 않게 한다.
+
+**인라인이 안 되던 두 가지 이유.** 둘 다 lld의 `-mllvm:-pass-remarks-missed=inline`로 찾았다.
+1. clang을 `-flto`(full)로 컴파일하면 소비자는 full 파티션, rustc의 비트코드는 ThinLTO 요약을 가진
+   thin 모듈이라 다른 파티션에 놓이고 둘 사이엔 인라인이 없다. `-flto=thin`으로 맞춰야 한다. 이건
+   rustc 책의 예시와 같다.
+2. 맞춘 뒤에도 `not inlined … conflicting target features`. 인라이너는 caller의 target-features가
+   callee의 것을 포함해야 허용하는데, rustc의 x86-64 기본은 `+cx16,+sse,+sse2,+sse3,+sahf`이고 clang의
+   기본은 `+cmov,+cx8,+fxsr,+mmx,+sse,+sse2,+x87`이다. 소비자를 `-march=x86-64-v2`(둘의 상위집합)로
+   컴파일하니 통과했다. 라이브러리 소비자에게 요구할 조건이 하나 늘어난 셈이다.
+
+**결과.**
+
+| 루프 | native 링크 | LTO 링크 | 루프 안에 남은 호출 (LTO) |
+|---|---|---|---|
+| vtable (`p->vtbl->Add`) | 1.38 ns/call | 1.19 ns/call | `call qword ptr [rax+0x18]` 그대로 |
+| 직접 심볼 (`probe_adder_add`) | 1.31 ns/call | 0.00 ns/call | 없음 — 인라인된 뒤 루프가 닫힌 식으로 접혔다 |
+| vtable, 같은 함수 안에서 생성 | 1.40 ns/call | 1.08 ns/call | 생성자(`probe_create_adder`)는 인라인됐지만 `Add`·`Release`는 간접 호출 그대로 |
+
+세 번째 행이 핵심이다. 생성자가 인라인돼 vtable 포인터를 저장하는 코드까지 같은 함수에 들어와도
+LLVM은 그 저장을 루프 안의 적재로 전달하지 않는다. 루프 안의 미지 호출이 객체를 쓸 수 있으므로
+적재를 호이스트할 수 없고, 호출을 알려면 적재가 필요하다. 프로파일 없는 LLVM은 간접 호출을
+추측적으로 승격하지 않는다(ICP는 PGO 전용). C++ 가상 호출의 WPD는 `!type` 메타데이터에 기대므로
+Rust가 만든 COM vtable에는 적용되지 않는다.
+
+**따라서** "소비자는 vtable로 쓰고 LTO가 알아서"는 성립하지 않는다. 되는 형태는 둘이다.
+- 슬롯 함수를 이름 있는 심볼로도 내보내고(포크한 `implement` 매크로가 오프셋을 알고 있어 자동 생성
+  가능), 정적 링크 소비자용 헤더가 인터페이스 메서드를 그 심볼로 매핑한다. 소비자 코드는 인터페이스
+  모양 그대로이고 호출은 직접 호출이라 위 둘째 행처럼 인라인된다. `this`는 vtable 경로와 같은 인터페이스
+  포인터다.
+- PGO로 간접 호출 승격. 추측적이고 프로파일이 필요하다.
+
+인라인의 이득은 작은 메서드에 몰린다. I/O 메서드는 끝이 시스템 콜이라 사라지는 건 호출 한 단계뿐이다.
+프로브는 `tools/lto-probe`에 두고, 루트 워크스페이스에서는 제외했다(`tools/bench`와 같은 이유).
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

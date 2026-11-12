@@ -1,0 +1,21 @@
+[package]
+name = "lto-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Does a COM vtable call into a Rust static library inline under cross-language LTO? One class, one method, a C++ caller; see build.sh."
+
+# Its own workspace, like tools/bench: nothing in the library's jobs
+# should compile this.
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+windows-core = "0.62.2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+debug = 0
