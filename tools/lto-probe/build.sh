@@ -64,7 +64,9 @@ for v in native lto; do
     rv=$(sed -E 's/.*run_vtable=([0-9a-f]+).*/\1/' <<<"$line")
     rd=$(sed -E 's/.*run_direct=([0-9a-f]+).*/\1/' <<<"$line")
     rf=$(sed -E 's/.*run_vtable_fresh=([0-9a-f]+).*/\1/' <<<"$line")
+    rh=$(sed -E 's/.*run_vtable_hoisted=([0-9a-f]+).*/\1/' <<<"$line")
     disassemble "$OUT/probe_$v.exe" "$rv" "run_vtable ($v)"
     disassemble "$OUT/probe_$v.exe" "$rd" "run_direct ($v)"
     disassemble "$OUT/probe_$v.exe" "$rf" "run_vtable_fresh ($v)"
+    disassemble "$OUT/probe_$v.exe" "$rh" "run_vtable_hoisted ($v)"
 done

@@ -64,6 +64,23 @@ __attribute__((noinline)) int run_vtable_fresh(int salt, int n) {
     return acc;
 }
 
+// As above, but the slot is read once, right after construction, where no
+// opaque call has happened since the constructor stored the vtable: the
+// value-flow proof the optimizer accepts, if it accepts any.
+__attribute__((noinline)) int run_vtable_hoisted(int salt, int n) {
+    auto* p = static_cast<IAdder*>(probe_create_adder(salt));
+    auto add = p->vtbl->Add;
+    auto release = p->vtbl->Release;
+    int acc = 0;
+    for (int i = 0; i < n; i++) {
+        int out;
+        add(p, i, acc, &out);
+        acc = out;
+    }
+    release(p);
+    return acc;
+}
+
 int main(int argc, char** argv) {
     int salt = argc > 1 ? std::atoi(argv[1]) : 7;
     int n = argc > 2 ? std::atoi(argv[2]) : 200'000'000;
@@ -83,14 +100,19 @@ int main(int argc, char** argv) {
     int c = run_vtable_fresh(salt, n);
     double tf = seconds_since(t0);
 
-    std::printf("vtable %.3f ns/call  direct %.3f ns/call  fresh %.3f ns/call  (acc %d %d %d)\n",
-                tv * 1e9 / n, td * 1e9 / n, tf * 1e9 / n, a, b, c);
+    t0 = std::chrono::steady_clock::now();
+    int d = run_vtable_hoisted(salt, n);
+    double th = seconds_since(t0);
+
+    std::printf("vtable %.3f ns/call  direct %.3f ns/call  fresh %.3f ns/call  hoisted %.3f ns/call  (acc %d %d %d %d)\n",
+                tv * 1e9 / n, td * 1e9 / n, tf * 1e9 / n, th * 1e9 / n, a, b, c, d);
     // Where the loops are, for build.sh to disassemble: the stripped image
     // has no symbol table, so RVAs are the only handle.
     auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleA(nullptr));
-    std::printf("rva run_vtable=%llx run_direct=%llx run_vtable_fresh=%llx\n",
+    std::printf("rva run_vtable=%llx run_direct=%llx run_vtable_fresh=%llx run_vtable_hoisted=%llx\n",
                 (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable) - base),
                 (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_direct) - base),
-                (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable_fresh) - base));
-    return a == b && b == c ? 0 : 1;
+                (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable_fresh) - base),
+                (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable_hoisted) - base));
+    return a == b && b == c && c == d ? 0 : 1;
 }
