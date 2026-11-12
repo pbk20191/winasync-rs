@@ -81,6 +81,21 @@ __attribute__((noinline)) int run_vtable_hoisted(int salt, int n) {
     return acc;
 }
 
+// The vtable as a symbol: the caller names the class's table instead of
+// reading the pointer out of the object. The slot is then a load from a
+// constant global, which folds before the inliner ever runs.
+extern "C" const IAdderVtbl ADDER_IADDER_VTABLE;
+
+__attribute__((noinline)) int run_vtable_symbol(IAdder* p, int n) {
+    int acc = 0;
+    for (int i = 0; i < n; i++) {
+        int out;
+        ADDER_IADDER_VTABLE.Add(p, i, acc, &out);
+        acc = out;
+    }
+    return acc;
+}
+
 int main(int argc, char** argv) {
     int salt = argc > 1 ? std::atoi(argv[1]) : 7;
     int n = argc > 2 ? std::atoi(argv[2]) : 200'000'000;
@@ -104,15 +119,22 @@ int main(int argc, char** argv) {
     int d = run_vtable_hoisted(salt, n);
     double th = seconds_since(t0);
 
-    std::printf("vtable %.3f ns/call  direct %.3f ns/call  fresh %.3f ns/call  hoisted %.3f ns/call  (acc %d %d %d %d)\n",
-                tv * 1e9 / n, td * 1e9 / n, tf * 1e9 / n, th * 1e9 / n, a, b, c, d);
+    auto* q = static_cast<IAdder*>(probe_create_adder(salt));
+    t0 = std::chrono::steady_clock::now();
+    int e = run_vtable_symbol(q, n);
+    double ts = seconds_since(t0);
+    q->vtbl->Release(q);
+
+    std::printf("vtable %.3f ns/call  direct %.3f ns/call  fresh %.3f ns/call  hoisted %.3f ns/call  symbol %.3f ns/call  (acc %d %d %d %d %d)\n",
+                tv * 1e9 / n, td * 1e9 / n, tf * 1e9 / n, th * 1e9 / n, ts * 1e9 / n, a, b, c, d, e);
     // Where the loops are, for build.sh to disassemble: the stripped image
     // has no symbol table, so RVAs are the only handle.
     auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleA(nullptr));
-    std::printf("rva run_vtable=%llx run_direct=%llx run_vtable_fresh=%llx run_vtable_hoisted=%llx\n",
+    std::printf("rva run_vtable=%llx run_direct=%llx run_vtable_fresh=%llx run_vtable_hoisted=%llx run_vtable_symbol=%llx\n",
                 (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable) - base),
                 (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_direct) - base),
                 (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable_fresh) - base),
-                (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable_hoisted) - base));
-    return a == b && b == c && c == d ? 0 : 1;
+                (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable_hoisted) - base),
+                (unsigned long long)(reinterpret_cast<std::uintptr_t>(&run_vtable_symbol) - base));
+    return a == b && b == c && c == d && d == e ? 0 : 1;
 }

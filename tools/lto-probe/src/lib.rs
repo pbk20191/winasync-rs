@@ -8,7 +8,9 @@
 //! `extern "C"` rather than an activation factory: the question is what the
 //! optimizer can do once it holds the interface pointer, not how it got it.
 //! `probe_adder_add` is the same method as a plain exported symbol, the
-//! upper bound a direct call can reach.
+//! upper bound a direct call can reach. `ADDER_IADDER_VTABLE` is the
+//! class's vtable as a symbol, so a caller can keep the vtable call shape
+//! and still give the optimizer a constant to fold.
 
 #![allow(non_snake_case)]
 
@@ -31,6 +33,14 @@ impl IAdder_Impl for Adder_Impl {
         HRESULT(0)
     }
 }
+
+/// `Adder`'s `IAdder` vtable as a named symbol: the same table the object
+/// carries (interface 1 of `Adder_Impl`, one pointer after the object's
+/// start, hence the offset of -1; the same thunks), reachable without
+/// reading it out of the object. A caller that knows the class can call
+/// through this and never touch the object's vtable pointer.
+#[unsafe(no_mangle)]
+pub static ADDER_IADDER_VTABLE: IAdder_Vtbl = IAdder_Vtbl::new::<Adder_Impl, { -1 }>();
 
 /// A new `Adder` as an `IAdder` interface pointer, refcount 1.
 #[unsafe(no_mangle)]

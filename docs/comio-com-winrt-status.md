@@ -1646,8 +1646,28 @@ Rust가 만든 COM vtable에는 적용되지 않는다.
 LTO 한 모듈로 묶어도 결과는 같았다. 패스 순서가 마지막 벽이다. `lld-link`에는 파이프라인을 바꾸는
 옵션이 없다.
 
-**따라서** "소비자는 vtable로 쓰고 LTO가 알아서"는 직접 호출까지는 되고 인라인은 안 된다. 인라인까지
-되는 형태는 둘이다.
+**vtable 자체를 심볼로 (2026-11-12, 다섯 번째 행).** 슬롯 함수가 아니라 클래스의 vtable 상수를 이름 있는
+심볼로 내보내고(`#[no_mangle] pub static ADDER_IADDER_VTABLE: IAdder_Vtbl = IAdder_Vtbl::new::<Adder_Impl, {-1}>()`),
+소비자가 `ADDER_IADDER_VTABLE.Add(p, …)`처럼 객체가 아니라 그 심볼에서 슬롯을 읽게 하면 객체 메모리
+적재가 사라진다. 상수 전역의 초기값은 LTO 병합 시점에 보이고, 그 적재는 IPSCCP/InstCombine이 인라이너
+**전에** 접는다. 결과는 LTO 모드에 따라 갈린다.
+
+| 모드 | `run_vtable_symbol` 루프 |
+|---|---|
+| ThinLTO (clang `-flto=thin`) | 직접 호출(`call 0x140014020`)이지만 인라인 안 됨 — 썽크는 소비자 모듈에 `declare`뿐. 요약 단계의 임포트는 호출 간선만 따르고 변수 참조로는 함수를 가져오지 않는다. `-mllvm:-force-import-all`은 `handle_alloc_error` 임포트 실패로 중단 |
+| full LTO (clang `-flto`, rustc `-Clto=fat -Clinker-plugin-lto`) | **썽크 인라인됨** (`IAdder_Vtbl::new::<Adder_Impl,-1>::Add` inlined, cost=-35), 루프가 닫힌 식으로 접혀 0.000 ns, 직접 심볼 루프와 같은 코드로 합쳐짐 |
+
+같은 full LTO에서도 hoisted 변형(객체에서 읽어 올림)은 여전히 인라인이 안 된다. 적재가 상수 전역에서
+오는지 객체 메모리에서 오는지가 인라이너 전후를 가른다. 참고로 `IAdder_Vtbl::new::<T, OFFSET>`의 OFFSET은
+썽크가 `this.offset(OFFSET)`로 쓰므로 interface 1은 `-1`이다. `1`을 주면 엉뚱한 메모리에서 salt를 읽어
+acc가 달라진다(처음 그렇게 틀렸다).
+
+**따라서** "소비자는 vtable로 쓰고 LTO가 알아서"는 그 vtable이 객체에서 읽히는 한 직접 호출까지이고,
+클래스의 vtable 심볼에서 읽히면 full LTO에서 인라인까지 된다. 내보낼 심볼은 메서드마다가 아니라
+(클래스, 인터페이스)마다 하나이고, 포크한 `implement` 매크로의 `VTABLE_INTERFACEn` 상수에 이름을 붙이는
+것으로 끝난다. 소비자 코드는 vtable 구조체를 통한 COM 호출 모양 그대로이되 클래스에 묶인다. 인라인까지
+되는 형태는 셋이다.
+- 클래스 vtable 심볼로 호출 (위). full LTO 필요.
 - 슬롯 함수를 이름 있는 심볼로도 내보내고(포크한 `implement` 매크로가 오프셋을 알고 있어 자동 생성
   가능), 정적 링크 소비자용 헤더가 인터페이스 메서드를 그 심볼로 매핑한다. 소비자 코드는 인터페이스
   모양 그대로이고 호출은 직접 호출이라 위 둘째 행처럼 인라인된다. `this`는 vtable 경로와 같은 인터페이스

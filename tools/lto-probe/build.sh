@@ -2,8 +2,9 @@
 # Builds the probe two ways and shows what became of the vtable call.
 #
 #   native  Rust and C++ compiled to machine code, linked as usual.
-#   lto     both compiled to LLVM bitcode, linked by rustc's own lld, which
-#           runs the LTO over the whole program.
+#   lto     both compiled to LLVM bitcode (ThinLTO), linked by rustc's own
+#           lld, which runs the LTO over the whole program.
+#   fat     the same with full LTO on both sides.
 #
 # rustc's LLVM is one major ahead of the installed clang (23 vs 22), so the
 # link must be done by rust-lld: a newer lld reads older bitcode, not the
@@ -51,6 +52,18 @@ RUSTFLAGS="-Clinker-plugin-lto -Cembed-bitcode=yes" cargo build --release -q --t
     "-mllvm:-pass-remarks=inline" "-mllvm:-pass-remarks-missed=inline" 2>&1 \
     | grep -E "'probe_" | sed -E 's/^<unknown>:0:0: //' | sort -u
 
+echo "== fat"
+# Full LTO on both sides, one module: the only mode in which a call
+# through the exported vtable symbol inlines. Under ThinLTO the slot load
+# folds to a direct call, but the thunk is never imported (imports follow
+# call edges, and a vtable is a reference, not a call).
+RUSTFLAGS="-Clinker-plugin-lto -Clto=fat -Cembed-bitcode=yes" cargo build --release -q --target-dir target/lto_fat --target x86_64-pc-windows-msvc
+"$CLANG" -nologo -O2 -MD -EHsc -flto /clang:-march=x86-64-v2 -c consumer.cpp "-Fo$OUT/consumer_fat.obj"
+"$OUT/lld-link.exe" -nologo "-out:$OUT/probe_fat.exe" "$OUT/consumer_fat.obj" \
+    target/lto_fat/x86_64-pc-windows-msvc/release/lto_probe.lib $LIBS -subsystem:console -opt:lldlto=3 \
+    "-mllvm:-pass-remarks=inline" 2>&1 \
+    | grep -E "'probe_|Vtbl3new" | sed -E 's/^<unknown>:0:0: //' | sort -u
+
 disassemble() { # exe, rva, label
     local start=$((0x140000000 + 0x$2))
     echo "--- $3 @ $2"
@@ -58,15 +71,19 @@ disassemble() { # exe, rva, label
         --start-address=$start --stop-address=$((start + 0xa0)) "$1" | tail -n +6 | grep -E "call|ret" || true
 }
 
-for v in native lto; do
+for v in native lto fat; do
     echo "== run $v"
-    line=$("$OUT/probe_$v.exe" 7 200000000 | tee /dev/stderr | grep '^rva')
+    # -a: with stderr redirected to a file, reopening it without append
+    # would truncate the log so far.
+    line=$("$OUT/probe_$v.exe" 7 200000000 | tee -a /dev/stderr | grep '^rva')
     rv=$(sed -E 's/.*run_vtable=([0-9a-f]+).*/\1/' <<<"$line")
     rd=$(sed -E 's/.*run_direct=([0-9a-f]+).*/\1/' <<<"$line")
     rf=$(sed -E 's/.*run_vtable_fresh=([0-9a-f]+).*/\1/' <<<"$line")
     rh=$(sed -E 's/.*run_vtable_hoisted=([0-9a-f]+).*/\1/' <<<"$line")
+    rs=$(sed -E 's/.*run_vtable_symbol=([0-9a-f]+).*/\1/' <<<"$line")
     disassemble "$OUT/probe_$v.exe" "$rv" "run_vtable ($v)"
     disassemble "$OUT/probe_$v.exe" "$rd" "run_direct ($v)"
     disassemble "$OUT/probe_$v.exe" "$rf" "run_vtable_fresh ($v)"
     disassemble "$OUT/probe_$v.exe" "$rh" "run_vtable_hoisted ($v)"
+    disassemble "$OUT/probe_$v.exe" "$rs" "run_vtable_symbol ($v)"
 done
