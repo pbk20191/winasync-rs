@@ -49,7 +49,8 @@ pub mod wait;
 pub use crate::common::block_on::block_on;
 #[allow(unused_imports)]
 pub use io::async_rw::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, TcpStreamIo, WriteHalf,
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, RawStream, ReadHalf, StreamIo,
+    TcpStreamIo, WriteHalf,
 };
 #[allow(unused_imports)]
 pub use io::file::{File, PageBuffers};

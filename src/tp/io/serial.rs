@@ -10,7 +10,7 @@
 //! are skipped otherwise. See `tests` below.
 
 use crate::common::buffer::BufResult;
-use super::{submit, IoRes, Issue};
+use super::{submit, IoRes, Issue, OpFuture};
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::Runtime;
 use std::sync::Arc;
@@ -97,18 +97,24 @@ impl SerialPort {
         &self,
         buf: B,
     ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
+        let fut = self.start_read(buf);
+        async move {
+            let (result, buf) = fut.await;
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, buf))
+        }
+    }
+
+    /// The read under [`read`](Self::read), as the nameable future it is;
+    /// the length is not yet marked. For the stream adapter.
+    pub(in crate::tp::io) fn start_read<B: IoBufMut>(&self, buf: B) -> OpFuture<B> {
         let handle = self.res.handle;
-        let fut = unsafe {
+        unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let slice =
                     core::slice::from_raw_parts_mut(buf.stable_mut_ptr(), IoBuf::bytes_total(buf));
                 classify(ReadFile(handle, Some(slice), None, Some(ovl)))
             })
-        };
-        async move {
-            let (result, buf) = fut.await;
-            let n = result.as_ref().ok().copied();
-            (result, crate::common::buffer::mark_read(n, buf))
         }
     }
 
@@ -117,12 +123,25 @@ impl SerialPort {
         &self,
         buf: B,
     ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
+        self.start_write(buf)
+    }
+
+    /// The write under [`write`](Self::write), nameable.
+    pub(in crate::tp::io) fn start_write<B: IoBuf>(&self, buf: B) -> OpFuture<B> {
         let handle = self.res.handle;
         unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
                 classify(WriteFile(handle, Some(slice), None, Some(ovl)))
             })
+        }
+    }
+
+    /// A second handle onto the same port; it closes once every handle is
+    /// gone. For the stream adapter's split halves.
+    pub(in crate::tp::io) fn share(&self) -> SerialPort {
+        SerialPort {
+            res: self.res.clone(),
         }
     }
 

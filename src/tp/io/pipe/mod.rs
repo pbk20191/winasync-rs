@@ -145,6 +145,37 @@ impl NamedPipeStream {
         }
     }
 
+    /// The read under [`read`](Self::read), as the nameable future it is;
+    /// the length is not yet marked. For the stream adapter.
+    pub(in crate::tp::io) fn start_read(&self, buf: Vec<u8>) -> super::MessageOp<Vec<u8>> {
+        self.read_part(buf)
+    }
+
+    /// The write under [`write`](Self::write), nameable.
+    pub(in crate::tp::io) fn start_write<B: IoBuf>(&self, buf: B) -> super::OpFuture<B> {
+        let handle = self.res.handle;
+        unsafe {
+            submit(&self.res, buf, move |ovl, buf| {
+                let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
+                match WriteFile(handle, Some(slice), None, Some(ovl)) {
+                    Ok(()) => Issue::SyncSuccess,
+                    Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
+                    Err(e) => Issue::Failed(e.code()),
+                }
+            })
+        }
+    }
+
+    /// A second handle onto the same pipe instance; it closes once every
+    /// handle is gone. For the stream adapter's split halves.
+    pub(in crate::tp::io) fn share(&self) -> NamedPipeStream {
+        NamedPipeStream {
+            res: self.res.clone(),
+            server_side: self.server_side,
+            message_mode: self.message_mode,
+        }
+    }
+
     /// One `ReadFile`, reporting whether the message it read from goes on.
     fn read_part<B: IoBufMut>(&self, buf: B) -> super::MessageOp<B> {
         let handle = self.res.handle;
@@ -361,18 +392,7 @@ impl NamedPipeStream {
         &self,
         buf: B,
     ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
-        let handle = self.res.handle;
-
-        unsafe {
-            submit(&self.res, buf, move |ovl, buf| {
-                let slice = core::slice::from_raw_parts(buf.stable_ptr(), IoBuf::len(buf));
-                match WriteFile(handle, Some(slice), None, Some(ovl)) {
-                    Ok(()) => Issue::SyncSuccess,
-                    Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => Issue::Pending,
-                    Err(e) => Issue::Failed(e.code()),
-                }
-            })
-        }
+        self.start_write(buf)
     }
 
     /// [`write`](Self::write), with a buffer that need not be `'static`:

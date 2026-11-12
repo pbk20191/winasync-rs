@@ -7,27 +7,38 @@
 //! future that started it is dropped — cancellation is asynchronous). The
 //! `AsyncRead`/`AsyncWrite` traits instead hand out *borrowed* slices per poll.
 //! Bridging the two safely requires the adapter to own an internal staging
-//! buffer and the in-flight `OpFuture` (boxed): the kernel
-//! only ever writes into the adapter-owned buffer, never the caller's slice, so
-//! dropping a combinator future mid-op can never leave the kernel writing into
-//! freed/foreign memory. Data is copied between the staging buffer and the
-//! caller's slice at completion.
+//! buffer and the in-flight operation: the kernel only ever writes into the
+//! adapter-owned buffer, never the caller's slice, so dropping a combinator
+//! future mid-op can never leave the kernel writing into freed/foreign memory.
+//! Data is copied between the staging buffer and the caller's slice at
+//! completion.
 //!
-//! The adapter is *unbuffered* on the write side (at most one WSASend in flight;
+//! The adapter is *unbuffered* on the write side (at most one send in flight;
 //! `poll_write` resolves when that send completes) and single-op on the read
-//! side (one WSARecv in flight; a short caller buffer keeps the unread remainder
-//! for the next `poll_read`). This preserves the one-poll-to-one-syscall
-//! cancellation story of the owned-buffer API.
+//! side (one receive in flight; a short caller buffer keeps the unread
+//! remainder for the next `poll_read`). This preserves the
+//! one-poll-to-one-syscall cancellation story of the owned-buffer API.
+//!
+//! # One adapter, every stream
+//! [`StreamIo`] is generic over [`RawStream`]: what the adapter needs of a
+//! stream is one nameable, unboxed future for a read and one for a write of a
+//! `Vec<u8>`, a second handle onto the same endpoint for [`split`], and a way
+//! to end the write side. TCP, AF_UNIX and Hyper-V sockets, named pipes and
+//! serial ports implement it; each gets an `into_io`. The trait is sealed:
+//! its futures are the crate's own op futures.
 //!
 //! # Full duplex
-//! [`TcpStreamIo`] is a [`ReadHalf`] + [`WriteHalf`] pair sharing the socket
-//! (via the refcounted `IoRes`). [`TcpStreamIo::split`] hands the two halves out
+//! [`StreamIo`] is a [`ReadHalf`] + [`WriteHalf`] pair sharing the endpoint
+//! (via the refcounted `IoRes`). [`StreamIo::split`] hands the two halves out
 //! so a reader and a writer can run concurrently (each owns its own in-flight
-//! op and staging; concurrent WSARecv + WSASend on one socket is supported) —
-//! the combinator methods need `&mut self`, so without splitting you cannot read
-//! and write the same adapter at once.
+//! op and staging; a concurrent read and write on one handle is supported) —
+//! the combinator methods need `&mut self`, so without splitting you cannot
+//! read and write the same adapter at once.
+//!
+//! [`split`]: StreamIo::split
 
 use super::net::TcpStream;
+use crate::common::buffer::BufResult;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use windows::Win32::Foundation::WIN32_ERROR;
@@ -81,27 +92,124 @@ pub trait AsyncWrite {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<windows_core::Result<()>>;
 }
 
-/// The receive in flight: the stream's own future, which is `Unpin` and
-/// nameable, so nothing is boxed to keep it in a field.
-type ReadFut = crate::common::opfuture::OpFuture<super::net::RecvPayload<Vec<u8>>>;
-type WriteFut = crate::common::opfuture::OpFuture<Vec<u8>>;
+// ---------------------------------------------------------------------------
+// What a stream gives the adapter
+// ---------------------------------------------------------------------------
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A stream the adapter can wrap: see the [module docs](self#one-adapter-every-stream).
+///
+/// Sealed; implemented by the crate's own stream types. The methods are the
+/// adapter's, not an API -- read and write through the type's own `read` /
+/// `write`, or through [`StreamIo`].
+pub trait RawStream: sealed::Sealed + Send + Sized + Unpin + 'static {
+    /// One receive into `buf`'s spare room, as the nameable future it is;
+    /// the buffer comes back with its length marking what arrived.
+    #[doc(hidden)]
+    fn start_read(&self, buf: Vec<u8>) -> StagedRead;
+    /// One send of `buf`, nameable.
+    #[doc(hidden)]
+    fn start_write(&self, buf: Vec<u8>) -> StagedWrite;
+    /// A second handle onto the same endpoint, which closes only once every
+    /// handle is gone.
+    #[doc(hidden)]
+    fn share(&self) -> Self;
+    /// Ends the write side so the peer reads EOF; a no-op where the transport
+    /// has no half-close (then only dropping the last handle ends it).
+    #[doc(hidden)]
+    fn shutdown_send(&self) -> windows_core::Result<()>;
+}
+
+type OpFuture<P> = crate::common::opfuture::OpFuture<P>;
+
+/// The receive in flight, by the shape of the kernel call under it. One enum
+/// rather than an associated type, so a stream's op future (crate-private)
+/// stays out of the public trait.
+enum ReadOp {
+    /// `WSARecv`: the flags word rides along in the payload.
+    Recv(OpFuture<super::net::RecvPayload<Vec<u8>>>),
+    /// `ReadFile`.
+    File(OpFuture<Vec<u8>>),
+    /// `ReadFile` on a pipe that may carry messages: a partial message is
+    /// bytes like any other, and the "more follows" bit is dropped.
+    Message(crate::common::opfuture::MessageOp<Vec<u8>>),
+}
+
+/// A staging read in flight. The adapter's; see [`RawStream`].
+#[doc(hidden)]
+pub struct StagedRead(ReadOp);
+
+impl StagedRead {
+    pub(in crate::tp::io) fn recv(op: OpFuture<super::net::RecvPayload<Vec<u8>>>) -> Self {
+        StagedRead(ReadOp::Recv(op))
+    }
+    pub(in crate::tp::io) fn file(op: OpFuture<Vec<u8>>) -> Self {
+        StagedRead(ReadOp::File(op))
+    }
+    pub(in crate::tp::io) fn message(op: crate::common::opfuture::MessageOp<Vec<u8>>) -> Self {
+        StagedRead(ReadOp::Message(op))
+    }
+}
+
+impl Future for StagedRead {
+    type Output = BufResult<usize, Vec<u8>>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (result, buf) = match &mut self.get_mut().0 {
+            ReadOp::Recv(op) => {
+                let (result, payload) = std::task::ready!(Pin::new(op).poll(cx));
+                (result, payload.buf)
+            }
+            ReadOp::File(op) => std::task::ready!(Pin::new(op).poll(cx)),
+            ReadOp::Message(op) => {
+                let (result, buf) = std::task::ready!(Pin::new(op).poll(cx));
+                (result.map(|(n, _more)| n), buf)
+            }
+        };
+        let n = result.as_ref().ok().copied();
+        Poll::Ready((result, crate::common::buffer::mark_read(n, buf)))
+    }
+}
+
+/// A staging write in flight. The adapter's; see [`RawStream`].
+#[doc(hidden)]
+pub struct StagedWrite(OpFuture<Vec<u8>>);
+
+impl StagedWrite {
+    pub(in crate::tp::io) fn new(op: OpFuture<Vec<u8>>) -> Self {
+        StagedWrite(op)
+    }
+}
+
+impl Future for StagedWrite {
+    type Output = BufResult<usize, Vec<u8>>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The adapter
+// ---------------------------------------------------------------------------
 
 const DEFAULT_READ_CAP: usize = 16 * 1024;
 
-/// The readable half of a split [`TcpStreamIo`] (also usable standalone).
-pub struct ReadHalf {
-    stream: TcpStream,
+/// The readable half of a split [`StreamIo`] (also usable standalone).
+pub struct ReadHalf<S: RawStream = TcpStream> {
+    stream: S,
     read_cap: usize,
-    /// In-flight WSARecv (owns the staging buffer the kernel writes into).
-    read_fut: Option<ReadFut>,
+    /// In-flight receive (owns the staging buffer the kernel writes into).
+    read_fut: Option<StagedRead>,
     /// A recycled read staging buffer (len == `read_cap`) awaiting reuse.
     read_spare: Option<Vec<u8>>,
     /// Bytes read but not yet handed to a caller: `(buffer, start, end)`.
     read_rem: Option<(Vec<u8>, usize, usize)>,
 }
 
-impl ReadHalf {
-    fn new(stream: TcpStream, read_cap: usize) -> Self {
+impl<S: RawStream> ReadHalf<S> {
+    fn new(stream: S, read_cap: usize) -> Self {
         Self {
             stream,
             read_cap: read_cap.max(1),
@@ -112,12 +220,12 @@ impl ReadHalf {
     }
 
     /// Borrows the underlying stream (e.g. for `peer_addr`).
-    pub fn get_ref(&self) -> &TcpStream {
+    pub fn get_ref(&self) -> &S {
         &self.stream
     }
 }
 
-impl AsyncRead for ReadHalf {
+impl<S: RawStream> AsyncRead for ReadHalf<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -153,9 +261,8 @@ impl AsyncRead for ReadHalf {
         // 3. Poll it; on completion copy into the caller's slice.
         match Pin::new(this.read_fut.as_mut().unwrap()).poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready((res, payload)) => {
+            Poll::Ready((res, staging)) => {
                 this.read_fut = None;
-                let staging = crate::common::buffer::mark_read(res.as_ref().ok().copied(), payload.buf);
                 match res {
                     Ok(n) => {
                         let m = buf.len().min(n);
@@ -177,17 +284,17 @@ impl AsyncRead for ReadHalf {
     }
 }
 
-/// The writable half of a split [`TcpStreamIo`] (also usable standalone).
-pub struct WriteHalf {
-    stream: TcpStream,
-    /// In-flight WSASend (owns the copied bytes the kernel reads from).
-    write_fut: Option<WriteFut>,
+/// The writable half of a split [`StreamIo`] (also usable standalone).
+pub struct WriteHalf<S: RawStream = TcpStream> {
+    stream: S,
+    /// In-flight send (owns the copied bytes the kernel reads from).
+    write_fut: Option<StagedWrite>,
     /// A recycled write staging buffer awaiting reuse.
     write_spare: Option<Vec<u8>>,
 }
 
-impl WriteHalf {
-    fn new(stream: TcpStream) -> Self {
+impl<S: RawStream> WriteHalf<S> {
+    fn new(stream: S) -> Self {
         Self {
             stream,
             write_fut: None,
@@ -196,12 +303,12 @@ impl WriteHalf {
     }
 
     /// Borrows the underlying stream (e.g. for `peer_addr`).
-    pub fn get_ref(&self) -> &TcpStream {
+    pub fn get_ref(&self) -> &S {
         &self.stream
     }
 }
 
-impl AsyncWrite for WriteHalf {
+impl<S: RawStream> AsyncWrite for WriteHalf<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -250,47 +357,51 @@ impl AsyncWrite for WriteHalf {
     }
 }
 
-/// An [`AsyncRead`] + [`AsyncWrite`] adapter around a [`TcpStream`], composed of
-/// a [`ReadHalf`] and a [`WriteHalf`]. Obtain one with [`TcpStream::into_io`],
-/// and [`split`](Self::split) it for concurrent full-duplex use.
-pub struct TcpStreamIo {
-    read: ReadHalf,
-    write: WriteHalf,
+/// An [`AsyncRead`] + [`AsyncWrite`] adapter around a stream, composed of a
+/// [`ReadHalf`] and a [`WriteHalf`]. Obtain one with the stream's `into_io`
+/// ([`TcpStream::into_io`] and the like), and [`split`](Self::split) it for
+/// concurrent full-duplex use.
+pub struct StreamIo<S: RawStream = TcpStream> {
+    read: ReadHalf<S>,
+    write: WriteHalf<S>,
 }
 
-impl TcpStreamIo {
+/// [`StreamIo`] over a [`TcpStream`].
+pub type TcpStreamIo = StreamIo<TcpStream>;
+
+impl<S: RawStream> StreamIo<S> {
     /// Wraps `stream` with a default read staging capacity.
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: S) -> Self {
         Self::with_capacity(stream, DEFAULT_READ_CAP)
     }
 
     /// Wraps `stream` with an explicit per-read staging capacity (the largest
-    /// amount a single underlying WSARecv will request).
-    pub fn with_capacity(stream: TcpStream, read_cap: usize) -> Self {
+    /// amount a single underlying read will request).
+    pub fn with_capacity(stream: S, read_cap: usize) -> Self {
         let write = WriteHalf::new(stream.share());
         let read = ReadHalf::new(stream, read_cap);
         Self { read, write }
     }
 
     /// Borrows the underlying stream (e.g. for `peer_addr`).
-    pub fn get_ref(&self) -> &TcpStream {
+    pub fn get_ref(&self) -> &S {
         self.read.get_ref()
     }
 
     /// Recovers a handle to the stream. Any in-flight staging is dropped (which
     /// cancels an in-flight op, as with dropping an owned-buffer future).
-    pub fn into_inner(self) -> TcpStream {
+    pub fn into_inner(self) -> S {
         self.read.stream
     }
 
     /// Splits into independently-ownable read and write halves for concurrent
     /// full-duplex use.
-    pub fn split(self) -> (ReadHalf, WriteHalf) {
+    pub fn split(self) -> (ReadHalf<S>, WriteHalf<S>) {
         (self.read, self.write)
     }
 }
 
-impl AsyncRead for TcpStreamIo {
+impl<S: RawStream> AsyncRead for StreamIo<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -300,7 +411,7 @@ impl AsyncRead for TcpStreamIo {
     }
 }
 
-impl AsyncWrite for TcpStreamIo {
+impl<S: RawStream> AsyncWrite for StreamIo<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -318,12 +429,139 @@ impl AsyncWrite for TcpStreamIo {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The streams
+// ---------------------------------------------------------------------------
+
+impl sealed::Sealed for TcpStream {}
+impl RawStream for TcpStream {
+    fn start_read(&self, buf: Vec<u8>) -> StagedRead {
+        StagedRead::recv(TcpStream::start_read(self, buf))
+    }
+    fn start_write(&self, buf: Vec<u8>) -> StagedWrite {
+        StagedWrite::new(TcpStream::start_write(self, buf))
+    }
+    fn share(&self) -> Self {
+        TcpStream::share(self)
+    }
+    fn shutdown_send(&self) -> windows_core::Result<()> {
+        TcpStream::shutdown_send(self)
+    }
+}
+
 impl TcpStream {
     /// Wraps this stream in an [`AsyncRead`]/[`AsyncWrite`] adapter.
     pub fn into_io(self) -> TcpStreamIo {
-        TcpStreamIo::new(self)
+        StreamIo::new(self)
     }
 }
+
+impl sealed::Sealed for super::unix::UnixStream {}
+impl RawStream for super::unix::UnixStream {
+    fn start_read(&self, buf: Vec<u8>) -> StagedRead {
+        StagedRead::recv(super::unix::UnixStream::start_read(self, buf))
+    }
+    fn start_write(&self, buf: Vec<u8>) -> StagedWrite {
+        StagedWrite::new(super::unix::UnixStream::start_write(self, buf))
+    }
+    fn share(&self) -> Self {
+        super::unix::UnixStream::share(self)
+    }
+    fn shutdown_send(&self) -> windows_core::Result<()> {
+        super::unix::UnixStream::shutdown_send(self)
+    }
+}
+
+impl super::unix::UnixStream {
+    /// Wraps this stream in an [`AsyncRead`]/[`AsyncWrite`] adapter.
+    pub fn into_io(self) -> StreamIo<Self> {
+        StreamIo::new(self)
+    }
+}
+
+impl sealed::Sealed for super::hvsock::HvStream {}
+impl RawStream for super::hvsock::HvStream {
+    fn start_read(&self, buf: Vec<u8>) -> StagedRead {
+        StagedRead::recv(super::hvsock::HvStream::start_read(self, buf))
+    }
+    fn start_write(&self, buf: Vec<u8>) -> StagedWrite {
+        StagedWrite::new(super::hvsock::HvStream::start_write(self, buf))
+    }
+    fn share(&self) -> Self {
+        super::hvsock::HvStream::share(self)
+    }
+    fn shutdown_send(&self) -> windows_core::Result<()> {
+        super::hvsock::HvStream::shutdown_send(self)
+    }
+}
+
+impl super::hvsock::HvStream {
+    /// Wraps this stream in an [`AsyncRead`]/[`AsyncWrite`] adapter.
+    pub fn into_io(self) -> StreamIo<Self> {
+        StreamIo::new(self)
+    }
+}
+
+impl sealed::Sealed for super::pipe::NamedPipeStream {}
+impl RawStream for super::pipe::NamedPipeStream {
+    fn start_read(&self, buf: Vec<u8>) -> StagedRead {
+        StagedRead::message(super::pipe::NamedPipeStream::start_read(self, buf))
+    }
+    fn start_write(&self, buf: Vec<u8>) -> StagedWrite {
+        StagedWrite::new(super::pipe::NamedPipeStream::start_write(self, buf))
+    }
+    fn share(&self) -> Self {
+        super::pipe::NamedPipeStream::share(self)
+    }
+    /// A pipe has no half-close: the peer reads EOF once the last handle is
+    /// closed, so `close` only flushes.
+    fn shutdown_send(&self) -> windows_core::Result<()> {
+        Ok(())
+    }
+}
+
+impl super::pipe::NamedPipeStream {
+    /// Wraps this stream in an [`AsyncRead`]/[`AsyncWrite`] adapter.
+    ///
+    /// On a message-mode pipe the adapter reads bytes without boundaries, as
+    /// [`read`](Self::read) does. A pipe has no half-close, so the adapter's
+    /// `close` only flushes; the peer reads EOF once the stream (every half of
+    /// it) is dropped.
+    pub fn into_io(self) -> StreamIo<Self> {
+        StreamIo::new(self)
+    }
+}
+
+impl sealed::Sealed for super::serial::SerialPort {}
+impl RawStream for super::serial::SerialPort {
+    fn start_read(&self, buf: Vec<u8>) -> StagedRead {
+        StagedRead::file(super::serial::SerialPort::start_read(self, buf))
+    }
+    fn start_write(&self, buf: Vec<u8>) -> StagedWrite {
+        StagedWrite::new(super::serial::SerialPort::start_write(self, buf))
+    }
+    fn share(&self) -> Self {
+        super::serial::SerialPort::share(self)
+    }
+    /// A line has no close to send; `close` only flushes.
+    fn shutdown_send(&self) -> windows_core::Result<()> {
+        Ok(())
+    }
+}
+
+impl super::serial::SerialPort {
+    /// Wraps this port in an [`AsyncRead`]/[`AsyncWrite`] adapter. Each
+    /// `poll_read` is one read as the port's timeouts decide it
+    /// ([`set_timeouts`](Self::set_timeouts)); there is nothing to close, so
+    /// the adapter's `close` only flushes.
+    pub fn into_io(self) -> StreamIo<Self> {
+        StreamIo::new(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combinators
+// ---------------------------------------------------------------------------
 
 /// Ergonomic `async` combinators over any [`AsyncRead`].
 pub trait AsyncReadExt: AsyncRead + Unpin {
@@ -488,41 +726,41 @@ mod futures_compat {
     }
 
     macro_rules! impl_futures_read {
-        ($t:ty) => {
-            impl futures_io::AsyncRead for $t {
+        ($t:ident) => {
+            impl<S: RawStream> futures_io::AsyncRead for $t<S> {
                 fn poll_read(
                     self: Pin<&mut Self>,
                     cx: &mut Context<'_>,
                     buf: &mut [u8],
                 ) -> Poll<io::Result<usize>> {
-                    map(<$t as AsyncRead>::poll_read(self, cx, buf))
+                    map(<$t<S> as AsyncRead>::poll_read(self, cx, buf))
                 }
             }
         };
     }
 
     macro_rules! impl_futures_write {
-        ($t:ty) => {
-            impl futures_io::AsyncWrite for $t {
+        ($t:ident) => {
+            impl<S: RawStream> futures_io::AsyncWrite for $t<S> {
                 fn poll_write(
                     self: Pin<&mut Self>,
                     cx: &mut Context<'_>,
                     buf: &[u8],
                 ) -> Poll<io::Result<usize>> {
-                    map(<$t as AsyncWrite>::poll_write(self, cx, buf))
+                    map(<$t<S> as AsyncWrite>::poll_write(self, cx, buf))
                 }
                 fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                    map(<$t as AsyncWrite>::poll_flush(self, cx))
+                    map(<$t<S> as AsyncWrite>::poll_flush(self, cx))
                 }
                 fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                    map(<$t as AsyncWrite>::poll_close(self, cx))
+                    map(<$t<S> as AsyncWrite>::poll_close(self, cx))
                 }
             }
         };
     }
 
-    impl_futures_read!(TcpStreamIo);
-    impl_futures_write!(TcpStreamIo);
+    impl_futures_read!(StreamIo);
+    impl_futures_write!(StreamIo);
     impl_futures_read!(ReadHalf);
     impl_futures_write!(WriteHalf);
 }

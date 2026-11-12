@@ -1566,6 +1566,38 @@ RIO op는 IRP/IOCP를 타지 않아 `SetFileCompletionNotificationModes`가 건�
 AF_UNIX·Hyper-V 전송의 "RIO 급 경로"는 없고, 그 패밀리들의 성능 상한은 tp의 overlapped + skip-completion이다.
 프로브는 다른 빌드에서 다시 재 볼 수 있도록 남겨 둔다.
 
+### 세 층의 읽기: 소유 · 어댑터 · `_unchecked`, 그리고 어댑터를 모든 스트림으로 (2026-11-12)
+
+completion I/O에서 "빌린 버퍼를 커널에 넘긴다"는 모델이 맞는지 다시 짚었다. 결론은 빌림이 아니라 **이동**이
+기본이라는 것이다. 호출이 돌아온 뒤에도 커널이 버퍼에 쓰고, future는 완료 전에 drop될 수 있으므로 `&mut [u8]`의
+동기 전제가 깨진다. 그래서 세 층이 있고 셋 다 남긴다.
+
+| 층 | 안전성 | 복사 | 취소 | 용도 |
+|---|---|---|---|---|
+| 소유 API (`read(buf) -> (Result, buf)`) | safe | 0 | 비동기, 버퍼는 작업이 쥠 | 기본 |
+| `AsyncRead`/`AsyncWrite` 어댑터 | safe | 1회 (스테이징 ↔ 호출자 슬라이스) | 어댑터 버퍼만 커널에 노출 | 코덱·TLS·HTTP 등 제네릭 코드 |
+| `*_unchecked(&mut [u8], event)` | unsafe (누수 금지가 계약) | 0 | Drop이 `CancelIoEx` 후 이벤트를 블로킹 대기 | 스택 버퍼, 비용을 아는 쪽 |
+
+규칙은 하나다. 빌린 슬라이스가 작업 수명 동안 커널에 노출된 채 빌림이 끝나면 안 된다. 소유 API는 버퍼를
+작업에 넘겨서, 어댑터는 자기 버퍼만 넘겨서, `_unchecked`는 빌림이 커널보다 오래 살게 해서 지킨다.
+`_unchecked`가 unsafe인 이유는 `mem::forget`뿐이고, 이는 언어가 누수를 안전하다고 정한 결과다. RIO에는
+빌린 변형이 없는데, 등록 메모리만 받으므로 개념 자체가 성립하지 않는다.
+
+어댑터는 TCP에만 있었다. `ReadHalf`가 진행 중인 future를 박싱 없이 필드로 들려면 이름 있는 타입이 필요한데,
+그것을 돌려주는 `start_read`가 TCP에만 있었기 때문이다. `tp::io::async_rw`를 `StreamIo<S: RawStream>`으로
+제네릭화했다. `RawStream`은 봉인된 trait로 `start_read`/`start_write`(`StagedRead`/`StagedWrite`, 커널 호출
+모양별 enum: `WSARecv`·`ReadFile`·메시지 파이프)·`share`·`shutdown_send` 넷을 요구한다. `TcpStreamIo`는
+`StreamIo<TcpStream>`의 별칭이고 공개 API는 그대로다. 붙인 곳:
+
+- `UnixStream`, `HvStream`: TCP와 같은 모양. `shutdown_send`를 공개로 추가했다.
+- `NamedPipeStream`: 절반 닫기가 없어 `close`는 flush만 한다. 메시지 모드에서는 경계 없이 바이트로 읽는다
+  (`ERROR_MORE_DATA`를 부분 메시지로 받아 `more` 비트를 버림). 테스트에서 40 000바이트 한 메시지가 16 KiB
+  스테이징 읽기 세 번으로 도착하는 것을 확인했다.
+- `SerialPort`: 닫을 것이 없어 `close`는 flush만. 포트가 없는 호스트에서는 타입 수준으로만 검증.
+- 파일은 위치 기반이라 커서를 들어야 하므로 미룬다.
+
+복사 비용은 그대로고 할당 0·박싱 0도 그대로다. `futures-io` impl은 `S`에 대해 제네릭이 됐다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |

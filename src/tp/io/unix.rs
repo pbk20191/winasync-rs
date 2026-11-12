@@ -10,7 +10,7 @@ use super::net::{
     classify_wsa_overlapped, new_socket, sock_check, AcceptPayload, RecvPayload,
     VectoredPayload, ADDR_SLOT,
 };
-use super::{submit, IoRes};
+use super::{submit, IoRes, OpFuture};
 use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::common::security::{self, SecurityDescriptor};
 use crate::tp::{Runtime, RuntimeInner};
@@ -19,8 +19,8 @@ use core::ffi::c_void;
 use std::mem;
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    bind, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
-    IPPROTO, SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
+    bind, listen, setsockopt, shutdown, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
+    IPPROTO, SD_SEND, SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
 };
 use windows_core::Error;
@@ -213,8 +213,19 @@ impl UnixStream {
         &self,
         buf: B,
     ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
+        let fut = self.start_read(buf);
+        async move {
+            let (result, payload) = fut.await;
+            let n = result.as_ref().ok().copied();
+            (result, crate::common::buffer::mark_read(n, payload.buf))
+        }
+    }
+
+    /// The overlapped receive under [`read`](Self::read), as the nameable
+    /// future it is; the length is not yet marked. For the stream adapter.
+    pub(in crate::tp::io) fn start_read<B: IoBufMut>(&self, buf: B) -> OpFuture<RecvPayload<B>> {
         let sock = self.res.socket();
-        let fut = unsafe {
+        unsafe {
             submit(&self.res, RecvPayload { buf, flags: 0 }, move |ovl, p| {
                 let wsabuf = WSABUF {
                     len: IoBuf::bytes_total(&p.buf) as u32,
@@ -223,13 +234,19 @@ impl UnixStream {
                 let r = WSARecv(sock, &[wsabuf], None, &mut p.flags, Some(ovl), None);
                 classify_wsa_overlapped(r == 0)
             })
-        };
-        async move {
-            let (result, payload) = fut.await;
-            {
-                let n = result.as_ref().ok().copied();
-                (result, crate::common::buffer::mark_read(n, payload.buf))
-            }
+        }
+    }
+
+    /// Half-closes the send direction; the peer's next read returns 0.
+    pub fn shutdown_send(&self) -> windows_core::Result<()> {
+        sock_check(unsafe { shutdown(self.res.socket(), SD_SEND) })
+    }
+
+    /// A second handle onto the same socket; it closes once every handle
+    /// is gone. For the stream adapter's split halves.
+    pub(in crate::tp::io) fn share(&self) -> UnixStream {
+        UnixStream {
+            res: self.res.clone(),
         }
     }
 
@@ -319,8 +336,12 @@ impl UnixStream {
         &self,
         buf: B,
     ) -> impl Future<Output = BufResult<usize, B>> + Send + use<B> {
+        self.start_write(buf)
+    }
+
+    /// The overlapped send under [`write`](Self::write), nameable.
+    pub(in crate::tp::io) fn start_write<B: IoBuf>(&self, buf: B) -> OpFuture<B> {
         let sock = self.res.socket();
-        
         unsafe {
             submit(&self.res, buf, move |ovl, buf| {
                 let wsabuf = WSABUF {
