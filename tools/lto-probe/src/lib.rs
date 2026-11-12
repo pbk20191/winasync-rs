@@ -42,6 +42,17 @@ impl IAdder_Impl for Adder_Impl {
 #[unsafe(no_mangle)]
 pub static ADDER_IADDER_VTABLE: IAdder_Vtbl = IAdder_Vtbl::new::<Adder_Impl, { -1 }>();
 
+/// The same table, not exported: reached only through
+/// [`probe_adder_vtable`], a function that returns its address. The
+/// question is whether a getter in front of the constant costs the
+/// optimizer the fold.
+static ADDER_IADDER_VTABLE_PRIVATE: IAdder_Vtbl = IAdder_Vtbl::new::<Adder_Impl, { -1 }>();
+
+#[unsafe(no_mangle)]
+pub extern "system" fn probe_adder_vtable() -> *const IAdder_Vtbl {
+    &ADDER_IADDER_VTABLE_PRIVATE
+}
+
 /// A new `Adder` as an `IAdder` interface pointer, refcount 1.
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_create_adder(salt: i32) -> *mut c_void {

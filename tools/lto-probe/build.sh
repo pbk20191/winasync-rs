@@ -73,17 +73,19 @@ disassemble() { # exe, rva, label
 
 for v in native lto fat; do
     echo "== run $v"
-    # -a: with stderr redirected to a file, reopening it without append
-    # would truncate the log so far.
-    line=$("$OUT/probe_$v.exe" 7 200000000 | tee -a /dev/stderr | grep '^rva')
+    "$OUT/probe_$v.exe" 7 200000000 > "$OUT/run_$v.txt"
+    cat "$OUT/run_$v.txt"
+    line=$(grep '^rva' "$OUT/run_$v.txt")
     rv=$(sed -E 's/.*run_vtable=([0-9a-f]+).*/\1/' <<<"$line")
     rd=$(sed -E 's/.*run_direct=([0-9a-f]+).*/\1/' <<<"$line")
     rf=$(sed -E 's/.*run_vtable_fresh=([0-9a-f]+).*/\1/' <<<"$line")
     rh=$(sed -E 's/.*run_vtable_hoisted=([0-9a-f]+).*/\1/' <<<"$line")
     rs=$(sed -E 's/.*run_vtable_symbol=([0-9a-f]+).*/\1/' <<<"$line")
+    rg=$(sed -E 's/.*run_vtable_getter=([0-9a-f]+).*/\1/' <<<"$line")
     disassemble "$OUT/probe_$v.exe" "$rv" "run_vtable ($v)"
     disassemble "$OUT/probe_$v.exe" "$rd" "run_direct ($v)"
     disassemble "$OUT/probe_$v.exe" "$rf" "run_vtable_fresh ($v)"
     disassemble "$OUT/probe_$v.exe" "$rh" "run_vtable_hoisted ($v)"
     disassemble "$OUT/probe_$v.exe" "$rs" "run_vtable_symbol ($v)"
+    disassemble "$OUT/probe_$v.exe" "$rg" "run_vtable_getter ($v)"
 done
