@@ -470,3 +470,5 @@ impl JobMessage {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod replace_probe_tests;

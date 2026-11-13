@@ -1766,6 +1766,37 @@ acc가 달라진다(처음 그렇게 틀렸다).
 불필요한 재조회 한 번이다. 비용은 소켓마다 비경합 락 한 번과, 소켓이 0개가 되는 순간마다
 `WSACleanup`/`WSAStartup` 한 쌍과 다음 소켓의 확장 함수 재조회 한 번이다.
 
+### 완료 포트는 평생이 아니다: `FileReplaceCompletionInformation` 실측 (2026-11-13)
+
+"소켓은 한 IOCP에 평생 묶인다"는 전제가 둘을 낳았다. `TcpListener::accept_into`가 재활용 소켓의 등록을
+통째로 들고 다니는 것, 그리고 `ioring`이 포트에 묶인 핸들을 거부하는 것. 전제의 근거는
+`CreateIoCompletionPort`가 이미 포트가 있는 핸들을 `ERROR_INVALID_PARAMETER`로 거부한다는 사실 하나였다.
+`NtSetInformationFile(FileReplaceCompletionInformation)`(Windows 8.1+)이 그 포트를 교체하거나 null로
+떼어낼 수 있다고 적혀 있어 재 보았다. 프로브는 `src/iocp/replace_probe_tests.rs`, 순수 Win32만 쓴다.
+
+| 대상 | 한 것 | 결과 (26320) |
+| --- | --- | --- |
+| 소켓 | A에 묶인 채 `CreateIoCompletionPort(B)` | `0x80070057` — 알려진 거부 |
+| 소켓 | `Replace(B)` 후 op | STATUS 0, 완료는 **B**로, A에는 없음 |
+| 소켓 | `Replace(null)` 후 `CreateIoCompletionPort(C)` | 둘 다 성공, 완료는 C로 |
+| 소켓 | `Replace(null)` 후 포트 없이 `WSARecv` | `hEvent`로 완료, 어느 포트에도 안 감 |
+| `TP_IO` 핸들 | `Replace(null)` 후 `CreateIoCompletionPort(D)` | 성공, 완료는 D로, 풀 콜백은 안 돎 |
+| `TP_IO` 핸들 | D에서 떼고 새 `CreateThreadpoolIo` | 성공, 콜백 돎, D에 잔류 없음 |
+| 파일 | `Replace(B)` | STATUS 0, 완료는 B로 |
+
+세 가지가 따라온다.
+- **`ReusableSocket`은 등록을 들고 다닐 필요가 없다.** 떼어내고 새 런타임에 다시 등록하면 된다. 다른 런타임,
+  다른 풀로 옮기는 것도 같은 한 줄이다.
+- **`ioring`은 tp 핸들을 받을 수 있다.** 지금은 "포트에 묶인 핸들은 `E_INVALIDARG`로 즉시 완료된다"고 거부하는데,
+  떼어낸 뒤 넘기면 된다. 반대로 ring이 쓰던 파일을 tp에 등록하는 것도.
+- **`TP_IO`가 쥔 핸들을 `CloseThreadpoolIo` 전에 떼어낼 수 있다.** 등록 해제가 핸들 close와 분리된다.
+
+주의 하나. `CancelThreadpoolIo`는 `StartThreadpoolIo`가 소비된 뒤에 부르면 fail-fast
+(`STATUS_INVALID_PARAMETER`, 프로세스 종료)다. 프로브가 처음에 그걸로 죽어서 알았다.
+
+아직 API로 올리지는 않았다. `IoReg`에 "떼어내서 핸들만 돌려주기"와 "다른 바인딩으로 옮기기"를 어떤 모양으로
+둘지는 사용처(`ReusableSocket`, `ioring` 입구)와 같이 정한다.
+
 ## 커밋 상태
 
 | 커밋 | 내용 |
