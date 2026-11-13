@@ -25,9 +25,9 @@
 //! The token makes that precondition structural: a socket that exists holds a
 //! reference, so the count cannot be zero while it does.
 
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio"))]
 use super::overlapped::Issue;
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio"))]
 use core::ffi::c_void;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket};
 use std::sync::Mutex;
@@ -37,11 +37,11 @@ use windows::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAGetLastError, 
 use windows::Win32::Networking::WinSock::SOCKET;
 #[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 use windows::Win32::Networking::WinSock::{WSASocketW, WSA_FLAG_OVERLAPPED};
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio"))]
 use windows::Win32::Networking::WinSock::{
     SIO_GET_EXTENSION_FUNCTION_POINTER, WSAIoctl, WSA_IO_PENDING,
 };
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio"))]
 use windows_core::GUID;
 
 /// How many [`WinsockRef`]s are alive.
@@ -172,6 +172,11 @@ impl WsaSocket {
         Self { sock, winsock }
     }
 
+    /// Reassembles what [`into_parts`](Self::into_parts) split.
+    pub fn from_parts(sock: OwnedSocket, winsock: WinsockRef) -> Self {
+        Self { sock, winsock }
+    }
+
     /// The socket, for the Winsock calls that want the raw value.
     pub fn raw(&self) -> SOCKET {
         SOCKET(self.sock.as_raw_socket() as usize)
@@ -288,7 +293,7 @@ pub fn sock_check(r: i32) -> windows_core::Result<()> {
 ///
 /// Reports only what the call did; whether a completion packet follows is
 /// decided by `submit` from the handle's notification mode (see [`Issue`]).
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio"))]
 pub fn classify_wsa_overlapped(succeeded: bool) -> Issue {
     if succeeded {
         Issue::SyncSuccess
@@ -301,7 +306,7 @@ pub fn classify_wsa_overlapped(succeeded: bool) -> Issue {
 
 /// [`classify_wsa_overlapped`] for the APIs that return `0` on success and
 /// `SOCKET_ERROR` otherwise (`WSARecv`, `WSASend`, ...).
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio"))]
 pub fn classify_wsa_ret(r: i32) -> Issue {
     classify_wsa_overlapped(r == 0)
 }
@@ -372,7 +377,7 @@ pub fn connectex(sock: SOCKET, cache: &ExtFnCache) -> windows_core::Result<Conne
 /// `F` must be the exact `extern "system"` signature the extension `id`
 /// names, and must be pointer-sized. `cache` must be dedicated to this one
 /// `id` *and* to sockets of one provider.
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+#[cfg(any(feature = "tp", feature = "comio"))]
 pub unsafe fn extension_fn<F: Copy>(
     sock: SOCKET,
     id: &GUID,

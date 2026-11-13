@@ -1268,3 +1268,117 @@ use crate::tp::{FileRange, TransmitSequence};
         let (n, _) = block_on(unsafe { b.recv_unchecked(&mut got[..], crate::tp::io_event().unwrap()) });
         assert_eq!(&got[..n.unwrap()], b"dgram");
     }
+
+/// A stream leaves its runtime with `detach` and joins another with
+/// `attach`. Leaving clears the completion mode it had set (measured: the
+/// kernel resets `FILE_SKIP_*` with the port), and the new registration
+/// reads that back rather than assuming either way; a stream with a read in
+/// flight refuses to leave until the read is gone.
+#[test]
+fn detach_moves_a_stream_to_another_runtime() {
+    use std::time::Instant;
+    let rt = Runtime::new();
+    let other = Runtime::new();
+    let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+        let listener = TcpListener::bind(
+            &rt,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            &SocketOptions::new(),
+        )
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(&rt, addr, &SocketOptions::new()).await.unwrap();
+        let server = listener.accept().await.unwrap();
+        client.set_skip_completion_on_success().unwrap();
+
+        // The client moves. Its skip mode went with the port, and the new
+        // registration knows that from the handle, not from assumption.
+        assert!(client.skips_completion_on_success());
+        let sock = client.detach().unwrap_or_else(|(_, e)| panic!("detach: {e:?}"));
+        let client = TcpStream::attach(&other, sock).unwrap();
+        assert!(
+            !client.skips_completion_on_success(),
+            "the mode survived the port, and the registration did not notice"
+        );
+        // Set again, so the exchange below runs in the mode that would hang
+        // if the registration's belief and the kernel's disagreed.
+        client.set_skip_completion_on_success().unwrap();
+        assert!(client.skips_completion_on_success());
+
+        // The server has a read in flight: refused, and handed back whole.
+        let pending = server.read(vec![0u8; 4]);
+        let server = match server.detach() {
+            Ok(_) => panic!("detached under an in-flight read"),
+            Err((server, e)) => {
+                assert_eq!(e.code(), windows::Win32::Foundation::ERROR_BUSY.to_hresult());
+                server
+            }
+        };
+        // Cancelled; the kernel's side releases the registration at the
+        // completion tail, moments later.
+        drop(pending);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut server = server;
+        let sock = loop {
+            match server.detach() {
+                Ok(sock) => break sock,
+                Err((back, _)) if Instant::now() < deadline => {
+                    server = back;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err((_, e)) => panic!("the cancelled read never let go: {e:?}"),
+            }
+        };
+        let server = TcpStream::attach(&other, sock).unwrap();
+
+        // Both now live on `other`, and still talk.
+        client.write(b"moved".to_vec()).await.0.unwrap();
+        let (n, b) = server.read(vec![0u8; 8]).await;
+        assert_eq!(&b[..n.unwrap()], b"moved");
+    }));
+    result.expect("detach/attach timed out");
+}
+
+/// A recycled socket can be handed to a listener on another runtime.
+#[test]
+fn a_reusable_socket_moves_between_runtimes() {
+    let rt = Runtime::new();
+    let other = Runtime::new();
+    let result = block_on(timeout(&rt, Duration::from_secs(10), async {
+        let bind = |rt: &Runtime| {
+            TcpListener::bind(
+                rt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                &SocketOptions::new(),
+            )
+            .unwrap()
+        };
+        let first = bind(&rt);
+        let second = bind(&other);
+
+        let c1 = TcpStream::connect(&rt, first.local_addr().unwrap(), &SocketOptions::new())
+            .await
+            .unwrap();
+        let s1 = first.accept().await.unwrap();
+        c1.write(b"a".to_vec()).await.0.unwrap();
+        let (n, b) = s1.read(vec![0u8; 4]).await;
+        assert_eq!(&b[..n.unwrap()], b"a");
+        drop(c1);
+        s1.disconnect(true).await.unwrap();
+
+        // Off `rt`, onto `other`, and into `second`'s accept.
+        let sock = s1
+            .into_reusable()
+            .detach()
+            .unwrap_or_else(|(_, e)| panic!("detach: {e:?}"));
+        let reusable = ReusableSocket::attach(&other, sock).unwrap();
+        let c2 = TcpStream::connect(&rt, second.local_addr().unwrap(), &SocketOptions::new())
+            .await
+            .unwrap();
+        let s2 = second.accept_into(reusable).await.unwrap();
+        c2.write(b"b".to_vec()).await.0.unwrap();
+        let (n, b) = s2.read(vec![0u8; 4]).await;
+        assert_eq!(&b[..n.unwrap()], b"b");
+    }));
+    result.expect("reusable move timed out");
+}

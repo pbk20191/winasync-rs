@@ -103,7 +103,8 @@ impl File {
 /// except one bound to an I/O completion port. Measured: an operation on
 /// such a handle completes at once with `E_INVALIDARG`, and nothing reaches
 /// the port. So a `tp::File`, which its runtime's pool owns, is refused this
-/// way rather than mis-delivered.
+/// way rather than mis-delivered -- until it leaves that pool:
+/// `tp::File::detach` hands back the bare handle, and `File::from` takes it.
 ///
 /// # Safety
 /// [`raw_handle`](Self::raw_handle) must return a handle that stays open for

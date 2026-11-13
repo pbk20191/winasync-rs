@@ -28,7 +28,9 @@ pub mod overlapped;
 pub mod opfuture;
 // Winsock error mapping + the overlapped-issue classifier, shared by every
 // socket transport in both overlapped runtimes.
-#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "http"))]
+// `iocp` because the overlapped core's socket registrations carry a
+// `WinsockRef`.
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio", feature = "http", feature = "iocp"))]
 pub mod winsock;
 // Owned buffers for completion-based IO, plus a slab pool. Not for `comio`,
 // whose streams speak WinRT `IBuffer` instead.

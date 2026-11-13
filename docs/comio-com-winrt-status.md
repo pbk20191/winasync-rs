@@ -1794,8 +1794,26 @@ acc가 달라진다(처음 그렇게 틀렸다).
 주의 하나. `CancelThreadpoolIo`는 `StartThreadpoolIo`가 소비된 뒤에 부르면 fail-fast
 (`STATUS_INVALID_PARAMETER`, 프로세스 종료)다. 프로브가 처음에 그걸로 죽어서 알았다.
 
-아직 API로 올리지는 않았다. `IoReg`에 "떼어내서 핸들만 돌려주기"와 "다른 바인딩으로 옮기기"를 어떤 모양으로
-둘지는 사용처(`ReusableSocket`, `ioring` 입구)와 같이 정한다.
+**API로 올렸다 (같은 날).** `IoReg::detach(Arc<Self>) -> Result<IoHandle, (Arc<Self>, Error)>`.
+`Arc::try_unwrap`이 "아무도 안 쓴다"의 정의다. 진행 중 op, 공유 half, clone이 전부 `Arc`를 들고 있으므로 하나라도
+있으면 `ERROR_BUSY`와 함께 등록을 그대로 돌려준다. 성공하면 포트를 먼저 떼고(`FileReplaceCompletionInformation`,
+null 포트), 그다음 `TP_IO`를 닫고, 핸들을 열린 채로 돌려준다. 실패한 `Replace`는 등록을 온전히 돌려준다.
+
+| 타입 | 추가된 것 |
+| --- | --- |
+| `TcpStream`, `UdpSocket`, `UnixStream`, `HvStream` | `detach(self) -> Result<WsaSocket, (Self, Error)>`, `attach(&Runtime, WsaSocket)` |
+| `TcpListener` | `detach` |
+| `ReusableSocket` | `detach`, `attach` — 재활용 소켓을 다른 런타임의 `accept_into`로 |
+| `tp::File` | `detach -> OwnedHandle`, `attach(&Runtime, OwnedHandle)`; `ioring::File::from(handle)`가 그대로 받는다 |
+
+소켓은 `OwnedSocket`이 아니라 `WsaSocket`으로 돌려준다. 토큰 없는 소켓은 우리 마지막 `WSACleanup`에 닫힐 수
+있기 때문이다(위 "Winsock 수명을 토큰으로").
+
+**덤으로 측정된 것 하나 더.** 포트를 떼면 `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` 모드도 같이 지워진다. 설정 직후
+`FileIoCompletionNotificationInformation`(class 41) 조회는 `0x3`, `Replace(null)` 뒤에는 `0`이다. 그래서
+`IoReg::register`가 이 모드를 **가정하지 않고 핸들에 묻는다**. 떼어낸 핸들은 꺼진 채로 오고, 밖에서 들어온
+핸들이 켜져 있으면 그대로 믿는다. 반대로 믿었다면 동기 완료 op이 오지 않을 패킷을 기다리며 멈춘다. 테스트는
+옮긴 뒤 모드가 꺼진 것을 확인하고, 다시 켠 채로 교환을 한 번 더 한다.
 
 ## 커밋 상태
 

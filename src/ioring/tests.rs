@@ -576,3 +576,28 @@ fn another_rings_registration_is_refused() {
     drop(file);
     let _ = std::fs::remove_file(&path);
 }
+
+/// A `tp::File` is refused by a ring while its runtime's pool owns it
+/// (`a_port_bound_handle_is_refused`); detached, the same handle is an
+/// ordinary file the ring reads.
+#[cfg(feature = "tp")]
+#[test]
+fn a_detached_tp_file_joins_a_ring() {
+    let rt = crate::tp::Runtime::new();
+    let path = std::env::temp_dir()
+        .join(format!("ioring_detach_{}.bin", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(&path, b"from tp to ring").unwrap();
+    let file = crate::tp::File::open(&rt, &path).unwrap();
+    let (r, b) = block_on(file.read_at(vec![0u8; 4], 0));
+    assert_eq!(&b[..r.unwrap()], b"from");
+
+    let handle = file.detach().unwrap_or_else(|(_, e)| panic!("detach: {e:?}"));
+    let ring = IoRing::new(4).unwrap();
+    let file = File::from(handle);
+    let (r, b) = block_on(ring.read(&file, vec![0u8; 32], 0));
+    assert_eq!(&b[..r.unwrap()], b"from tp to ring");
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}

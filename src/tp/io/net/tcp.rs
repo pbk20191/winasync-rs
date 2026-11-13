@@ -89,6 +89,22 @@ impl TcpListener {
         addr_of_socket(self.res.socket())
     }
 
+    /// Takes the listening socket out of the runtime, open and unbound; see
+    /// [`TcpStream::detach`]. Refuses while an accept is in flight.
+    pub fn detach(self) -> Result<WsaSocket, (TcpListener, windows_core::Error)> {
+        let (family, socket_flags) = (self.family, self.socket_flags);
+        crate::tp::io::detach_socket(self.res).map_err(|(res, e)| {
+            (
+                TcpListener {
+                    res,
+                    family,
+                    socket_flags,
+                },
+                e,
+            )
+        })
+    }
+
     /// Finishes an accept the kernel completes synchronously on the issuing
     /// thread, skipping the completion port and its pool thread; see
     /// [`TcpStream::set_skip_completion_on_success`]. That is an accept
@@ -296,6 +312,26 @@ impl TcpStream {
     ) -> windows_core::Result<TcpStream> {
         let res = crate::tp::io::register_on(rt, sock)?;
         Ok(TcpStream { res })
+    }
+
+    /// Registers a connected socket with `rt`: the other half of
+    /// [`detach`](Self::detach), on this or any other runtime.
+    pub fn attach(rt: &Runtime, sock: WsaSocket) -> windows_core::Result<TcpStream> {
+        TcpStream::from_socket(&rt.inner, sock)
+    }
+
+    /// Takes the socket out of the runtime, open and unbound, to register
+    /// elsewhere -- another runtime, a completion port, a ring -- or use
+    /// synchronously. Refuses, handing the stream back, while an operation
+    /// is in flight or a split half or shared handle still exists.
+    pub fn detach(self) -> Result<WsaSocket, (TcpStream, windows_core::Error)> {
+        crate::tp::io::detach_socket(self.res).map_err(|(res, e)| (TcpStream { res }, e))
+    }
+
+    /// Whether `set_skip_completion_on_success` is in effect on the socket.
+    #[cfg(test)]
+    pub(crate) fn skips_completion_on_success(&self) -> bool {
+        self.res.skips_completion_on_success()
     }
 
     /// Connects to `addr` (IPv4 or IPv6), creating the socket as `options`
@@ -710,7 +746,8 @@ impl TcpStream {
     /// Consumes this stream, handing its socket (with its existing `IoRes`/TP_IO
     /// retained) to [`TcpListener::accept_into`] for reuse. Call after
     /// `disconnect(true).await` on a finished connection. Keeping the `IoRes`
-    /// avoids a completion-port re-association, which Windows forbids.
+    /// saves re-registering, which is all it saves: a socket can leave its
+    /// port ([`detach`](Self::detach)) and join another.
     pub fn into_reusable(self) -> ReusableSocket {
         ReusableSocket { res: self.res }
     }
@@ -718,9 +755,29 @@ impl TcpStream {
 
 /// A finished TCP socket (disconnected with reuse via `DisconnectEx` +
 /// `TF_REUSE_SOCKET`) retaining its `IoRes`/TP_IO, ready to be recycled by
-/// [`TcpListener::accept_into`] without a new `socket()` or completion-port
-/// re-association. Dropped without reuse, it closes the socket normally (the
-/// `IoRes`'s own `Drop`).
+/// [`TcpListener::accept_into`] without a new `socket()` or registration.
+/// Dropped without reuse, it closes the socket normally (the `IoRes`'s own
+/// `Drop`).
+///
+/// It need not stay on the runtime that produced it: [`detach`](Self::detach)
+/// and [`attach`](Self::attach) move it to another, whose listener then
+/// recycles it.
 pub struct ReusableSocket {
     res: Arc<IoRes>,
+}
+
+impl ReusableSocket {
+    /// Registers a disconnected, reusable socket with `rt`, for that
+    /// runtime's [`TcpListener::accept_into`].
+    pub fn attach(rt: &Runtime, sock: WsaSocket) -> windows_core::Result<ReusableSocket> {
+        let res = crate::tp::io::register_on(&rt.inner, sock)?;
+        Ok(ReusableSocket { res })
+    }
+
+    /// Takes the socket out of its runtime, open and unbound. Nothing can be
+    /// in flight on a reusable socket, so this only fails if the handle
+    /// refuses to leave its port.
+    pub fn detach(self) -> Result<WsaSocket, (ReusableSocket, windows_core::Error)> {
+        crate::tp::io::detach_socket(self.res).map_err(|(res, e)| (ReusableSocket { res }, e))
+    }
 }

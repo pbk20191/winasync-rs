@@ -11,7 +11,8 @@
 //! passed through to/from the OS `sockaddr_in6` as-is (no byte-swap); only
 //! non-zero flow labels crossing to a differing stack would be affected.
 
-use crate::common::winsock::{ExtFnCache, WsaSocket};
+pub use crate::common::winsock::WsaSocket;
+use crate::common::winsock::ExtFnCache;
 use super::file::File;
 use super::{submit, IoRes, OpFuture};
 use crate::common::buffer::{IoBuf, IoBufMut};

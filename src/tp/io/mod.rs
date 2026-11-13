@@ -46,6 +46,27 @@ pub(crate) fn register_on(rt: &Arc<RuntimeInner>, io: impl Into<IoHandle>) -> wi
     IoReg::register(io, Binding::Pool(rt.pool_ref()))
 }
 
+/// [`IoReg::detach`] for a socket registration: the socket with its Winsock
+/// reference, or the registration back with why.
+pub(crate) fn detach_socket(
+    res: Arc<IoRes>,
+) -> Result<crate::common::winsock::WsaSocket, (Arc<IoRes>, windows_core::Error)> {
+    IoReg::detach(res).map(|h| match h {
+        IoHandle::Socket(sock, winsock) => crate::common::winsock::WsaSocket::from_parts(sock, winsock),
+        _ => unreachable!("a socket registration holds a socket"),
+    })
+}
+
+/// [`IoReg::detach`] for a file registration.
+pub(crate) fn detach_handle(
+    res: Arc<IoRes>,
+) -> Result<std::os::windows::io::OwnedHandle, (Arc<IoRes>, windows_core::Error)> {
+    IoReg::detach(res).map(|h| match h {
+        IoHandle::Handle(handle) => handle,
+        _ => unreachable!("a file registration holds a handle"),
+    })
+}
+
 /// Buffers of an in-flight `WSAIoctl`, kept in the op block until it
 /// completes.
 struct SocketIoctl<I, O> {

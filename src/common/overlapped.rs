@@ -237,12 +237,60 @@ impl IoReg {
         Ok(Arc::new(Self {
             handle,
             is_socket: owned.is_socket(),
-            skip_on_success: AtomicBool::new(false),
+            // Asked of the kernel, not assumed false: the mode is a property
+            // of the handle, set by whoever had it before. Believing a
+            // skipping handle does not skip would wait for a packet that
+            // never comes. (Measured: removing the port with
+            // `FileReplaceCompletionInformation` clears the mode, so a
+            // handle from `detach` answers false here; one from elsewhere
+            // may not.)
+            skip_on_success: AtomicBool::new(nt::skips_completion_on_success(handle)),
             io: tp_io,
             owned: Some(owned),
             spare: Mutex::new([None, None]),
             _binding: binding,
         }))
+    }
+
+    /// Takes the handle back out of the engine, open and unbound, so it can
+    /// be registered elsewhere -- another runtime, a caller's port, an I/O
+    /// ring -- or used synchronously.
+    ///
+    /// Refuses while anything else holds the registration: an operation in
+    /// flight, a shared half, a clone. Those each hold an `Arc` of it, so
+    /// "nobody else" is exactly `Arc::try_unwrap` succeeding, and the
+    /// registration comes back untouched in the error.
+    ///
+    /// Measured (`iocp::replace_probe_tests`): a handle's completion port
+    /// can be removed with `FileReplaceCompletionInformation`, after which
+    /// `CreateIoCompletionPort` and `CreateThreadpoolIo` accept it again, for
+    /// sockets and files alike. Removing the port also clears the handle's
+    /// `FILE_SKIP_*` completion modes, so the handle comes back as it was
+    /// opened; a new registration sets them again if it wants them. The
+    /// `TP_IO`, if any, is closed after the port is gone; nothing is started
+    /// on it, since nothing holds the registration.
+    pub fn detach(this: Arc<Self>) -> core::result::Result<IoHandle, (Arc<Self>, windows_core::Error)> {
+        let mut reg = Arc::try_unwrap(this).map_err(|shared| {
+            (
+                shared,
+                windows_core::Error::new(
+                    windows::Win32::Foundation::ERROR_BUSY.to_hresult(),
+                    "the registration is shared or has an operation in flight",
+                ),
+            )
+        })?;
+        // The port first, while the TP_IO still exists: a failure here leaves
+        // the registration whole, and it goes back to the caller.
+        if let Err(e) = nt::remove_completion_port(reg.handle) {
+            return Err((Arc::new(reg), e));
+        }
+        if let Some(io) = reg.io.take() {
+            unsafe { CloseThreadpoolIo(io) };
+        }
+        let owned = reg.owned.take().expect("taken only here and in drop");
+        // `reg` drops with no TP_IO and no handle: it frees its spare blocks
+        // and releases the binding.
+        Ok(owned)
     }
 
     pub fn socket(&self) -> SOCKET {
@@ -310,6 +358,103 @@ impl Drop for IoReg {
         for spare in self.spare.get_mut().unwrap().iter_mut().filter_map(Option::take) {
             unsafe { std::alloc::dealloc(spare.ptr, spare.layout) };
         }
+    }
+}
+
+/// The two `ntdll` calls behind [`IoReg::detach`] and the mode query in
+/// [`IoReg::register`]: the information classes they use have no Win32
+/// wrapper. Looked up by name once, like `iocp`'s wait-packet calls.
+mod nt {
+    use super::*;
+    use std::sync::OnceLock;
+    use windows::Win32::System::IO::IO_STATUS_BLOCK;
+
+    type SetInfo = unsafe extern "system" fn(HANDLE, *mut IO_STATUS_BLOCK, *const c_void, u32, i32) -> i32;
+    type QueryInfo = unsafe extern "system" fn(HANDLE, *mut IO_STATUS_BLOCK, *mut c_void, u32, i32) -> i32;
+
+    /// `FILE_COMPLETION_INFORMATION`.
+    #[repr(C)]
+    struct CompletionInformation {
+        port: HANDLE,
+        key: *mut c_void,
+    }
+
+    /// `FILE_IO_COMPLETION_NOTIFICATION_INFORMATION`.
+    #[repr(C)]
+    struct NotificationInformation {
+        flags: u32,
+    }
+
+    /// `FileIoCompletionNotificationInformation`: the `FILE_SKIP_*` flags.
+    const IO_COMPLETION_NOTIFICATION_INFORMATION: i32 = 41;
+    /// `FileReplaceCompletionInformation`: replace the port, or remove it
+    /// with a null one. Windows 8.1 and later.
+    const REPLACE_COMPLETION_INFORMATION: i32 = 61;
+
+    fn api() -> Option<&'static (SetInfo, QueryInfo)> {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        static API: OnceLock<Option<(SetInfo, QueryInfo)>> = OnceLock::new();
+        API.get_or_init(|| unsafe {
+            let ntdll = GetModuleHandleW(windows_core::w!("ntdll.dll")).ok()?;
+            let set = GetProcAddress(ntdll, windows_core::PCSTR(c"NtSetInformationFile".as_ptr().cast()))?;
+            let query = GetProcAddress(ntdll, windows_core::PCSTR(c"NtQueryInformationFile".as_ptr().cast()))?;
+            Some((
+                core::mem::transmute::<unsafe extern "system" fn() -> isize, SetInfo>(set),
+                core::mem::transmute::<unsafe extern "system" fn() -> isize, QueryInfo>(query),
+            ))
+        })
+        .as_ref()
+    }
+
+    /// Dissociates `handle` from whatever completion port it has.
+    pub(super) fn remove_completion_port(handle: HANDLE) -> windows_core::Result<()> {
+        let (set, _) = api().ok_or_else(|| {
+            windows_core::Error::new(
+                windows::Win32::Foundation::ERROR_PROC_NOT_FOUND.to_hresult(),
+                "this ntdll has no NtSetInformationFile",
+            )
+        })?;
+        let info = CompletionInformation {
+            port: HANDLE::default(),
+            key: ptr::null_mut(),
+        };
+        let mut iosb = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            set(
+                handle,
+                &mut iosb,
+                &info as *const _ as *const c_void,
+                size_of::<CompletionInformation>() as u32,
+                REPLACE_COMPLETION_INFORMATION,
+            )
+        };
+        if status < 0 {
+            // `HRESULT_FROM_NT`.
+            return Err(windows_core::Error::from_hresult(windows_core::HRESULT(status | 0x1000_0000)));
+        }
+        Ok(())
+    }
+
+    /// Whether `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` is set on `handle`.
+    /// `false` when the question cannot be asked, which is also what the
+    /// registration assumed before it asked.
+    pub(super) fn skips_completion_on_success(handle: HANDLE) -> bool {
+        let Some((_, query)) = api() else {
+            return false;
+        };
+        let mut info = NotificationInformation { flags: 0 };
+        let mut iosb = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            query(
+                handle,
+                &mut iosb,
+                &mut info as *mut _ as *mut c_void,
+                size_of::<NotificationInformation>() as u32,
+                IO_COMPLETION_NOTIFICATION_INFORMATION,
+            )
+        };
+        const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u32 = 0x1;
+        status >= 0 && info.flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS != 0
     }
 }
 

@@ -104,6 +104,25 @@ impl File {
         )
     }
 
+    /// Registers an open overlapped file handle with `rt`: the other half of
+    /// [`detach`](Self::detach), on this or any other runtime. A handle
+    /// opened without `FILE_FLAG_OVERLAPPED` registers but every operation
+    /// on it then blocks the issuing thread.
+    pub fn attach(rt: &Runtime, handle: std::os::windows::io::OwnedHandle) -> windows_core::Result<File> {
+        let res = crate::tp::io::register_on(&rt.inner, handle)?;
+        Ok(File { res })
+    }
+
+    /// Takes the handle out of the runtime, open and unbound, to register
+    /// elsewhere -- another runtime, a completion port, an I/O ring (an
+    /// [`ioring::File`](crate::ioring::File) is made from it directly) -- or
+    /// to use synchronously. Refuses, handing the file back, while an
+    /// operation is in flight or a byte-range lock guard or `TransmitFile`
+    /// still shares the registration.
+    pub fn detach(self) -> Result<std::os::windows::io::OwnedHandle, (File, windows_core::Error)> {
+        crate::tp::io::detach_handle(self.res).map_err(|(res, e)| (File { res }, e))
+    }
+
     /// Skips the completion packet whenever an op on this handle completes
     /// **synchronously**, finishing it on the issuing thread with no pool
     /// hand-off and no context switch.

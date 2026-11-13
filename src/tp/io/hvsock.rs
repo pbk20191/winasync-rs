@@ -144,6 +144,18 @@ impl HvStream {
         Ok(HvStream { res })
     }
 
+    /// Registers a connected socket with `rt`: the other half of
+    /// [`detach`](Self::detach).
+    pub fn attach(rt: &Runtime, sock: WsaSocket) -> windows_core::Result<HvStream> {
+        HvStream::from_socket(&rt.inner, sock)
+    }
+
+    /// Takes the socket out of the runtime, open and unbound; see
+    /// [`TcpStream::detach`](crate::tp::TcpStream::detach).
+    pub fn detach(self) -> Result<WsaSocket, (HvStream, windows_core::Error)> {
+        crate::tp::io::detach_socket(self.res).map_err(|(res, e)| (HvStream { res }, e))
+    }
+
     /// Connects to `addr`. `connect_timeout_ms`, when given, caps how long the
     /// provider waits for the target partition to answer — without it a
     /// connect to a VM that is not listening can hang for the provider's own

@@ -159,6 +159,18 @@ impl UnixStream {
         Ok(UnixStream { res })
     }
 
+    /// Registers a connected socket with `rt`: the other half of
+    /// [`detach`](Self::detach).
+    pub fn attach(rt: &Runtime, sock: WsaSocket) -> windows_core::Result<UnixStream> {
+        UnixStream::from_socket(&rt.inner, sock)
+    }
+
+    /// Takes the socket out of the runtime, open and unbound; see
+    /// [`TcpStream::detach`](crate::tp::TcpStream::detach).
+    pub fn detach(self) -> Result<WsaSocket, (UnixStream, windows_core::Error)> {
+        crate::tp::io::detach_socket(self.res).map_err(|(res, e)| (UnixStream { res }, e))
+    }
+
     /// Connects to the AF_UNIX socket at `path`.
     pub async fn connect(rt: &Runtime, path: &str) -> windows_core::Result<UnixStream> {
         // Closed on any early return from here on.

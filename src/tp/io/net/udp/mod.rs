@@ -68,6 +68,19 @@ impl UdpSocket {
         Ok(UdpSocket { res })
     }
 
+    /// Registers a socket with `rt`: the other half of
+    /// [`detach`](Self::detach).
+    pub fn attach(rt: &Runtime, sock: WsaSocket) -> windows_core::Result<UdpSocket> {
+        let res = crate::tp::io::register_on(&rt.inner, sock)?;
+        Ok(UdpSocket { res })
+    }
+
+    /// Takes the socket out of the runtime, open and unbound; see
+    /// [`TcpStream::detach`](crate::tp::TcpStream::detach).
+    pub fn detach(self) -> Result<WsaSocket, (UdpSocket, windows_core::Error)> {
+        crate::tp::io::detach_socket(self.res).map_err(|(res, e)| (UdpSocket { res }, e))
+    }
+
     /// Sends a sequence of in-memory buffers and/or file ranges as one
     /// `TransmitPackets` call -- one datagram. Resolves to the number of
     /// bytes sent. See [`TransmitSequence`](crate::tp::TransmitSequence) for
