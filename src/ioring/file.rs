@@ -78,6 +78,20 @@ impl From<std::os::windows::io::OwnedHandle> for File {
 }
 
 impl File {
+    /// Takes the handle back, open, when this is its only owner: no clone,
+    /// and no operation still in flight on it. The other direction of
+    /// `From<OwnedHandle>`, and the same rule as `tp::File::detach`; a
+    /// `tp::File::attach` takes what this returns.
+    pub fn into_handle(self) -> core::result::Result<std::os::windows::io::OwnedHandle, File> {
+        use std::os::windows::io::FromRawHandle;
+        let owned = Arc::try_unwrap(self.handle).map_err(|handle| File { handle })?;
+        let raw = owned.0;
+        // Ours to close no longer: the caller's `OwnedHandle` will.
+        core::mem::forget(owned);
+        // SAFETY: an open handle this value owned exclusively.
+        Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw.0) })
+    }
+
     /// Takes ownership of `handle`: it is closed with the last clone and the
     /// last operation that uses it.
     ///

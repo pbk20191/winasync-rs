@@ -13,6 +13,13 @@
 //! reviewer should see both change in the same commit as the RDL that caused
 //! it. Nothing in an ordinary `cargo build` runs this.
 
+//! `cargo run -p winmdgen -- header` regenerates only the static library's
+//! C/C++ header (see `header.rs`), which depends on the bindings and on the
+//! `Export =` lists in `src/comio` rather than on the RDL. The full run
+//! writes it too.
+
+mod header;
+
 use std::path::{Path, PathBuf};
 
 /// The file name is the namespace, which is the convention every WinRT
@@ -24,6 +31,11 @@ const BINDINGS: &str = "src/comio/bindings.rs";
 
 fn main() {
     let root = repo_root();
+
+    if std::env::args().nth(1).as_deref() == Some("header") {
+        header::generate(&root);
+        return;
+    }
 
     let rdl = root.join(RDL);
     let winmd = root.join(WINMD);
@@ -72,6 +84,8 @@ fn main() {
     );
 
     println!("wrote {}", bindings.display());
+
+    header::generate(&root);
 }
 
 /// The repository root, derived from this tool's own manifest rather than the

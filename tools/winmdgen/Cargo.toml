@@ -35,3 +35,8 @@ windows-rdl = { git = "https://github.com/microsoft/windows-rs", rev = "7f3b5242
 # Pinned to the 0.62 line alongside `windows`/`windows-core` in the root
 # manifest. Verified to read a 0.100-produced `.winmd` without complaint.
 windows-bindgen = "0.62"
+# The header generator reads the vtable structs out of the generated
+# bindings and the `#[implement]` lists out of `src/comio`. Both crates are
+# already in the tree through `windows-rdl`.
+syn = { version = "2", features = ["full"] }
+quote = "1"

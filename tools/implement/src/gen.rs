@@ -62,12 +62,18 @@ fn gen_vtable_exports(inputs: &ImplementInputs) -> Vec<syn::Item> {
         .map(|chain| {
             let vtbl_ty = chain.implement.to_vtbl_ident();
             let vtable_const_ident = &chain.vtable_const_ident;
-            let fn_ident = quote::format_ident!(
-                "{}_{}_vtable",
-                prefix,
-                chain.implement.export_name(),
-                span = prefix.span()
-            );
+            let interface = chain.implement.export_name();
+            // A runtime class in the list (named like the type implementing
+            // it, which is how every class here is spelled) stands for its
+            // default interface, whose name the macro cannot see. Its symbol
+            // is the bare prefix: `<prefix>_vtable` is "the class's default
+            // interface table", and the header derives the interface name
+            // from the metadata.
+            let fn_ident = if inputs.original_ident == interface {
+                quote::format_ident!("{}_vtable", prefix, span = prefix.span())
+            } else {
+                quote::format_ident!("{}_{}_vtable", prefix, interface, span = prefix.span())
+            };
             let doc = format!(
                 "The vtable of `{}` for `{}`, as the object carries it; for a caller that links statically and knows the class.",
                 inputs.original_ident,

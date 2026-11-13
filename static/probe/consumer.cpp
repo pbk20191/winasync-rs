@@ -38,11 +38,10 @@ __attribute__((noinline)) HRESULT close_via_object(Object<IClosableVtbl_>* p) {
     return p->vtbl->Close(p);
 }
 
-// Through the class's table: the same slot, from a constant.
+// Through the class's table: the same slot, from a constant. The header's
+// wrapper is exactly `getter()->Close(self)`.
 __attribute__((noinline)) HRESULT close_via_class_table(Object<IClosableVtbl_>* p) {
-    auto* table = static_cast<const IClosableVtbl_*>(
-        Pbk20191_WinAsync_Comio_NamedPipeConnectionListener_IClosable_vtable());
-    return table->Close(p);
+    return winasync::NamedPipeConnectionListener::Close(p);
 }
 
 static Object<IClosableVtbl_>* make_listener() {
@@ -74,8 +73,8 @@ int main() {
     HRESULT hb = close_via_class_table(b);
     // The exported table is the object's: same slot, same function.
     bool same = reinterpret_cast<const void*>(a->vtbl->Close) ==
-        reinterpret_cast<const void*>(static_cast<const IClosableVtbl_*>(
-            Pbk20191_WinAsync_Comio_NamedPipeConnectionListener_IClosable_vtable())->Close);
+        reinterpret_cast<const void*>(
+            Pbk20191_WinAsync_Comio_NamedPipeConnectionListener_IClosable_vtable()->Close);
     a->vtbl->Release(a);
     b->vtbl->Release(b);
     std::printf("close via object 0x%08lx, via class table 0x%08lx, same slot %s\n", ha, hb, same ? "yes" : "no");

@@ -68,6 +68,9 @@ use r#gen::gen_all;
 /// ```
 /// One function per interface in the list, named `<prefix>_<Interface>_vtable`
 /// (a generic interface's arguments join the name: `IIterable_HSTRING`).
+/// A runtime class in the list -- recognised by having the same name as
+/// the type implementing it -- stands for its default interface, whose
+/// name the macro cannot see, so its function is the bare `<prefix>_vtable`.
 /// Not available on generic types, which have no single vtable to export.
 ///
 /// `ExportCfg = "feature = \"static-exports\""` puts that cfg on the

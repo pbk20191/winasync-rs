@@ -1693,7 +1693,7 @@ winasync에 `static-exports` 피처를 두어 `static/`만 켠다. 제네릭이 
 `Dll*`가 쓰는 `comio::activation`의 같은 테이블을 감싼다. `dylib` 피처는 켜지 않는다. 언로드 카운팅과
 `DllCanUnloadNow`의 `WSACleanup`은 DLL의 것이다. C 선언은 `static/include/winasync_static.h`에 있고, getter는
 `const void*`를 돌려주어 소비자가 자기 프로젝션의 vtable 타입으로 캐스팅한다. 헤더는 `Export =` 목록에서
-스크립트로 생성했다.
+스크립트로 생성했다. *(2026-11-13: 아래 "심볼 이름과 타입 있는 헤더"로 대체됐다.)*
 
 **실측 (`static/probe/`).** C++ 소비자가 `winasync_get_activation_factory`로 `NamedPipeConnectionListener`를
 만들고 `IClosable::Close`를 두 길로 부른다. full LTO(라이브러리 `-Clto=fat -Clinker-plugin-lto`, clang `-flto`,
@@ -1765,6 +1765,36 @@ acc가 달라진다(처음 그렇게 틀렸다).
 새 스레드의 `WSAStartup`이 자기 소켓 생성보다 앞서므로 그 소켓이 프로바이더 언로드를 겪을 수 없고, 최악은
 불필요한 재조회 한 번이다. 비용은 소켓마다 비경합 락 한 번과, 소켓이 0개가 되는 순간마다
 `WSACleanup`/`WSAStartup` 한 쌍과 다음 소켓의 확장 함수 재조회 한 번이다.
+
+### 정적 링크: 심볼 이름과 타입 있는 헤더 (2026-11-13)
+
+첫 정적 링크 소비자가 생기면 심볼 이름은 IID처럼 얼어붙으므로, 그 전에 둘을 정리했다.
+
+**기본 인터페이스 심볼.** `#[implement]` 목록의 런타임 클래스 항목(`HttpServer`)은 기본 인터페이스
+(`IHttpServer`)의 vtable을 뜻하는데 매크로는 그 이름을 볼 수 없어서 `..._HttpServer_HttpServer_vtable`이
+나왔다. 이제 클래스 항목은 구현 타입과 이름이 같다는 사실로 알아보고 접두사만으로 이름 짓는다:
+`Pbk20191_WinAsync_Comio_HttpServer_vtable` = "HttpServer의 기본 인터페이스 테이블". 어느 인터페이스인지는
+헤더가 메타데이터에서 밝힌다. 규칙은 관례(클래스 항목 = 구현 struct와 같은 이름)이고 아홉 클래스 모두 그렇다.
+
+**헤더 생성기는 Rust로, `cargo run -p winmdgen -- header`.** 입력은 둘이다. `src/comio/bindings.rs`의 `*_Vtbl`
+구조체(bindgen이 `.winmd`에서 파생한 ABI라 매개변수가 이미 ABI 타입으로 환원돼 있다: 인터페이스·문자열은
+`void*`, 스칼라는 스칼라)와, `src/comio`의 `#[implement(..., Export = ...)]` 목록(매크로와 같은 방식으로 읽는다).
+클래스의 기본 인터페이스는 bindgen이 내는 `impl Interface for HttpServer { type Vtable = <IHttpServer as
+Interface>::Vtable }`에서 푼다. `Windows.*` 인터페이스 셋(`IClosable`, `IInputStream`, `IOutputStream`)과
+`IInspectable` 베이스는 SDK의 ABI라 생성기 안에 손으로 적었다. 출력 `static/include/winasync_static.h`는 세
+층이다.
+- C: 인터페이스마다 `typedef struct Pbk20191_WinAsync_Comio_IHttpServerVtbl { winasync_IInspectableVtbl base;
+  HRESULT (__stdcall *BindAsync)(void* self, void* a1, void** a2); ... }`, 그리고 타입 있는 getter
+  `const ...Vtbl* __stdcall Pbk20191_WinAsync_Comio_HttpServer_vtable(void)`. `const void*`와 캐스팅은 없어졌다.
+- C++: 클래스 네임스페이스마다 메서드 하나에 인라인 함수 하나.
+  `winasync::HttpServer::BindAsync(void* self, ...)`는 `getter()->BindAsync(self, ...)`다. `self`는 그 인터페이스의
+  객체 포인터이고, C++/WinRT에서는 `winrt::get_abi(obj.as<I>())`.
+- C++/WinRT: 프로젝션 헤더가 먼저 포함돼 있으면(`WINRT_Pbk20191_WinAsync_Comio_H`, `WINRT_Windows_Foundation_H`
+  가드) 프로젝션 인터페이스를 받는 오버로드가 열린다. `winasync::HttpServer::Close(IClosable const&)`.
+
+구조체 by-value 매개변수는 `TimeSpan`/`DateTime`(INT64 하나)만 나와서 헤더 머리에 typedef로 두었고, 새 타입이
+나타나면 생성기가 이름을 대며 멈춘다. `static/probe/consumer.cpp`는 캐스팅 대신 `winasync::
+NamedPipeConnectionListener::Close(p)`를 부르고, 인라인 결과는 같다.
 
 ### 완료 포트는 평생이 아니다: `FileReplaceCompletionInformation` 실측 (2026-11-13)
 
