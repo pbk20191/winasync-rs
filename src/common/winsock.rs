@@ -12,12 +12,12 @@
 //! `WSAStartup` and `WSACleanup` are refcounted by `ws2_32` itself, so the API
 //! already has the shape of an `Arc`: each user balances its own pair and
 //! nobody needs to know who else is in the process. This module follows that
-//! shape with [`WinsockRef`], a zero-sized token whose constructor calls
-//! `WSAStartup` and whose `Drop` calls `WSACleanup`. Every socket this crate
-//! owns carries one, so Winsock is up exactly while something of ours needs
-//! it and comes down with the last socket -- in the server DLL, in the static
-//! library and in a plain `tp` executable alike, with no entry point having
-//! to decide when.
+//! shape with [`WinsockRef`], a zero-sized token: the first one calls
+//! `WSAStartup`, the last one dropped calls `WSACleanup`, and the ones in
+//! between only count. Every socket this crate owns carries one, so Winsock
+//! is up exactly while something of ours needs it and comes down with the
+//! last socket -- in the server DLL, in the static library and in a plain
+//! `tp` executable alike, with no entry point having to decide when.
 //!
 //! Until 2026-11-13 this was a `Mutex<bool>` raised by the first socket and
 //! lowered by `DllCanUnloadNow`, which had to establish "nothing of ours is
@@ -46,9 +46,21 @@ use windows_core::GUID;
 
 /// How many [`WinsockRef`]s are alive.
 ///
-/// Only read for [`wsa_initialized`] and for deciding, in `Drop`, whether a
-/// release is the last one and must retire the provider caches.
-static REFS: AtomicUsize = AtomicUsize::new(0);
+/// Under a lock rather than an atomic because the two transitions that
+/// matter -- 0 to 1 and 1 to 0 -- each pair a count change with a Winsock
+/// call, and the pair has to be indivisible: a second taker that saw the
+/// count at 1 before the first taker's `WSAStartup` returned would create
+/// its socket into `WSANOTINITIALISED`. Every other transition is a bare
+/// increment or decrement under an uncontended lock, which is cheaper than
+/// the `WSAStartup` call it replaces.
+static REFS: Mutex<usize> = Mutex::new(0);
+
+/// Takes the count's lock, tolerating a poisoned one: the count is updated
+/// only after the Winsock call it pairs with succeeded, so it is never left
+/// half-written.
+fn refs() -> std::sync::MutexGuard<'static, usize> {
+    REFS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// How many times our last Winsock reference has been released.
 ///
@@ -59,10 +71,10 @@ static TEARDOWNS: AtomicUsize = AtomicUsize::new(0);
 
 /// One reason Winsock must stay up.
 ///
-/// `WSAStartup` on construction, `WSACleanup` on drop; zero-sized, and held
-/// as a field by everything that owns a socket. Cloning takes a reference of
-/// its own rather than sharing one, which is what a field in a second object
-/// needs.
+/// The first one calls `WSAStartup`, the last one out calls `WSACleanup`;
+/// the ones in between only count. Zero-sized, and held as a field by
+/// everything that owns a socket. Cloning takes a reference of its own
+/// rather than sharing one, which is what a field in a second object needs.
 ///
 /// The ordering argument that makes the provider caches sound rests on this
 /// token: a cached pointer is only ever *called* by something that owns a
@@ -75,12 +87,13 @@ impl WinsockRef {
     /// Takes a Winsock reference. Panics if `WSAStartup` fails, which on a
     /// supported Windows means the process is already in trouble.
     pub fn new() -> Self {
-        let mut data = WSADATA::default();
-        let r = unsafe { WSAStartup(0x0202, &mut data) };
-        assert_eq!(r, 0, "WSAStartup failed: {r}");
-        // Relaxed is enough on the way up: nothing is ordered against a
-        // count going from n to n+1.
-        REFS.fetch_add(1, Ordering::Relaxed);
+        let mut refs = refs();
+        if *refs == 0 {
+            let mut data = WSADATA::default();
+            let r = unsafe { WSAStartup(0x0202, &mut data) };
+            assert_eq!(r, 0, "WSAStartup failed: {r}");
+        }
+        *refs += 1;
         Self(())
     }
 }
@@ -99,15 +112,20 @@ impl Clone for WinsockRef {
 
 impl Drop for WinsockRef {
     fn drop(&mut self) {
-        // The last of ours: bump the stamp *before* the call, so a lookup
-        // racing this already sees its cache as stale by the time the
-        // provider can go away. A lookup that holds its own token cannot be
-        // racing a last release at all -- see the type's doc.
-        if REFS.fetch_sub(1, Ordering::Release) == 1 {
+        let mut refs = refs();
+        *refs -= 1;
+        if *refs == 0 {
+            // The last of ours: bump the stamp *before* the call, so a
+            // lookup racing this already sees its cache as stale by the time
+            // the provider can go away. A lookup that holds its own token
+            // cannot be racing a last release at all -- see the type's doc.
             TEARDOWNS.fetch_add(1, Ordering::Release);
-        }
-        unsafe {
-            let _ = WSACleanup();
+            // Held across the call on purpose: a taker arriving now waits
+            // for the cleanup to finish and then starts Winsock afresh,
+            // rather than racing its `WSAStartup` against this.
+            unsafe {
+                let _ = WSACleanup();
+            }
         }
     }
 }
@@ -115,7 +133,7 @@ impl Drop for WinsockRef {
 /// Whether any [`WinsockRef`] is alive, i.e. whether `WSAStartup` is in
 /// effect on this crate's account.
 pub fn wsa_initialized() -> bool {
-    REFS.load(Ordering::Acquire) > 0
+    *refs() > 0
 }
 
 /// An overlapped socket together with the Winsock reference that keeps it

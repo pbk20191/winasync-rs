@@ -1739,9 +1739,12 @@ acc가 달라진다(처음 그렇게 틀렸다).
   빌드에 들어가는 날 모듈이 영원히 언로드 불가가 되는 함정이었다.
 
 `WSAStartup`/`WSACleanup`은 `ws2_32`가 refcount하므로 API 자체가 `Arc` 모양이다. 그 모양을 그대로 따랐다.
-`common::winsock::WinsockRef`는 `ModuleRef`와 같은 ZST 토큰이다. 생성자가 `WSAStartup`, `Drop`이
-`WSACleanup`, 그리고 우리 카운트가 0으로 떨어지는 마지막 `Drop`만 `TEARDOWNS` 스탬프를 올린다(호출보다
+`common::winsock::WinsockRef`는 `ModuleRef`와 같은 ZST 토큰이다. 첫 토큰이 `WSAStartup`, 마지막 토큰의
+`Drop`이 `WSACleanup`, 그 사이는 카운트만 오르내린다. 마지막 `Drop`이 `TEARDOWNS` 스탬프를 올린다(호출보다
 **먼저** 올려서, 경합하는 조회가 프로바이더가 사라질 수 있는 시점에는 이미 자기 캐시를 stale로 본다).
+카운트는 원자가 아니라 `Mutex<usize>`다. 0↔1 전이는 카운트 변경과 Winsock 호출이 한 덩어리여야 해서다.
+원자 카운터면 A가 0→1을 올리고 `WSAStartup`을 끝내기 전에 B가 1→2를 보고 소켓을 만들어
+`WSANOTINITIALISED`를 받는다. 그 밖의 전이는 비경합 락 아래의 증감 하나라 대체한 `WSAStartup` 호출보다 싸다.
 
 | 조각 | 역할 |
 | --- | --- |
@@ -1760,8 +1763,8 @@ acc가 달라진다(처음 그렇게 틀렸다).
 그 객체가 토큰을 드니 우리 카운트가 0이 아니고, 따라서 우리 쪽에서 마지막 `WSACleanup`이 일어날 수 없다.
 남은 경합은 "마지막 토큰을 놓는 스레드가 `WSACleanup`을 부르는 사이 다른 스레드가 새 토큰을 만든다"인데,
 새 스레드의 `WSAStartup`이 자기 소켓 생성보다 앞서므로 그 소켓이 프로바이더 언로드를 겪을 수 없고, 최악은
-불필요한 재조회 한 번이다. 비용은 소켓마다 `WSAStartup`/`WSACleanup` 한 쌍(락 하나와 카운터)과, 소켓이
-0개가 되는 순간마다 다음 소켓이 확장 함수를 ioctl로 한 번 더 조회하는 것이다.
+불필요한 재조회 한 번이다. 비용은 소켓마다 비경합 락 한 번과, 소켓이 0개가 되는 순간마다
+`WSACleanup`/`WSAStartup` 한 쌍과 다음 소켓의 확장 함수 재조회 한 번이다.
 
 ## 커밋 상태
 
