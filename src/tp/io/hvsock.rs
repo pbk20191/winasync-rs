@@ -14,7 +14,7 @@
 
 use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
-use crate::common::winsock::ExtFnCache;
+use crate::common::winsock::{ExtFnCache, WsaSocket};
 use super::net::{
     classify_wsa_overlapped, new_socket, sock_check, AcceptPayload, RecvPayload,
     VectoredPayload, ADDR_SLOT,
@@ -24,10 +24,9 @@ use crate::common::buffer::{IoBuf, IoBufMut};
 use crate::tp::{Runtime, RuntimeInner};
 use crate::common::winsock::{connectex, ConnectExFn};
 use core::ffi::c_void;
-use std::mem;
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    bind, listen, setsockopt, shutdown, AcceptEx, ADDRESS_FAMILY, AF_HYPERV, INVALID_SOCKET,
+    bind, listen, setsockopt, shutdown, AcceptEx, ADDRESS_FAMILY, AF_HYPERV,
     IPPROTO, SD_SEND, SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
     SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
 };
@@ -52,7 +51,7 @@ fn get_connectex(sock: SOCKET) -> windows_core::Result<ConnectExFn> {
 
 /// Creates an AF_HYPERV stream socket. Fails with `WSAEAFNOSUPPORT` (10047)
 /// where the Hyper-V socket provider is not present.
-fn hv_socket() -> windows_core::Result<SOCKET> {
+fn hv_socket() -> windows_core::Result<WsaSocket> {
     new_socket(
         ADDRESS_FAMILY(AF_HYPERV),
         SOCK_STREAM,
@@ -140,7 +139,7 @@ impl HvStream {
         crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
-    fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<HvStream> {
+    fn from_socket(rt: &Arc<RuntimeInner>, sock: WsaSocket) -> windows_core::Result<HvStream> {
         let res = crate::tp::io::register_on(rt, sock)?;
         Ok(HvStream { res })
     }
@@ -154,9 +153,9 @@ impl HvStream {
         addr: HvSocketAddr,
         connect_timeout_ms: Option<u32>,
     ) -> windows_core::Result<HvStream> {
-        let sock = hv_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = hv_socket()?;
+        let sock = owned.raw();
         if let Some(ms) = connect_timeout_ms {
             sock_check(unsafe {
                 setsockopt(sock, HV_PROTOCOL_RAW, HVSOCKET_CONNECT_TIMEOUT, Some(&ms.to_ne_bytes()))
@@ -363,9 +362,9 @@ impl HvListener {
     /// Host-to-host loopback works without it, so a listener that answers
     /// locally may still be unreachable from a VM.
     pub fn bind(rt: &Runtime, addr: HvSocketAddr) -> windows_core::Result<HvListener> {
-        let sock = hv_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = hv_socket()?;
+        let sock = owned.raw();
         let (sa, len) = addr.to_raw();
         sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
         sock_check(unsafe { listen(sock, crate::common::winsock::LISTEN_BACKLOG) })?;
@@ -399,7 +398,7 @@ impl HvListener {
                     let mut bytes = 0u32;
                     let ok = AcceptEx(
                         listen_sock,
-                        p.accept_sock,
+                        p.accept_sock.raw(),
                         p.addr_buf.as_mut_ptr() as *mut c_void,
                         0,
                         ADDR_SLOT as u32,
@@ -411,11 +410,11 @@ impl HvListener {
                 },
             )
         };
-        let (result, mut payload) = fut.await;
+        let (result, payload) = fut.await;
         result?;
-        let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = payload.accept_sock;
+        let sock = owned.raw();
         let listen_val = listen_sock.0.to_ne_bytes();
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
         let stream = HvStream::from_socket(&self.rt.inner, owned)?;

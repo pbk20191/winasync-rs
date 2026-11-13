@@ -11,7 +11,7 @@
 //! passed through to/from the OS `sockaddr_in6` as-is (no byte-swap); only
 //! non-zero flow labels crossing to a differing stack would be affected.
 
-use crate::common::winsock::ExtFnCache;
+use crate::common::winsock::{ExtFnCache, WsaSocket};
 use super::file::File;
 use super::{submit, IoRes, OpFuture};
 use crate::common::buffer::{IoBuf, IoBufMut};
@@ -36,8 +36,8 @@ use windows::Win32::Networking::WinSock::{
     IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_UNBLOCK_SOURCE, SO_REUSEADDR,
     getsockopt,
     UDP_COALESCED_INFO, UDP_RECV_MAX_COALESCED_SIZE, UDP_SEND_MSG_SIZE,
-    bind, closesocket, connect, listen, setsockopt, shutdown, AcceptEx, WSARecv, WSARecvFrom, WSASend, WSASendTo,
-    ADDRESS_FAMILY, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, INVALID_SOCKET,
+    bind, connect, listen, setsockopt, shutdown, AcceptEx, WSARecv, WSARecvFrom, WSASend, WSASendTo,
+    ADDRESS_FAMILY, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0,
     IPPROTO, IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, SD_SEND, SOCKADDR,
     SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM, SOCK_STREAM,
     SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, TF_DISCONNECT,
@@ -102,7 +102,7 @@ pub(super) fn new_socket(
     family: ADDRESS_FAMILY,
     socktype: WINSOCK_SOCKET_TYPE,
     proto: IPPROTO,
-) -> windows_core::Result<SOCKET> {
+) -> windows_core::Result<WsaSocket> {
     new_socket_with(family, socktype, proto, 0)
 }
 
@@ -119,9 +119,7 @@ pub(crate) fn new_socket_with(
     socktype: WINSOCK_SOCKET_TYPE,
     proto: IPPROTO,
     extra_flags: u32,
-) -> windows_core::Result<SOCKET> {
-    // See `comio::unix::new_socket` for why this is not `wsa_init()` plus a
-    // separate `WSASocketW`.
+) -> windows_core::Result<WsaSocket> {
     crate::common::winsock::socket(family.0 as i32, socktype.0, proto.0, extra_flags)
 }
 
@@ -194,22 +192,11 @@ pub(super) const ADDR_SLOT: usize = size_of::<SOCKADDR_STORAGE>() + 16;
 
 /// Owns the pre-created accept socket and address buffer while AcceptEx is in
 /// flight. If the op is cancelled the completion callback frees the block and
-/// this Drop closes the socket.
+/// the socket closes with it; on success the socket is moved out.
 pub(in crate::tp::io) struct AcceptPayload {
-    pub(in crate::tp::io) accept_sock: SOCKET,
+    pub(in crate::tp::io) accept_sock: WsaSocket,
     pub(in crate::tp::io) addr_buf: Box<[u8; 2 * ADDR_SLOT]>,
 }
-
-impl Drop for AcceptPayload {
-    fn drop(&mut self) {
-        if self.accept_sock != INVALID_SOCKET {
-            unsafe { closesocket(self.accept_sock) };
-        }
-    }
-}
-
-// SOCKET is a plain kernel handle value.
-unsafe impl Send for AcceptPayload {}
 
 /// Payload for [`TcpListener::accept_into`]: the recycled socket's `IoRes` (kept
 /// alive for the op — its socket is the AcceptEx target, and its TP_IO is reused
@@ -226,21 +213,11 @@ struct AcceptIntoPayload {
 /// data **before** the two address slots, so it is one heap `Vec` instead of a
 /// fixed array.
 struct AcceptDataPayload {
-    accept_sock: SOCKET,
+    accept_sock: WsaSocket,
     /// `recv_len + 2 * ADDR_SLOT` bytes: data, then local addr, then remote.
     buf: Vec<u8>,
     recv_len: usize,
 }
-
-impl Drop for AcceptDataPayload {
-    fn drop(&mut self) {
-        if self.accept_sock != INVALID_SOCKET {
-            unsafe { closesocket(self.accept_sock) };
-        }
-    }
-}
-
-unsafe impl Send for AcceptDataPayload {}
 
 /// Payload of a WSARecv: the buffer plus the flags word, which the provider
 /// may write at completion time and therefore must live in the op block.

@@ -14,24 +14,27 @@
 //!   * `cbSize` must be set on input and comes back as the table's own size,
 //!     which is how the provider version-negotiates.
 
-use std::sync::OnceLock;
 use windows::Win32::Networking::WinSock::{
-    closesocket, WSAIoctl, WSASocketW, AF_INET, RIO_EXTENSION_FUNCTION_TABLE,
+    WSAIoctl, AF_INET, RIO_EXTENSION_FUNCTION_TABLE,
     SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCKET, SOCK_DGRAM, WSAID_MULTIPLE_RIO,
-    WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
+    WSA_FLAG_REGISTERED_IO,
 };
 
-use crate::common::winsock::{wsa_init, wsa_last_err};
+use crate::common::winsock::{wsa_last_err, ProviderCache};
 
 /// The provider's RIO entry points.
 ///
 /// Every function pointer is validated non-null once, at [`rio_table`] time,
 /// so the accessors cannot fail. Keeping the raw table rather than unpacking
 /// it into thirteen fields keeps this honest about what the provider returned.
+///
+/// Handed out **by value**: thirteen pointers, copied once per call site next
+/// to a syscall. A `&'static` would have been cheaper to hand out and
+/// impossible to retire -- see [`rio_table`].
+#[derive(Clone, Copy)]
 pub(crate) struct RioTable(RIO_EXTENSION_FUNCTION_TABLE);
 
-// The table is a set of plain function pointers into mswsock.dll, valid for
-// the process's lifetime.
+// The table is a set of plain function pointers into mswsock.dll.
 unsafe impl Send for RioTable {}
 unsafe impl Sync for RioTable {}
 
@@ -49,45 +52,31 @@ impl RioTable {
     }
 }
 
-/// Fetches (once) the provider's RIO table.
+/// Fetches the provider's RIO table, cached while its provider is.
 ///
 /// Fails where RIO is unavailable — the provider answers `WSAEOPNOTSUPP` /
 /// `WSAEINVAL` — so callers can degrade to the ordinary overlapped transports
 /// rather than assuming RIO exists.
-pub(crate) fn rio_table() -> windows_core::Result<&'static RioTable> {
-    static TABLE: OnceLock<RioTable> = OnceLock::new();
-    if let Some(t) = TABLE.get() {
-        return Ok(t);
-    }
-    let fetched = fetch()?;
-    // These are provider-owned function pointers handed out as `&'static`,
-    // so there is no way to retire them if Winsock is torn down and the
-    // provider goes with it. Say so, and `winsock::wsa_shutdown` will refuse
-    // for the life of the process. `rio` is not part of the `dylib` server
-    // build, so in practice this vetoes nothing that was going to happen.
-    crate::common::winsock::pin();
-    // A racing thread may have published first; either table is equally valid.
-    let _ = TABLE.set(fetched);
-    Ok(TABLE.get().expect("table published above"))
+///
+/// The table is provider-owned, like any extension pointer, so it lives in a
+/// [`ProviderCache`] and is re-fetched after a last release of our Winsock
+/// reference. Until 2026-11-13 it was a `OnceLock` handed out as `&'static`,
+/// which could not be retired and so vetoed Winsock teardown for the life of
+/// the process -- harmless while `rio` stayed out of the server DLL, and a
+/// module that could never unload the day it went in. Every caller holds a
+/// `WinsockRef` of its own (the queue, the registration, the socket), so a
+/// table it is handed stays valid for as long as it uses it.
+pub(crate) fn rio_table() -> windows_core::Result<RioTable> {
+    static TABLE: ProviderCache<RioTable> = ProviderCache::new();
+    TABLE.get_or_fetch(fetch)
 }
 
 fn fetch() -> windows_core::Result<RioTable> {
-    wsa_init();
     // A throwaway socket purely to reach the provider. UDP/AF_INET is the
-    // cheapest; the table is the TCP/IP provider's either way.
-    let sock = unsafe {
-        WSASocketW(
-            AF_INET.0 as i32,
-            SOCK_DGRAM.0,
-            0,
-            None,
-            0,
-            WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
-        )
-    }?;
-    let result = fetch_on(sock);
-    unsafe { closesocket(sock) };
-    result
+    // cheapest; the table is the TCP/IP provider's either way. It brings its
+    // own Winsock reference and closes on the way out.
+    let sock = crate::common::winsock::socket(AF_INET.0 as i32, SOCK_DGRAM.0, 0, WSA_FLAG_REGISTERED_IO)?;
+    fetch_on(sock.raw())
 }
 
 fn fetch_on(sock: SOCKET) -> windows_core::Result<RioTable> {
@@ -163,6 +152,10 @@ mod tests {
                 // Cached: a second call must hand back the same table.
                 let again = rio_table().unwrap();
                 assert_eq!(again.cb_size(), t.cb_size());
+                assert_eq!(
+                    again.raw().RIOSend.map(|f| f as usize),
+                    t.raw().RIOSend.map(|f| f as usize)
+                );
             }
             Err(e) => panic!("RIO unavailable on this machine: {e:?}"),
         }

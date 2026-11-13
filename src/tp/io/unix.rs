@@ -5,7 +5,7 @@
 
 use crate::common::buffer::BufResult;
 use std::os::windows::io::AsHandle;
-use crate::common::winsock::ExtFnCache;
+use crate::common::winsock::{ExtFnCache, WsaSocket};
 use super::net::{
     classify_wsa_overlapped, new_socket, sock_check, AcceptPayload, RecvPayload,
     VectoredPayload, ADDR_SLOT,
@@ -16,10 +16,9 @@ use crate::common::security::{self, SecurityDescriptor};
 use crate::tp::{Runtime, RuntimeInner};
 use crate::common::winsock::{connectex, ConnectExFn};
 use core::ffi::c_void;
-use std::mem;
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    bind, listen, setsockopt, shutdown, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
+    bind, listen, setsockopt, shutdown, AcceptEx, ADDRESS_FAMILY, AF_UNIX,
     IPPROTO, SD_SEND, SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSARecv, WSASend,
 };
@@ -62,7 +61,7 @@ fn sockaddr_un_autobind() -> (SOCKADDR_UN, i32) {
     )
 }
 
-fn unix_socket() -> windows_core::Result<SOCKET> {
+fn unix_socket() -> windows_core::Result<WsaSocket> {
     new_socket(ADDRESS_FAMILY(AF_UNIX), SOCK_STREAM, IPPROTO(0))
 }
 
@@ -155,16 +154,16 @@ impl UnixStream {
         crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
-    fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<UnixStream> {
+    fn from_socket(rt: &Arc<RuntimeInner>, sock: WsaSocket) -> windows_core::Result<UnixStream> {
         let res = crate::tp::io::register_on(rt, sock)?;
         Ok(UnixStream { res })
     }
 
     /// Connects to the AF_UNIX socket at `path`.
     pub async fn connect(rt: &Runtime, path: &str) -> windows_core::Result<UnixStream> {
-        let sock = unix_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = unix_socket()?;
+        let sock = owned.raw();
         let (local, local_len) = sockaddr_un_autobind();
         sock_check(unsafe { bind(sock, &local as *const _ as *const SOCKADDR, local_len) })?;
         // Prime the ConnectEx pointer on this socket before registration.
@@ -442,9 +441,9 @@ impl UnixListener {
         path: &str,
         security: Option<&SecurityDescriptor>,
     ) -> windows_core::Result<UnixListener> {
-        let sock = unix_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = unix_socket()?;
+        let sock = owned.raw();
         let (sa, len) = sockaddr_un(path)?;
         sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, len) })?;
         if let Some(security) = security {
@@ -481,7 +480,7 @@ impl UnixListener {
                     let mut bytes = 0u32;
                     let ok = AcceptEx(
                         listen_sock,
-                        p.accept_sock,
+                        p.accept_sock.raw(),
                         p.addr_buf.as_mut_ptr() as *mut c_void,
                         0,
                         ADDR_SLOT as u32,
@@ -493,11 +492,11 @@ impl UnixListener {
                 },
             )
         };
-        let (result, mut payload) = fut.await;
+        let (result, payload) = fut.await;
         result?;
-        let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = payload.accept_sock;
+        let sock = owned.raw();
         let listen_val = listen_sock.0.to_ne_bytes();
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
         let stream = UnixStream::from_socket(&self.rt.inner, owned)?;

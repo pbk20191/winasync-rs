@@ -43,26 +43,6 @@ fn classify_wsa(r: i32) -> Issue {
     }
 }
 
-/// Holds a pre-created accept socket while `AcceptEx` is in flight, closing
-/// it if the accept is abandoned before the op resolves.
-///
-/// Sound as a plain frame-local guard, unlike the address buffer beside it:
-/// closing a socket with a pending overlapped op aborts the op and releases
-/// the handle; there is no kernel-owned *memory* behind the socket value that
-/// a late completion could still write into.
-pub(crate) struct AcceptSockGuard(pub(crate) SOCKET);
-
-impl Drop for AcceptSockGuard {
-    fn drop(&mut self) {
-        if self.0 != windows::Win32::Networking::WinSock::INVALID_SOCKET {
-            unsafe { windows::Win32::Networking::WinSock::closesocket(self.0) };
-        }
-    }
-}
-
-// SOCKET is a plain kernel handle value.
-unsafe impl Send for AcceptSockGuard {}
-
 /// A duplex WinRT stream over one overlapped-registered handle/socket.
 ///
 /// `Pbk20191.WinAsync.Comio.TransportStream` in metadata; the generated class type

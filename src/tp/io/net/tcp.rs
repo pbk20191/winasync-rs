@@ -54,9 +54,9 @@ impl TcpListener {
     ) -> windows_core::Result<TcpListener> {
         let extra_flags = options.for_tcp()?.wsa_flags;
         let family = family_of(&addr);
-        let sock = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
+        let sock = owned.raw();
         let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let len = write_sockaddr(&addr, &mut storage);
         sock_check(unsafe { bind(sock, &storage as *const _ as *const SOCKADDR, len) })?;
@@ -116,7 +116,7 @@ impl TcpListener {
                     let mut bytes = 0u32;
                     let ok = AcceptEx(
                         listen_sock,
-                        p.accept_sock,
+                        p.accept_sock.raw(),
                         p.addr_buf.as_mut_ptr() as *mut c_void,
                         0, // complete on connect; do not wait for first data
                         ADDR_SLOT as u32,
@@ -128,11 +128,11 @@ impl TcpListener {
                 },
             )
         };
-        let (result, mut payload) = fut.await;
+        let (result, payload) = fut.await;
         result?;
-        let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = payload.accept_sock;
+        let sock = owned.raw();
         // Until SO_UPDATE_ACCEPT_CONTEXT (value = the listen socket) the
         // accepted socket is half-configured (shutdown/getsockname/
         // getpeername fail).
@@ -175,7 +175,7 @@ impl TcpListener {
                     let mut bytes = 0u32;
                     let ok = AcceptEx(
                         listen_sock,
-                        p.accept_sock,
+                        p.accept_sock.raw(),
                         p.buf.as_mut_ptr() as *mut c_void,
                         p.recv_len as u32,
                         ADDR_SLOT as u32,
@@ -187,15 +187,15 @@ impl TcpListener {
                 },
             )
         };
-        let (result, mut payload) = fut.await;
+        let (result, payload) = fut.await;
         // The completion byte count covers only the received data, not the
         // address slots (those are filled regardless).
         let received = result?;
-        let sock = mem::replace(&mut payload.accept_sock, INVALID_SOCKET);
-        let mut data = mem::take(&mut payload.buf);
-        data.truncate(received.min(payload.recv_len));
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = payload.accept_sock;
+        let sock = owned.raw();
+        let mut data = payload.buf;
+        data.truncate(received.min(payload.recv_len));
         let listen_val = listen_sock.0.to_ne_bytes();
         sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, Some(&listen_val)) })?;
         let stream = TcpStream::from_socket(self.res.runtime_inner(), owned)?;
@@ -268,7 +268,7 @@ impl TcpStream {
     /// [`TcpListener::from_std`]).
     pub fn from_std(rt: &Runtime, stream: std::net::TcpStream) -> windows_core::Result<TcpStream> {
         let owned: std::os::windows::io::OwnedSocket = stream.into();
-        TcpStream::from_socket(&rt.inner, owned.into())
+        TcpStream::from_socket(&rt.inner, owned)
     }
 
     /// Sends a Winsock control code (`WSAIoctl`, overlapped) with `input`,
@@ -290,7 +290,10 @@ impl TcpStream {
         crate::tp::io::socket_ioctl(&self.res, code, input, output)
     }
 
-    fn from_socket(rt: &Arc<RuntimeInner>, sock: crate::common::overlapped::IoHandle) -> windows_core::Result<TcpStream> {
+    fn from_socket(
+        rt: &Arc<RuntimeInner>,
+        sock: impl Into<crate::common::overlapped::IoHandle>,
+    ) -> windows_core::Result<TcpStream> {
         let res = crate::tp::io::register_on(rt, sock)?;
         Ok(TcpStream { res })
     }
@@ -304,9 +307,9 @@ impl TcpStream {
     ) -> windows_core::Result<TcpStream> {
         let extra_flags = options.for_tcp()?.wsa_flags;
         let family = family_of(&addr);
-        let sock = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = new_socket_with(family, SOCK_STREAM, IPPROTO_TCP, extra_flags)?;
+        let sock = owned.raw();
         // ConnectEx fails with WSAEINVAL on an unbound socket.
         let mut local = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
         let local_len = write_sockaddr(&wildcard(family), &mut local);

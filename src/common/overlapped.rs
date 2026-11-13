@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use crate::common::pool::PoolRef;
-use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, OwnedHandle, OwnedSocket};
+use crate::common::winsock::{WinsockRef, WsaSocket};
+use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle, OwnedSocket};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::WinSock::SOCKET;
 use windows::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
@@ -71,7 +72,9 @@ pub static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 /// way out when it fails.
 pub enum IoHandle {
     Handle(OwnedHandle),
-    Socket(OwnedSocket),
+    /// A socket and the Winsock reference that keeps it valid; the socket
+    /// closes first, the reference releases after.
+    Socket(OwnedSocket, WinsockRef),
     /// A named-pipe instance: closes its handle, then releases the count it
     /// holds -- which must not fall while the instance is still open.
     #[cfg(any(feature = "tp", feature = "comio"))]
@@ -84,9 +87,19 @@ impl From<OwnedHandle> for IoHandle {
     }
 }
 
+/// A socket from outside the crate -- `std`'s, say -- takes a reference of
+/// its own on the way in.
 impl From<OwnedSocket> for IoHandle {
     fn from(s: OwnedSocket) -> Self {
-        IoHandle::Socket(s)
+        let (sock, winsock) = WsaSocket::from_owned(s).into_parts();
+        IoHandle::Socket(sock, winsock)
+    }
+}
+
+impl From<WsaSocket> for IoHandle {
+    fn from(s: WsaSocket) -> Self {
+        let (sock, winsock) = s.into_parts();
+        IoHandle::Socket(sock, winsock)
     }
 }
 
@@ -104,20 +117,20 @@ impl IoHandle {
     /// # Safety
     /// As [`from_handle`](Self::from_handle), for a socket.
     pub unsafe fn from_socket(socket: SOCKET) -> Self {
-        IoHandle::Socket(unsafe { OwnedSocket::from_raw_socket(socket.0 as u64) })
+        unsafe { WsaSocket::from_raw(socket) }.into()
     }
 
     fn raw(&self) -> HANDLE {
         match self {
             IoHandle::Handle(h) => HANDLE(h.as_raw_handle()),
-            IoHandle::Socket(s) => HANDLE(s.as_raw_socket() as *mut c_void),
+            IoHandle::Socket(s, _) => HANDLE(s.as_raw_socket() as *mut c_void),
             #[cfg(any(feature = "tp", feature = "comio"))]
             IoHandle::PipeInstance(i) => i.handle,
         }
     }
 
     fn is_socket(&self) -> bool {
-        matches!(self, IoHandle::Socket(_))
+        matches!(self, IoHandle::Socket(..))
     }
 }
 

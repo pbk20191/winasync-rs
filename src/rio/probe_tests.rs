@@ -22,7 +22,7 @@ use super::cq::RioCq;
 use super::rq::RIO_INVALID_RQ;
 use super::table::rio_table;
 use super::RioBufferPool;
-use crate::common::winsock::{wsa_init, wsa_last_err};
+use crate::common::winsock::{wsa_last_err, WinsockRef};
 
 /// The family's end of the probe: the RIO socket, and a plain peer connected
 /// to it (the peer's socket is returned to be closed).
@@ -36,7 +36,6 @@ struct Family {
 }
 
 fn rio_socket(f: &Family) -> windows_core::Result<SOCKET> {
-    wsa_init();
     unsafe {
         WSASocketW(
             f.family,
@@ -106,6 +105,9 @@ fn hv_pair(rio: SOCKET) -> Result<SOCKET, String> {
 }
 
 fn probe(f: &Family) -> String {
+    // The raw sockets below are covered by this one reference for the
+    // probe's whole duration.
+    let _winsock = WinsockRef::new();
     let table = match rio_table() {
         Ok(t) => t,
         Err(e) => return format!("{}: no RIO table: {e:?}", f.name),

@@ -53,7 +53,7 @@ use std::net::SocketAddr;
 use super::buffer::RioSlice;
 use super::rq::RIO_INVALID_CQ;
 use super::table::rio_table;
-use crate::common::winsock::wsa_last_err;
+use crate::common::winsock::{wsa_last_err, WinsockRef};
 use crate::common::tpctx::CtxHeader;
 #[cfg(feature = "tp")]
 use crate::tp::Runtime;
@@ -327,6 +327,10 @@ struct CqState {
     /// outstanding and future operation just never completes. Recording it
     /// gives [`RioCq::pump_error`] something to report.
     pump_error: AtomicU32,
+    /// The queue is the provider's; this keeps the provider for as long as
+    /// anything -- the handle, the pump, a teardown on another thread --
+    /// still refers to it.
+    winsock: WinsockRef,
 }
 
 /// How a completion queue announces that it has results.
@@ -498,6 +502,8 @@ impl RioCq {
     /// constructors each setting both by hand, is a double free if they drift
     /// one way and a leak the other.
     fn with_pump(size: u32, pool: PoolRef) -> windows_core::Result<Arc<Self>> {
+        // Before the queue exists, so it is covered from its first moment.
+        let winsock = WinsockRef::new();
         // Read before the pool moves into the context.
         let env = pool.env();
         let release_ourselves = !pool.finalizes();
@@ -529,6 +535,7 @@ impl RioCq {
             closing: AtomicBool::new(false),
             pump_error: AtomicU32::new(0),
             mode: Mode::Pump,
+            winsock,
         });
         let pump = Arc::new(PoolPump {
             header: unsafe { CtxHeader::new(release_pump) },
@@ -609,8 +616,9 @@ impl RioCq {
                 },
             },
         };
+        let winsock = WinsockRef::new();
         let cq = create_cq(size, Some(&notify))?;
-        let this = Self::externally_driven(cq, Mode::Iocp);
+        let this = Self::externally_driven(winsock, cq, Mode::Iocp);
         // Arm the first notification here rather than making the caller
         // remember to: an unarmed queue is silent, which looks like a
         // delivery failure rather than a missing call.
@@ -655,8 +663,9 @@ impl RioCq {
                 },
             },
         };
+        let winsock = WinsockRef::new();
         let cq = create_cq(size, Some(&notify))?;
-        let this = Self::externally_driven(cq, Mode::Event);
+        let this = Self::externally_driven(winsock, cq, Mode::Event);
         // Armed here for the same reason as the IOCP mode: an unarmed queue
         // is silent, which reads as a delivery failure rather than a missing
         // call.
@@ -671,11 +680,14 @@ impl RioCq {
     /// no-op here rather than an error, so one drain-and-rearm loop can serve
     /// every mode.
     pub fn polling(size: u32) -> windows_core::Result<Arc<Self>> {
+        let winsock = WinsockRef::new();
         let cq = create_cq(size, None)?;
-        Ok(Self::externally_driven(cq, Mode::Polling))
+        Ok(Self::externally_driven(winsock, cq, Mode::Polling))
     }
 
-    fn externally_driven(cq: RIO_CQ, mode: Mode) -> Arc<Self> {
+    /// `winsock` is the reference taken before `cq` was created; an
+    /// externally driven queue's whole provider dependency is that handle.
+    fn externally_driven(winsock: WinsockRef, cq: RIO_CQ, mode: Mode) -> Arc<Self> {
         Arc::new(RioCq {
             state: Arc::new(CqState {
                 cq,
@@ -683,6 +695,7 @@ impl RioCq {
                 closing: AtomicBool::new(false),
                 pump_error: AtomicU32::new(0),
                 mode,
+                winsock,
             }),
             pump: None,
         })
@@ -979,6 +992,9 @@ thread_local! {
 struct Teardown {
     pump: Pump,
     cq: RIO_CQ,
+    /// The queue's own state may be gone by the time this runs; the close
+    /// still needs the provider.
+    _winsock: WinsockRef,
 }
 
 // Every field is a kernel handle or a raw pointer this value now owns
@@ -1022,6 +1038,7 @@ impl Drop for RioCq {
             let salvage = Teardown {
                 pump,
                 cq: self.state.cq,
+                _winsock: self.state.winsock.clone(),
             };
             std::thread::spawn(move || salvage.run());
             return;

@@ -35,33 +35,29 @@
 //! decremented at the release tail — so this module reads it rather than
 //! keeping a second one.
 //!
-//! # And one thing that is not counted but still given back
+//! # And the process-global state that is not counted here at all
 //!
 //! Live objects are not the only way a module becomes unremovable. Anything
 //! it installed in **process-global state** has to be returned too, and
-//! `WSAStartup` is the case here.
+//! `WSAStartup` is the case here: unloading with the reference held leaks
+//! it, and a later reload gets a fresh module image that calls `WSAStartup`
+//! again, so the count climbs once per load cycle.
 //!
-//! [`crate::common::winsock::wsa_init`] raises the process's Winsock
-//! reference the first time any socket transport is constructed. Unloading in
-//! that state leaks the reference, and -- worse -- a later reload gets a
-//! fresh module image and calls `WSAStartup` again, so the count climbs once
-//! per load cycle.
+//! Nothing in this module returns it, because nothing has to. Every socket
+//! this crate owns carries a [`crate::common::winsock::WinsockRef`], whose
+//! `Drop` is the `WSACleanup`; the last socket out takes Winsock down with
+//! it. The two counts above reaching zero therefore *implies* the Winsock
+//! count is zero -- every socket lives inside an object or an in-flight
+//! operation -- and `DllCanUnloadNow` has nothing to release when it says
+//! yes. The provider-owned caches (`ConnectEx` addresses, the RIO table) are
+//! stamped with the number of times that last reference has gone, so a value
+//! fetched under one Winsock is never reused under the next.
 //!
-//! This used to be unfixable, and [`can_unload`] simply answered no once
-//! Winsock was up. The obstacle was never `WSACleanup` itself but the
-//! pointers: `unix` and `hvsock` cache `ConnectEx` / `AcceptEx` addresses
-//! from `SIO_GET_EXTENSION_FUNCTION_POINTER`, which belong to the Winsock
-//! *provider*, in `OnceLock`s that cannot be reset. A cleanup reaching zero
-//! may unload that provider and leave the caches aimed at freed code, which
-//! trades a leak for a dangling call.
-//!
-//! `common::winsock::ExtFnCache` closes that: every cached pointer carries
-//! the teardown count it was fetched under, so a `WSACleanup` retires all of
-//! them at once and the next lookup re-fetches. With the caches invalidatable
-//! the reference became returnable, and [`release_process_state`] returns it.
-//! A module that holds provider state it genuinely cannot retire says so with
-//! `winsock::pin` and the teardown is refused -- `rio`'s RIO function table
-//! is the one such caller.
+//! Until 2026-11-13 the reference was a flag raised by the first socket and
+//! lowered by a `release_process_state` that `DllCanUnloadNow` called just
+//! before answering `S_OK` -- the only place that could establish "nothing of
+//! ours is live" from outside, and a place that did not exist without the
+//! DLL. The token puts the precondition where it is structural.
 //!
 //! # The residual race
 //!
@@ -178,46 +174,6 @@ pub fn can_unload() -> bool {
         && LOCKS.load(Ordering::Acquire) == 0
 }
 
-/// Gives back the process-global state this module took.
-///
-/// Called from `DllCanUnloadNow` immediately before it answers `S_OK`, and
-/// nowhere else. That is the only sound moment and the only sound place:
-///
-/// - **The moment**, because [`can_unload`] has just established that nothing
-///   of ours is live, and every socket this crate owns lives inside an object
-///   or an in-flight operation that it counts. No objects and no operations
-///   means no sockets.
-/// - **The place**, because `DllCanUnloadNow` is an ordinary call from
-///   `CoFreeUnusedLibraries`, not a `DllMain` callback. `WSACleanup` can
-///   unload provider DLLs, so calling it under the loader lock is the
-///   deadlock that lock exists to prevent. `DllMain` can observe; it cannot
-///   do this.
-///
-/// A query with a side effect is unusual, and the side effect is chosen to be
-/// harmless if the host then declines to unload us: the next socket
-/// constructor calls `WSAStartup` again, and every cached extension pointer
-/// re-fetches because the teardown bumped the stamp they are compared
-/// against.
-///
-/// Returns whether anything was released, which is only of interest to tests.
-///
-/// # Safety
-///
-/// [`can_unload`] must have returned true, and the build must be the server
-/// DLL, where every socket this crate owns is counted by it. Neither holds in
-/// an executable that turns on `dylib` beside `tp`: an idle tp listener sits
-/// outside every count, and this would close it. Public only for
-/// `tests/unload.rs`, which needs a process of its own.
-#[doc(hidden)]
-#[cfg(feature = "dylib")]
-pub unsafe fn release_process_state() -> bool {
-    // Winsock is the whole list. The Windows App SDK bootstrap that would
-    // otherwise belong here is `#[cfg(test)]` in `dq` and never ships in this
-    // module; thread-pool registrations are owned by the objects already
-    // counted above and are closed by their `Drop`.
-    crate::common::winsock::wsa_shutdown()
-}
-
 /// The live object count.
 ///
 /// Not the same thing as [`can_unload`]: this is the object half only.
@@ -256,8 +212,9 @@ pub fn locks_held() -> usize {
 /// There is deliberately no cleanup here. `DllMain` runs under the loader
 /// lock, where the useful things -- `WSACleanup`, waiting on thread-pool
 /// callbacks, anything that could load or unload a module -- are exactly what
-/// must not be called. Observing is safe; acting is not. Cleanup happens in
-/// [`release_process_state`], from `DllCanUnloadNow`.
+/// must not be called. Observing is safe; acting is not. There is also
+/// nothing left to clean: a socket's `Drop` releases its own Winsock
+/// reference, and a module with no sockets holds none.
 ///
 /// Returns the `BOOL` `DllMain` must return; anything but TRUE fails the
 /// load.

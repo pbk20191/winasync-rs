@@ -16,14 +16,14 @@
 
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    closesocket, connect, listen, IPPROTO_TCP, RIO_MSG_DEFER, RIO_MSG_DONT_NOTIFY, SOCKADDR, SOCKADDR_STORAGE,
+    connect, listen, IPPROTO_TCP, RIO_MSG_DEFER, RIO_MSG_DONT_NOTIFY, SOCKADDR, SOCKADDR_STORAGE,
     SOCKET, SOCK_STREAM,
 };
 
 use super::buffer::RioSlice;
 use super::cq::RioCq;
 use super::rq::{bind_socket, new_rio_socket, RequestQueue, RqConfig};
-use crate::common::winsock::sock_check;
+use crate::common::winsock::{sock_check, WsaSocket};
 use crate::common::sockaddr::{addr_of_socket, write_sockaddr};
 use std::net::SocketAddr;
 
@@ -33,30 +33,20 @@ use std::net::SocketAddr;
 /// this is a thin wrapper that exists mainly to carry the RIO flag onto the
 /// accepted sockets.
 pub struct RioTcpListener {
-    sock: SOCKET,
+    sock: WsaSocket,
 }
-
-unsafe impl Send for RioTcpListener {}
-unsafe impl Sync for RioTcpListener {}
 
 impl RioTcpListener {
     pub fn bind(addr: SocketAddr) -> windows_core::Result<Self> {
+        // Closed on any early return from here on.
         let sock = new_rio_socket(&addr, SOCK_STREAM.0, IPPROTO_TCP.0)?;
-        let setup = || -> windows_core::Result<()> {
-            bind_socket(sock, &addr)?;
-            sock_check(unsafe { listen(sock, crate::common::winsock::LISTEN_BACKLOG) })
-        };
-        match setup() {
-            Ok(()) => Ok(Self { sock }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        bind_socket(sock.raw(), &addr)?;
+        sock_check(unsafe { listen(sock.raw(), crate::common::winsock::LISTEN_BACKLOG) })?;
+        Ok(Self { sock })
     }
 
     pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
-        addr_of_socket(self.sock)
+        addr_of_socket(self.sock.raw())
     }
 
     /// Accepts one connection and attaches a request queue to it.
@@ -70,16 +60,10 @@ impl RioTcpListener {
         config: RqConfig,
     ) -> windows_core::Result<RioTcpStream> {
         let accepted =
-            unsafe { windows::Win32::Networking::WinSock::accept(self.sock, None, None) }?;
+            unsafe { windows::Win32::Networking::WinSock::accept(self.sock.raw(), None, None) }?;
         // WSA_FLAG_REGISTERED_IO is inherited, so the accepted socket is
         // already RIO-capable.
         RioTcpStream::attach(accepted, cq, config)
-    }
-}
-
-impl Drop for RioTcpListener {
-    fn drop(&mut self) {
-        unsafe { closesocket(self.sock) };
     }
 }
 
@@ -91,10 +75,13 @@ impl Drop for RioTcpListener {
 /// of its own; see there for how to split it across tasks.
 pub struct RioTcpStream {
     sock: SOCKET,
+    /// The socket, when this stream is its owner: it closes before `rq`
+    /// releases the queue. `None` when the socket came from the overlapped
+    /// engine's handshake -- that stream owns it and its TP_IO registration,
+    /// and is kept in `owner` so exactly one owner closes it, whichever path
+    /// created it.
+    owned: Option<WsaSocket>,
     rq: RequestQueue,
-    /// Set when the socket came from the overlapped engine's handshake. That
-    /// stream owns the socket and its TP_IO registration, so this one must
-    /// not close it — exactly one owner, whichever path created it.
     #[cfg(feature = "tp")]
     owner: Option<crate::tp::io::net::TcpStream>,
 }
@@ -110,38 +97,43 @@ impl RioTcpStream {
         addr: SocketAddr,
         config: RqConfig,
     ) -> windows_core::Result<Self> {
+        // Closed on any early return from here on.
         let sock = new_rio_socket(&addr, SOCK_STREAM.0, IPPROTO_TCP.0)?;
         let mut storage = unsafe { core::mem::zeroed::<SOCKADDR_STORAGE>() };
         let len = write_sockaddr(&addr, &mut storage);
-        if let Err(e) =
-            sock_check(unsafe { connect(sock, &storage as *const _ as *const SOCKADDR, len) })
-        {
-            unsafe { closesocket(sock) };
-            return Err(e);
-        }
-        Self::attach(sock, cq, config)
+        sock_check(unsafe { connect(sock.raw(), &storage as *const _ as *const SOCKADDR, len) })?;
+        Self::attach_owned(sock, cq, config)
     }
 
     /// Gives an already-connected RIO-capable socket a request queue.
     ///
-    /// Takes ownership: the stream closes the socket when dropped.
+    /// Takes ownership: the stream closes the socket when dropped, and the
+    /// caller must not. The socket must be open and closed by nothing else;
+    /// a socket handed over twice is closed twice.
     pub fn attach(
         sock: SOCKET,
         cq: &Arc<RioCq>,
         config: RqConfig,
     ) -> windows_core::Result<Self> {
-        match RequestQueue::attach(sock, cq, config) {
-            Ok(rq) => Ok(Self {
-                sock,
-                rq,
-                #[cfg(feature = "tp")]
-                owner: None,
-            }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        // SAFETY: ownership is this function's documented contract, as it
+        // was when the stream closed the raw value itself.
+        let owned = unsafe { WsaSocket::from_raw(sock) };
+        Self::attach_owned(owned, cq, config)
+    }
+
+    fn attach_owned(
+        owned: WsaSocket,
+        cq: &Arc<RioCq>,
+        config: RqConfig,
+    ) -> windows_core::Result<Self> {
+        let rq = RequestQueue::attach(owned.raw(), cq, config)?;
+        Ok(Self {
+            sock: owned.raw(),
+            owned: Some(owned),
+            rq,
+            #[cfg(feature = "tp")]
+            owner: None,
+        })
     }
 
     pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
@@ -217,18 +209,6 @@ impl RioTcpStream {
         self.rq.commit_sends()
     }
 
-}
-
-impl Drop for RioTcpStream {
-    fn drop(&mut self) {
-        // A stream built on a `tp` handshake does not own its socket; the
-        // overlapped stream it kept does, and closes it on its own drop.
-        #[cfg(feature = "tp")]
-        if self.owner.is_some() {
-            return;
-        }
-        unsafe { closesocket(self.sock) };
-    }
 }
 
 #[cfg(test)]
@@ -331,6 +311,7 @@ mod compose {
             let rq = RequestQueue::attach(stream.raw_socket(), cq, config)?;
             Ok(Self {
                 sock: stream.raw_socket(),
+                owned: None,
                 owner: Some(stream),
                 rq,
             })

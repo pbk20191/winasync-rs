@@ -411,6 +411,8 @@ $l.Bind($name)
 
    **고쳤다 (2026-11-09).** `common::winsock::ExtFnCache`가 `OnceLock<usize>` 8개를 대체한다. 각 항목이 **채워질 당시의 teardown 횟수**를 같이 들고 있어서, `WSACleanup` 한 번이 전부를 한꺼번에 퇴역시키고 다음 조회가 재질의한다. 캐시를 무효화할 수 있게 되자 참조도 돌려줄 수 있게 됐다.
 
+   *(2026-11-13: 아래 표의 조각들은 `WinsockRef` 토큰으로 대체됐다. "Winsock 수명을 토큰으로" 절 참고.)*
+
    | 조각 | 역할 |
    | --- | --- |
    | `STARTUP: Mutex<Startup>` | startup·teardown·**소켓 생성**을 서로 직렬화. 소켓 생성이 목록에 있는 게 핵심 — `wsa_init()` 후 별도 `WSASocketW`는 그 사이에 teardown이 끼어들 창을 남긴다. `winsock::socket()`이 둘을 잠금 아래 묶는다 |
@@ -695,7 +697,8 @@ DLL에만 있어야 할 동작이 다른 경로로 닿는지 점검했다. rlib�
   먼저다). detach는 attach한 핸들일 때만 믿는다. export와 import library는 Windows 기능으로 보고
   그대로 둔다.
 - **`common::winsock::wsa_shutdown`**: cfg 없는 safe `pub fn`이라 `tp`만 쓰는 빌드에서도 자기
-  소켓 밑에서 `WSACleanup`을 부를 수 있었다. `pub(crate)`로 내렸다.
+  소켓 밑에서 `WSACleanup`을 부를 수 있었다. `pub(crate)`로 내렸다. *(2026-11-13: 함수 자체가
+  사라졌다. 소켓마다 `WinsockRef`를 들어서 남의 소켓 밑에서 내릴 길이 구조적으로 없다.)*
 - **`dylib` 피처를 외부에서 켜는 경우**: cargo에는 비공개 피처가 없다. 켜면 `dll_main`,
   `dll_can_unload_now`, `release_process_state`가 열린다. 셋 다 `unsafe fn` + `#[doc(hidden)]`로
   바꾸고 "DLL 진입점에서만"을 safety 조건으로 적었다. `tp`와 `dylib`를 같이 켠 exe에서는 대기 중인
@@ -1721,6 +1724,44 @@ acc가 달라진다(처음 그렇게 틀렸다).
 
 인라인의 이득은 작은 메서드에 몰린다. I/O 메서드는 끝이 시스템 콜이라 사라지는 건 호출 한 단계뿐이다.
 프로브는 `tools/lto-probe`에 두고, 루트 워크스페이스에서는 제외했다(`tools/bench`와 같은 이유).
+
+### Winsock 수명을 토큰으로: `WinsockRef` (2026-11-13)
+
+정적 라이브러리를 만들고 나니 질문이 하나 남았다. DLL이 내려갈 때 Rust `static`은 `Drop`이 돌지 않는다
+(MSVC CRT가 `DLL_PROCESS_DETACH`에서 돌리는 소멸자 테이블은 C++ 컴파일러가 채우는 것이고, rustc는 거기에
+아무것도 넣지 않는다). 그래서 위 7번의 `release_process_state`가 `DllCanUnloadNow` 직전에 `WSACleanup`을
+명시적으로 불렀는데, 그 설계는 세 가지를 떠안고 있었다.
+
+- "우리 것이 하나도 살아 있지 않다"는 전제조건을 **밖에서** 세워 줘야 했다. 그래서 조회 함수에 부수효과가
+  붙었고, `tp`만 쓰는 빌드와 `static/`에서는 정리할 길이 아예 없었다.
+- `STARTUP` 뮤텍스가 소켓 생성까지 감싸야 했다. teardown이 초기화와 `WSASocketW` 사이에 끼어들 수 있어서다.
+- `rio::table`이 함수 테이블을 `&'static`으로 내주느라 `pin()`으로 teardown을 영구 거부했다. rio가 `dylib`
+  빌드에 들어가는 날 모듈이 영원히 언로드 불가가 되는 함정이었다.
+
+`WSAStartup`/`WSACleanup`은 `ws2_32`가 refcount하므로 API 자체가 `Arc` 모양이다. 그 모양을 그대로 따랐다.
+`common::winsock::WinsockRef`는 `ModuleRef`와 같은 ZST 토큰이다. 생성자가 `WSAStartup`, `Drop`이
+`WSACleanup`, 그리고 우리 카운트가 0으로 떨어지는 마지막 `Drop`만 `TEARDOWNS` 스탬프를 올린다(호출보다
+**먼저** 올려서, 경합하는 조회가 프로바이더가 사라질 수 있는 시점에는 이미 자기 캐시를 stale로 본다).
+
+| 조각 | 역할 |
+| --- | --- |
+| `WsaSocket` | `winsock::socket()`의 반환형. `OwnedSocket` + `WinsockRef`, 참조를 **먼저** 잡고 소켓을 만든다. 소켓이 존재하는 동안 우리 카운트는 0이 될 수 없다. 드롭 시 자동 close라 생성자의 수동 `closesocket` 오류 경로가 전부 사라졌다 |
+| `IoHandle::Socket(OwnedSocket, WinsockRef)` | tp·comio의 모든 소켓 등록이 토큰을 든다. `share()`로 공유되는 등록도 자연히 포함 |
+| `AcceptPayload.accept_sock: WsaSocket` | 진행 중 accept 소켓. `AcceptSockGuard`와 두 payload의 수동 `Drop`이 없어졌다 |
+| `ProviderCache<T: Copy>` | 옛 `ExtFnCache`의 일반화. `ExtFnCache = ProviderCache<usize>`, RIO 테이블은 `ProviderCache<RioTable>` |
+| `rio_table() -> RioTable` | **값 반환**(13개 포인터, 104바이트). `pin()`이 사라졌다. `CqState`·`RioBufferPool`·RIO 소켓들이 토큰을 들고, 펌프 밖 스레드에서 도는 `Teardown`도 하나 복제해 든다 |
+| `resolve()` | `GetAddrInfoExW`는 소켓 없이 Winsock을 쓰므로 토큰을 await 너머까지 든다 |
+
+사라진 것: `STARTUP`, `PINNED`, `pin()`, `wsa_init()`, `wsa_shutdown()`, `release_process_state()`.
+`dll_can_unload_now`는 safe한 순수 조회가 됐다. `tests/unload.rs` 6절은 "리스너가 살아 있는 동안
+`wsa_initialized()`, 마지막 소켓을 드롭하면 거짓, 다시 만들면 참"으로 바뀌었다.
+
+안전 논거는 토큰 하나로 닫힌다. 캐시된 프로바이더 포인터를 **호출**하는 쪽은 항상 소켓을 가진 객체이고,
+그 객체가 토큰을 드니 우리 카운트가 0이 아니고, 따라서 우리 쪽에서 마지막 `WSACleanup`이 일어날 수 없다.
+남은 경합은 "마지막 토큰을 놓는 스레드가 `WSACleanup`을 부르는 사이 다른 스레드가 새 토큰을 만든다"인데,
+새 스레드의 `WSAStartup`이 자기 소켓 생성보다 앞서므로 그 소켓이 프로바이더 언로드를 겪을 수 없고, 최악은
+불필요한 재조회 한 번이다. 비용은 소켓마다 `WSAStartup`/`WSACleanup` 한 쌍(락 하나와 카운터)과, 소켓이
+0개가 되는 순간마다 다음 소켓이 확장 함수를 ioctl로 한 번 더 조회하는 것이다.
 
 ## 커밋 상태
 

@@ -127,9 +127,9 @@ impl UdpSocket {
         options: &SocketOptions,
     ) -> windows_core::Result<UdpSocket> {
         let family = family_of(&addr);
-        let sock = new_socket_with(family, SOCK_DGRAM, IPPROTO_UDP, options.wsa_flags)?;
         // Closed on any early return from here on.
-        let owned = unsafe { crate::common::overlapped::IoHandle::from_socket(sock) };
+        let owned = new_socket_with(family, SOCK_DGRAM, IPPROTO_UDP, options.wsa_flags)?;
+        let sock = owned.raw();
         if options.reuse_address {
             let v: u32 = 1;
             sock_check(unsafe { setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, Some(&v.to_ne_bytes())) })?;

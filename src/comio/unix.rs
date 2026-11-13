@@ -13,7 +13,7 @@
 //! `accept()`/`connect()` future is dropped — see its doc comment.
 
 use crate::common::security::{PeerIdentity, SecurityDescriptor};
-use crate::common::winsock::ExtFnCache;
+use crate::common::winsock::{ExtFnCache, WsaSocket};
 use crate::comio::unload::ModuleRef;
 use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, ConnectExFn,
@@ -23,22 +23,19 @@ use super::bindings::Pbk20191::WinAsync::Comio::{ITransport_Impl, IUnixConnector
 use super::connector::{connect_op, ConnectSink};
 use super::listener::{AcceptSink, Accepted};
 use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
-use super::stream::{self, AcceptSockGuard};
-use super::tpio::{self, IoHandle, IoReg, OpHandle};
+use super::stream;
+use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use core::ffi::c_void;
-use std::mem;
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX, INVALID_SOCKET,
+    bind, listen, setsockopt, AcceptEx, ADDRESS_FAMILY, AF_UNIX,
     SOCKADDR, SOCKADDR_UN, SOCKET, SOCK_STREAM, SOL_SOCKET,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
 };
 use windows_core::{Error, Result, HRESULT};
 
-fn new_socket() -> Result<SOCKET> {
-    // Through `winsock::socket` rather than `wsa_init()` + `WSASocketW`: the
-    // two-step form leaves a window for a teardown to land between them.
+fn new_socket() -> Result<WsaSocket> {
     crate::common::winsock::socket(AF_UNIX as i32, SOCK_STREAM.0, 0, 0)
 }
 
@@ -111,9 +108,9 @@ impl UnixStreamListener {
     /// pipe's descriptor was enforced everywhere. Where the boundary must
     /// hold, use a named pipe, or check the peer's SID at accept.
     pub fn bind(path: &str, security: Option<&SecurityDescriptor>) -> Result<Self> {
-        let sock = new_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { IoHandle::from_socket(sock) };
+        let owned = new_socket()?;
+        let sock = owned.raw();
         let register = move || -> Result<Arc<IoReg>> {
             let (sa, addrlen) = sockaddr_un(path)?;
             sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, addrlen) })?;
@@ -128,9 +125,14 @@ impl UnixStreamListener {
 
     /// Accepts one connection, returning it as a duplex WinRT stream.
     pub async fn accept(&self) -> Result<ITransportStream> {
-        let accept_sock = new_socket()?;
+        // A plain frame-local guard is sound for the socket, unlike the
+        // address buffer beside it: closing a socket with a pending
+        // overlapped op aborts the op and releases the handle; there is no
+        // kernel-owned *memory* behind the socket value that a late
+        // completion could still write into.
+        let guard = new_socket()?;
+        let accept_sock = guard.raw();
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
-        let mut guard = AcceptSockGuard(accept_sock);
 
         // The address buffer, in contrast to the socket above, IS kernel-
         // owned memory for the duration of the op: `AcceptEx` writes the
@@ -166,11 +168,9 @@ impl UnixStreamListener {
         .await;
         result?;
 
-        // Success: take the socket out of the guard so its `Drop` no longer
-        // closes it (`IoReg::register` owns it from here).
-        let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
-        // Closed on any early return from here on.
-        let owned = unsafe { IoHandle::from_socket(sock) };
+        // Success: the guard becomes the registration's socket.
+        let owned = guard;
+        let sock = owned.raw();
         let finish = move || -> Result<ITransportStream> {
             // Until `SO_UPDATE_ACCEPT_CONTEXT` (value = the listen socket)
             // the accepted socket is half-configured.
@@ -211,7 +211,8 @@ impl UnixStreamListener {
         &self,
         on_result: AcceptSink,
     ) -> Result<OpHandle> {
-        let accept_sock = new_socket()?;
+        let owned = new_socket()?;
+        let accept_sock = owned.raw();
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
 
         // Same kernel-owned-memory reasoning as `accept()`'s `addr_buf`:
@@ -231,7 +232,7 @@ impl UnixStreamListener {
                     let res = if ioresult == 0 {
                         let listen_val = listen_sock.0.to_ne_bytes();
                         // Closed on any early return from here on.
-                        let owned = IoHandle::from_socket(accept_sock);
+                        let owned = owned;
                         let finish = move || -> Result<Accepted> {
                             sock_check(setsockopt(
                                 accept_sock,
@@ -248,7 +249,7 @@ impl UnixStreamListener {
                         };
                         finish()
                     } else {
-                        closesocket(accept_sock);
+                        drop(owned);
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };
                     on_result.deliver(res);
@@ -292,9 +293,9 @@ impl UnixConnector {
     /// Connects to the AF_UNIX socket bound at `path`, returning the
     /// connection as a duplex WinRT stream.
     pub async fn connect(path: &str) -> Result<ITransportStream> {
-        let sock = new_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { IoHandle::from_socket(sock) };
+        let owned = new_socket()?;
+        let sock = owned.raw();
         let prepared = (move || -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
             let (local, local_len) = sockaddr_un_autobind();
@@ -350,9 +351,9 @@ impl UnixConnector {
         path: &str,
         on_result: ConnectSink,
     ) -> Result<OpHandle> {
-        let sock = new_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { IoHandle::from_socket(sock) };
+        let owned = new_socket()?;
+        let sock = owned.raw();
         let prepared = (move || -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
             let (local, local_len) = sockaddr_un_autobind();

@@ -68,13 +68,12 @@ pub unsafe extern "system" fn DllGetActivationFactory(
     unsafe { activation::dll_get_activation_factory(name, factory) }
 }
 
-/// `S_OK` only when nothing this module owns can still execute, and the
-/// moment it says so it gives back `WSAStartup`'s process reference.
+/// `S_OK` only when nothing this module owns can still execute. Nothing to
+/// give back at that point: each socket released its own Winsock reference
+/// as it closed.
 #[unsafe(no_mangle)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    // SAFETY: this is the DLL's export, and the DLL carries `comio` alone, so
-    // every socket in it is one `can_unload` counts.
-    unsafe { activation::dll_can_unload_now() }
+    activation::dll_can_unload_now()
 }
 
 /// Load and unload notifications. Records this module's handle on attach

@@ -33,6 +33,7 @@ use super::cq::Request;
 use super::rq::RIO_INVALID_BUFFERID;
 use super::table::rio_table;
 use crate::common::buffer::{IoBuf, IoBufMut, SlabBuf, SlabPool};
+use crate::common::winsock::WinsockRef;
 
 /// A [`SlabPool`] whose whole region is registered with RIO.
 ///
@@ -47,12 +48,16 @@ pub struct RioBufferPool {
     /// whatever operation slice `i` is in — and an operation allocates
     /// nothing.
     slots: Box<[Request]>,
+    /// The registration is the provider's; this keeps the provider.
+    _winsock: WinsockRef,
 }
 
 impl RioBufferPool {
     /// Allocates and registers a slab of `slice_count` slices of
     /// `slice_size` bytes.
     pub fn new(slice_size: usize, slice_count: u32) -> windows_core::Result<Arc<Self>> {
+        // Before the table and the registration, so neither can outlive it.
+        let winsock = WinsockRef::new();
         let table = rio_table()?;
         let slab = SlabPool::new(slice_size, slice_count)?;
         let (base, len) = slab.region();
@@ -63,7 +68,12 @@ impl RioBufferPool {
             return Err(crate::common::winsock::wsa_last_err());
         }
         let slots = (0..slice_count).map(|_| Request::empty()).collect();
-        Ok(Arc::new(Self { slab, id, slots }))
+        Ok(Arc::new(Self {
+            slab,
+            id,
+            slots,
+            _winsock: winsock,
+        }))
     }
 
     /// The operation slot of `slice` — `slice` must be of this pool.

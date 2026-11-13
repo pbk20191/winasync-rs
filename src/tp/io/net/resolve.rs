@@ -63,7 +63,10 @@ pub fn resolve(
     let host = HSTRING::from(host);
     let service = HSTRING::from(port.to_string());
     async move {
-        crate::common::winsock::wsa_init();
+        // Held across the await: the lookup is a Winsock call from start to
+        // finish, and the reference is what keeps Winsock up while nothing
+        // else of ours may be.
+        let _winsock = crate::common::winsock::WinsockRef::new();
         // Everything holding a raw pointer stays inside this block, so none
         // of it lives across the await below and the future stays `Send`.
         let (mut lookup, issued) = {

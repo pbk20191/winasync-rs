@@ -6,185 +6,235 @@
 //! stopped holding at three: `classify_wsa_overlapped` in particular encodes
 //! the overlapped-issue contract, and a divergent copy of *that* is a silent
 //! hang, not a cosmetic difference. One copy now.
+//!
+//! # Winsock's lifetime is a reference, not a flag
+//!
+//! `WSAStartup` and `WSACleanup` are refcounted by `ws2_32` itself, so the API
+//! already has the shape of an `Arc`: each user balances its own pair and
+//! nobody needs to know who else is in the process. This module follows that
+//! shape with [`WinsockRef`], a zero-sized token whose constructor calls
+//! `WSAStartup` and whose `Drop` calls `WSACleanup`. Every socket this crate
+//! owns carries one, so Winsock is up exactly while something of ours needs
+//! it and comes down with the last socket -- in the server DLL, in the static
+//! library and in a plain `tp` executable alike, with no entry point having
+//! to decide when.
+//!
+//! Until 2026-11-13 this was a `Mutex<bool>` raised by the first socket and
+//! lowered by `DllCanUnloadNow`, which had to establish "nothing of ours is
+//! live" from the outside and could not be reached at all without the DLL.
+//! The token makes that precondition structural: a socket that exists holds a
+//! reference, so the count cannot be zero while it does.
 
-#[cfg(any(feature = "tp", feature = "comio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 use super::overlapped::Issue;
-#[cfg(any(feature = "tp", feature = "comio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 use core::ffi::c_void;
+use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Foundation::WIN32_ERROR;
 use windows::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAGetLastError, WSAStartup};
-#[cfg(any(feature = "tp", feature = "comio"))]
+use windows::Win32::Networking::WinSock::SOCKET;
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 use windows::Win32::Networking::WinSock::{WSASocketW, WSA_FLAG_OVERLAPPED};
-#[cfg(any(feature = "tp", feature = "comio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 use windows::Win32::Networking::WinSock::{
-    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKET, WSAIoctl, WSA_IO_PENDING,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, WSAIoctl, WSA_IO_PENDING,
 };
-#[cfg(any(feature = "tp", feature = "comio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 use windows_core::GUID;
 
-/// Whether `WSAStartup` is currently in effect, and nothing else.
-struct Startup {
-    up: bool,
-}
-
-/// Serializes startup, teardown, and socket creation against each other.
+/// How many [`WinsockRef`]s are alive.
 ///
-/// Socket creation is in that list deliberately. `wsa_init()` followed by a
-/// separate `WSASocketW` leaves a window in which a teardown can land between
-/// them, and the socket then fails with `WSANOTINITIALISED` for no reason the
-/// caller can act on. [`socket`] holds this across both.
-static STARTUP: Mutex<Startup> = Mutex::new(Startup { up: false });
+/// Only read for [`wsa_initialized`] and for deciding, in `Drop`, whether a
+/// release is the last one and must retire the provider caches.
+static REFS: AtomicUsize = AtomicUsize::new(0);
 
-/// How many times Winsock has been torn down.
+/// How many times our last Winsock reference has been released.
 ///
-/// Readable without the lock, and the reason provider function pointers can
-/// be cached at all now that teardown exists — see [`ExtFnCache`]. Anything
-/// cached before a teardown is stale afterwards, because the provider that
-/// owned it may have been unloaded with it.
+/// The stamp on every provider-derived cache -- see [`ProviderCache`]. Our
+/// count reaching zero is the moment `WSACleanup` can reach *its* zero and
+/// unload a provider, so anything cached before that is stale after it.
 static TEARDOWNS: AtomicUsize = AtomicUsize::new(0);
 
-/// Set by anything holding provider-derived state it cannot invalidate.
-static PINNED: AtomicBool = AtomicBool::new(false);
+/// One reason Winsock must stay up.
+///
+/// `WSAStartup` on construction, `WSACleanup` on drop; zero-sized, and held
+/// as a field by everything that owns a socket. Cloning takes a reference of
+/// its own rather than sharing one, which is what a field in a second object
+/// needs.
+///
+/// The ordering argument that makes the provider caches sound rests on this
+/// token: a cached pointer is only ever *called* by something that owns a
+/// socket, that thing holds a token, and while any token exists the count is
+/// nonzero and no release of ours can be the last. The caches are stamped so
+/// that a pointer fetched before a last release is never reused after it.
+pub struct WinsockRef(());
 
-/// Takes the startup lock, tolerating a poisoned one.
-///
-/// Poisoning here means a previous caller panicked between `WSAStartup` and
-/// releasing the lock. The `up` flag is a single `bool` written after the
-/// call succeeded, so it is never left half-updated, and failing every
-/// subsequent socket because of one unrelated panic is the worse outcome.
-fn lock() -> std::sync::MutexGuard<'static, Startup> {
-    STARTUP.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn ensure_started(state: &mut Startup) {
-    if state.up {
-        return;
-    }
-    let mut data = WSADATA::default();
-    let r = unsafe { WSAStartup(0x0202, &mut data) };
-    assert_eq!(r, 0, "WSAStartup failed: {r}");
-    state.up = true;
-}
-
-/// Process-wide Winsock initialization. Idempotent and safe to call from
-/// every socket constructor.
-///
-/// Balanced by `wsa_shutdown` since 2026-11-09. It was a `Once` that never
-/// ran down, on the reasoning that "a library has no way to know it is the
-/// last user" — which misreads the API. `WSAStartup` and `WSACleanup` are
-/// refcounted precisely so each component balances its own call and nobody
-/// has to know about the others.
-///
-/// What actually blocked teardown was the pointers: extension functions
-/// fetched through `SIO_GET_EXTENSION_FUNCTION_POINTER` belong to the
-/// *provider*, and they were cached in `OnceLock`s that cannot be reset, so a
-/// `WSACleanup` reaching zero could unload the provider and leave those
-/// caches aimed at freed code. [`ExtFnCache`] fixes that by stamping each
-/// entry with `TEARDOWNS`, which is what made teardown safe to do at all.
-///
-/// Prefer [`socket`] where you are about to create one: it closes the window
-/// between initializing and using.
-pub fn wsa_init() {
-    ensure_started(&mut lock());
-}
-
-/// Creates an overlapped socket, initializing Winsock if needed.
-///
-/// `flags` is the complete `dwFlags` for `WSASocketW`; `WSA_FLAG_OVERLAPPED`
-/// is added for you, since every socket in this crate is overlapped.
-#[cfg(any(feature = "tp", feature = "comio"))]
-pub fn socket(af: i32, ty: i32, protocol: i32, flags: u32) -> windows_core::Result<SOCKET> {
-    let mut state = lock();
-    ensure_started(&mut state);
-    // Still holding the lock: a teardown between the two would fail this
-    // call with `WSANOTINITIALISED`.
-    unsafe { WSASocketW(af, ty, protocol, None, 0, WSA_FLAG_OVERLAPPED | flags) }
-}
-
-/// Releases this module's Winsock reference.
-///
-/// Returns whether it actually called `WSACleanup`, so a caller can tell
-/// "there was nothing to release" from "something is holding it".
-///
-/// **Only safe to call when nothing of ours is live.** Every socket this
-/// crate owns lives inside an object or an in-flight operation that
-/// `comio::unload::can_unload` counts, so that function returning true is the
-/// precondition. It is called from `DllCanUnloadNow`, which is not under the
-/// loader lock — `DllMain` would be, and `WSACleanup` can unload provider
-/// DLLs, which is exactly the deadlock the loader lock exists to prevent.
-///
-/// Refuses while [`pin`] has been called. Teardown is only sound if every
-/// cached provider pointer can be invalidated, and a pin is how a module
-/// says it holds one that cannot be.
-///
-/// Crate-private because the precondition is one only `comio::unload` can
-/// establish. As a `pub fn` it let any caller -- a `tp`-only build included,
-/// where no such count exists -- tear Winsock down under its own live sockets.
-pub(crate) fn wsa_shutdown() -> bool {
-    if PINNED.load(Ordering::Acquire) {
-        return false;
-    }
-    let mut state = lock();
-    if !state.up {
-        return false;
-    }
-    // Bump before the call, not after: a lookup racing this must already see
-    // its cache as stale by the time the provider can go away.
-    TEARDOWNS.fetch_add(1, Ordering::Release);
-    unsafe {
-        let _ = WSACleanup();
-    }
-    state.up = false;
-    true
-}
-
-/// Declares that the caller holds provider-derived state it cannot
-/// invalidate, which vetoes `wsa_shutdown` for the life of the process.
-///
-/// `rio::table` is the one caller: its `RIO_EXTENSION_FUNCTION_TABLE` is
-/// cached behind a `OnceLock` and handed out as `&'static`, so there is no
-/// way to retire it. Pinning is the honest answer — a module that cannot give
-/// its pointers back should say so rather than let somebody else free the
-/// memory under them.
-pub fn pin() {
-    PINNED.store(true, Ordering::Release);
-}
-
-/// Whether `WSAStartup` is currently in effect.
-pub fn wsa_initialized() -> bool {
-    lock().up
-}
-
-/// A cached Winsock extension function pointer.
-///
-/// Replaces the `OnceLock<usize>` each transport used to declare. The
-/// difference is the stamp: a pointer fetched before a `WSACleanup` is not
-/// valid after one, because the provider that owned it may have been unloaded
-/// in between, and a `OnceLock` has no way to say so.
-///
-/// A `Mutex` rather than a pair of atomics on purpose. The reader has to see
-/// the pointer and its stamp as one value — torn across two atomic loads, a
-/// reader could pair a stale pointer with a fresh stamp and call freed code.
-/// A seqlock would avoid the lock; it is not worth the subtlety for something
-/// consulted once per connect, beside a syscall.
-#[cfg(any(feature = "tp", feature = "comio"))]
-pub struct ExtFnCache(Mutex<Option<(usize, usize)>>);
-
-#[cfg(any(feature = "tp", feature = "comio"))]
-impl ExtFnCache {
-    pub const fn new() -> Self {
-        Self(Mutex::new(None))
+impl WinsockRef {
+    /// Takes a Winsock reference. Panics if `WSAStartup` fails, which on a
+    /// supported Windows means the process is already in trouble.
+    pub fn new() -> Self {
+        let mut data = WSADATA::default();
+        let r = unsafe { WSAStartup(0x0202, &mut data) };
+        assert_eq!(r, 0, "WSAStartup failed: {r}");
+        // Relaxed is enough on the way up: nothing is ordered against a
+        // count going from n to n+1.
+        REFS.fetch_add(1, Ordering::Relaxed);
+        Self(())
     }
 }
 
-#[cfg(any(feature = "tp", feature = "comio"))]
-impl Default for ExtFnCache {
+impl Default for WinsockRef {
     fn default() -> Self {
         Self::new()
     }
 }
+
+impl Clone for WinsockRef {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for WinsockRef {
+    fn drop(&mut self) {
+        // The last of ours: bump the stamp *before* the call, so a lookup
+        // racing this already sees its cache as stale by the time the
+        // provider can go away. A lookup that holds its own token cannot be
+        // racing a last release at all -- see the type's doc.
+        if REFS.fetch_sub(1, Ordering::Release) == 1 {
+            TEARDOWNS.fetch_add(1, Ordering::Release);
+        }
+        unsafe {
+            let _ = WSACleanup();
+        }
+    }
+}
+
+/// Whether any [`WinsockRef`] is alive, i.e. whether `WSAStartup` is in
+/// effect on this crate's account.
+pub fn wsa_initialized() -> bool {
+    REFS.load(Ordering::Acquire) > 0
+}
+
+/// An overlapped socket together with the Winsock reference that keeps it
+/// valid.
+///
+/// What [`socket`] returns. The reference is taken *before* `WSASocketW`
+/// and lives as long as the socket, so there is no moment at which the
+/// socket exists and a last release of ours could `WSACleanup` it away. The
+/// socket closes on drop, which is also what makes early returns in the
+/// constructors clean without a guard.
+///
+/// Field order is the drop order: the socket first, the reference after.
+pub struct WsaSocket {
+    sock: OwnedSocket,
+    winsock: WinsockRef,
+}
+
+impl WsaSocket {
+    /// Adopts a socket somebody else created, taking a reference for it.
+    ///
+    /// # Safety
+    /// `sock` is open, owned by the caller, and closed by nothing else.
+    pub unsafe fn from_raw(sock: SOCKET) -> Self {
+        // The reference first, so the count is nonzero before the socket is
+        // ours.
+        let winsock = WinsockRef::new();
+        Self {
+            sock: unsafe { OwnedSocket::from_raw_socket(sock.0 as u64) },
+            winsock,
+        }
+    }
+
+    /// Adopts an owned socket, taking a reference for it.
+    pub fn from_owned(sock: OwnedSocket) -> Self {
+        let winsock = WinsockRef::new();
+        Self { sock, winsock }
+    }
+
+    /// The socket, for the Winsock calls that want the raw value.
+    pub fn raw(&self) -> SOCKET {
+        SOCKET(self.sock.as_raw_socket() as usize)
+    }
+
+    /// Splits into the socket and its reference. Drop the reference after
+    /// the socket, never before.
+    pub fn into_parts(self) -> (OwnedSocket, WinsockRef) {
+        (self.sock, self.winsock)
+    }
+}
+
+/// Creates an overlapped socket with a Winsock reference of its own.
+///
+/// `flags` is the complete `dwFlags` for `WSASocketW`; `WSA_FLAG_OVERLAPPED`
+/// is added for you, since every socket in this crate is overlapped.
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
+pub fn socket(af: i32, ty: i32, protocol: i32, flags: u32) -> windows_core::Result<WsaSocket> {
+    let winsock = WinsockRef::new();
+    let sock = unsafe { WSASocketW(af, ty, protocol, None, 0, WSA_FLAG_OVERLAPPED | flags) }?;
+    Ok(WsaSocket {
+        sock: unsafe { OwnedSocket::from_raw_socket(sock.0 as u64) },
+        winsock,
+    })
+}
+
+/// A cached value that belongs to a Winsock provider and is only valid while
+/// that provider is loaded: an extension function pointer, or RIO's whole
+/// function table.
+///
+/// A provider can be unloaded by the `WSACleanup` that takes the process's
+/// count to zero, and ours reaching zero is the only way that can happen on
+/// our account. So every entry carries the teardown stamp it was fetched
+/// under -- how many times a last [`WinsockRef`] has been released -- and a
+/// mismatch means "fetch again". That is the whole difference
+/// from a `OnceLock`, which has no way to say its value has expired.
+///
+/// A `Mutex` rather than a pair of atomics on purpose. The reader has to see
+/// the value and its stamp as one thing -- torn across two atomic loads, a
+/// reader could pair a stale pointer with a fresh stamp and call freed code.
+/// A seqlock would avoid the lock; it is not worth the subtlety for something
+/// consulted once per connect, beside a syscall.
+pub struct ProviderCache<T>(Mutex<Option<(usize, T)>>);
+
+impl<T: Copy> ProviderCache<T> {
+    pub const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// The cached value if its stamp is current, else whatever `fetch`
+    /// produces, cached under the stamp read *before* the fetch.
+    ///
+    /// Reading the stamp first matters: if a last release lands between the
+    /// read and the fetch, the entry is written already-stale and the next
+    /// caller re-fetches. The reverse order could stamp a stale value as
+    /// fresh. (A caller holding a token makes that race impossible, but the
+    /// cache does not know who holds what and is correct either way.)
+    pub fn get_or_fetch(
+        &self,
+        fetch: impl FnOnce() -> windows_core::Result<T>,
+    ) -> windows_core::Result<T> {
+        let generation = TEARDOWNS.load(Ordering::Acquire);
+        if let Some((cached_generation, v)) = *self.0.lock().unwrap_or_else(|e| e.into_inner())
+            && cached_generation == generation
+        {
+            return Ok(v);
+        }
+        let v = fetch()?;
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((generation, v));
+        Ok(v)
+    }
+}
+
+impl<T: Copy> Default for ProviderCache<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A cached Winsock extension function pointer, stored as its address.
+pub type ExtFnCache = ProviderCache<usize>;
 
 /// The calling thread's last Winsock error as an `HRESULT`.
 pub fn wsa_last_hr() -> windows_core::HRESULT {
@@ -196,7 +246,6 @@ pub fn wsa_last_err() -> windows_core::Error {
     windows_core::Error::from_hresult(wsa_last_hr())
 }
 
-/// Maps a Winsock "0 or SOCKET_ERROR" return to a `Result`.
 /// The `backlog` every listener in this crate passes to `listen`.
 ///
 /// Not the `windows` crate's `SOMAXCONN`: that binding comes from the old
@@ -207,6 +256,7 @@ pub fn wsa_last_err() -> windows_core::Error {
 /// `winsock2.h` value.
 pub const LISTEN_BACKLOG: i32 = 0x7fff_ffff;
 
+/// Maps a Winsock "0 or SOCKET_ERROR" return to a `Result`.
 pub fn sock_check(r: i32) -> windows_core::Result<()> {
     if r == 0 {
         Ok(())
@@ -220,7 +270,7 @@ pub fn sock_check(r: i32) -> windows_core::Result<()> {
 ///
 /// Reports only what the call did; whether a completion packet follows is
 /// decided by `submit` from the handle's notification mode (see [`Issue`]).
-#[cfg(any(feature = "tp", feature = "comio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 pub fn classify_wsa_overlapped(succeeded: bool) -> Issue {
     if succeeded {
         Issue::SyncSuccess
@@ -233,7 +283,7 @@ pub fn classify_wsa_overlapped(succeeded: bool) -> Issue {
 
 /// [`classify_wsa_overlapped`] for the APIs that return `0` on success and
 /// `SOCKET_ERROR` otherwise (`WSARecv`, `WSASend`, ...).
-#[cfg(any(feature = "tp", feature = "comio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 pub fn classify_wsa_ret(r: i32) -> Issue {
     classify_wsa_overlapped(r == 0)
 }
@@ -256,7 +306,7 @@ pub type ConnectExFn = unsafe extern "system" fn(
 ) -> windows_core::BOOL;
 
 /// Fetches `ConnectEx` for `sock`'s provider, caching into the caller's
-/// `OnceLock`.
+/// cache.
 ///
 /// Each transport passes its own cache: the pointer belongs to the socket's
 /// service provider, and AF_INET, AF_UNIX and AF_HYPERV are different
@@ -296,15 +346,15 @@ pub fn connectex(sock: SOCKET, cache: &ExtFnCache) -> windows_core::Result<Conne
 /// `ExtFnCache` keeps the cache per provider at the cost of one extra ioctl
 /// per family per process, which is the conservative reading of the contract.
 ///
-/// The cache is also stamped with `TEARDOWNS`, so a `WSACleanup` retires
-/// every entry: the pointer belongs to a provider that teardown may have
-/// unloaded.
+/// The cache is stamped (see [`ProviderCache`]), so a last release of our
+/// Winsock reference retires every entry: the pointer belongs to a provider
+/// that the `WSACleanup` may have unloaded.
 ///
 /// # Safety
 /// `F` must be the exact `extern "system"` signature the extension `id`
 /// names, and must be pointer-sized. `cache` must be dedicated to this one
 /// `id` *and* to sockets of one provider.
-#[cfg(any(feature = "tp", feature = "comio"))]
+#[cfg(any(feature = "tp", feature = "comio", feature = "rio"))]
 pub unsafe fn extension_fn<F: Copy>(
     sock: SOCKET,
     id: &GUID,
@@ -315,43 +365,34 @@ pub unsafe fn extension_fn<F: Copy>(
         size_of::<*mut c_void>(),
         "extension_fn::<F> requires a bare function pointer"
     );
-    // Read the stamp before the ioctl, not after: if a teardown lands in
-    // between, the entry we are about to write is already stale and the next
-    // caller re-fetches. The reverse order could stamp a stale pointer as
-    // fresh.
-    let generation = TEARDOWNS.load(Ordering::Acquire);
-    if let Some((cached_generation, p)) = *cache.0.lock().unwrap_or_else(|e| e.into_inner())
-        && cached_generation == generation
-    {
-        return Ok(unsafe { core::mem::transmute_copy::<usize, F>(&p) });
-    }
-    let mut raw: *mut c_void = core::ptr::null_mut();
-    let mut bytes = 0u32;
-    let r = unsafe {
-        WSAIoctl(
-            sock,
-            SIO_GET_EXTENSION_FUNCTION_POINTER,
-            Some(id as *const GUID as *const c_void),
-            size_of::<GUID>() as u32,
-            Some(&mut raw as *mut _ as *mut c_void),
-            size_of::<*mut c_void>() as u32,
-            &mut bytes,
-            None,
-            None,
-        )
-    };
-    if r != 0 {
-        return Err(wsa_last_err());
-    }
-    if raw.is_null() {
-        // A provider reporting success with a null pointer is broken. Return
-        // an error rather than panic: this crate keeps panics away from the
-        // FFI paths.
-        return Err(windows_core::Error::from_hresult(windows_core::HRESULT(
-            0x8000_4003u32 as i32, // E_POINTER
-        )));
-    }
-    let p = raw as usize;
-    *cache.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((generation, p));
+    let p = cache.get_or_fetch(|| {
+        let mut raw: *mut c_void = core::ptr::null_mut();
+        let mut bytes = 0u32;
+        let r = unsafe {
+            WSAIoctl(
+                sock,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                Some(id as *const GUID as *const c_void),
+                size_of::<GUID>() as u32,
+                Some(&mut raw as *mut _ as *mut c_void),
+                size_of::<*mut c_void>() as u32,
+                &mut bytes,
+                None,
+                None,
+            )
+        };
+        if r != 0 {
+            return Err(wsa_last_err());
+        }
+        if raw.is_null() {
+            // A provider reporting success with a null pointer is broken.
+            // Return an error rather than panic: this crate keeps panics
+            // away from the FFI paths.
+            return Err(windows_core::Error::from_hresult(windows_core::HRESULT(
+                0x8000_4003u32 as i32, // E_POINTER
+            )));
+        }
+        Ok(raw as usize)
+    })?;
     Ok(unsafe { core::mem::transmute_copy::<usize, F>(&p) })
 }

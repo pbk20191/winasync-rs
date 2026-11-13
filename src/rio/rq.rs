@@ -13,14 +13,13 @@
 
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    RIO_BUFFERID, RIO_CQ, RIO_RQ, SOCKADDR, SOCKADDR_STORAGE, SOCKET, WSASocketW,
-    WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
+    RIO_BUFFERID, RIO_CQ, RIO_RQ, SOCKADDR, SOCKADDR_STORAGE, SOCKET, WSA_FLAG_REGISTERED_IO,
 };
 
 use super::buffer::RioSlice;
 use super::cq::{Outcome, Request, RioCq};
 use super::table::rio_table;
-use crate::common::winsock::{wsa_init, wsa_last_err};
+use crate::common::winsock::{wsa_last_err, WsaSocket};
 use std::net::SocketAddr;
 
 /// `RIO_INVALID_BUFFERID` — `(ULONG_PTR)0xFFFFFFFF`, so not sign-extended on
@@ -67,22 +66,12 @@ pub(crate) fn new_rio_socket(
     addr: &SocketAddr,
     sock_type: i32,
     protocol: i32,
-) -> windows_core::Result<SOCKET> {
-    wsa_init();
+) -> windows_core::Result<WsaSocket> {
     let family = match addr {
         SocketAddr::V4(_) => windows::Win32::Networking::WinSock::AF_INET,
         SocketAddr::V6(_) => windows::Win32::Networking::WinSock::AF_INET6,
     };
-    unsafe {
-        WSASocketW(
-            family.0 as i32,
-            sock_type,
-            protocol,
-            None,
-            0,
-            WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO,
-        )
-    }
+    crate::common::winsock::socket(family.0 as i32, sock_type, protocol, WSA_FLAG_REGISTERED_IO)
 }
 
 /// Binds `sock` to `addr`.

@@ -16,7 +16,7 @@
 //! differ; see [`crate::common::hvaddr`] for the addressing, shared with
 //! `tp`'s Hyper-V transport.
 
-use crate::common::winsock::ExtFnCache;
+use crate::common::winsock::{ExtFnCache, WsaSocket};
 use crate::comio::unload::ModuleRef;
 use crate::common::winsock::{
     classify_wsa_overlapped, connectex, sock_check, ConnectExFn,
@@ -26,17 +26,16 @@ use super::bindings::Pbk20191::WinAsync::Comio::{IHyperVConnector_Impl, ITranspo
 use super::connector::{connect_op, ConnectSink};
 use super::listener::{AcceptSink, Accepted};
 use super::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
-use super::stream::{self, AcceptSockGuard};
-use super::tpio::{self, IoHandle, IoReg, OpHandle};
+use super::stream;
+use super::tpio::{self, IoReg, OpHandle};
 use super::waitop::await_io_owning;
 use crate::common::hvaddr::{
     peer_addr_of, HvSocketAddr, SockaddrHv, HV_GUID_ZERO, HV_PROTOCOL_RAW,
 };
 use core::ffi::c_void;
-use std::mem;
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    bind, closesocket, listen, setsockopt, AcceptEx, AF_HYPERV, INVALID_SOCKET,
+    bind, listen, setsockopt, AcceptEx, AF_HYPERV,
     SOCKADDR, SOCKET, SOCK_STREAM, SOL_SOCKET,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
 };
@@ -44,8 +43,7 @@ use windows_core::{Error, HSTRING, Result, HRESULT};
 
 /// Creates an AF_HYPERV stream socket. Fails with `WSAEAFNOSUPPORT` (10047)
 /// where the Hyper-V socket provider is not present.
-fn new_socket() -> Result<SOCKET> {
-    // See `unix::new_socket` for why this is not `wsa_init()` + `WSASocketW`.
+fn new_socket() -> Result<WsaSocket> {
     crate::common::winsock::socket(AF_HYPERV as i32, SOCK_STREAM.0, HV_PROTOCOL_RAW, 0)
 }
 
@@ -76,9 +74,9 @@ impl HvStreamListener {
     /// Host-to-host loopback works without it, so a listener that answers
     /// locally may still be unreachable from a VM.
     pub fn bind(addr: HvSocketAddr) -> Result<Self> {
-        let sock = new_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { IoHandle::from_socket(sock) };
+        let owned = new_socket()?;
+        let sock = owned.raw();
         let register = move || -> Result<Arc<IoReg>> {
             let (sa, addrlen) = addr.to_raw();
             sock_check(unsafe { bind(sock, &sa as *const _ as *const SOCKADDR, addrlen) })?;
@@ -90,9 +88,11 @@ impl HvStreamListener {
 
     /// Accepts one connection, returning it as a duplex WinRT stream.
     pub async fn accept(&self) -> Result<ITransportStream> {
-        let accept_sock = new_socket()?;
+        // A frame-local guard is sound for the socket; see
+        // `super::unix::accept`.
+        let guard = new_socket()?;
+        let accept_sock = guard.raw();
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
-        let mut guard = AcceptSockGuard(accept_sock);
 
         // The address buffer is kernel-owned memory for the op's duration (see
         // `super::unix::accept`'s long-form note): it must outlive not just
@@ -118,9 +118,9 @@ impl HvStreamListener {
         .await;
         result?;
 
-        let sock = mem::replace(&mut guard.0, INVALID_SOCKET);
-        // Closed on any early return from here on.
-        let owned = unsafe { IoHandle::from_socket(sock) };
+        // Success: the guard becomes the registration's socket.
+        let owned = guard;
+        let sock = owned.raw();
         let finish = move || -> Result<ITransportStream> {
             let listen_val = listen_sock.0.to_ne_bytes();
             sock_check(unsafe {
@@ -141,7 +141,8 @@ impl HvStreamListener {
         &self,
         on_result: AcceptSink,
     ) -> Result<OpHandle> {
-        let accept_sock = new_socket()?;
+        let owned = new_socket()?;
+        let accept_sock = owned.raw();
         let listen_sock = SOCKET(self.reg.handle.0 as usize);
 
         let mut addr_buf: Box<[u8; 2 * ADDR_SLOT]> = Box::new([0u8; 2 * ADDR_SLOT]);
@@ -156,7 +157,7 @@ impl HvStreamListener {
                     let res = if ioresult == 0 {
                         let listen_val = listen_sock.0.to_ne_bytes();
                         // Closed on any early return from here on.
-                        let owned = IoHandle::from_socket(accept_sock);
+                        let owned = owned;
                         let finish = move || -> Result<Accepted> {
                             sock_check(setsockopt(
                                 accept_sock,
@@ -182,7 +183,7 @@ impl HvStreamListener {
                         };
                         finish()
                     } else {
-                        closesocket(accept_sock);
+                        drop(owned);
                         Err(Error::from_hresult(HRESULT::from_win32(ioresult)))
                     };
                     on_result.deliver(res);
@@ -225,9 +226,9 @@ pub(crate) const TRANSPORT: &str = "hyperv";
 impl HyperVConnector {
     /// Connects to `addr`, returning the connection as a duplex WinRT stream.
     pub async fn connect(addr: HvSocketAddr) -> Result<ITransportStream> {
-        let sock = new_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { IoHandle::from_socket(sock) };
+        let owned = new_socket()?;
+        let sock = owned.raw();
         let prepared = (move || -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket; the
             // AF_HYPERV equivalent of an autobind is the all-zero endpoint.
@@ -278,9 +279,9 @@ impl HyperVConnector {
         addr: HvSocketAddr,
         on_result: ConnectSink,
     ) -> Result<OpHandle> {
-        let sock = new_socket()?;
         // Closed on any early return from here on.
-        let owned = unsafe { IoHandle::from_socket(sock) };
+        let owned = new_socket()?;
+        let sock = owned.raw();
         let prepared = (move || -> Result<(ConnectExFn, Arc<IoReg>)> {
             // ConnectEx fails with WSAEINVAL on an unbound socket.
             let (local, local_len) = HvSocketAddr::new(HV_GUID_ZERO, HV_GUID_ZERO).to_raw();

@@ -25,7 +25,7 @@
 use winasync::comio::NamedPipeConnector;
 use winasync::comio::activation::{CLSID_NAMED_PIPE_CONNECTOR, dll_get_class_object};
 use winasync::comio::bindings::Pbk20191::WinAsync::Comio::ITransportStream;
-use winasync::comio::unload::{can_unload, locks_held, outstanding, release_process_state};
+use winasync::comio::unload::{can_unload, locks_held, outstanding};
 use winasync::common::winsock::wsa_initialized;
 use std::time::{Duration, Instant};
 use windows::Storage::Streams::{Buffer, IInputStream, InputStreamOptions};
@@ -214,50 +214,51 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
         "the operation never settled; LIVE_OPS is still nonzero"
     );
 
-    // --- 6. Process-global state is given back, not kept -----------------
+    // --- 6. Process-global state leaves with the last socket -------------
     // Everything above used named pipes, which never touch Winsock. A socket
-    // transport raises the process's Winsock reference, and the module used
-    // to answer a permanent "no" from that point on because the cached
-    // provider pointers could not be retired. They can now, so the reference
-    // is returnable and the answer goes back to yes -- once somebody asks.
+    // transport takes a Winsock reference, and the module used to answer a
+    // permanent "no" from that point on because the cached provider
+    // pointers could not be retired. Now each socket carries its own
+    // reference and releases it as it closes, so nothing is left for the
+    // module to give back once its objects and operations are gone.
     assert!(can_unload(), "precondition: still unloadable before any socket");
+    assert!(!wsa_initialized(), "precondition: Winsock is not up before any socket");
 
     // Constructing the connector is not enough -- Winsock comes up when a
     // socket is actually created. A connect to a path nothing is listening
-    // on creates one and then fails, which is all this needs.
+    // on creates one and then fails, which is all this needs. A bound
+    // listener on the side holds a socket -- and so a reference -- across
+    // that.
     let unix = winasync::comio::UnixConnector::new();
     let typed: winasync::comio::bindings::Pbk20191::WinAsync::Comio::IUnixConnector =
         unix.cast().expect("QI IUnixConnector");
-    let path = std::env::temp_dir().join(format!("comio_unload_{}.sock", std::process::id()));
-    let endpoint = windows_core::HSTRING::from(path.to_string_lossy().as_ref());
-    let _ = typed.ConnectAsync(&endpoint).and_then(|op| op.join());
-    drop(typed);
-    drop(unix);
-
-    assert_eq!(outstanding(), 0, "the connector outlived its reference");
+    let dir = std::env::temp_dir();
+    let held = dir.join(format!("comio_unload_held_{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&held);
+    let listener = winasync::comio::UnixStreamListener::bind(&held.to_string_lossy(), None)
+        .expect("bind a listener to hold a socket");
     assert!(
         wsa_initialized(),
         "a socket was created without bringing Winsock up"
     );
+    let path = dir.join(format!("comio_unload_{}.sock", std::process::id()));
+    let endpoint = windows_core::HSTRING::from(path.to_string_lossy().as_ref());
+    let _ = typed.ConnectAsync(&endpoint).and_then(|op| op.join());
+    drop(typed);
+    drop(unix);
+    settle(|| outstanding() == 0, "the connector outlived its reference");
+    assert!(
+        wsa_initialized(),
+        "the listener's socket is open, so its reference must still be held"
+    );
+
+    // The last socket out takes Winsock with it.
+    drop(listener);
+    let _ = std::fs::remove_file(&held);
+    settle(|| !wsa_initialized(), "the last socket closed without releasing Winsock");
     assert!(
         can_unload(),
         "objects are gone, so the module should be willing to unload"
-    );
-
-    // The release is what `DllCanUnloadNow` performs just before saying yes.
-    // SAFETY (here and below): `can_unload` holds, and this test process
-    // builds only `comio` sockets, every one of which it counts.
-    assert!(
-        unsafe { release_process_state() },
-        "nothing was released, but Winsock was up"
-    );
-    assert!(
-        !wsa_initialized(),
-        "the Winsock reference was not given back"
-    );
-    assert!(
-        !unsafe { release_process_state() },
-        "a second release claimed to have done something"
     );
 
     // And the module still works afterwards. This is the half that the
@@ -272,15 +273,19 @@ fn the_module_refuses_to_unload_while_anything_of_its_own_is_live() {
     let _ = typed.ConnectAsync(&endpoint).and_then(|op| op.join());
     drop(typed);
     drop(again);
-    assert!(
-        wsa_initialized(),
-        "Winsock did not come back up for a socket created after teardown"
-    );
-    assert_eq!(outstanding(), 0);
-    assert!(
-        unsafe { release_process_state() },
-        "the second reference was not released"
-    );
+    settle(|| outstanding() == 0, "the second connector outlived its reference");
+    settle(|| !wsa_initialized(), "the second socket closed without releasing Winsock");
+    assert!(can_unload());
+}
+
+/// Waits briefly for a condition that a completion callback settles on
+/// another thread, then asserts it.
+fn settle(cond: impl Fn() -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !cond() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(cond(), "{what}");
 }
 
 /// A listener bound to a fresh pipe name, plus that name.

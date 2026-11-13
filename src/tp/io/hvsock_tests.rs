@@ -14,9 +14,7 @@ fn hv_unsupported(e: &windows_core::Error) -> bool {
 #[test]
 fn hv_socket_can_be_created() {
     match hv_socket() {
-        Ok(s) => {
-            unsafe { windows::Win32::Networking::WinSock::closesocket(s) };
-        }
+        Ok(_socket) => {}
         Err(e) if hv_unsupported(&e) => {
             eprintln!("skipped: AF_HYPERV unsupported on this machine");
         }

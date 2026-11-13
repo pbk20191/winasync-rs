@@ -29,19 +29,23 @@
 
 use std::sync::Arc;
 use windows::Win32::Networking::WinSock::{
-    closesocket, RIO_MSG_DEFER, RIO_MSG_DONT_NOTIFY, SOCKADDR, SOCKADDR_INET, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM,
+    RIO_MSG_DEFER, RIO_MSG_DONT_NOTIFY, SOCKADDR, SOCKADDR_INET, SOCKADDR_STORAGE, SOCKET, SOCK_DGRAM,
 };
 
 use super::buffer::RioSlice;
 use super::cq::RioCq;
 use super::rq::{bind_socket, new_rio_socket, RequestQueue, RqConfig, WSAENOBUFS_HRESULT};
-use crate::common::winsock::sock_check;
+use crate::common::winsock::{sock_check, WsaSocket};
 
 use std::net::SocketAddr;
 
 /// A UDP socket driven by Registered I/O.
 pub struct RioUdpSocket {
-    sock: SOCKET,
+    /// Closing is the only way to stop outstanding operations. Their
+    /// completions still arrive — with `WSAECONNABORTED` — and the completion
+    /// queue stays alive to receive them because `rq` holds an `Arc` of it.
+    /// Declared first so it closes before the queue is released.
+    sock: WsaSocket,
     /// Registered slots for the `RIO_BUF` addresses that `RIOReceiveEx` /
     /// `RIOSendEx` need. Sized to the request queue, so a post that the queue
     /// would accept always finds a slot.
@@ -68,40 +72,24 @@ impl RioUdpSocket {
         addr: SocketAddr,
         config: RqConfig,
     ) -> windows_core::Result<Self> {
+        // Closed on any early return from here on.
         let sock = new_rio_socket(
             &addr,
             SOCK_DGRAM.0,
             windows::Win32::Networking::WinSock::IPPROTO_UDP.0,
         )?;
-
-        let build = || -> windows_core::Result<RequestQueue> {
-            bind_socket(sock, &addr)?;
-            RequestQueue::attach(sock, cq, config)
-        };
-
-        let addrs = match super::buffer::RioBufferPool::new(
+        let addrs = super::buffer::RioBufferPool::new(
             size_of::<SOCKADDR_INET>(),
             config.max_outstanding_recv + config.max_outstanding_send,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                return Err(e);
-            }
-        };
-
-        match build() {
-            Ok(rq) => Ok(Self { sock, addrs, rq }),
-            Err(e) => {
-                unsafe { closesocket(sock) };
-                Err(e)
-            }
-        }
+        )?;
+        bind_socket(sock.raw(), &addr)?;
+        let rq = RequestQueue::attach(sock.raw(), cq, config)?;
+        Ok(Self { sock, addrs, rq })
     }
 
     /// The bound address (useful after binding port 0).
     pub fn local_addr(&self) -> windows_core::Result<SocketAddr> {
-        local_addr_of(self.sock)
+        local_addr_of(self.sock.raw())
     }
 
     /// Posts a receive into `slice`.
@@ -140,7 +128,7 @@ impl RioUdpSocket {
         let len = write_sockaddr(&addr, &mut storage);
         sock_check(unsafe {
             windows::Win32::Networking::WinSock::connect(
-                self.sock,
+                self.sock.raw(),
                 &storage as *const _ as *const SOCKADDR,
                 len,
             )
@@ -269,16 +257,6 @@ impl RioUdpSocket {
         self.rq.post_ex(dest.is_some(), slice, addr_slice)
     }
 
-}
-
-impl Drop for RioUdpSocket {
-    /// Closing is the only way to stop outstanding operations. Their
-    /// completions still arrive — with `WSAECONNABORTED` — and the completion
-    /// queue stays alive to receive them because this socket holds an `Arc`
-    /// of it.
-    fn drop(&mut self) {
-        unsafe { closesocket(self.sock) };
-    }
 }
 
 fn write_sockaddr(addr: &SocketAddr, storage: &mut SOCKADDR_STORAGE) -> i32 {
